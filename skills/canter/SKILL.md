@@ -89,11 +89,16 @@ keep their pre-rename spelling — the normative list is
 | `service install-plan [--config PATH] [--json]` | read-only (renders; never activates) | Renders the per-user launchd/systemd unit text + install steps. |
 | `service status-plan [--config PATH] [--json]` | read-only (renders) | Renders verification steps for the unit. |
 | `service uninstall-plan [--config PATH] [--json]` | read-only (renders) | Renders removal steps for the unit. |
+| `grant issue --request FILE --issue N --expires-in SECS [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]` | **daemon-journaled mint (no repository/session/external effect)** | Mints ONE route grant (`hf-grant/v1`) through the closed `grants.issue` method from a reviewed bound-input document; every binding is derived (repository, workflow hash, role/policy revision, phase, caps, scope, live epoch, explicit expiry), the intent is journaled before the row, a production-class binding and an already-expired window refuse typed, and the minted `gr_` id is presented at the board / `queue submit` authorization point. |
 | daemon `apply` RPC (NOT a CLI subcommand) | **grant-gated mutation** | One digest-bound plan step per request over the socket, idempotency-keyed, journaled before effect; typed `hf-outcome/v1`. |
 
-There is no CLI mutation command. Any task that needs a fleet mutation must
-route through the daemon `apply` RPC with an authorized route grant — never
-through a workaround.
+Mutating surfaces are the daemon's closed, journaled methods: the CLI
+exposes `grant issue`, `lane request`, `queue submit` and the run controls
+(pause/resume/retry) as thin clients over them, and each records durable
+intent before any effect. `apply` (step execution, spawn/prompt/Git effects)
+remains a daemon RPC that no CLI subcommand exposes, and production-class
+work stays human-only. Never work around a refusal: fix the reviewed inputs
+and re-run the surface that refused.
 
 ## JSON envelope contract
 
@@ -156,6 +161,14 @@ renderings until an authorized grant + daemon `apply` executes them.
   hashes, `state_epoch`, expiry, and instance; grants expire and die with
   their epoch (material edits or restore rotate the epoch and invalidate
   prior grants).
+- The SUPPORTED mint path is `canter grant issue` over the closed
+  `grants.issue` method: it mints ONE grant from the reviewed bound-input
+  document (`canter queue preview --out`) with every binding derived, the
+  intent journaled before the row, and typed refusals for a moved role
+  revision / epoch, an expired window and a production-class binding.
+  Minting is NOT authorization — the minted id is presented at the board /
+  `queue submit` point. `grants.list` reads live grants; `grants.revoke`
+  cancels one.
 - `apply` runs ONE plan step per request, requires `params.idempotency_key`
   (`ik_` + 8-64 `[a-z0-9-]`), revalidates live under the state lock
   (epoch/grant/expiry/revision/hashes/capability) and journals

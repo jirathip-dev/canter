@@ -617,6 +617,7 @@ fn dispatch(shared: &Arc<Shared>, request: &Request) -> String {
         "lane.start" => method_lane_start(shared, request),
         "lane.adopt" => method_lane_adopt(shared, request),
         "lane.successor.consume" => method_lane_successor_consume(shared, request),
+        "grants.issue" => method_grants_issue(shared, request),
         "grants.list" => method_grants_list(shared, request),
         "journal.tail" => method_journal_tail(shared, request),
         "grants.revoke" => method_grants_revoke(shared, request),
@@ -5747,6 +5748,175 @@ fn publish_after_state_change(shared: &Arc<Shared>, audit: Option<AuditRow>) {
     let _ = seq; // the event seq is carried by the row itself
 }
 
+/// `grants.issue` (issue #92): the supported production mint path for route
+/// grants — the caller that turns a reviewed binding into a `hf-grant/v1`
+/// row. Until this method existed, `State::issue_grant` had test-only
+/// callers, so no supported surface could produce a grant id for
+/// `queue submit --grant` / `board --grant`.
+///
+/// The presented `params.grant` document is the exact `hf-grant/v1` binding
+/// (repository, issue number + acceptance revision, workflow/policy hashes,
+/// phase, scope, caps, expiry, state epoch): the daemon validates it BEFORE
+/// any journaling (a refused document never leaves a claim behind), refuses
+/// a document that is already expired at mint time and any production-class
+/// binding, then journals `mutate.grant.issue` and inserts exactly ONE row
+/// inside the claim window. Everything else is the shared mutation contract:
+/// the key is spent per attempt (replay of the same request id + key returns
+/// the recorded response), and an interrupt between intent and outcome
+/// leaves no partial grant — the row is either absent (reconcile reports
+/// `never committed`) or fully committed (reconcile re-reads it).
+fn method_grants_issue(shared: &Arc<Shared>, request: &Request) -> String {
+    let Some(grant) = request
+        .params
+        .as_ref()
+        .and_then(|params| params.get("grant"))
+    else {
+        return err_response(
+            &request.id,
+            "refusal.malformed",
+            "grants.issue requires params.grant (one hf-grant/v1 document)",
+        );
+    };
+    if !matches!(grant, Val::Obj(_)) {
+        return err_response(
+            &request.id,
+            "refusal.malformed",
+            "grants.issue params.grant must be an hf-grant/v1 object",
+        );
+    }
+    // Fail closed BEFORE the claim: the document must be a valid binding of
+    // this family (the state layer re-validates as the inner fence).
+    let verdict = validate_doc(Family::Grant, grant);
+    if !verdict.is_accepted() {
+        let code = verdict
+            .refusal()
+            .map(refusal_code)
+            .unwrap_or("refusal.malformed");
+        return err_response(&request.id, code, verdict.message());
+    }
+    let grant_id = grant
+        .get("grant_id")
+        .and_then(Val::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if !crate::formats::is_grant_id(&grant_id) {
+        return err_response(
+            &request.id,
+            "refusal.malformed",
+            "grants.issue requires params.grant.grant_id (gr_ + 16 lowercase hex)",
+        );
+    }
+    // Production-class authority is never minted over the socket surface:
+    // the operator path holds production boundaries, so a production-class
+    // grant would be a capability nothing can authorize. This refuses
+    // before the claim, with the same typed code the apply gate uses.
+    let phase = grant.get("phase").and_then(Val::as_str).unwrap_or_default();
+    let production_caps = grant
+        .get("caps")
+        .and_then(Val::as_array)
+        .map(|caps| {
+            caps.iter()
+                .any(|cap| matches!(cap.as_str(), Some("production") | Some("release")))
+        })
+        .unwrap_or(false);
+    if phase == "production" || production_caps {
+        return err_response(
+            &request.id,
+            crate::mutation::code::PRODUCTION_CONFIRMATION,
+            "a production-class grant is never minted from this surface (production authority \
+             requires a fresh interactive TTY-confirmed digest, and grants.issue carries no \
+             confirmation channel)",
+        );
+    }
+    // An already-dead grant is never minted: the mint path refuses what the
+    // consumers would refuse on their first read (refusal.grant.expired).
+    let expires_at = grant
+        .get("expires_at")
+        .and_then(Val::as_str)
+        .unwrap_or_default();
+    let now = time::rfc3339_now();
+    if crate::mutation::is_expired(expires_at, &now) {
+        return err_response(
+            &request.id,
+            crate::mutation::code::GRANT_EXPIRED,
+            format!(
+                "grant {grant_id} expires at {expires_at}, which is not in the future; an expired grant is never minted"
+            ),
+        );
+    }
+    match journal_mutation(shared, request, "mutate.grant.issue", &grant_id) {
+        Intent::Claimed { key } => {
+            crash_point("grants.issue.after-intent");
+            let guard = match shared.lock_state() {
+                Ok(guard) => guard,
+                Err(message) => {
+                    return err_response(&request.id, "state.unavailable", message);
+                }
+            };
+            let response = match guard.issue_grant(grant) {
+                Ok(row) => {
+                    // The row is committed from here on; an interrupt before
+                    // the outcome resolves is the "committed, unresolved"
+                    // window (restart reconciliation re-reads the row).
+                    crash_point("grants.issue.after-commit");
+                    resolve_mutation_on(
+                        &guard,
+                        &shared.log,
+                        request,
+                        &key,
+                        "grants.issue",
+                        true,
+                        minted_grant_doc(&row),
+                        None,
+                    )
+                }
+                Err(err) => resolve_mutation_on(
+                    &guard,
+                    &shared.log,
+                    request,
+                    &key,
+                    "grants.issue",
+                    false,
+                    null(),
+                    Some((err.code, err.message)),
+                ),
+            };
+            drop(guard);
+            publish_after_state_change(shared, None);
+            response
+        }
+        Intent::Replay { response } => replay(shared, &response),
+        Intent::Refused { code, message } => err_response(&request.id, code, message),
+    }
+}
+
+/// Render one minted grant row as the `hf-grant/v1` document that was
+/// minted: the contract shape (caps is the JSON array the family validator
+/// requires), never the `grants.list` projection.
+fn minted_grant_doc(row: &crate::state::GrantRow) -> Val {
+    let caps = Val::parse_json(&row.caps).unwrap_or(Val::Arr(Vec::new()));
+    object(vec![
+        ("schema", string("hf-grant/v1")),
+        ("grant_id", string(&row.grant_id)),
+        ("repository", string(&row.repository)),
+        (
+            "issue",
+            object(vec![
+                ("number", integer(row.issue_number)),
+                ("revision", string(&row.issue_revision)),
+            ]),
+        ),
+        ("workflow_hash", string(&row.workflow_hash)),
+        ("policy_hash", string(&row.policy_hash)),
+        ("phase", string(&row.phase)),
+        ("scope", string(&row.scope)),
+        ("caps", caps),
+        ("expires_at", string(&row.expires_at)),
+        ("state_epoch", integer(row.state_epoch)),
+        ("created_at", string(&row.created_at)),
+    ])
+}
+
 fn method_grants_revoke(shared: &Arc<Shared>, request: &Request) -> String {
     let Some(grant_id) = request
         .params
@@ -6570,6 +6740,19 @@ fn reconcile_claims(
                 {
                     reconcile_queue_submission(state, log, params)?;
                 }
+                // Issue #92: an interrupted `grants.issue` claim reconciles
+                // against its commit marker — the grant row itself. The
+                // insert is one statement, so a present row means the mint
+                // committed and a missing row means no grant exists (no
+                // partial grant can survive the interrupt). Nothing is ever
+                // re-executed and the claim stays ambiguous: a retry needs a
+                // fresh idempotency key.
+                if claim.method == "grants.issue"
+                    && let Ok(doc) = Val::parse_json(&claim.request_line)
+                    && let Some(params) = doc.get("params")
+                {
+                    reconcile_grant_issue(state, log, params)?;
+                }
                 // Issue #86: an interrupted run-control claim reconciles
                 // against its commit marker — the run's durable control
                 // rows. The readback says whether the control committed;
@@ -7121,6 +7304,99 @@ fn reconcile_lane_successor(
             err.code, err.message
         )),
     }
+}
+
+/// Restart reconciliation for one interrupted `grants.issue` claim (issue
+/// #92 AC4). The grant row is the commit marker: issuance is ONE insert, so
+/// re-reading the row is enough to know whether the mint happened.
+///
+/// - Row present: the mint committed. The readback re-verifies the durable
+///   binding against the presented document (repository, issue number +
+///   revision, expiry, epoch) so a divergence is stated instead of assumed;
+///   nothing is re-executed and no second grant is ever inserted.
+/// - Row absent: the mint never committed. No partial grant exists — the
+///   insert is all-or-nothing — and a retry (fresh idempotency key) mints
+///   from live state.
+///
+/// Either way the claim itself stays ambiguous (the generic reconciliation
+/// outcome): an operator decides what happens next.
+fn reconcile_grant_issue(state: &State, log: &DaemonLog, params: &Val) -> Result<(), DaemonError> {
+    let Some(grant) = params.get("grant") else {
+        log.write(
+            "warn",
+            "reconcile.grants.issue",
+            "interrupted grant issuance claim carries no params.grant; there is no commit \
+             marker to read back",
+        );
+        return Ok(());
+    };
+    let grant_id = grant
+        .get("grant_id")
+        .and_then(Val::as_str)
+        .unwrap_or_default();
+    if !crate::formats::is_grant_id(grant_id) {
+        log.write(
+            "warn",
+            "reconcile.grants.issue",
+            "interrupted grant issuance claim carries no grant id; there is no commit marker to \
+             read back",
+        );
+        return Ok(());
+    }
+    let read = state.grant_by_id(grant_id).map_err(|err| {
+        daemon_error(
+            "daemon.reconcile",
+            format!(
+                "grant issuance reconciliation: {}: {}",
+                err.code, err.message
+            ),
+        )
+    })?;
+    let Some(row) = read else {
+        log.write(
+            "info",
+            "reconcile.grants.issue",
+            &format!(
+                "interrupted grant issuance {grant_id} never committed; the mint is one insert, \
+                 so no partial grant exists and a retry needs a fresh idempotency key"
+            ),
+        );
+        return Ok(());
+    };
+    let presented_revision = grant
+        .get("issue")
+        .and_then(|issue| issue.get("revision"))
+        .and_then(Val::as_str)
+        .unwrap_or_default();
+    let presented_expiry = grant
+        .get("expires_at")
+        .and_then(Val::as_str)
+        .unwrap_or_default();
+    if row.issue_revision != presented_revision
+        || row.expires_at != presented_expiry
+        || grant.get("repository").and_then(Val::as_str) != Some(row.repository.as_str())
+    {
+        log.write(
+            "warn",
+            "reconcile.grants.issue",
+            &format!(
+                "interrupted grant issuance {grant_id} committed a DIFFERENT binding than the \
+                 interrupted request carried; the committed row stands and external \
+                 reconciliation is required"
+            ),
+        );
+        return Ok(());
+    }
+    log.write(
+        "info",
+        "reconcile.grants.issue",
+        &format!(
+            "grant issuance {grant_id} was committed before the interrupt (status {}, epoch {}); \
+             the row stands, nothing is re-executed, and the claim needs a fresh idempotency key",
+            row.status, row.state_epoch
+        ),
+    );
+    Ok(())
 }
 
 /// Restart reconciliation for one interrupted `queue.submit` claim (issue

@@ -89,7 +89,8 @@ WORKFLOW_NODE_KINDS = frozenset(
      "gate", "human_approval", "merge", "terminal"}
 )
 RPC_METHODS = frozenset(
-    {"capabilities", "doctor", "status", "plan", "apply", "grants.list",
+    {"capabilities", "doctor", "status", "plan", "apply",
+     "grants.issue", "grants.list",
      "grants.revoke", "schedules.list", "schedules.create", "schedules.pause",
      "schedules.resume", "schedules.delete", "schedules.evaluate",
      "lane.replacement.request", "lane.replacement.advance",

@@ -538,6 +538,50 @@ release process activates (docs/RELEASING.md), then semver applies.
   eligible — no scope expansion, no new issue creation and no speculative
   prerequisite chain.
 
+### Added (issue #92 — Supported production grant issuance path)
+
+- `grants.issue` extends the closed RPC set (36 -> 37) with the MINT half of
+  the route-grant contract: `State::issue_grant` existed with test-only
+  callers, so no supported surface could produce the `gr_` id that
+  `apply` / `queue submit --grant` / `board --grant` authorize against. The
+  method takes `params.grant` (one `hf-grant/v1` document) plus
+  `params.idempotency_key`, validates the document BEFORE any journaling,
+  journals `mutate.grant.issue` before the single row insert, and returns
+  the minted document itself. Exactly-once per idempotency key, replay of
+  the same request id + key returns the recorded response, and an interrupt
+  between intent and outcome leaves no partial grant: restart
+  reconciliation re-reads the row as its commit marker and reports
+  `committed before the interrupt` / `never committed`.
+- `canter grant issue --request FILE --issue N --expires-in SECS` is the
+  supported CLI mint path over that method. Every binding is DERIVED from
+  the reviewed bound-input document (`canter queue preview --out`), the
+  configuration re-observed now, the live daemon epoch and the explicit
+  window: repository identity, issue number + acceptance revision,
+  `workflow_hash`, `policy_hash` (the reviewed role-configuration
+  revision), phase, caps, scope (`worktrees/issues/N`), `state_epoch`,
+  `expires_at`. The grant id is content-addressed (`gr_` + sha256 of the
+  canonical binding), so the same reviewed run + window names one grant and
+  a second mint refuses `state.grant_exists` instead of issuing a second
+  authorization. Minting is NOT authorization: the returned id is presented
+  at the board / `queue submit` point, and the reviewed digest approval
+  there is unchanged.
+- Fail-closed refusals on the mint surface: a foreign/malformed document
+  (`usage.grant_request`), an issue outside the reviewed selected set
+  (`usage.grant_issue`), a moved role revision
+  (`refusal.profile.revision`), a moved epoch (`state.epoch_mismatch`,
+  with epoch rotation invalidating the grant), an already-expired window
+  (`refusal.grant.expired`) and any production-class binding (phase
+  `production` or a `production`/`release` capability →
+  `refusal.policy.production_confirmation`: production authority stays
+  human-only and this surface carries no confirmation channel) — refused
+  before any claim or row, in the CLI and again in the daemon.
+- `tests/grant_issue.rs` proves the surface over the real binary, the real
+  socket and real daemon children (14 tests): the minted binding read back
+  by `grants.list` and by the dispatched run, consumption through the real
+  `queue submit` path, expiry/epoch/role/production refusals, exactly-once
+  + recorded replay, both crash points, and the untouched single-writer
+  daemon lock.
+
 ### Added (issue #78 — CLI preview / request / inspect for one explicit lane handoff)
 
 - The thin CLI lane surface over the completed daemon handoff path

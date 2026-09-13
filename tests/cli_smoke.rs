@@ -124,6 +124,7 @@ fn every_documented_command_has_working_help() {
         "run status",
         "supervision status",
         "board",
+        "grant issue",
     ] {
         assert!(usage.contains(command), "USAGE must document `{command}`");
     }
@@ -137,6 +138,8 @@ fn every_documented_command_has_working_help() {
         &["run", "--help"][..],
         &["supervision", "--help"][..],
         &["board", "--help"][..],
+        &["grant", "--help"][..],
+        &["grant", "issue", "--help"][..],
     ] {
         let out = run(args);
         assert!(out.status.success(), "{args:?} --help should exit 0");
