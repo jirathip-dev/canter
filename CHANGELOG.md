@@ -560,8 +560,10 @@ release process activates (docs/RELEASING.md), then semver applies.
   `workflow_hash`, `policy_hash` (the reviewed role-configuration
   revision), phase, caps, scope (`worktrees/issues/N`), `state_epoch`,
   `expires_at`. The grant id is content-addressed (`gr_` + sha256 of the
-  canonical binding), so the same reviewed run + window names one grant and
-  a second mint refuses `state.grant_exists` instead of issuing a second
+  canonical binding; the reviewed binding is the identity and the window is
+  deliberately not part of it), so one reviewed run names exactly one grant
+  whatever window a caller asks for, and a re-mint refuses
+  `state.grant_exists` instead of issuing a second
   authorization. Minting is NOT authorization: the returned id is presented
   at the board / `queue submit` point, and the reviewed digest approval
   there is unchanged.

@@ -421,6 +421,22 @@ fn text_of(doc: &Val, key: &str) -> String {
         .to_string()
 }
 
+/// The daemon's live grant population (the `grants.list` read over the
+/// socket), so a test can assert that no second authorization appeared.
+fn listed_grants(fixture: &Fixture) -> Vec<Val> {
+    let listed = rpc_ok(
+        &fixture.socket,
+        &fresh_id(90),
+        "grants.list",
+        Some(object(vec![])),
+    );
+    listed
+        .get("grants")
+        .and_then(Val::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
 // ---------------------------------------------------------------------------
 // AC1/AC2: the mint path exists, is daemon-issued, and preserves the binding
 // ---------------------------------------------------------------------------
@@ -984,15 +1000,23 @@ fn replay_returns_the_recorded_outcome_and_a_second_mint_never_duplicates() {
     assert!(stderr.contains("state.claim_reused"), "{stderr}");
 
     // A fresh key with the same binding refuses instead of creating a second
-    // authorization for the same reviewed run.
+    // authorization for the same reviewed run — and it refuses WHATEVER
+    // window is asked for: the grant id is the identity of the reviewed
+    // binding, not of the window, so a re-mint with a longer `--expires-in`
+    // cannot slip a second grant past the first one.
     let (exit, _stdout, stderr) =
-        fixture.grant_issue_with(&request, 5, 3600, Some(&key("replay-0002")));
+        fixture.grant_issue_with(&request, 5, 7200, Some(&key("replay-0002")));
     assert_eq!(exit, 1, "second key refuses: {stderr}");
     assert!(stderr.contains("state.grant_exists"), "{stderr}");
+    assert_eq!(
+        listed_grants(&fixture).len(),
+        1,
+        "exactly one grant for the reviewed binding after the longer-window re-mint"
+    );
 
     // Exactly-once + recorded replay at the wire level, on a DISTINCT
-    // document (a different window means a different content-addressed id):
-    // the SAME request id and key return the recorded response byte-for-byte.
+    // document (a separate mint, so a separate claim): the SAME request id
+    // and key return the recorded response byte-for-byte.
     let mut other_document = document.clone();
     if let Val::Obj(map) = &mut other_document {
         map.insert("grant_id".to_string(), string("gr_00000000000000ee"));
@@ -1157,11 +1181,18 @@ fn a_crash_after_the_commit_keeps_exactly_one_grant() {
         .expect("grants");
     assert_eq!(grants.len(), 1, "exactly the committed grant: {listed:?}");
 
-    // The same binding with a fresh key still refuses: no duplicate grant.
+    // The same binding with a fresh key still refuses — whatever window is
+    // asked for — so no duplicate grant appears: exactly one survives the
+    // interrupt.
     let (exit, _stdout, stderr) =
-        fixture.grant_issue_with(&request, 5, 3600, Some(&key("crash-commit-0002")));
+        fixture.grant_issue_with(&request, 5, 7200, Some(&key("crash-commit-0002")));
     assert_eq!(exit, 1, "no duplicate mint: {stderr}");
     assert!(stderr.contains("state.grant_exists"), "{stderr}");
+    assert_eq!(
+        listed_grants(&fixture).len(),
+        1,
+        "exactly one grant after the crash and the longer-window re-mint"
+    );
 
     shutdown(daemon);
 }

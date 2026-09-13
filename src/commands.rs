@@ -4224,7 +4224,6 @@ fn execute_grant_issue(args: &GrantIssueArgs, invocation: &Invocation) -> CmdRes
         &selected.revision,
         &role_revision,
         &scope,
-        &expires_at,
         epoch,
     );
     let caps: Vec<Val> = request
@@ -4309,17 +4308,17 @@ fn execute_grant_issue(args: &GrantIssueArgs, invocation: &Invocation) -> CmdRes
 
 /// The content-addressed grant id: `gr_` + first 16 hex of the sha256 over
 /// the canonical binding material (domain-separated), the same rule the plan
-/// id and the work-item id follow. `created_at` is deliberately NOT part of
-/// the binding, so the same reviewed run + window always names the same grant
-/// (and a second mint of it refuses `state.grant_exists` instead of silently
-/// creating a second authorization).
+/// id and the work-item id follow. The identity is the REVIEWED BINDING, not
+/// the window: `created_at` and `expires_at` are deliberately NOT part of it,
+/// so one reviewed run names exactly one grant whatever a caller asks for and
+/// a re-mint with ANY window refuses `state.grant_exists` (the first minted
+/// window stands) instead of silently creating a second authorization.
 fn grant_id_for(
     request: &crate::queue_preview::QueueRequest,
     issue_number: i64,
     issue_revision: &str,
     policy_hash: &str,
     scope: &str,
-    expires_at: &str,
     state_epoch: i64,
 ) -> String {
     let caps: Vec<Val> = request
@@ -4343,7 +4342,6 @@ fn grant_id_for(
         ("phase", string(&request.boundary.phase)),
         ("scope", string(scope)),
         ("caps", Val::Arr(caps)),
-        ("expires_at", string(expires_at)),
         ("state_epoch", integer(state_epoch)),
     ]);
     format!(
