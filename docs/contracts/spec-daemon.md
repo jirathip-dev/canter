@@ -60,7 +60,13 @@ remain usable without it; SQLite owns state; no network control API).
   outcome leaves no partial grant (restart reconciliation re-reads the row
   and reports `committed before the interrupt` / `never committed`). The
   response document is the minted `hf-grant/v1` document itself (the
-  contract shape, `caps` as an array). Minting is not authorization: the
+  contract shape, `caps` as an array). The `gr_` id is content-addressed
+  over the REVIEWED BINDING (repository, issue number + acceptance revision,
+  workflow hash, policy hash, phase, scope, caps, live state epoch); the
+  requested window is deliberately not part of that identity, so a re-mint
+  of the same binding refuses `state.grant_exists` whatever `expires_at` it
+  asks for and the first minted window stands.
+  Minting is not authorization: the
   grant only becomes authority at the board / `queue submit` point.
 - `apply` **requires** `params.idempotency_key` (`ik_` format): an apply
   without a key is refused at parse time (`rpc/request.malformed.json`).
