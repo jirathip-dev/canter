@@ -6144,14 +6144,22 @@ mod tests {
 
     #[test]
     fn missing_config_is_a_typed_config_error() {
-        // The unit test process has no canter config (no XDG override in
-        // scope), so plan/status/config validate must refuse with exit 5.
-        let result = execute(&invocation(&["plan", "widgets", "1"]));
-        assert_eq!(result.exit_code, 5);
-        assert_eq!(result.kind, Kind::Error);
-        assert_envelope_valid("plan", &result);
-        let error = result.error.as_ref().expect("error doc");
-        assert_eq!(error.code, "config.not_found");
+        // Discovery is rooted at a home that holds no config, so the assertion
+        // holds whatever the developer's ambient
+        // $HOME/.config/canter/config.toml contains: plan/status/config
+        // validate must refuse with exit 5 and the typed config.not_found.
+        for (argv, command) in [
+            (&["plan", "widgets", "1"][..], "plan"),
+            (&["status"][..], "status"),
+            (&["config", "validate"][..], "config validate"),
+        ] {
+            let result = crate::config::with_config_home(None, || execute(&invocation(argv)));
+            assert_eq!(result.exit_code, 5, "{argv:?}");
+            assert_eq!(result.kind, Kind::Error, "{argv:?}");
+            assert_envelope_valid(command, &result);
+            let error = result.error.as_ref().expect("error doc");
+            assert_eq!(error.code, "config.not_found", "{argv:?}");
+        }
     }
 
     #[test]
