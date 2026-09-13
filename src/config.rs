@@ -216,10 +216,51 @@ pub fn legacy_config_path() -> Option<PathBuf> {
 }
 
 fn config_path_in(dir_name: &str) -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(home) = overridden_config_home() {
+        return home.map(|home| home.join(dir_name).join("config.toml"));
+    }
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
     let base = xdg.or_else(|| home.map(|home| home.join(".config")));
     base.map(|base| base.join(dir_name).join("config.toml"))
+}
+
+// Test-only override of the config home used by `config_path_in`.
+//
+// The override is thread-local and compiled only into the crate's test target
+// (`cfg(test)`), so the shipped binary's discovery — explicit `--config`, then
+// the XDG default — is untouched. A suite that reads the ambient
+// `$HOME/.config/canter/config.toml` is not hermetic: a developer (or a lane
+// acceptance run) that saved a config there silently changes what the
+// no-config tests exercise. `home: None` means "no config home at all", i.e.
+// no config can be discovered.
+#[cfg(test)]
+thread_local! {
+    static CONFIG_HOME_OVERRIDE: std::cell::RefCell<Option<Option<PathBuf>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn overridden_config_home() -> Option<Option<PathBuf>> {
+    CONFIG_HOME_OVERRIDE.with(|cell| cell.borrow().clone())
+}
+
+/// Run `f` with config discovery rooted at `home` (test-only; see the
+/// `CONFIG_HOME_OVERRIDE` seam above). Nested scopes restore the previous root.
+#[cfg(test)]
+pub fn with_config_home<R>(home: Option<PathBuf>, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Option<PathBuf>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CONFIG_HOME_OVERRIDE.with(|cell| *cell.borrow_mut() = self.0.take());
+        }
+    }
+    let previous = CONFIG_HOME_OVERRIDE.with(|cell| cell.replace(Some(home)));
+    let restore = Restore(previous);
+    let out = f();
+    drop(restore);
+    out
 }
 
 /// A human hint naming where the default config would live.

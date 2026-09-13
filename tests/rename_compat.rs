@@ -116,6 +116,14 @@ impl Fixture {
         self.dir.join("r")
     }
 
+    /// The fixture's own (empty) config home. Discovery must never read the
+    /// developer's ambient `$XDG_CONFIG_HOME`/`~/.config/canter/config.toml`:
+    /// an ambient `[daemon] socket` would replace the derived socket this
+    /// test exists to pin.
+    fn config_home(&self) -> PathBuf {
+        self.dir.join("c")
+    }
+
     /// Spawn `canter daemon run` WITHOUT a socket override: both the state
     /// tree and the socket directory must derive from the fixture XDG homes,
     /// which is exactly what proves the adoption rule.
@@ -125,6 +133,7 @@ impl Fixture {
             .args(["daemon", "run"])
             .env("XDG_STATE_HOME", self.state_home())
             .env("XDG_RUNTIME_DIR", self.runtime_dir())
+            .env("XDG_CONFIG_HOME", self.config_home())
             .env("HOME", &self.dir)
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr))

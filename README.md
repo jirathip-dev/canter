@@ -246,13 +246,18 @@ $ canter daemon status --json   # from another terminal: exit 0
  "exit_code":0,"kind":"ok","schema":"hf-output/v1"}
 ```
 
-Granting and applying are **daemon RPC operations, not CLI subcommands**: you
-request a route grant bound to the plan's digest, and each `apply` request
-executes exactly one plan step (checkout, then worktree, then harness start,
-prompt, outcome, review evidence, merge, cleanup — each gated on its own
-conditions) with an idempotency key, and writes the outcome to the journal
-before the effect. The full grant/apply workflow, its refusal codes, and its
-typed outcome statuses are documented — with synthetic examples only — in
+Granting and applying: `canter grant issue` is the SUPPORTED production
+grant-issuance path (a thin CLI over the daemon's closed `grants.issue`
+method) — it mints ONE `hf-grant/v1` from a reviewed bound-input document,
+and the minted grant id is what `canter board --grant` / `canter queue
+submit --grant` present. Issuance is not authorization: the board remains
+the authorization point. `apply` stays a **daemon RPC operation, not a CLI
+subcommand**: each `apply` request executes exactly one plan step
+(checkout, then worktree, then harness start, prompt, outcome, review
+evidence, merge, cleanup — each gated on its own conditions) with an
+idempotency key, and writes the outcome to the journal before the effect.
+The full grant/apply workflow, its refusal codes, and its typed outcome
+statuses are documented — with synthetic examples only — in
 [docs/OPERATIONS.md](docs/OPERATIONS.md) section 6.
 
 **5. You verify.** Every step was journaled and is read back exactly; replaying
@@ -369,7 +374,7 @@ facts a build binds (`state schema version: 12`; migration chain m0001–m0012;
 18 document schema families from `hf-config/v1` to `hf-board/v1`).
 
 **Command surface** — mirrors `canter --help` on the release binary
-exactly (one line per shipped command; 23 subcommands):
+exactly (one line per shipped command; 24 subcommands):
 
 | Command | Behavior (from `--help`) |
 | --- | --- |
@@ -392,6 +397,7 @@ exactly (one line per shipped command; 23 subcommands):
 | `run retry --run RUN_ID --step STEP [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]` | Authorize ONE bounded re-dispatch of ONE diagnosed step of the run (invalid/revoked/stale/succeeded/exhausted retries refuse). |
 | `run status --run RUN_ID [--socket PATH] [--config PATH] [--json]` | Read one run's control state back read-only (active / pause_requested / paused + live boundary). |
 | `supervision status --run RUN_ID [--socket PATH] [--config PATH] [--json]` | Read one supervised run's versioned `hf-supervision/v1` status back read-only (class/reason/eligibility, freshness, last check, next eligible check; supervision is armed by `queue submit --supervise arm`; a verified delivery each advances the authorized queue once and admits the next eligible approved issue under the existing admission checks, and nothing else is ever continued). |
+| `grant issue --request FILE --issue N --expires-in SECS [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]` | Mint ONE route grant (`hf-grant/v1`) through the daemon from a reviewed bound-input document (`canter queue preview --out`): every binding is derived (repository, workflow hash, role/policy revision, phase, caps, scope, live epoch, explicit expiry), issuance is journaled before the row and exactly-once per idempotency key, a production-class binding and an already-expired window refuse typed, and minting is NOT authorization (the board/`queue submit` remains the authorization point). |
 | `service doctor [--config PATH] [--json]` | Check the daemon environment read-only (platform, config, socket state, unit placement). |
 | `service install-plan [--config PATH] [--json]` | Render the per-user launchd/systemd unit text + install steps (never installs). |
 | `service status-plan [--config PATH] [--json]` | Render the status/verification steps for the unit (never queries the service manager). |

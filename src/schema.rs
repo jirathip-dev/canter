@@ -1187,13 +1187,18 @@ pub const SUPPORTED_FAMILIES: [Family; 18] = [
 /// methods are added by issue #76 (one daemon-coordinated start/adopt
 /// transition: one generation/nonce owns the fresh successor, adapter-
 /// observed verification, a reconciliation-not-replay adoption re-query,
-/// and exactly-once completion consumption after adoption).
-pub const RPC_METHODS: [&str; 36] = [
+/// and exactly-once completion consumption after adoption). The
+/// `grants.issue` method is added by issue #92 (the supported production
+/// mint path for route grants: `params.grant` carries the exact
+/// `hf-grant/v1` document, issuance stays daemon-issued — the closed set
+/// grows by exactly the one method issuance needs).
+pub const RPC_METHODS: [&str; 37] = [
     "capabilities",
     "doctor",
     "status",
     "plan",
     "apply",
+    "grants.issue",
     "grants.list",
     "grants.revoke",
     "schedules.list",

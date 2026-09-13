@@ -409,14 +409,15 @@ Failure → remedy:
 
 ## 6. Grant-gated mutations (daemon `apply` — RPC only)
 
-Boundary: the CLI surface is read-only for repository, session, and
-external effects. The only mutation paths are the daemon `apply` RPC over
-the local socket (issue #8 semantics, [spec-plans.md](contracts/spec-plans.md),
-[spec-daemon.md](contracts/spec-daemon.md)) and the explicitly authorized
+Boundary: the CLI surface never mutates repositories, sessions, or external
+state. The mutation paths are the daemon `apply` RPC over the local socket
+(issue #8 semantics, [spec-plans.md](contracts/spec-plans.md),
+[spec-daemon.md](contracts/spec-daemon.md)), the explicitly authorized
 `canter lane request` record (section 11) — the latter records a durable
-request and has no spawn, kill, signal, Git, grant, or resume effect.
-There is **no** CLI subcommand that mutates repositories, sessions, or
-external state. The material below is the operator
+request and has no spawn, kill, signal, Git, grant, or resume effect — and
+the supported mint path below, which only inserts a durable grant row in the
+daemon's own state (no repository, session, signal, Git, or external effect).
+The material below is the operator
 workflow in terms of the documented contract and is **synthetic guidance**:
 this repository never mutates real repositories, fleets, or external state,
 and its tests use disposable local repositories and fakes only.
@@ -432,9 +433,29 @@ with a fresh interactive TTY for production-branch effects.
 2. **Grant.** A route grant (`hf-grant/v1`) is the only authorization to
    start durable work. It binds repository, plan digest, capabilities,
    role/policy hashes, `state_epoch`, expiry, and instance. Grants are
-   issued/consumed by the daemon, expire, and die with their epoch —
-   request one from the daemon (`grants.list` shows live grants;
-   `grants.revoke` cancels one).
+   issued/consumed by the daemon, expire, and die with their epoch.
+   The SUPPORTED mint path is `canter grant issue`, a thin CLI over the
+   daemon's closed `grants.issue` method — the same method any other client
+   may call, journaled before the row and exactly-once per idempotency key.
+   Review the run first (`canter queue preview ... --out request.json`), then
+   mint the grant for ONE reviewed issue:
+
+       canter grant issue --request request.json --issue 92 --expires-in 3600
+
+   Every binding is derived from that reviewed document plus the
+   configuration re-observed now plus the live epoch — never typed by hand:
+   repository identity, `issue.number` + acceptance revision,
+   `workflow_hash`, `policy_hash` (the reviewed role-configuration
+   revision), `phase`, `caps`, `scope` (`worktrees/issues/N`), `state_epoch`
+   and the explicit expiry. A moved role revision
+   (`refusal.profile.revision`), a moved epoch (`state.epoch_mismatch`), an
+   already-expired window (`refusal.grant.expired`), a production-class
+   binding (`refusal.policy.production_confirmation`) and a foreign or
+   malformed document (`usage.grant_request`) all refuse typed before any
+   row exists. Minting is NOT authorization: the returned `gr_` id is
+   presented at the board / `queue submit` point, which stays the
+   authorization. `grants.list` shows live grants; `grants.revoke` cancels
+   one.
 3. **Apply.** `apply` executes **one plan step per request** and requires
    `params.idempotency_key` (`ik_` + 8-64 `[a-z0-9-]`). The daemon
    recomputes the digest before anything is journaled, then revalidates

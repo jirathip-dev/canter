@@ -72,6 +72,7 @@ USAGE:
     canter run retry --run RUN_ID --step STEP [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run status --run RUN_ID [--socket PATH] [--config PATH] [--json]
     canter supervision status --run RUN_ID [--socket PATH] [--config PATH] [--json]
+    canter grant issue --request FILE --issue N --expires-in SECS [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter service doctor [--config PATH] [--json]
     canter service install-plan [--config PATH] [--json]
     canter service status-plan [--config PATH] [--json]
@@ -103,6 +104,10 @@ COMMANDS:
                      supervised run back (read-only; supervision is armed
                      with the run's queue submission and evaluated by the
                      daemon, and this surface never continues work).
+    grant            Mint ONE route grant (`hf-grant/v1`) through the daemon
+                     from a reviewed bound-input document, so the operator
+                     authority path has a supported way to obtain the grant
+                     id it authorizes (issuance is not authorization).
     service          Render per-user launchd/systemd plans; doctor checks.
 
 EXIT CODES (with or without --json):
@@ -143,6 +148,9 @@ pub struct Invocation {
     /// Supervision subcommand (status; issue #95): the versioned supervision
     /// status of ONE run. Read-only.
     pub supervision_action: Option<SupervisionAction>,
+    /// Grant subcommand (issue #92): the supported production mint path for
+    /// ONE route grant derived from a reviewed bound-input document.
+    pub grant_action: Option<GrantAction>,
 }
 
 /// Run-scoped control subcommands (issue #86): pause, resume, retry or
@@ -241,6 +249,39 @@ pub enum SupervisionAction {
 pub struct SupervisionStatusArgs {
     /// The supervised run identity (`run-` + 16 hex).
     pub run: String,
+    /// Explicit daemon socket override.
+    pub socket: Option<String>,
+}
+
+/// Grant subcommands (issue #92): the supported production mint path for ONE
+/// route grant. Issuance is not authorization — the grant only becomes
+/// authority when the operator presents it at the board/`queue submit`
+/// authorization point.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GrantAction {
+    /// Mint ONE `hf-grant/v1` through the daemon: `grant issue`.
+    Issue(GrantIssueArgs),
+}
+
+/// `grant issue`: the reviewed bound-input document plus the exact issue
+/// and expiry the grant binds.
+///
+/// Every other grant field is DERIVED (repository identity, workflow hash,
+/// role/policy revision, phase, caps, scope) so no binding can be typed by
+/// hand: the minted grant binds exactly the reviewed material the operator
+/// is about to authorize.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GrantIssueArgs {
+    /// Path of the reviewed bound-input document (`canter queue preview
+    /// --out`; the same material `queue submit --request` reads).
+    pub request_path: PathBuf,
+    /// The reviewed issue number the grant binds (one of the document's
+    /// `selected[]` entries).
+    pub issue: i64,
+    /// Seconds from now until expiry (`--expires-in SECS`).
+    pub expires_in: i64,
+    /// `--idempotency-key`: replay-safe automation key.
+    pub idempotency_key: Option<String>,
     /// Explicit daemon socket override.
     pub socket: Option<String>,
 }
@@ -597,6 +638,7 @@ pub fn parse_invocation(args: &[String]) -> Result<Invocation, ParseError> {
         "queue" => parse_queue(&rest),
         "run" => parse_run(&rest),
         "supervision" => parse_supervision(&rest),
+        "grant" => parse_grant(&rest),
         other => Err(ParseError::Usage(format!("unknown command {other:?}"))),
     }
 }
@@ -639,6 +681,7 @@ fn parse_flag_command(name: &str, args: &[&String]) -> Result<Invocation, ParseE
         queue_action: None,
         run_action: None,
         supervision_action: None,
+        grant_action: None,
     })
 }
 
@@ -802,6 +845,7 @@ fn parse_board(args: &[&String]) -> Result<Invocation, ParseError> {
         queue_action: None,
         run_action: None,
         supervision_action: None,
+        grant_action: None,
     })
 }
 
@@ -819,6 +863,7 @@ fn help_request(name: &str) -> String {
         "queue" => QUEUE_USAGE.trim_end().to_string(),
         "run" => RUN_USAGE.trim_end().to_string(),
         "supervision" => SUPERVISION_USAGE.trim_end().to_string(),
+        "grant" => GRANT_USAGE.trim_end().to_string(),
         "service" => SERVICE_USAGE.trim_end().to_string(),
         _ => USAGE.to_string(),
     }
@@ -987,6 +1032,7 @@ fn parse_config(args: &[&String]) -> Result<Invocation, ParseError> {
         queue_action: None,
         run_action: None,
         supervision_action: None,
+        grant_action: None,
     })
 }
 
@@ -1082,6 +1128,7 @@ fn parse_daemon(args: &[&String]) -> Result<Invocation, ParseError> {
         queue_action: None,
         run_action: None,
         supervision_action: None,
+        grant_action: None,
     })
 }
 
@@ -1143,6 +1190,7 @@ fn parse_service(args: &[&String]) -> Result<Invocation, ParseError> {
         queue_action: None,
         run_action: None,
         supervision_action: None,
+        grant_action: None,
     })
 }
 
@@ -1329,6 +1377,7 @@ fn parse_lane(args: &[&String]) -> Result<Invocation, ParseError> {
             queue_action: None,
             run_action: None,
             supervision_action: None,
+            grant_action: None,
         });
     }
 
@@ -1402,6 +1451,7 @@ fn parse_lane(args: &[&String]) -> Result<Invocation, ParseError> {
         queue_action: None,
         run_action: None,
         supervision_action: None,
+        grant_action: None,
     })
 }
 
@@ -1588,6 +1638,7 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
         queue_action: None,
         run_action: Some(action),
         supervision_action: None,
+        grant_action: None,
     })
 }
 
@@ -1661,8 +1712,144 @@ fn parse_supervision(args: &[&String]) -> Result<Invocation, ParseError> {
             run,
             socket,
         })),
+        grant_action: None,
     })
 }
+
+/// Parse `grant <issue>` (issue #92): the supported production mint path for
+/// ONE route grant derived from the reviewed bound-input document.
+///
+/// Issuance is not authorization: the minted grant is only presented at the
+/// board/`queue submit` authorization point, and the digest the operator
+/// approves there is still the reviewed bound-input digest. The mint itself
+/// binds exactly that reviewed material (repository, workflow hash, role
+/// revision, boundary phase/caps, the selected issue and its acceptance
+/// revision), plus the live state epoch and an explicit expiry.
+fn parse_grant(args: &[&String]) -> Result<Invocation, ParseError> {
+    let action = args
+        .first()
+        .ok_or_else(|| ParseError::Help(help_request("grant")))?;
+    let command = match action.as_str() {
+        "issue" => "grant issue",
+        "-h" | "--help" => return Err(ParseError::Help(help_request("grant"))),
+        other => {
+            return Err(ParseError::Usage(format!(
+                "grant: unknown subcommand {other:?}; run `canter grant --help`"
+            )));
+        }
+    };
+    let mut json = false;
+    let mut config_path: Option<PathBuf> = None;
+    let mut socket: Option<String> = None;
+    let mut request_path: Option<PathBuf> = None;
+    let mut issue: Option<i64> = None;
+    let mut expires_in: Option<i64> = None;
+    let mut idempotency_key: Option<String> = None;
+    let rest = &args[1..];
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index].as_str() {
+            "--json" => json = true,
+            "--config" => {
+                let value = flag_value(rest, &mut index, command, "--config")?;
+                config_path = Some(PathBuf::from(value));
+            }
+            "--socket" => {
+                socket = Some(flag_value(rest, &mut index, command, "--socket")?);
+            }
+            "--request" => {
+                let value = flag_value(rest, &mut index, command, "--request")?;
+                request_path = Some(PathBuf::from(value));
+            }
+            "--issue" => {
+                let value = flag_value(rest, &mut index, command, "--issue")?;
+                let number: u64 = value.parse().map_err(|_| {
+                    ParseError::Usage(format!(
+                        "{command}: --issue takes a digits-only issue number, got {value:?}"
+                    ))
+                })?;
+                if number == 0 || number > i64::MAX as u64 {
+                    return Err(ParseError::Usage(format!(
+                        "{command}: --issue must be a positive issue number, got {value:?}"
+                    )));
+                }
+                issue = Some(number as i64);
+            }
+            "--expires-in" => {
+                let value = flag_value(rest, &mut index, command, "--expires-in")?;
+                let seconds: i64 = value.parse().map_err(|_| {
+                    ParseError::Usage(format!(
+                        "{command}: --expires-in takes whole seconds, got {value:?}"
+                    ))
+                })?;
+                if !(1..=GRANT_EXPIRY_MAX_SECS).contains(&seconds) {
+                    return Err(ParseError::Usage(format!(
+                        "{command}: --expires-in must be 1..={GRANT_EXPIRY_MAX_SECS} seconds, got \
+                         {value:?}"
+                    )));
+                }
+                expires_in = Some(seconds);
+            }
+            "--idempotency-key" => {
+                let value = flag_value(rest, &mut index, command, "--idempotency-key")?;
+                if !crate::formats::is_idempotency_key(&value) {
+                    return Err(ParseError::Usage(format!(
+                        "{command}: --idempotency-key must be `ik_` + 8-64 of [a-z0-9-], got \
+                         {value:?}"
+                    )));
+                }
+                idempotency_key = Some(value);
+            }
+            "-h" | "--help" => return Err(ParseError::Help(help_request("grant"))),
+            flag => {
+                return Err(ParseError::Usage(format!(
+                    "{command}: unknown flag {flag:?}; run `canter grant --help`"
+                )));
+            }
+        }
+        index += 1;
+    }
+    let Some(request_path) = request_path else {
+        return Err(ParseError::Usage(format!(
+            "{command}: --request FILE is required (the reviewed bound-input document)"
+        )));
+    };
+    let Some(issue) = issue else {
+        return Err(ParseError::Usage(format!(
+            "{command}: --issue N is required (the reviewed issue the grant binds)"
+        )));
+    };
+    let Some(expires_in) = expires_in else {
+        return Err(ParseError::Usage(format!(
+            "{command}: --expires-in SECS is required (the authorization window)"
+        )));
+    };
+    Ok(Invocation {
+        command: command.to_string(),
+        json,
+        config_path,
+        board: None,
+        plan: None,
+        config_action: None,
+        daemon_action: None,
+        service_action: None,
+        lane_action: None,
+        queue_action: None,
+        run_action: None,
+        supervision_action: None,
+        grant_action: Some(GrantAction::Issue(GrantIssueArgs {
+            request_path,
+            issue,
+            expires_in,
+            idempotency_key,
+            socket,
+        })),
+    })
+}
+
+/// Upper bound on `grant issue --expires-in`: 30 days. A grant is the
+/// authorization window of one reviewed run, not a standing capability.
+const GRANT_EXPIRY_MAX_SECS: i64 = 30 * 24 * 60 * 60;
 
 /// Parse `queue <submit|status|preview>` (issue #85; `preview` is the
 /// plan producer of the operator path, issue #91).
@@ -2024,6 +2211,7 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
         queue_action: Some(queue_action),
         run_action: None,
         supervision_action: None,
+        grant_action: None,
     })
 }
 
@@ -2258,6 +2446,7 @@ fn parse_plan(args: &[&String]) -> Result<Invocation, ParseError> {
         queue_action: None,
         run_action: None,
         supervision_action: None,
+        grant_action: None,
     })
 }
 
@@ -2350,6 +2539,9 @@ pub fn execute(invocation: &Invocation) -> CmdResult {
     }
     if let Some(action) = invocation.supervision_action.clone() {
         return execute_supervision(action, invocation);
+    }
+    if let Some(action) = invocation.grant_action.clone() {
+        return execute_grant(action, invocation);
     }
     if let Some(action) = invocation.queue_action.clone() {
         return execute_queue(action, invocation);
@@ -3794,6 +3986,461 @@ fn fresh_role_binding(
     }
 }
 
+/// Grant subcommand dispatch (issue #92).
+fn execute_grant(action: GrantAction, invocation: &Invocation) -> CmdResult {
+    match action {
+        GrantAction::Issue(args) => execute_grant_issue(&args, invocation),
+    }
+}
+
+/// `grant issue` (issue #92): mint ONE route grant through the daemon from
+/// the reviewed bound-input document.
+///
+/// The whole binding is DERIVED — the document the operator reviewed plus the
+/// configuration re-observed now plus the live epoch and an explicit expiry —
+/// and the daemon is the authority that validates, journals and inserts it
+/// (`grants.issue`). Issuance is not authorization: what the operator
+/// authorizes is still the reviewed digest at the board/`queue submit` point,
+/// with the minted grant id presented as the binding.
+fn execute_grant_issue(args: &GrantIssueArgs, invocation: &Invocation) -> CmdResult {
+    let config = match load_optional_config(invocation) {
+        Ok(config) => config,
+        Err(result) => return result,
+    };
+    let text = match std::fs::read_to_string(&args.request_path) {
+        Ok(text) => text,
+        Err(err) => {
+            return lane_error(
+                "usage.grant_request",
+                format!(
+                    "grant issue: cannot read {} ({err}); --request names the reviewed \
+                     bound-input document",
+                    args.request_path.display()
+                ),
+                false,
+            );
+        }
+    };
+    let bound = match Val::parse_json(&text) {
+        Ok(bound @ Val::Obj(_)) => bound,
+        _ => {
+            return lane_error(
+                "usage.grant_request",
+                format!(
+                    "grant issue: {} must carry one bound-input preview document (JSON object)",
+                    args.request_path.display()
+                ),
+                false,
+            );
+        }
+    };
+    let plan_digest = match crate::queue_executor::bound_digest(&bound) {
+        Ok(digest) => digest,
+        Err(err) => return lane_error(err.code, err.message, false),
+    };
+    // The reviewed role configuration is re-observed from the CURRENT config
+    // (the same rule `queue submit` applies): the grant's policy hash is that
+    // revision, so a moved configuration refuses typed before anything is
+    // sent and never mints a grant against a stale role.
+    let harness_key = bound
+        .get("role_config")
+        .and_then(|role| role.get("key"))
+        .and_then(Val::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if harness_key.is_empty() {
+        return lane_error(
+            "usage.grant_request",
+            "grant issue: the bound-input document requires role_config.key (the reviewed role \
+             configuration)"
+                .to_string(),
+            false,
+        );
+    }
+    let (binding_doc, role_revision) = match fresh_role_binding(config.as_ref(), &harness_key) {
+        Ok(pair) => pair,
+        Err(result) => return *result,
+    };
+    // One strict reading of the document: the same typed rebuild the
+    // submission and the operator surface use (closed key set, foreign
+    // schema refused, the presented role revision must agree with the
+    // re-observed one).
+    let material = crate::queue_executor::SubmissionMaterial {
+        idempotency_key: String::new(),
+        preview: bound.clone(),
+        binding: binding_doc,
+        digest: plan_digest.clone(),
+        epoch: 0,
+        role_revision: role_revision.clone(),
+        caps: crate::lifecycle::ConcurrencyCaps::default(),
+        host_available: None,
+        harness_lanes: None,
+        grants: Vec::new(),
+        resume: Vec::new(),
+        supervision: None,
+    };
+    let request = match crate::queue_executor::presented_request(&material) {
+        Ok(request) => request,
+        Err(err) => return lane_error(err.code, err.message, false),
+    };
+    // The reviewed completion boundary and its capabilities: only the closed
+    // grant sets reach the wire, and a production-class binding is refused
+    // here and again in the daemon (production authority is human-only).
+    let phase = request.boundary.phase.clone();
+    if !crate::schema::GRANT_PHASES.contains(&phase.as_str()) {
+        return lane_error(
+            "usage.grant_boundary",
+            format!(
+                "grant issue: the reviewed boundary phase {phase:?} is outside the closed grant \
+                 phase set"
+            ),
+            false,
+        );
+    }
+    for cap in &request.boundary.caps {
+        if !crate::schema::GRANT_CAPS.contains(&cap.as_str()) {
+            return lane_error(
+                "usage.grant_boundary",
+                format!(
+                    "grant issue: the reviewed boundary capability {cap:?} is outside the closed \
+                     grant capability set"
+                ),
+                false,
+            );
+        }
+    }
+    if phase == "production"
+        || request
+            .boundary
+            .caps
+            .iter()
+            .any(|cap| cap == "production" || cap == "release")
+    {
+        return lane_error(
+            crate::mutation::code::PRODUCTION_CONFIRMATION,
+            "grant issue: a production-class binding (phase/capability) is never minted over the \
+             socket surface; production authority requires a fresh interactive TTY-confirmed \
+             digest, which this surface does not carry"
+                .to_string(),
+            false,
+        );
+    }
+    if !crate::formats::is_hex64(&request.workflow_hash) {
+        return lane_error(
+            "usage.grant_request",
+            format!(
+                "grant issue: the reviewed workflow hash {:?} is not the 64-hex digest the grant \
+                 binds",
+                request.workflow_hash
+            ),
+            false,
+        );
+    }
+    // The reviewed selected issue the grant binds: its identity and its
+    // exact acceptance revision come from the document, never from argv.
+    let selected = request.selected.iter().find(|issue| {
+        crate::queue_preview::IssueId::parse(&issue.id, &request.repository)
+            .map(|id| id.number == args.issue)
+            .unwrap_or(false)
+    });
+    let Some(selected) = selected else {
+        let reviewed: Vec<String> = request
+            .selected
+            .iter()
+            .map(|issue| issue.id.clone())
+            .collect();
+        return lane_error(
+            "usage.grant_issue",
+            format!(
+                "grant issue: --issue {} is not one of the reviewed selected issues ({})",
+                args.issue,
+                reviewed.join(", ")
+            ),
+            false,
+        );
+    };
+    if !crate::formats::is_hex40(&selected.revision) {
+        return lane_error(
+            "usage.grant_issue",
+            format!(
+                "grant issue: the reviewed acceptance revision {:?} for issue {} is not 40-hex",
+                selected.revision, args.issue
+            ),
+            false,
+        );
+    }
+    // The repository identity comes from the validated configuration, never
+    // from argv or from the document alone.
+    let configured_repository = config
+        .as_ref()
+        .map(|config| {
+            config
+                .repositories
+                .iter()
+                .any(|repository| repository.identity() == request.repository)
+        })
+        .unwrap_or(false);
+    if !configured_repository {
+        return lane_error(
+            "            ",
+            format!(
+                "grant issue: the reviewed document binds {:?}, which is not a configured \
+                 repository of this installation (see `canter config show --json`)",
+                request.repository
+            ),
+            false,
+        );
+    }
+    let socket = effective_socket(args.socket.as_deref(), config.as_ref());
+    let paths = match derive_paths(socket) {
+        Ok(paths) => paths,
+        Err(result) => return result,
+    };
+    if let Err(result) = require_live_daemon(&paths) {
+        return *result;
+    }
+    // The live epoch: the grant dies with its epoch, so the mint binds the
+    // epoch the daemon holds right now (a moved epoch refuses typed).
+    let epoch = {
+        let params = object(vec![]);
+        match read_only_call(&paths.socket_path, "state.epoch", Some(&params)) {
+            Ok(result) => result
+                .get("epoch")
+                .and_then(|epoch| epoch.get("epoch"))
+                .and_then(Val::as_int)
+                .unwrap_or(0),
+            Err(RpcError { code, message }) => {
+                return lane_error(&code, format!("grant issue: {message}"), false);
+            }
+        }
+    };
+    let now = crate::time::unix_now();
+    let created_at = crate::time::rfc3339_from_unix(now);
+    let expires_at = crate::time::rfc3339_from_unix(now + args.expires_in);
+    let scope = format!("worktrees/issues/{}", args.issue);
+    let grant_id = grant_id_for(
+        &request,
+        args.issue,
+        &selected.revision,
+        &role_revision,
+        &scope,
+        epoch,
+    );
+    let caps: Vec<Val> = request
+        .boundary
+        .caps
+        .iter()
+        .map(|cap| string(cap))
+        .collect();
+    let document = object(vec![
+        ("schema", string("hf-grant/v1")),
+        ("grant_id", string(&grant_id)),
+        ("repository", string(&request.repository)),
+        (
+            "issue",
+            object(vec![
+                ("number", integer(args.issue)),
+                ("revision", string(&selected.revision)),
+            ]),
+        ),
+        ("workflow_hash", string(&request.workflow_hash)),
+        ("policy_hash", string(&role_revision)),
+        ("phase", string(&phase)),
+        ("scope", string(&scope)),
+        ("caps", Val::Arr(caps)),
+        ("expires_at", string(&expires_at)),
+        ("state_epoch", integer(epoch)),
+        ("created_at", string(&created_at)),
+    ]);
+    let key = args
+        .idempotency_key
+        .clone()
+        .unwrap_or_else(|| format!("ik_grant-{now}-{}", client::fresh_id()));
+    let params = object(vec![
+        ("grant", document.clone()),
+        ("idempotency_key", string(&key)),
+    ]);
+    let minted = match client::call(&paths.socket_path, "grants.issue", Some(&params)) {
+        Ok(minted @ Val::Obj(_)) => minted,
+        Ok(_) => {
+            return lane_error(
+                "daemon.response",
+                "grant issue: the daemon returned no grant document".to_string(),
+                false,
+            );
+        }
+        Err(RpcError { code, message }) => {
+            return lane_error(&code, format!("grant issue: {message}"), false);
+        }
+    };
+    if !grant_binding_matches(&minted, &document) {
+        return lane_error(
+            "daemon.grant_mismatch",
+            "grant issue: the daemon returned a grant document that does not match the requested \
+             binding (nothing is treated as authorized)"
+                .to_string(),
+            false,
+        );
+    }
+    let next = format!("canter board --plan FILE --grant {}={grant_id}", args.issue);
+    let data = object(vec![
+        ("schema", string("hf-grant/v1")),
+        ("grant_id", string(&grant_id)),
+        ("plan_digest", string(&plan_digest)),
+        ("grant", minted),
+        (
+            "next",
+            object(vec![
+                ("command", string(&next)),
+                (
+                    "note",
+                    string(
+                        "the board (or `queue submit`) remains the authorization point: minting is \
+                         not authorization",
+                    ),
+                ),
+            ]),
+        ),
+    ]);
+    let human = render_grant_issue_human(&data);
+    ok_result(data, human)
+}
+
+/// The content-addressed grant id: `gr_` + first 16 hex of the sha256 over
+/// the canonical binding material (domain-separated), the same rule the plan
+/// id and the work-item id follow. The identity is the REVIEWED BINDING, not
+/// the window: `created_at` and `expires_at` are deliberately NOT part of it,
+/// so one reviewed run names exactly one grant whatever a caller asks for and
+/// a re-mint with ANY window refuses `state.grant_exists` (the first minted
+/// window stands) instead of silently creating a second authorization.
+fn grant_id_for(
+    request: &crate::queue_preview::QueueRequest,
+    issue_number: i64,
+    issue_revision: &str,
+    policy_hash: &str,
+    scope: &str,
+    state_epoch: i64,
+) -> String {
+    let caps: Vec<Val> = request
+        .boundary
+        .caps
+        .iter()
+        .map(|cap| string(cap))
+        .collect();
+    let preimage = object(vec![
+        ("schema", string("hf-grant-id/v1")),
+        ("repository", string(&request.repository)),
+        (
+            "issue",
+            object(vec![
+                ("number", integer(issue_number)),
+                ("revision", string(issue_revision)),
+            ]),
+        ),
+        ("workflow_hash", string(&request.workflow_hash)),
+        ("policy_hash", string(policy_hash)),
+        ("phase", string(&request.boundary.phase)),
+        ("scope", string(scope)),
+        ("caps", Val::Arr(caps)),
+        ("state_epoch", integer(state_epoch)),
+    ]);
+    format!(
+        "gr_{}",
+        &crate::canonical::sha256_hex(&canonical_bytes(&preimage))[..16]
+    )
+}
+
+/// Cross-check the minted document against the exact binding this invocation
+/// derived: every contract key must agree (an extra key the daemon may add in
+/// a later slice is tolerated; a moved binding is not).
+fn grant_binding_matches(minted: &Val, requested: &Val) -> bool {
+    const KEYS: [&str; 12] = [
+        "schema",
+        "grant_id",
+        "repository",
+        "issue",
+        "workflow_hash",
+        "policy_hash",
+        "phase",
+        "scope",
+        "caps",
+        "expires_at",
+        "state_epoch",
+        "created_at",
+    ];
+    KEYS.iter()
+        .all(|key| match (minted.get(key), requested.get(key)) {
+            (Some(left), Some(right)) => canonical_bytes(left) == canonical_bytes(right),
+            _ => false,
+        })
+}
+
+/// The human rendering of one minted grant (the same data the JSON envelope
+/// carries; never a second contract).
+fn render_grant_issue_human(data: &Val) -> String {
+    let text = |path: &[&str]| -> String {
+        let mut current = data;
+        for key in path {
+            match current.get(key) {
+                Some(value) => current = value,
+                None => return String::new(),
+            }
+        }
+        current.as_str().unwrap_or_default().to_string()
+    };
+    let grant_id = text(&["grant_id"]);
+    let grant = data.get("grant").cloned().unwrap_or_else(null);
+    let number = grant
+        .get("issue")
+        .and_then(|issue| issue.get("number"))
+        .and_then(Val::as_int)
+        .unwrap_or(0);
+    let revision = grant
+        .get("issue")
+        .and_then(|issue| issue.get("revision"))
+        .and_then(Val::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let caps = grant
+        .get("caps")
+        .and_then(Val::as_array)
+        .map(|caps| {
+            caps.iter()
+                .filter_map(Val::as_str)
+                .collect::<Vec<&str>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    let mut out = String::new();
+    out.push_str(&format!("grant {grant_id} issued (active)\n"));
+    out.push_str(&format!(
+        "  binds {}#{number}@{revision}\n",
+        text(&["grant", "repository"])
+    ));
+    out.push_str(&format!(
+        "  phase {} · scope {} · caps {caps}\n",
+        text(&["grant", "phase"]),
+        text(&["grant", "scope"])
+    ));
+    out.push_str(&format!(
+        "  workflow_hash {}\n  policy_hash   {}\n",
+        text(&["grant", "workflow_hash"]),
+        text(&["grant", "policy_hash"])
+    ));
+    out.push_str(&format!(
+        "  state_epoch {} · created {} · expires {}\n",
+        text(&["grant", "state_epoch"]),
+        text(&["grant", "created_at"]),
+        text(&["grant", "expires_at"])
+    ));
+    out.push_str(&format!(
+        "  reviewed plan digest {}\n",
+        text(&["plan_digest"])
+    ));
+    out.push_str(&format!("next: {}\n", text(&["next", "command"])));
+    out
+}
+
 /// `queue submit`: authorize and commit ONE approved selected-issue run.
 /// The local preflight is exactly the digest check plus the config
 /// re-observation; every durable fact is the daemon's to revalidate.
@@ -4906,6 +5553,52 @@ EXIT CODES: 0 ok · 1 daemon/transport error · 2 usage · 4 refusal
 (usage.supervision.*, state.not_found, daemon refusals) · 5 config error.
 ";
 
+const GRANT_USAGE: &str = "\
+canter grant issue — mint ONE route grant through the daemon
+
+USAGE:
+    canter grant issue --request FILE --issue N --expires-in SECS \
+[--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
+
+A route grant is the only authorization to start durable work, so this is the
+SUPPORTED mint path: the daemon inserts ONE hf-grant/v1 row through the closed
+`grants.issue` method (journaled intent -> effect -> typed outcome), and the
+resulting grant id is what `canter board --grant` / `canter queue submit
+--grant` present. Issuance is NOT authorization: the board remains the
+authorization point, and the digest the operator approves there is still the
+reviewed bound-input digest.
+
+FILE is the reviewed bound-input document `canter queue preview --out`
+produces (the same material `queue submit --request` and `board --plan`
+read). Every grant field is DERIVED from that document plus the configuration
+and live state — never typed by hand:
+
+  repository        the document's repository identity (must be configured)
+  issue             the reviewed selected[] entry `--issue N` names, with
+                    its exact 40-hex acceptance revision
+  workflow_hash     the document's workflow.hash
+  policy_hash       the document's role_config.revision, re-observed from the
+                    CURRENT configuration (a moved revision refuses typed
+                    before anything is sent)
+  phase / caps      the document's boundary phase and capabilities
+  scope             worktrees/issues/N (the reviewed planned scope)
+  state_epoch       the live daemon epoch (a moved epoch refuses)
+  expires_at        now + --expires-in SECS
+  grant_id          content-addressed: gr_ + first 16 hex of sha256 over the
+                    canonical binding
+
+Refusals (exit 4): a malformed or foreign document (usage.grant_request), an
+issue outside the reviewed selected set (usage.grant_issue), a moved role
+revision (refusal.profile.revision), a production-class binding
+(refusal.policy.production_confirmation: production authority stays
+human-only), an already-expired window (refusal.grant.expired), a moved state
+epoch (state.epoch_mismatch), an existing grant id (state.grant_exists), and
+the daemon claim refusals (refusal.idempotency, state.claim_incomplete).
+
+EXIT CODES: 0 ok · 1 operational/daemon error · 2 usage · 4 refusal ·
+5 config error.
+";
+
 /// Resolve the daemon socket override: the CLI flag wins over
 /// `config.daemon.socket`; otherwise the XDG runtime default applies.
 fn effective_socket(flag: Option<&str>, config: Option<&Config>) -> Option<String> {
@@ -5353,6 +6046,9 @@ fn per_command_usage(command: &str) -> &'static str {
         "queue" => {
             "usage: canter queue preview --repository KEY --harness KEY --host HOST --issue N=HEX40... --caps G/R/H [--out FILE]\n       canter queue submit --request FILE --confirm-digest HEX64 --caps G/R/H [--epoch N]\n       canter queue status --submission QS_ID"
         }
+        "grant" => {
+            "usage: canter grant issue --request FILE --issue N --expires-in SECS [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]"
+        }
         _ => "usage: canter [--help] [--version] | canter <command> [options]",
     }
 }
@@ -5446,14 +6142,22 @@ mod tests {
 
     #[test]
     fn missing_config_is_a_typed_config_error() {
-        // The unit test process has no canter config (no XDG override in
-        // scope), so plan/status/config validate must refuse with exit 5.
-        let result = execute(&invocation(&["plan", "widgets", "1"]));
-        assert_eq!(result.exit_code, 5);
-        assert_eq!(result.kind, Kind::Error);
-        assert_envelope_valid("plan", &result);
-        let error = result.error.as_ref().expect("error doc");
-        assert_eq!(error.code, "config.not_found");
+        // Discovery is rooted at a home that holds no config, so the assertion
+        // holds whatever the developer's ambient
+        // $HOME/.config/canter/config.toml contains: plan/status/config
+        // validate must refuse with exit 5 and the typed config.not_found.
+        for (argv, command) in [
+            (&["plan", "widgets", "1"][..], "plan"),
+            (&["status"][..], "status"),
+            (&["config", "validate"][..], "config validate"),
+        ] {
+            let result = crate::config::with_config_home(None, || execute(&invocation(argv)));
+            assert_eq!(result.exit_code, 5, "{argv:?}");
+            assert_eq!(result.kind, Kind::Error, "{argv:?}");
+            assert_envelope_valid(command, &result);
+            let error = result.error.as_ref().expect("error doc");
+            assert_eq!(error.code, "config.not_found", "{argv:?}");
+        }
     }
 
     #[test]

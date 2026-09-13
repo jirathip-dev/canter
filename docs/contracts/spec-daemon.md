@@ -23,7 +23,7 @@ remain usable without it; SQLite owns state; no network control API).
 ```
 
 - `method` is a closed set: `capabilities`, `doctor`, `status`, `plan`,
-  `apply`, `grants.list`, `grants.revoke`, `schedules.list`,
+  `apply`, `grants.issue`, `grants.list`, `grants.revoke`, `schedules.list`,
   `schedules.create`, `schedules.pause`, `schedules.resume`,
   `schedules.delete`, `schedules.evaluate`, `lane.replacement.request`,
   `lane.replacement.advance`, `lane.replacement.hold`,
@@ -41,8 +41,33 @@ remain usable without it; SQLite owns state; no network control API).
   request-only lane replacement surface, the safe-boundary checkpoint
   surface, and the guarded single-session retirement over the socket;
   issues #85/#86 add the queue submission surface and the run-scoped
-  controls, and issue #95 adds the supervision status read; the closed set
+  controls, and issue #95 adds the supervision status read; issue #92 adds
+  `grants.issue`, the mint half of the route-grant contract the closed set
+  was missing; the closed set
   above is mirrored by the Rust schema validator and the fixture oracle).
+- `grants.issue` **requires** `params.grant` (one `hf-grant/v1` object) and
+  `params.idempotency_key`: it is the SUPPORTED production mint path for a
+  route grant (a caller could otherwise never obtain the `gr_` id that
+  `apply` / `queue.submit` / the board present). The document is validated
+  before anything is journaled, an already-expired window refuses
+  `refusal.grant.expired` and a production-class binding (phase
+  `production`, or a `production`/`release` capability) refuses
+  `refusal.policy.production_confirmation` — production authority stays
+  human-only and this surface carries no confirmation channel. The intent
+  (`mutate.grant.issue`) is journaled before the row is inserted, so the
+  mint is exactly-once per idempotency key, a replay of the same request id
+  + key returns the recorded response, and an interrupt between intent and
+  outcome leaves no partial grant (restart reconciliation re-reads the row
+  and reports `committed before the interrupt` / `never committed`). The
+  response document is the minted `hf-grant/v1` document itself (the
+  contract shape, `caps` as an array). The `gr_` id is content-addressed
+  over the REVIEWED BINDING (repository, issue number + acceptance revision,
+  workflow hash, policy hash, phase, scope, caps, live state epoch); the
+  requested window is deliberately not part of that identity, so a re-mint
+  of the same binding refuses `state.grant_exists` whatever `expires_at` it
+  asks for and the first minted window stands.
+  Minting is not authorization: the
+  grant only becomes authority at the board / `queue submit` point.
 - `apply` **requires** `params.idempotency_key` (`ik_` format): an apply
   without a key is refused at parse time (`rpc/request.malformed.json`).
   Replaying the same request id + idempotency key returns the recorded
