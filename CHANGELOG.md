@@ -664,6 +664,11 @@ release process activates (docs/RELEASING.md), then semver applies.
   3600 s) plus an optional reviewed `deadline_secs` plan policy; the
   effective deadline rides on the step result, and a deadline terminates
   the child AND its process group.
+- Group termination is confined to the effect-class harness invocations (the
+  prompt row and a declared start row): every other adapter operation — the
+  workspace protocol rows — spawns byte-for-byte as it did before the group
+  runner existed, so the blast radius of the deadline fix stays on the
+  audited effect path (issue #92 round 4).
 - The harness prompt row runs the run's declared role binding (`-p <role>`,
   the declared provider/model pair, `chat --continue <session>
   --create-if-missing`) instead of a bare one-shot invocation; the session

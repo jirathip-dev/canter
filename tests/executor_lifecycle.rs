@@ -262,12 +262,20 @@ fn a_child_that_exits_while_a_descendant_holds_the_pipes_returns_promptly() {
     // measured from the child's exit, so the op returns within the documented
     // grace with the partial capture — it must never wait out the rest of the
     // deadline window for a descendant that is not even reachable.
+    //
+    // The descendant deliberately outlives the deadline by a wide margin
+    // (issue #92 round 4): with a shorter-lived descendant the pre-fix bound
+    // returned early too (its pipes closed at the descendant's exit), so the
+    // elapsed assertion could not bite. A descendant that outlives
+    // `deadline + grace` makes the read bound the only thing that can end the
+    // op, which is exactly the property asserted below; the test reaps it by
+    // its recorded pid.
     let dir = Dir::new("exit-pipe-holder");
     let bin = dir.path("fakebin");
     let pid_file = dir.path("survivor.pid");
     let lane = dir.write_executable(
         "fakebin/exit-holder",
-        "printf 'partial'\nset -m\nsleep 20 &\necho $! > \"$LANE_SURVIVOR_PID\"\nexit 0",
+        "printf 'partial'\nset -m\nsleep 90 &\necho $! > \"$LANE_SURVIVOR_PID\"\nexit 0",
     );
     let env = runner_env(&bin, &[("LANE_SURVIVOR_PID", &pid_file.to_string_lossy())]);
 
@@ -295,11 +303,16 @@ fn a_child_that_exits_while_a_descendant_holds_the_pipes_returns_promptly() {
         describe(&out)
     );
     // The op must end shortly after the child is gone, never wait out the
-    // rest of the deadline window: the bound asserted here is far below the
-    // 30 s deadline but generous enough for a loaded host's scheduling jitter
-    // (the pre-fix bound waited `deadline + grace` = ~30 s).
+    // rest of the deadline window. The bound is the deadline itself: the
+    // pre-fix read bound was `started + deadline + PIPE_READ_GRACE` (~30.75 s
+    // for this 30 s deadline), so a pre-fix op necessarily finishes above
+    // `timeout` and this assertion cannot be satisfied by the old behaviour
+    // (RED observed with that bound restored: round-4 probe P1). A tighter
+    // flat bound is not usable evidence here: the fixture's own start-up sits
+    // inside `elapsed`, and a loaded host stretched it past any sub-second
+    // margin (2.99 s measured against a 2.75 s bound, issue #92 round 3).
     assert!(
-        elapsed < Duration::from_secs(10),
+        elapsed < timeout,
         "a child that exits must not make the op wait out its {timeout:?} deadline for a \
          descendant's pipes, took {elapsed:?}: {}",
         describe(&out)
@@ -397,6 +410,91 @@ fn a_deadline_within_the_bound_completes_and_keeps_its_group() {
 
     assert_eq!(out.status, ProcStatus::Exit(0), "{:?}", out.stderr);
     assert_eq!(out.stdout, "done", "the real child stdout is captured");
+}
+
+// ---------------------------------------------------------------------------
+// Blast radius (issue #92 round 4): the group guarantee belongs to the
+// effect-class harness invocations only. The prompt row leads its own process
+// group; every other adapter operation (the workspace protocol rows) spawns
+// exactly as it did before the group runner existed.
+// ---------------------------------------------------------------------------
+
+/// A fake that records whether it was made the leader of a new process group
+/// (`$$` equals its own pgid) or inherited the runner's group.
+fn group_shape_fake(dir: &Dir, name: &str, extra: &str) -> PathBuf {
+    dir.write_executable(
+        &format!("fakebin/{name}"),
+        &format!(
+            "pg=$(ps -o pgid= -p $$ | tr -d ' ')\n\
+             if [ \"$pg\" = \"$$\" ]; then printf 'self' > \"$LANE_GROUP_SHAPE\"; \
+             else printf 'inherited' > \"$LANE_GROUP_SHAPE\"; fi\n\
+             {extra}"
+        ),
+    )
+}
+
+fn group_shape_of(path: &Path) -> String {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+#[test]
+fn the_effect_prompt_row_leads_its_own_process_group() {
+    let dir = Dir::new("effect-group-shape");
+    let bin = dir.path("fakebin");
+    let shape = dir.path("group-shape.txt");
+    let env = runner_env(&bin, &[("LANE_GROUP_SHAPE", &shape.to_string_lossy())]);
+    group_shape_fake(&dir, "hermes", "printf 'ok'");
+    let profile = Profile::official(canter::adapters::HarnessKind::Hermes, "lane-7")
+        .expect("profile")
+        .with_binding("provider-a", "model-a")
+        .expect("binding");
+    let identity = bind_identity("lane-7", "tty-7", 1).expect("identity");
+    let session = new_session("sess-92", identity).expect("session");
+
+    let result = execute_op(
+        &profile,
+        &prompt_request(&session, "work", Duration::from_secs(10)),
+        &env,
+    );
+
+    assert_eq!(result.status, "succeeded", "{:?}", result.message);
+    assert_eq!(
+        group_shape_of(&shape),
+        "self",
+        "the effect prompt row must lead its own process group (the deadline reaps it)"
+    );
+}
+
+#[test]
+fn every_other_adapter_op_spawns_exactly_as_before_the_group_runner() {
+    let dir = Dir::new("workspace-group-shape");
+    let bin = dir.path("fakebin");
+    let shape = dir.path("group-shape.txt");
+    let env = runner_env(&bin, &[("LANE_GROUP_SHAPE", &shape.to_string_lossy())]);
+    group_shape_fake(&dir, "herdr", "printf '{}'");
+    let profile = Profile::official(canter::adapters::HarnessKind::Pi, "pi").expect("profile");
+    let identity = bind_identity("pi", "tty-9", 1).expect("identity");
+    let session = new_session("sess-0002", identity).expect("session");
+    let request = OpRequest {
+        op: Op::Interrupt,
+        session: &session,
+        payload: None,
+        timeout: Duration::from_secs(10),
+    };
+
+    // The op's own answer is irrelevant here: the claim under test is how the
+    // child was spawned, which the fake recorded before answering.
+    let _ = execute_op(&profile, &request, &env);
+
+    assert_eq!(
+        group_shape_of(&shape),
+        "inherited",
+        "a workspace-protocol op must inherit the runner's process group, exactly as it did \
+         before the group runner existed (issue #92 round 4)"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -1790,7 +1790,7 @@ fn execute_op_inner(
             // subprocess, and nothing is invented for a profile that
             // declares no row.
             if let Some(row) = profile.op_args.get("start") {
-                let out = run_typed(&profile.executable, row, request.timeout, env, cwd);
+                let out = run_typed_grouped(&profile.executable, row, request.timeout, env, cwd);
                 if let ProcessOutcome::Failed(err) = out {
                     return op_result(
                         profile,
@@ -1856,7 +1856,7 @@ fn execute_op_inner(
             // Data-last rule (AC5): the payload is appended as one literal
             // argv element; nothing else in the argv depends on it.
             args.push(payload.to_string());
-            let out = run_typed(&profile.executable, &args, request.timeout, env, cwd);
+            let out = run_typed_grouped(&profile.executable, &args, request.timeout, env, cwd);
             match out {
                 ProcessOutcome::Ok(text) => {
                     let payload = prompt_result_payload(profile, text);
@@ -3032,6 +3032,32 @@ fn run_typed(
     env: &BTreeMap<String, String>,
     cwd: Option<&Path>,
 ) -> ProcessOutcome {
+    run_typed_with(program, args, timeout, env, cwd, false)
+}
+
+/// Issue #92 round 4 (blast radius): the group runner is for the effect-class
+/// harness invocations only — the prompt row and a declared start row. Their
+/// child leads its own process group and a deadline reaps the group. Every
+/// other adapter operation (the workspace protocol rows) keeps the
+/// pre-existing spawn path, byte for byte.
+fn run_typed_grouped(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+    env: &BTreeMap<String, String>,
+    cwd: Option<&Path>,
+) -> ProcessOutcome {
+    run_typed_with(program, args, timeout, env, cwd, true)
+}
+
+fn run_typed_with(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+    env: &BTreeMap<String, String>,
+    cwd: Option<&Path>,
+    grouped: bool,
+) -> ProcessOutcome {
     let resolved = match resolve_executable(program, env) {
         Ok(path) => path,
         Err(err) => {
@@ -3042,13 +3068,18 @@ fn run_typed(
             });
         }
     };
-    let out = run_grouped(ProcSpec {
+    let spec = ProcSpec {
         program: resolved.to_str().unwrap_or_default(),
         args,
         env,
         cwd,
         timeout,
-    });
+    };
+    let out = if grouped {
+        run_grouped(spec)
+    } else {
+        run(spec)
+    };
     match out.status {
         ProcStatus::Exit(0) => {
             let text = redact(&out.stdout);
@@ -3096,7 +3127,9 @@ fn run_typed(
         ProcStatus::SpawnFailed(message) => ProcessOutcome::Failed(ProcessFailure {
             code: CODE_UNAVAILABLE,
             message: format!("could not spawn {program:?}: {message}"),
-            detail: format!("while spawning {program:?}"),
+            // The OS error rides in the detail too: the round-3 Linux log
+            // named only the site, and the cause was unrecoverable from it.
+            detail: format!("while spawning {program:?}: {message}"),
         }),
     }
 }
@@ -3870,6 +3903,34 @@ mod tests {
 
     fn evidence_doc(json: &str) -> Val {
         Val::parse_json(json).expect("evidence doc")
+    }
+
+    #[test]
+    fn the_workspace_protocol_rows_keep_the_pre_existing_spawn_path() {
+        // Issue #92 round 4: the group runner (own process group, group reap)
+        // is for the effect-class harness invocations only. A workspace
+        // protocol row must spawn exactly as it did before the group runner
+        // existed — the child inherits the runner's process group. Hosted CI
+        // caught the opposite on a loaded Linux runner at the test below, so
+        // this pin lives beside it.
+        let fake = FakeWorkspace::new(
+            "group-shape",
+            "pg=$(ps -o pgid= -p $$ | tr -d ' ')\n\
+             if [ \"$pg\" = \"$$\" ]; then echo self > \"$(dirname \"$0\")/group-shape.txt\"; \
+             else echo inherited > \"$(dirname \"$0\")/group-shape.txt\"; fi\n\
+             echo '{\"interrupted\":true}'",
+        );
+        let target = retirement_target();
+        let profile = Profile::official(HarnessKind::Pi, "pi").expect("profile");
+        let result = retirement_stop(&profile, &target, &fake.env(), ADAPTER_TIMEOUT);
+
+        assert_eq!(result.status, "succeeded", "{:?}", result.detail);
+        let shape = std::fs::read_to_string(fake.dir.join("group-shape.txt")).unwrap_or_default();
+        assert_eq!(
+            shape.trim(),
+            "inherited",
+            "a workspace protocol row must keep the pre-existing spawn path"
+        );
     }
 
     #[test]

@@ -155,7 +155,13 @@ runs control-plane effects:
     the step outcome/evidence always names the deadline the effect used;
   - the child of an effect leads its own process group and a deadline
     EMPTIES that group (no orphan), reporting `adapter.timeout` as the typed
-    `ambiguous` outcome. The guarantee is verification, not one CLI form: a
+    `ambiguous` outcome. Group semantics are confined to the effect-class
+    harness invocations — the prompt row and a declared start row — because
+    that is the audited defect path; every other adapter operation (the
+    workspace protocol rows: observe/identity/interrupt/outcome/retirement)
+    keeps the pre-existing spawn path unchanged, so a workspace row that
+    existed before the group runner spawns byte-for-byte as it did
+    (issue #92 round 4). The guarantee is verification, not one CLI form: a
     `kill -9 -<pgid>` helper attempt is made first (best-effort — the
     negative-pid form is not portable), then the group's live members are
     enumerated with a portable `ps -A -o pid=,pgid=,stat=` and terminated by
