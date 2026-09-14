@@ -39,6 +39,15 @@ Normative rules:
   refused (`plan.malformed.json`).
 - Plans do not classify risk; risk comes from the target/effect table in
   the daemon ([risk-model.md](risk-model.md)) — nodes cannot downgrade it.
+- The built-in selected-issue spine binds `worktree_create`, `prompt`, and
+  `collect_outcome` to one feature branch/worktree. Its prompt and collection
+  declare `requires_delta:true`; collection refuses
+  `refusal.collect.empty_delta` unless the worker head contains a committed
+  file delta from this run's own successfully recorded `checkout` base.
+  `base_head` defaults only from that durable response, never from whatever
+  the integration clone points at later. A plan may explicitly declare
+  `requires_delta:false` for a legitimate no-op prompt; collection then
+  succeeds with equal base/head while still enforcing the bound output branch.
 
 ### Canonical serialization and digest
 

@@ -1496,6 +1496,19 @@ fn read_dispatch_material(
             }
         }
     }
+    if let Some(base) = recorded
+        .as_ref()
+        .and_then(|context| context.integration_base.as_deref())
+    {
+        for step in &mut steps {
+            if step.get("kind").and_then(Val::as_str) == Some("collect_outcome") {
+                let derived = object(vec![("base_head", string(base))]);
+                if let Some(params) = merged_step_params(Some(&derived), step.get("params")) {
+                    *step = step_with_params(step, &params);
+                }
+            }
+        }
+    }
     Ok(DispatchMaterial {
         instance,
         spine,

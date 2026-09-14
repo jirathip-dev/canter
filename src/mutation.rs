@@ -197,6 +197,10 @@ pub mod code {
     pub const SESSION_UNBOUND: &str = "refusal.session.unbound";
     /// Malformed structured output from a child.
     pub const MALFORMED_OUTPUT: &str = "refusal.malformed.output";
+    /// A delta-required collection found no committed content change.
+    pub const COLLECT_EMPTY_DELTA: &str = "refusal.collect.empty_delta";
+    /// The addressed worktree is not the worker output location the run bound.
+    pub const OUTPUT_LOCATION: &str = "refusal.worker.output_location";
 }
 
 /// A typed engine error/refusal.
@@ -1102,11 +1106,23 @@ pub fn contained_path(root: &Path, relative: &str) -> Result<PathBuf, MutationEr
     if relative.is_empty() {
         return Err(MutationError::new(code::UNCONTAINED, "empty path"));
     }
-    let candidate = root.join(relative);
-    if !is_contained(root, &candidate) {
+    let relative = Path::new(relative);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
         return Err(MutationError::new(
             code::UNCONTAINED,
-            format!("path {relative:?} escapes the containment root"),
+            format!("path {:?} escapes the containment root", relative.display()),
+        ));
+    }
+    let root = canonical_or(root);
+    let candidate = root.join(relative);
+    if !is_contained(&root, &candidate) {
+        return Err(MutationError::new(
+            code::UNCONTAINED,
+            format!("path {:?} escapes the containment root", relative.display()),
         ));
     }
     Ok(candidate)
@@ -1601,6 +1617,10 @@ pub struct PromptInputs {
     pub payload: String,
     /// The relative lane worktree the prompt runs inside.
     pub worktree: String,
+    /// The feature branch this run bound, when declared.
+    pub branch: Option<String>,
+    /// Whether the following collection requires a committed delta.
+    pub requires_delta: bool,
 }
 
 /// Resolve the params-caused inputs of `prompt` (params required; payload and
@@ -1616,12 +1636,29 @@ pub fn prompt_inputs(
     let payload = param_str(Some(params), "payload")?.to_string();
     let worktree = param_str(Some(params), "worktree")?.to_string();
     screened_containment(contract, &worktree)?;
+    let branch = match param_str_opt(Some(params), "branch") {
+        Some(branch) if is_slug(branch) => Some(branch.to_string()),
+        Some(_) => return Err(refusal(code::BAD_PARAMS, "prompt branch must be a slug")),
+        None => None,
+    };
+    let requires_delta = match params.get("requires_delta") {
+        Some(Val::Bool(value)) => *value,
+        Some(_) => {
+            return Err(refusal(
+                code::BAD_PARAMS,
+                "prompt requires_delta must be true|false",
+            ));
+        }
+        None => false,
+    };
     let declared = declared_session(Some(params), "prompt")?;
     Ok(PromptInputs {
         harness: harness_inputs(params)?,
         declared,
         payload,
         worktree,
+        branch,
+        requires_delta,
     })
 }
 
@@ -1632,6 +1669,10 @@ pub struct CollectOutcomeInputs {
     pub worktree: String,
     /// The declared integration base (`params.base_head`), when present.
     pub base_head: Option<String>,
+    /// The feature branch the run bound, when declared.
+    pub branch: Option<String>,
+    /// Whether an empty committed delta is a typed refusal.
+    pub requires_delta: bool,
 }
 
 /// Resolve the params-caused inputs of `collect_outcome` (worktree required;
@@ -1647,9 +1688,31 @@ pub fn collect_outcome_inputs(
         Some(_) => return Err(refusal(code::BAD_PARAMS, "base_head must be 40-hex")),
         None => None,
     };
+    let branch = match param_str_opt(params, "branch") {
+        Some(branch) if is_slug(branch) => Some(branch.to_string()),
+        Some(_) => {
+            return Err(refusal(
+                code::BAD_PARAMS,
+                "collect_outcome branch must be a slug",
+            ));
+        }
+        None => None,
+    };
+    let requires_delta = match params.and_then(|value| value.get("requires_delta")) {
+        Some(Val::Bool(value)) => *value,
+        Some(_) => {
+            return Err(refusal(
+                code::BAD_PARAMS,
+                "collect_outcome requires_delta must be true|false",
+            ));
+        }
+        None => false,
+    };
     Ok(CollectOutcomeInputs {
         worktree,
         base_head,
+        branch,
+        requires_delta,
     })
 }
 
@@ -2386,6 +2449,10 @@ fn effect_prompt(ctx: &EffectContext<'_>) -> EffectOutcome {
             format!("{} is not a git worktree", worktree.display()),
         );
     }
+    let branch = match observed_worktree_branch(ctx, &worktree, inputs.branch.as_deref()) {
+        Ok(branch) => branch,
+        Err(outcome) => return outcome,
+    };
     let profile = match harness_profile(ctx, params) {
         Ok(profile) => profile,
         Err(outcome) => return outcome,
@@ -2431,7 +2498,42 @@ fn effect_prompt(ctx: &EffectContext<'_>) -> EffectOutcome {
             .and_then(|payload| payload.get("transcript").cloned())
             .unwrap_or_else(null),
     );
+    fields.insert("worktree".to_string(), string(&inputs.worktree));
+    fields.insert("branch".to_string(), string(&branch));
+    fields.insert("requires_delta".to_string(), bool_(inputs.requires_delta));
     ok(Val::Obj(fields))
+}
+
+/// Read the branch of the exact worktree a prompt/collection binds. A
+/// declared mismatch is an output-location refusal, never success against a
+/// different worker checkout.
+fn observed_worktree_branch(
+    ctx: &EffectContext<'_>,
+    worktree: &Path,
+    expected: Option<&str>,
+) -> Result<String, EffectOutcome> {
+    let branch = run_git(ctx, worktree, &["branch", "--show-current"])?
+        .stdout
+        .trim()
+        .to_string();
+    if branch.is_empty() {
+        return Err(refusal(
+            code::OUTPUT_LOCATION,
+            format!("worker output location {} has no branch", worktree.display()),
+        ));
+    }
+    if let Some(expected) = expected
+        && branch != expected
+    {
+        return Err(refusal(
+            code::OUTPUT_LOCATION,
+            format!(
+                "worker output location {} is on branch {branch:?}, not the run's bound branch {expected:?}",
+                worktree.display()
+            ),
+        ));
+    }
+    Ok(branch)
 }
 
 /// `collect_outcome`: collect the lane's commits/head since the integration
@@ -2446,25 +2548,42 @@ fn effect_collect_outcome(ctx: &EffectContext<'_>) -> EffectOutcome {
         Ok(path) => path,
         Err(err) => return refusal(err.code, err.message),
     };
-    let base_head = match inputs.base_head {
+    let base_head = match inputs
+        .base_head
+        .or_else(|| ctx.observed_integration_base.map(str::to_string))
+    {
         Some(head) => head,
-        None => match run_git(
-            ctx,
-            ctx.integration_repo,
-            &["rev-parse", ctx.integration_branch],
-        ) {
-            Ok(out) => out.stdout.trim().to_string(),
-            Err(outcome) => return outcome,
-        },
+        None => {
+            return refusal(
+                code::BAD_PARAMS,
+                "collect_outcome requires base_head from this run's recorded checkout or the apply's exact observed integration base; the current integration branch is never substituted",
+            );
+        }
     };
-    if !is_hex40(&base_head) {
-        return refusal(code::BAD_PARAMS, "base_head must be 40-hex");
-    }
     let head_out = match run_git(ctx, &worktree, &["rev-parse", "--verify", "HEAD"]) {
         Ok(out) => out,
         Err(outcome) => return outcome,
     };
     let head = head_out.stdout.trim().to_string();
+    let branch = match observed_worktree_branch(ctx, &worktree, inputs.branch.as_deref()) {
+        Ok(branch) => branch,
+        Err(outcome) => return outcome,
+    };
+    if run_git(
+        ctx,
+        &worktree,
+        &["merge-base", "--is-ancestor", &base_head, &head],
+    )
+    .is_err()
+    {
+        return refusal(
+            code::OUTPUT_LOCATION,
+            format!(
+                "worker output head {head} in {} is not descended from this run's recorded base {base_head}",
+                worktree.display()
+            ),
+        );
+    }
     let log_out = match run_git(
         ctx,
         &worktree,
@@ -2476,13 +2595,7 @@ fn effect_collect_outcome(ctx: &EffectContext<'_>) -> EffectOutcome {
         ],
     ) {
         Ok(out) => out,
-        Err(_) => run_git(ctx, &worktree, &["log", "--format=%H", "--max-count=32"])
-            .unwrap_or_else(|_| crate::process::ProcOut {
-                status: crate::process::ProcStatus::Exit(0),
-                stdout: String::new(),
-                stderr: String::new(),
-                elapsed_ms: 0,
-            }),
+        Err(outcome) => return outcome,
     };
     let commits: Vec<Val> = log_out
         .stdout
@@ -2490,10 +2603,37 @@ fn effect_collect_outcome(ctx: &EffectContext<'_>) -> EffectOutcome {
         .filter(|line| is_hex40(line))
         .map(string)
         .collect();
+    let delta = match run_git(
+        ctx,
+        &worktree,
+        &["diff", "--name-only", &base_head, &head, "--"],
+    ) {
+        Ok(out) => out,
+        Err(outcome) => return outcome,
+    };
+    let changed: Vec<Val> = delta
+        .stdout
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(string)
+        .collect();
+    if inputs.requires_delta && (head == base_head || commits.is_empty() || changed.is_empty()) {
+        return refusal(
+            code::COLLECT_EMPTY_DELTA,
+            format!(
+                "collect_outcome requires a committed delta in worktree {:?} on branch {branch:?}, but recorded base {base_head} and head {head} contain no changed files",
+                inputs.worktree,
+            ),
+        );
+    }
     ok(object(vec![
         ("head", string(&head)),
         ("commits", Val::Arr(commits)),
         ("base_head", string(&base_head)),
+        ("worktree", string(&inputs.worktree)),
+        ("branch", string(&branch)),
+        ("requires_delta", bool_(inputs.requires_delta)),
+        ("changed_files", Val::Arr(changed)),
     ]))
 }
 

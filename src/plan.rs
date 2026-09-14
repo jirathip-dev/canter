@@ -20,7 +20,7 @@
 
 use crate::canonical::{canonical_bytes, sha256_hex};
 use crate::config::{Repository, WorkflowPin};
-use crate::value::{Val, integer, null, object, string};
+use crate::value::{Val, bool_, integer, null, object, string};
 
 /// The built-in doctrine workflow id known to this read-only slice.
 pub const DOCTRINE_WORKFLOW_ID: &str = "fleet-doctrine-1";
@@ -229,6 +229,7 @@ pub fn queue_run_steps(
                 ("harness_key", string(harness_key)),
                 ("worktree", string(&worktree)),
                 ("branch", string(&branch)),
+                ("requires_delta", bool_(true)),
             ])),
         });
         steps.push(PlanStep {
@@ -237,6 +238,7 @@ pub fn queue_run_steps(
             params: Some(object(vec![
                 ("worktree", string(&worktree)),
                 ("branch", string(&branch)),
+                ("requires_delta", bool_(true)),
             ])),
         });
         // Review facts are supplied only after an independent review, but an

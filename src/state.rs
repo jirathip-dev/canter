@@ -2750,9 +2750,10 @@ impl State {
         Ok(Some(steps))
     }
 
-    /// The recorded dispatch context of one run: its first immutable topology
-    /// and newest explicit admission attestation. These are caller-observed
-    /// durable facts; continuation never invents a topology or measurement.
+    /// The recorded dispatch context of one run: its first immutable topology,
+    /// newest explicit admission attestation and successful checkout base.
+    /// These are caller-observed durable facts; continuation never invents a
+    /// topology, resource measurement, or integration base.
     pub fn run_dispatch_context(
         &self,
         instance_id: &str,
@@ -2760,18 +2761,21 @@ impl State {
         let conn = self.lock("run_dispatch_context")?;
         let mut statement = conn
             .prepare(
-                "SELECT request_line FROM idempotency
+                "SELECT request_line, response FROM idempotency
                   WHERE method = 'apply' AND outcome IS NOT NULL
                   ORDER BY rowid",
             )
             .map_err(|err| StateError::from_sqlite("run_dispatch_context: prepare", err))?;
         let rows = statement
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(|err| StateError::from_sqlite("run_dispatch_context: query", err))?;
         let mut topology: Option<Val> = None;
         let mut admission: Option<Val> = None;
+        let mut integration_base: Option<String> = None;
         for row in rows {
-            let line =
+            let (line, response_line) =
                 row.map_err(|err| StateError::from_sqlite("run_dispatch_context: row", err))?;
             let Ok(request) = Val::parse_json(&line) else {
                 continue;
@@ -2800,10 +2804,22 @@ impl State {
             {
                 admission = Some(presented.clone());
             }
+            if integration_base.is_none()
+                && let Ok(response) = Val::parse_json(&response_line)
+                && response.get("ok").and_then(Val::as_bool) == Some(true)
+                && let Some(base) = response
+                     .get("result")
+                    .and_then(|result| result.get("integration_base"))
+                    .and_then(Val::as_str)
+                && crate::formats::is_hex40(base)
+            {
+                integration_base = Some(base.to_string());
+            }
         }
         Ok(topology.map(|topology| RecordedDispatch {
             topology,
             admission,
+            integration_base,
         }))
     }
 
@@ -10885,14 +10901,16 @@ pub struct SupervisionEvidence {
     pub newest_evidence: Option<EvidenceRow>,
 }
 
-/// The recorded dispatch context of one run: the first topology it bound and
-/// the newest explicit admission attestation.
+/// The recorded dispatch context of one run: the first topology it bound,
+/// the newest explicit admission attestation and the successful checkout base.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecordedDispatch {
     /// The immutable `topology` object the run's first dispatch presented.
     pub topology: Val,
     /// The newest recorded `flags.admission` object, when one was presented.
     pub admission: Option<Val>,
+    /// The integration base read by the run's successful checkout step.
+    pub integration_base: Option<String>,
 }
 
 /// The plan of one committed supervision check (built by the driver from the

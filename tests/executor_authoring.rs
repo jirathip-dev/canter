@@ -128,9 +128,15 @@ impl Fixture {
         field(&doc, &["data"]).clone()
     }
     fn git(&self, args: &[&str]) -> String {
+        self.git_at(&self.path("repo"), args)
+    }
+    fn worktree_git(&self, args: &[&str]) -> String {
+        self.git_at(&self.path("trees/issues-5"), args)
+    }
+    fn git_at(&self, directory: &std::path::Path, args: &[&str]) -> String {
         let out = Command::new("/usr/bin/git")
             .arg("-C")
-            .arg(self.path("repo"))
+            .arg(directory)
             .args(args)
             .env("HOME", &self.root)
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -138,7 +144,8 @@ impl Fixture {
             .unwrap();
         assert!(
             out.status.success(),
-            "git {args:?}: {}",
+            "git at {} {args:?}: {}",
+            directory.display(),
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8(out.stdout).unwrap().trim().to_string()
@@ -267,6 +274,34 @@ impl Fixture {
                 ),
             ])),
         );
+    }
+    fn through_prompt(&self, run: &str, payload: &str, requires_delta: bool) {
+        self.admission();
+        self.ok(&[
+            "run",
+            "dispatch",
+            "--run",
+            run,
+            "--step",
+            "p3",
+            "--admission",
+            self.path("admission.json").to_str().unwrap(),
+        ]);
+        let expectation = format!("requires_delta={requires_delta}");
+        self.ok(&[
+            "run",
+            "dispatch",
+            "--run",
+            run,
+            "--step",
+            "p4-5",
+            "--admission",
+            self.path("admission.json").to_str().unwrap(),
+            "--param",
+            &format!("payload={payload}"),
+            "--param",
+            &expectation,
+        ]);
     }
 }
 impl Drop for Fixture {
@@ -481,4 +516,116 @@ fn f8_supported_surface_binds_reviewed_role_and_derived_session() {
     ] {
         assert!(argv.contains(required), "missing {required}: {argv}");
     }
+}
+
+#[test]
+fn f9_collect_uses_recorded_base_and_requires_a_real_delta() {
+    let fixture = Fixture::new();
+    let run = fixture.run();
+    let first = fixture.first(&run);
+    let recorded_base = text(&first, &["dispatch", "integration_base"]).to_string();
+    succeeded(&fixture.ok(&["run", "dispatch", "--run", &run, "--step", "p2-5"]));
+    fixture.through_prompt(&run, "no-op worker", true);
+
+    // Move the integration checkout after p1. Collection must retain p1's
+    // recorded base rather than observing the clone's new branch head.
+    fixture.write("repo/moved.txt", "new integration head\n");
+    fixture.git(&["add", "moved.txt"]);
+    fixture.git(&[
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "commit",
+        "-m",
+        "move integration",
+    ]);
+    assert_ne!(fixture.git(&["rev-parse", "HEAD"]), recorded_base);
+
+    let (exit, empty) = fixture.cli(&[
+        "run",
+        "dispatch",
+        "--run",
+        &run,
+        "--step",
+        "p5-5",
+    ]);
+    assert_eq!(exit, 4, "{empty:?}");
+    assert_eq!(
+        text(&empty, &["error", "code"]),
+        "refusal.collect.empty_delta"
+    );
+    assert!(text(&empty, &["error", "message"]).contains(&recorded_base));
+
+    fixture.write("trees/issues-5/change.txt", "worker delta\n");
+    fixture.worktree_git(&["add", "change.txt"]);
+    fixture.worktree_git(&[
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "commit",
+        "-m",
+        "worker delta",
+    ]);
+    fixture.ok(&["run", "retry", "--run", &run, "--step", "p5-5"]);
+    let collected = fixture.ok(&["run", "dispatch", "--run", &run, "--step", "p5-5"]);
+    succeeded(&collected);
+    assert_eq!(text(&collected, &["dispatch", "base_head"]), recorded_base);
+    assert_eq!(
+        field(&collected, &["dispatch", "changed_files"]),
+        &Val::Arr(vec![string("change.txt")])
+    );
+}
+
+#[test]
+fn f9_explicit_no_delta_prompt_expectation_allows_a_no_op() {
+    let fixture = Fixture::new();
+    let run = fixture.run();
+    let first = fixture.first(&run);
+    let recorded_base = text(&first, &["dispatch", "integration_base"]).to_string();
+    succeeded(&fixture.ok(&["run", "dispatch", "--run", &run, "--step", "p2-5"]));
+    fixture.through_prompt(&run, "legitimate no-op", false);
+    let collected = fixture.ok(&[
+        "run",
+        "dispatch",
+        "--run",
+        &run,
+        "--step",
+        "p5-5",
+        "--param",
+        "requires_delta=false",
+    ]);
+    succeeded(&collected);
+    assert_eq!(text(&collected, &["dispatch", "base_head"]), recorded_base);
+    assert_eq!(text(&collected, &["dispatch", "head"]), recorded_base);
+    assert_eq!(
+        field(&collected, &["dispatch", "requires_delta"]),
+        &Val::Bool(false)
+    );
+}
+
+#[test]
+fn f9_collect_refuses_a_different_worker_output_branch() {
+    let fixture = Fixture::new();
+    let run = fixture.run();
+    succeeded(&fixture.first(&run));
+    succeeded(&fixture.ok(&["run", "dispatch", "--run", &run, "--step", "p2-5"]));
+    fixture.through_prompt(&run, "branch-bound output", false);
+    fixture.worktree_git(&["branch", "-m", "foreign-output"]);
+    let (exit, refused) = fixture.cli(&[
+        "run",
+        "dispatch",
+        "--run",
+        &run,
+        "--step",
+        "p5-5",
+        "--param",
+        "requires_delta=false",
+    ]);
+    assert_eq!(exit, 4, "{refused:?}");
+    assert_eq!(
+        text(&refused, &["error", "code"]),
+        "refusal.worker.output_location"
+    );
 }

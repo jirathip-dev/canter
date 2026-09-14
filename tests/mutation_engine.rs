@@ -892,7 +892,7 @@ fn lane_flow_merges_verified_head_closes_issue_and_cleans_with_salvage() {
             .unwrap_or("")
             .contains("lane transcript ok")
     );
-    let collected = scenario.apply_ok(13, "o1", None, None);
+    let collected = scenario.apply_ok(13, "o1", None, Some(&integration_base));
     let feature_head = collected
         .get("head")
         .and_then(Val::as_str)
@@ -979,7 +979,7 @@ fn moved_integration_base_invalidates_stale_evidence_and_refuses_merge() {
     scenario.apply_ok(30, "w1", None, None);
     scenario.apply_ok(31, "h1", None, None);
     scenario.apply_ok(32, "p1", None, None);
-    let collected = scenario.apply_ok(33, "o1", None, None);
+    let collected = scenario.apply_ok(33, "o1", None, Some(&integration_base));
     let feature_head = collected
         .get("head")
         .and_then(Val::as_str)
@@ -1204,7 +1204,7 @@ fn premature_issue_close_refuses_closure_premature_over_the_wire() {
     scenario.apply_ok(81, "w1", None, None);
     scenario.apply_ok(82, "h1", None, None);
     scenario.apply_ok(83, "p1", None, None);
-    let collected = scenario.apply_ok(84, "o1", None, None);
+    let collected = scenario.apply_ok(84, "o1", None, Some(&base));
     let feature = collected
         .get("head")
         .and_then(Val::as_str)
