@@ -1056,7 +1056,11 @@ fn validate_plan(obj: &Val) -> Verdict {
                     }
                 }
                 match step.get("params") {
-                    None | Some(Val::Null) | Some(Val::Obj(_)) => {}
+                    None | Some(Val::Null) => {}
+                    Some(Val::Obj(params))
+                        if params
+                            .keys()
+                            .all(|key| crate::formats::is_step_param_name(key)) => {}
                     Some(other) => {
                         return Verdict::refuse(
                             Refusal::Malformed,

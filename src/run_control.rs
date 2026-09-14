@@ -159,6 +159,10 @@ pub struct DispatchParams {
     /// The operator's step inputs, merged over the step's committed params.
     /// `None` = the committed params as reviewed (no correction).
     pub step_params: Option<Val>,
+    /// Initial lane paths; later dispatches reuse the recorded topology.
+    pub topology: Option<Val>,
+    /// Explicit current admission attestation; never a synthesized measurement.
+    pub admission: Option<Val>,
 }
 
 /// Validate one required key and return its closed key set check.
@@ -313,7 +317,14 @@ pub fn parse_retry_params(params: &Val) -> Result<RetryParams, ControlError> {
 pub fn parse_dispatch_params(params: &Val) -> Result<DispatchParams, ControlError> {
     only_keys(
         params,
-        &["idempotency_key", "instance_id", "step", "params"],
+        &[
+            "idempotency_key",
+            "instance_id",
+            "step",
+            "params",
+            "topology",
+            "admission",
+        ],
         "run.dispatch",
     )?;
     let idempotency_key = required(params, "idempotency_key", "run.dispatch")?;
@@ -342,7 +353,9 @@ pub fn parse_dispatch_params(params: &Val) -> Result<DispatchParams, ControlErro
     }
     let step_params = match params.get("params") {
         None | Some(Val::Null) => None,
-        Some(inputs @ Val::Obj(_)) => Some(inputs.clone()),
+        Some(inputs @ Val::Obj(map)) if map.keys().all(|key| formats::is_step_param_name(key)) => {
+            Some(inputs.clone())
+        }
         Some(other) => {
             return Err(ControlError::new(
                 "refusal.malformed",
@@ -353,11 +366,21 @@ pub fn parse_dispatch_params(params: &Val) -> Result<DispatchParams, ControlErro
             ));
         }
     };
+    let context = |name: &str| match params.get(name) {
+        None | Some(Val::Null) => Ok(None),
+        Some(value @ Val::Obj(_)) => Ok(Some(value.clone())),
+        _ => Err(ControlError::new(
+            "refusal.malformed",
+            format!("run.dispatch {name} must be an object"),
+        )),
+    };
     Ok(DispatchParams {
         idempotency_key,
         instance_id,
         step,
         step_params,
+        topology: context("topology")?,
+        admission: context("admission")?,
     })
 }
 

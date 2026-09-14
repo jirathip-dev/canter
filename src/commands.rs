@@ -225,6 +225,10 @@ pub struct RunDispatchArgs {
     /// The operator's step-specific inputs (`--param KEY=VALUE`, repeatable);
     /// merged over the step's committed params.
     pub params: Vec<(String, Val)>,
+    /// Optional first-dispatch topology document.
+    pub topology: Option<PathBuf>,
+    /// Optional fresh admission attestation document.
+    pub admission: Option<PathBuf>,
     /// `--idempotency-key`: replay-safe automation key.
     pub idempotency_key: Option<String>,
     /// Explicit daemon socket override.
@@ -1503,6 +1507,8 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
     let mut step: Option<String> = None;
     let mut idempotency_key: Option<String> = None;
     let mut step_params: Vec<(String, Val)> = Vec::new();
+    let mut topology = None;
+    let mut admission = None;
     let rest = &args[1..];
     let mut index = 0;
     while index < rest.len() {
@@ -1556,6 +1562,15 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
                 }
                 step = Some(value);
             }
+            "--topology" | "--admission" if action.as_str() == "dispatch" => {
+                let flag = rest[index].as_str();
+                let value = PathBuf::from(flag_value(rest, &mut index, command, flag)?);
+                if flag == "--topology" {
+                    topology = Some(value);
+                } else {
+                    admission = Some(value);
+                }
+            }
             "--param" => {
                 let value = flag_value(rest, &mut index, command, "--param")?;
                 let Some((name, raw)) = value.split_once('=') else {
@@ -1563,9 +1578,9 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
                         "{command}: --param must be KEY=VALUE, got {value:?}"
                     )));
                 };
-                if !crate::formats::is_slug(name) {
+                if !crate::formats::is_step_param_name(name) {
                     return Err(ParseError::Usage(format!(
-                        "{command}: --param key must be a step param name (slug), got {name:?}"
+                        "{command}: --param key must be a step param name ([a-z][a-z0-9_-]*), got {name:?}"
                     )));
                 }
                 // One deterministic typing rule: a value that IS JSON
@@ -1669,6 +1684,8 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
                 run,
                 step,
                 params: step_params,
+                topology,
+                admission,
                 idempotency_key,
                 socket,
             })
@@ -5069,7 +5086,28 @@ fn execute_run_dispatch(args: &RunDispatchArgs, invocation: &Invocation) -> CmdR
                 .collect(),
         ))
     };
-    let params = crate::run_control::dispatch_params(&key, &args.run, &args.step, supplied);
+    let mut params = crate::run_control::dispatch_params(&key, &args.run, &args.step, supplied);
+    for (name, path) in [("topology", &args.topology), ("admission", &args.admission)] {
+        if let Some(path) = path {
+            let value = std::fs::read_to_string(path)
+                .map_err(|err| err.to_string())
+                .and_then(|text| Val::parse_json(&text));
+            match value {
+                Ok(value @ Val::Obj(_)) => {
+                    if let Val::Obj(map) = &mut params {
+                        map.insert(name.to_string(), value);
+                    }
+                }
+                _ => {
+                    return lane_error(
+                        "usage.run_dispatch",
+                        format!("run dispatch: --{name} requires a readable JSON object"),
+                        false,
+                    );
+                }
+            }
+        }
+    }
     match client::call(&paths.socket_path, "run.dispatch", Some(&params)) {
         Ok(result) => {
             let human = crate::run_control::render_human(&result);

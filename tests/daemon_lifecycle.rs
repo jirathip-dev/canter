@@ -669,6 +669,8 @@ impl AdmissionScenario {
             Some(object(vec![
                 ("harness_key", string("lane")),
                 ("session_id", string("sess-lc-1")),
+                ("herdr_session", string("sess-lc-1")),
+                ("terminal_session", string("sess-lc-1")),
                 ("generation", integer(1)),
                 ("executable", string("hf-lane")),
                 ("kind", string("argv")),

@@ -709,11 +709,19 @@ fn parse_steps(value: Option<&Val>) -> Result<Vec<PlannedStep>, SubmissionError>
             .to_string();
         let params = match step.get("params") {
             None | Some(Val::Null) => None,
-            Some(value @ Val::Obj(_)) => Some(value.clone()),
+            Some(value @ Val::Obj(params))
+                if params
+                    .keys()
+                    .all(|key| crate::formats::is_step_param_name(key)) =>
+            {
+                Some(value.clone())
+            }
             _ => {
                 return Err(SubmissionError::new(
                     "usage.queue_submission.preview",
-                    format!("the bound step {id:?} params must be an object or null"),
+                    format!(
+                        "the bound step {id:?} params must be an object with names matching [a-z][a-z0-9_-]*, or null"
+                    ),
                 ));
             }
         };

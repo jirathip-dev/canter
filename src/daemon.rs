@@ -1411,8 +1411,8 @@ struct DispatchMaterial {
     spine: Vec<String>,
     steps: Vec<Val>,
     topology: Val,
-    caps: Option<Val>,
-    harness_lanes: Option<i64>,
+    profile: Option<Val>,
+    admission: Option<Val>,
 }
 
 /// Read the dispatch material of one run (issue #92 F4 and the operator
@@ -1423,6 +1423,7 @@ struct DispatchMaterial {
 fn read_dispatch_material(
     state: &crate::state::State,
     instance_id: &str,
+    topology: Option<&Val>,
 ) -> Result<DispatchMaterial, (String, String)> {
     let instance = state
         .instance_by_id(instance_id)
@@ -1446,29 +1447,62 @@ fn read_dispatch_material(
         .run_step_spine(instance_id)
         .map_err(|err| (err.code.to_string(), err.message))?
         .ok_or_else(no_spine)?;
-    let steps = state
+    let mut steps = state
         .run_step_documents(instance_id)
         .map_err(|err| (err.code.to_string(), err.message))?
         .ok_or_else(no_spine)?;
     let recorded = state
         .run_dispatch_context(instance_id)
-        .map_err(|err| (err.code.to_string(), err.message))?
-        .ok_or_else(|| {
-            (
+        .map_err(|err| (err.code.to_string(), err.message))?;
+    let topology = match (recorded.as_ref(), topology) {
+        (Some(recorded), Some(presented)) if recorded.topology != *presented => {
+            return Err((
                 crate::run_control::codes::SCOPE.to_string(),
                 format!(
-                    "run {instance_id} has no recorded dispatch topology; the first dispatch of a \
-                     run belongs to the caller that holds it"
+                    "run {instance_id} already bound a different topology; dispatch never changes its lane paths"
                 ),
-            )
-        })?;
+            ));
+        }
+        (Some(recorded), _) => recorded.topology.clone(),
+        (None, Some(presented)) => presented.clone(),
+        (None, None) => {
+            return Err((
+                crate::run_control::codes::SCOPE.to_string(),
+                format!(
+                    "run {instance_id} needs --topology FILE for its first dispatch: integration_branch, production_branches, integration_repo and worktrees_root"
+                ),
+            ));
+        }
+    };
+    let profile = state
+        .run_role_binding(instance_id)
+        .map_err(|err| (err.code.to_string(), err.message))?;
+    if let Some(profile) = &profile {
+        for step in &mut steps {
+            if matches!(
+                step.get("kind").and_then(Val::as_str),
+                Some("harness_start" | "prompt")
+            ) {
+                let derived = object(vec![
+                    (
+                        "harness_key",
+                        profile.get("key").cloned().unwrap_or_else(null),
+                    ),
+                    ("kind", profile.get("kind").cloned().unwrap_or_else(null)),
+                ]);
+                if let Some(params) = merged_step_params(Some(&derived), step.get("params")) {
+                    *step = step_with_params(step, &params);
+                }
+            }
+        }
+    }
     Ok(DispatchMaterial {
         instance,
         spine,
         steps,
-        topology: recorded.topology,
-        caps: recorded.caps,
-        harness_lanes: recorded.harness_lanes,
+        topology,
+        profile,
+        admission: recorded.as_ref().and_then(|context| context.admission.clone()),
     })
 }
 
@@ -1502,12 +1536,8 @@ fn dispatch_request_from(
         ("digest_confirmed", bool_(false)),
         ("scheduled", bool_(false)),
     ];
-    if let Some(caps) = material.caps.clone() {
-        let mut admission = vec![("caps", caps)];
-        if let Some(lanes) = material.harness_lanes {
-            admission.push(("harness_lanes", integer(lanes)));
-        }
-        flags.push(("admission", object(admission)));
+    if let Some(admission) = &material.admission {
+        flags.push(("admission", admission.clone()));
     }
     let params = object(vec![
         ("idempotency_key", string(key)),
@@ -1525,6 +1555,7 @@ fn dispatch_request_from(
             ]),
         ),
         ("topology", material.topology.clone()),
+        ("profile", material.profile.clone().unwrap_or_else(null)),
         ("flags", object(flags)),
     ]);
     let id = format!("disp_{step_id}");
@@ -1555,7 +1586,7 @@ fn build_dispatch_request(
     key: &str,
 ) -> Result<Request, String> {
     let state = shared.lock_state()?;
-    let material = read_dispatch_material(&state, instance_id)
+    let material = read_dispatch_material(&state, instance_id, None)
         .map_err(|(code, message)| format!("{code}: {message}"))?;
     dispatch_request_from(&material, step_id, step_params, key)
         .map_err(|(code, message)| format!("{code}: {message}"))
@@ -3492,10 +3523,14 @@ fn method_run_dispatch(shared: &Arc<Shared>, request: &Request) -> String {
             Ok(state) => state,
             Err(message) => return err_response(&request.id, "state.unavailable", message),
         };
-        let material = match read_dispatch_material(&state, &parsed.instance_id) {
-            Ok(material) => material,
-            Err((code, message)) => return err_response(&request.id, &code, message),
-        };
+        let mut material =
+            match read_dispatch_material(&state, &parsed.instance_id, parsed.topology.as_ref()) {
+                Ok(material) => material,
+                Err((code, message)) => return err_response(&request.id, &code, message),
+            };
+        if parsed.admission.is_some() {
+            material.admission = parsed.admission.clone();
+        }
         if !material.spine.iter().any(|step| step == &parsed.step) {
             return err_response(
                 &request.id,

@@ -2547,6 +2547,54 @@ impl State {
         }
     }
 
+    /// Recover the full reviewed binding from the submission's durable claim.
+    /// The bound preview pins its key/revision; the claim retains the document.
+    pub fn run_role_binding(&self, instance_id: &str) -> Result<Option<Val>, StateError> {
+        let Some(identity) = self.run_role_identity(instance_id)? else {
+            return Ok(None);
+        };
+        let conn = self.lock("run_role_binding")?;
+        let mut statement = conn
+            .prepare(
+                "SELECT d.key, d.request_line, s.submission_id FROM idempotency d
+             JOIN queue_submissions s ON s.digest = json_extract(d.request_line, '$.params.digest')
+             JOIN queue_submission_items i ON i.submission_id = s.submission_id
+             WHERE d.method = 'queue.submit' AND i.instance_id = ?1 AND i.status = 'admitted'",
+            )
+            .map_err(|err| StateError::from_sqlite("run_role_binding: prepare", err))?;
+        let rows = statement
+            .query_map(params![instance_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|err| StateError::from_sqlite("run_role_binding: query", err))?;
+        for row in rows {
+            let (key, line, submission) =
+                row.map_err(|err| StateError::from_sqlite("run_role_binding: row", err))?;
+            let doc =
+                Val::parse_json(&line).map_err(|message| state_error("state.corrupt", message))?;
+            let params = doc.get("params").unwrap_or(&Val::Null);
+            let digest = params
+                .get("digest")
+                .and_then(Val::as_str)
+                .unwrap_or_default();
+            if crate::queue_executor::submission_id(digest, &key) != submission {
+                continue;
+            }
+            if let Some(binding) = params.get("binding") {
+                let parsed = crate::config::ProfileBinding::from_doc(binding)
+                    .map_err(|err| state_error(err.code(), err.message()))?;
+                if (parsed.key, parsed.revision) == identity {
+                    return Ok(Some(binding.clone()));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// The committed executable spine of one run as raw step documents
     /// (`None` for a run without a committed queue submission). The spine is
     /// the reviewed bound-input `steps` array — never a caller's.
@@ -2560,20 +2608,59 @@ impl State {
                 format!("the committed bound-input line of {instance_id} is unreadable: {message}"),
             )
         })?;
-        Ok(Some(
-            doc.get("steps")
+        let mut steps = doc
+            .get("steps")
+            .and_then(Val::as_array)
+            .cloned()
+            .unwrap_or_default();
+        // Apply claims already persist the effective params before an effect.
+        // Replay only the addressed step's inputs, not a caller's entire plan.
+        let conn = self.lock("run_step_documents")?;
+        let mut statement = conn
+            .prepare("SELECT request_line FROM idempotency WHERE method = 'apply' ORDER BY rowid")
+            .map_err(|err| StateError::from_sqlite("run_step_documents: prepare", err))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|err| StateError::from_sqlite("run_step_documents: query", err))?;
+        for row in rows {
+            let line =
+                row.map_err(|err| StateError::from_sqlite("run_step_documents: row", err))?;
+            let request =
+                Val::parse_json(&line).map_err(|message| state_error("state.corrupt", message))?;
+            let Some(params) = request.get("params") else {
+                continue;
+            };
+            if params.get("instance_id").and_then(Val::as_str) != Some(instance_id) {
+                continue;
+            }
+            let id = params.get("step").and_then(Val::as_str);
+            let Some(recorded) = params
+                .get("plan")
+                .and_then(|plan| plan.get("steps"))
                 .and_then(Val::as_array)
-                .cloned()
-                .unwrap_or_default(),
-        ))
+                .and_then(|steps| {
+                    steps
+                        .iter()
+                        .find(|step| step.get("id").and_then(Val::as_str) == id)
+                })
+            else {
+                continue;
+            };
+            if let Some(Val::Obj(step)) = steps
+                .iter_mut()
+                .find(|step| step.get("id").and_then(Val::as_str) == id)
+                && recorded.get("kind") == step.get("kind")
+                && let Some(inputs @ Val::Obj(_)) = recorded.get("params")
+            {
+                step.insert("params".to_string(), inputs.clone());
+            }
+        }
+        Ok(Some(steps))
     }
 
-    /// The newest recorded dispatch context of one run (issue #92 F4): the
-    /// exact `topology` block and the admission inputs (`caps`, occupancy)
-    /// one of the run's own applies presented. Durable caller-attested
-    /// inputs — a supervision dispatch re-presents them and never invents a
-    /// topology or a measurement. `None` when the run has no recorded
-    /// dispatch at all.
+    /// The recorded dispatch context of one run: its first immutable topology
+    /// and newest explicit admission attestation. These are caller-observed
+    /// durable facts; continuation never invents a topology or measurement.
     pub fn run_dispatch_context(
         &self,
         instance_id: &str,
@@ -2583,13 +2670,14 @@ impl State {
             .prepare(
                 "SELECT request_line FROM idempotency
                   WHERE method = 'apply' AND outcome IS NOT NULL
-                  ORDER BY claimed_at, key",
+                  ORDER BY rowid",
             )
             .map_err(|err| StateError::from_sqlite("run_dispatch_context: prepare", err))?;
         let rows = statement
             .query_map([], |row| row.get::<_, String>(0))
             .map_err(|err| StateError::from_sqlite("run_dispatch_context: query", err))?;
-        let mut out = None;
+        let mut topology: Option<Val> = None;
+        let mut admission: Option<Val> = None;
         for row in rows {
             let line =
                 row.map_err(|err| StateError::from_sqlite("run_dispatch_context: row", err))?;
@@ -2600,26 +2688,31 @@ impl State {
             if params.get("instance_id").and_then(Val::as_str) != Some(instance_id) {
                 continue;
             }
-            let Some(topology) = params.get("topology") else {
-                continue;
-            };
-            let admission = params
+            if let Some(presented @ Val::Obj(_)) = params.get("topology") {
+                match &topology {
+                    Some(bound) if bound != presented => {
+                        return Err(state_error(
+                            "state.corrupt",
+                            format!(
+                                "run {instance_id} recorded conflicting dispatch topologies"
+                            ),
+                        ));
+                    }
+                    None => topology = Some(presented.clone()),
+                    _ => {}
+                }
+            }
+            if let Some(presented @ Val::Obj(_)) = params
                 .get("flags")
                 .and_then(|flags| flags.get("admission"))
-                .cloned();
-            out = Some(RecordedDispatch {
-                topology: topology.clone(),
-                caps: admission
-                    .as_ref()
-                    .and_then(|admission| admission.get("caps"))
-                    .cloned(),
-                harness_lanes: admission
-                    .as_ref()
-                    .and_then(|admission| admission.get("harness_lanes"))
-                    .and_then(Val::as_int),
-            });
+            {
+                admission = Some(presented.clone());
+            }
         }
-        Ok(out)
+        Ok(topology.map(|topology| RecordedDispatch {
+            topology,
+            admission,
+        }))
     }
 
     /// The `harness_start` step of one run whose dispatch is recorded as
@@ -10699,18 +10792,14 @@ pub struct SupervisionEvidence {
     pub newest_evidence: Option<EvidenceRow>,
 }
 
-/// The newest recorded dispatch context of one run (issue #92 F4): the
-/// caller-attested inputs a supervision dispatch re-presents, because the
-/// daemon holds no topology of its own.
+/// The recorded dispatch context of one run: the first topology it bound and
+/// the newest explicit admission attestation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecordedDispatch {
-    /// The `topology` object the run's own dispatch presented.
+    /// The immutable `topology` object the run's first dispatch presented.
     pub topology: Val,
-    /// The recorded `flags.admission.caps` object, when that dispatch
-    /// carried an admission block (fan-out steps do).
-    pub caps: Option<Val>,
-    /// The recorded `flags.admission.harness_lanes` occupancy attestation.
-    pub harness_lanes: Option<i64>,
+    /// The newest recorded `flags.admission` object, when one was presented.
+    pub admission: Option<Val>,
 }
 
 /// The plan of one committed supervision check (built by the driver from the

@@ -100,7 +100,7 @@ RPC_METHODS = frozenset(
      "lane.retire",
      "lane.start", "lane.adopt", "lane.successor.consume",
      "state.epoch", "queue.submit", "queue.status",
-     "run.pause", "run.resume", "run.retry", "run.status",
+     "run.pause", "run.resume", "run.retry", "run.dispatch", "run.status",
      "supervision.status",
      "backup.create", "restore.begin", "journal.tail",
      "events.subscribe"}
@@ -466,6 +466,8 @@ def validate_plan(obj: dict) -> tuple[str, str]:
         params = step.get("params")
         if params is not None and not isinstance(params, dict):
             return _ref(REFUSE_MALFORMED, "plan step params must be an object or null")
+        if isinstance(params, dict) and any(not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", key) for key in params):
+            return _ref(REFUSE_MALFORMED, "invalid plan step param name")
     return _ref(ACCEPT, "plan ok")
 
 

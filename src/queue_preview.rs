@@ -460,6 +460,19 @@ fn validate_request(request: &QueueRequest) -> Result<Validated, PreviewError> {
                 format!("the declared step id {:?} appears twice", step.id),
             ));
         }
+        if let Some(Val::Obj(params)) = &step.params
+            && !params
+                .keys()
+                .all(|key| formats::is_step_param_name(key))
+        {
+            return Err(PreviewError::new(
+                "usage.queue_steps",
+                format!(
+                    "step {:?} carries a param name outside [a-z][a-z0-9_-]*",
+                    step.id
+                ),
+            ));
+        }
     }
     if request.selected.is_empty() {
         return Err(PreviewError::new(
