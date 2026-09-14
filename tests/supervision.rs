@@ -2032,6 +2032,16 @@ fn the_prompt_runs_the_runs_declared_role_binding_and_continues_its_session() {
         "the real child stdout is the step result: {}",
         canter::canonical::canonical_text(&prompted)
     );
+    // AC-F1 (issue #92) visibility clause, pinned: the EFFECTIVE deadline
+    // the effect used rides on the step outcome, so a step can never report
+    // a result without the deadline it ran under. This prompt declares no
+    // `deadline_secs`, so the documented per-kind default must be the value.
+    assert_eq!(
+        prompted.get("deadline_secs").and_then(Val::as_int),
+        Some(canter::mutation::PROMPT_DEADLINE_DEFAULT_SECS as i64),
+        "the effective deadline rides on the step outcome: {}",
+        canter::canonical::canonical_text(&prompted)
+    );
 
     shutdown(daemon);
 }

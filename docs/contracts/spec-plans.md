@@ -148,7 +148,9 @@ runs control-plane effects:
     3600 s (`EFFECT_DEADLINE_CEILING_SECS`);
   - a reviewed plan step may declare its own `deadline_secs` (policy, bound
     by the plan digest); a value outside `1..=ceiling` — or a non-integer —
-    refuses `refusal.plan.malformed` before the effect runs;
+    refuses `refusal.request.malformed` (`effect_deadline_secs` validates
+    the override; `refusal.plan.malformed` is bind-time only) before the
+    effect runs;
   - the EFFECTIVE value rides on the step's `result` as `deadline_secs`, so
     the step outcome/evidence always names the deadline the effect used;
   - the child of an effect leads its own process group and a deadline
