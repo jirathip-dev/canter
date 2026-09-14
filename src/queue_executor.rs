@@ -1111,14 +1111,8 @@ fn classify_items(
                 let row = state
                     .grant_by_id(presented_grant)
                     .map_err(|err| SubmissionError::new(err.code, err.message))?;
-                match grant_binding_refusal(
-                    state,
-                    material,
-                    presented_grant,
-                    row,
-                    &id,
-                    &revision,
-                )? {
+                match grant_binding_refusal(state, material, presented_grant, row, &id, &revision)?
+                {
                     Some((code, message)) => SubmissionVerdict::Refused { code, message },
                     None => {
                         let stored = state

@@ -1825,6 +1825,67 @@ impl State {
         Ok(audit)
     }
 
+    /// Commit an evidence-based diagnosed-step resolution as one atomic
+    /// journal transition. The resolution itself is the durable attempt-ledger
+    /// row; any pending retry authorization is consumed by this no-effect
+    /// record so it cannot later re-execute the diagnosed effect.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve_run_step_claim(
+        &self,
+        key: &str,
+        method: &str,
+        outcome_line: &str,
+        response_line: &str,
+        instance_id: &str,
+        step_id: &str,
+        at: &str,
+    ) -> Result<AuditRow, StateError> {
+        self.ensure_writable()?;
+        let mut conn = self.lock("resolve_run_step_claim")?;
+        let tx = conn
+            .transaction()
+            .map_err(|err| StateError::from_sqlite("resolve_run_step_claim: begin", err))?;
+        let exists: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM instances WHERE instance_id = ?1",
+                params![instance_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("resolve_run_step_claim: run", err))?;
+        if exists.is_none() {
+            return Err(state_error(
+                "state.not_found",
+                format!("no instance {instance_id}"),
+            ));
+        }
+        tx.execute(
+            "UPDATE run_retries SET consumed_at = ?3, consumed_key = ?4
+              WHERE instance_id = ?1 AND step_id = ?2 AND consumed_at = ''",
+            params![instance_id, step_id, at, key],
+        )
+        .map_err(|err| StateError::from_sqlite("resolve_run_step_claim: retry", err))?;
+        let action = format!("outcome.{method}");
+        let audit = self.append_audit_locked(&tx, &action, key, key, None, None)?;
+        let affected = tx
+            .execute(
+                "UPDATE idempotency SET status = 'spent', outcome = ?1, response = ?2,
+                        resolved_at = ?3
+                  WHERE key = ?4 AND method = ?5 AND status = 'claimed'",
+                params![outcome_line, response_line, at, key, method],
+            )
+            .map_err(|err| StateError::from_sqlite("resolve_run_step_claim: claim", err))?;
+        if affected != 1 {
+            return Err(state_error(
+                "state.claim_conflict",
+                format!("claim {key:?} is not the unresolved {method} claim"),
+            ));
+        }
+        tx.commit()
+            .map_err(|err| StateError::from_sqlite("resolve_run_step_claim: commit", err))?;
+        Ok(audit)
+    }
+
     /// Every un-resolved claim (the recovery checkpoint queue). On restart
     /// the daemon reconciles each one before accepting retries (AC4).
     pub fn claims_in_flight(&self) -> Result<Vec<ClaimRow>, StateError> {
@@ -2751,9 +2812,9 @@ impl State {
     }
 
     /// The recorded dispatch context of one run: its first immutable topology,
-    /// newest explicit admission attestation and successful checkout base.
+    /// newest explicit admission attestation and successful worker heads.
     /// These are caller-observed durable facts; continuation never invents a
-    /// topology, resource measurement, or integration base.
+    /// topology, resource measurement, or repository head.
     pub fn run_dispatch_context(
         &self,
         instance_id: &str,
@@ -2774,6 +2835,7 @@ impl State {
         let mut topology: Option<Val> = None;
         let mut admission: Option<Val> = None;
         let mut integration_base: Option<String> = None;
+        let mut feature_head: Option<String> = None;
         for row in rows {
             let (line, response_line) =
                 row.map_err(|err| StateError::from_sqlite("run_dispatch_context: row", err))?;
@@ -2789,37 +2851,45 @@ impl State {
                     Some(bound) if bound != presented => {
                         return Err(state_error(
                             "state.corrupt",
-                            format!(
-                                "run {instance_id} recorded conflicting dispatch topologies"
-                            ),
+                            format!("run {instance_id} recorded conflicting dispatch topologies"),
                         ));
                     }
                     None => topology = Some(presented.clone()),
                     _ => {}
                 }
             }
-            if let Some(presented @ Val::Obj(_)) = params
-                .get("flags")
-                .and_then(|flags| flags.get("admission"))
+            if let Some(presented @ Val::Obj(_)) =
+                params.get("flags").and_then(|flags| flags.get("admission"))
             {
                 admission = Some(presented.clone());
             }
-            if integration_base.is_none()
-                && let Ok(response) = Val::parse_json(&response_line)
+            if let Ok(response) = Val::parse_json(&response_line)
                 && response.get("ok").and_then(Val::as_bool) == Some(true)
-                && let Some(base) = response
-                     .get("result")
-                    .and_then(|result| result.get("integration_base"))
-                    .and_then(Val::as_str)
-                && crate::formats::is_hex40(base)
+                && let Some(result) = response.get("result")
             {
-                integration_base = Some(base.to_string());
+                if integration_base.is_none()
+                    && let Some(base) = result
+                        .get("integration_base")
+                        .or_else(|| result.get("base_head"))
+                        .and_then(Val::as_str)
+                        .filter(|base| crate::formats::is_hex40(base))
+                {
+                    integration_base = Some(base.to_string());
+                }
+                if let Some(head) = result
+                    .get("feature_head")
+                    .and_then(Val::as_str)
+                    .filter(|head| crate::formats::is_hex40(head))
+                {
+                    feature_head = Some(head.to_string());
+                }
             }
         }
         Ok(topology.map(|topology| RecordedDispatch {
             topology,
             admission,
             integration_base,
+            feature_head,
         }))
     }
 
@@ -2908,19 +2978,23 @@ impl State {
         let conn = self.lock("run_step_attempts")?;
         let mut statement = conn
             .prepare(
-                "SELECT request_line, outcome FROM idempotency
-                  WHERE method = 'apply' AND outcome IS NOT NULL
-                  ORDER BY claimed_at, key",
+                "SELECT method, request_line, outcome FROM idempotency
+                  WHERE method IN ('apply', 'run.resolve') AND outcome IS NOT NULL
+                  ORDER BY rowid",
             )
             .map_err(|err| StateError::from_sqlite("run_step_attempts: prepare", err))?;
         let rows = statement
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
             })
             .map_err(|err| StateError::from_sqlite("run_step_attempts: query", err))?;
         let mut out = Vec::new();
         for row in rows {
-            let (line, outcome) =
+            let (method, line, outcome) =
                 row.map_err(|err| StateError::from_sqlite("run_step_attempts: row", err))?;
             let Some(outcome) = outcome else {
                 continue;
@@ -2945,6 +3019,9 @@ impl State {
                 .and_then(Val::as_str)
                 .unwrap_or("unknown")
                 .to_string();
+            if method == "run.resolve" && status != "succeeded" {
+                continue;
+            }
             out.push((step, status));
         }
         Ok(out)
@@ -10902,7 +10979,7 @@ pub struct SupervisionEvidence {
 }
 
 /// The recorded dispatch context of one run: the first topology it bound,
-/// the newest explicit admission attestation and the successful checkout base.
+/// the newest explicit admission attestation and successful worker heads.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecordedDispatch {
     /// The immutable `topology` object the run's first dispatch presented.
@@ -10911,6 +10988,8 @@ pub struct RecordedDispatch {
     pub admission: Option<Val>,
     /// The integration base read by the run's successful checkout step.
     pub integration_base: Option<String>,
+    /// The newest feature head read by a successful outcome collection.
+    pub feature_head: Option<String>,
 }
 
 /// The plan of one committed supervision check (built by the driver from the
@@ -12272,19 +12351,23 @@ impl State {
     ) -> Result<Vec<(String, String, String)>, StateError> {
         let mut statement = conn
             .prepare(
-                "SELECT request_line, outcome FROM idempotency
-                  WHERE method = 'apply' AND outcome IS NOT NULL
-                  ORDER BY claimed_at, key",
+                "SELECT method, request_line, outcome FROM idempotency
+                  WHERE method IN ('apply', 'run.resolve') AND outcome IS NOT NULL
+                  ORDER BY rowid",
             )
             .map_err(|err| StateError::from_sqlite("supervision attempts: prepare", err))?;
         let rows = statement
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
             })
             .map_err(|err| StateError::from_sqlite("supervision attempts: query", err))?;
         let mut out = Vec::new();
         for row in rows {
-            let (line, outcome) =
+            let (method, line, outcome) =
                 row.map_err(|err| StateError::from_sqlite("supervision attempts: row", err))?;
             let Some(outcome) = outcome else {
                 continue;
@@ -12309,6 +12392,9 @@ impl State {
                 .and_then(Val::as_str)
                 .unwrap_or("unknown")
                 .to_string();
+            if method == "run.resolve" && status != "succeeded" {
+                continue;
+            }
             let code = outcome
                 .get("error")
                 .and_then(|error| error.get("code"))

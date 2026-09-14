@@ -461,9 +461,7 @@ fn validate_request(request: &QueueRequest) -> Result<Validated, PreviewError> {
             ));
         }
         if let Some(Val::Obj(params)) = &step.params
-            && !params
-                .keys()
-                .all(|key| formats::is_step_param_name(key))
+            && !params.keys().all(|key| formats::is_step_param_name(key))
         {
             return Err(PreviewError::new(
                 "usage.queue_steps",

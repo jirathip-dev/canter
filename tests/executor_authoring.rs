@@ -56,7 +56,7 @@ impl Fixture {
             fixture.path("d.sock").to_str().unwrap()));
         fixture.write(
             "bin/hermes",
-            "#!/bin/sh\ncase \"$*\" in\n  *persist-me*) test -f \"$HOME/allow-prompt\" || exit 9 ;;\nesac\nprintf '%s\\n' \"$@\" > prompt-argv\nprintf 'fixture output\\n'\n",
+            "#!/bin/sh\nprintf 'x\\n' >> \"$HOME/prompt-count\"\ncase \"$*\" in\n  *persist-me*) test -f \"$HOME/allow-prompt\" || exit 9 ;;\nesac\nprintf '%s\\n' \"$@\" > prompt-argv\nprintf 'fixture output\\n'\n",
         );
         std::fs::set_permissions(
             fixture.path("bin/hermes"),
@@ -72,10 +72,7 @@ impl Fixture {
                     "integration_repo",
                     string(fixture.path("repo").to_str().unwrap()),
                 ),
-                (
-                    "worktrees_root",
-                    string(worktrees_root.to_str().unwrap()),
-                ),
+                ("worktrees_root", string(worktrees_root.to_str().unwrap())),
             ])),
         );
         fixture.restart();
@@ -303,6 +300,43 @@ impl Fixture {
             &expectation,
         ]);
     }
+    fn failed_prompt(&self) -> String {
+        let run = self.run();
+        self.first(&run);
+        self.ok(&["run", "dispatch", "--run", &run, "--step", "p2-5"]);
+        self.admission();
+        self.ok(&[
+            "run",
+            "dispatch",
+            "--run",
+            &run,
+            "--step",
+            "p3",
+            "--admission",
+            self.path("admission.json").to_str().unwrap(),
+        ]);
+        let (exit, failed) = self.cli(&[
+            "run",
+            "dispatch",
+            "--run",
+            &run,
+            "--step",
+            "p4-5",
+            "--admission",
+            self.path("admission.json").to_str().unwrap(),
+            "--param",
+            "payload=persist-me",
+        ]);
+        assert_eq!(exit, 1, "{failed:?}");
+        assert_eq!(text(&failed, &["error", "code"]), "adapter.exit");
+        run
+    }
+    fn prompt_invocations(&self) -> usize {
+        std::fs::read_to_string(self.path("prompt-count"))
+            .expect("prompt argv")
+            .lines()
+            .count()
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -392,10 +426,7 @@ fn f4_later_authorization_rebinds_revision_but_older_window_is_stale() {
     let digest_a = fixture.preview(REV);
     let grant_a = fixture.grant("3600");
     let admitted_a = fixture.submit(&digest_a, text(&grant_a, &["grant_id"]));
-    let old_run = admitted_a
-        .get("items")
-        .and_then(Val::as_array)
-        .unwrap()[0]
+    let old_run = admitted_a.get("items").and_then(Val::as_array).unwrap()[0]
         .get("instance_id")
         .and_then(Val::as_str)
         .unwrap()
@@ -459,7 +490,10 @@ fn f3_inputs_survive_restart_and_a_no_input_redispatch() {
     fixture.ok(&["run", "retry", "--run", &run, "--step", "p4-5"]);
     let continued = fixture.ok(&["run", "dispatch", "--run", &run, "--step", "p4-5"]);
     succeeded(&continued);
-    assert_eq!(text(&continued, &["step", "params", "payload"]), "persist-me");
+    assert_eq!(
+        text(&continued, &["step", "params", "payload"]),
+        "persist-me"
+    );
     assert!(fixture.path("trees/issues-5/.git").exists());
 }
 
@@ -505,8 +539,7 @@ fn f8_supported_surface_binds_reviewed_role_and_derived_session() {
         "payload=bounded fixture work",
     ]);
     succeeded(&prompted);
-    let argv =
-        std::fs::read_to_string(fixture.path("trees/issues-5/prompt-argv")).unwrap();
+    let argv = std::fs::read_to_string(fixture.path("trees/issues-5/prompt-argv")).unwrap();
     for required in [
         "worker",
         "provider-a",
@@ -542,14 +575,7 @@ fn f9_collect_uses_recorded_base_and_requires_a_real_delta() {
     ]);
     assert_ne!(fixture.git(&["rev-parse", "HEAD"]), recorded_base);
 
-    let (exit, empty) = fixture.cli(&[
-        "run",
-        "dispatch",
-        "--run",
-        &run,
-        "--step",
-        "p5-5",
-    ]);
+    let (exit, empty) = fixture.cli(&["run", "dispatch", "--run", &run, "--step", "p5-5"]);
     assert_eq!(exit, 4, "{empty:?}");
     assert_eq!(
         text(&empty, &["error", "code"]),
@@ -606,13 +632,13 @@ fn f9_explicit_no_delta_prompt_expectation_allows_a_no_op() {
 }
 
 #[test]
-fn f9_collect_refuses_a_different_worker_output_branch() {
+fn f9_collection_refuses_a_moved_worker_output_branch() {
     let fixture = Fixture::new();
     let run = fixture.run();
-    succeeded(&fixture.first(&run));
-    succeeded(&fixture.ok(&["run", "dispatch", "--run", &run, "--step", "p2-5"]));
-    fixture.through_prompt(&run, "branch-bound output", false);
-    fixture.worktree_git(&["branch", "-m", "foreign-output"]);
+    fixture.first(&run);
+    fixture.ok(&["run", "dispatch", "--run", &run, "--step", "p2-5"]);
+    fixture.through_prompt(&run, "no-op", false);
+    fixture.worktree_git(&["branch", "-m", "other-branch"]);
     let (exit, refused) = fixture.cli(&[
         "run",
         "dispatch",
@@ -628,4 +654,98 @@ fn f9_collect_refuses_a_different_worker_output_branch() {
         text(&refused, &["error", "code"]),
         "refusal.worker.output_location"
     );
+}
+
+#[test]
+fn f10_unresolved_prompt_stays_fenced_without_reexecuting_the_effect() {
+    let fixture = Fixture::new();
+    let run = fixture.failed_prompt();
+    assert_eq!(fixture.prompt_invocations(), 1);
+
+    let (exit, skipped) = fixture.cli(&[
+        "run",
+        "dispatch",
+        "--run",
+        &run,
+        "--step",
+        "p5-5",
+        "--param",
+        "requires_delta=false",
+    ]);
+    assert_eq!(exit, 4, "{skipped:?}");
+    assert_eq!(text(&skipped, &["error", "code"]), "refusal.run.step_order");
+
+    let (exit, repeated) = fixture.cli(&["run", "dispatch", "--run", &run, "--step", "p4-5"]);
+    assert_eq!(exit, 4, "{repeated:?}");
+    assert_eq!(
+        text(&repeated, &["error", "code"]),
+        "refusal.run.retry_required"
+    );
+    assert_eq!(
+        fixture.prompt_invocations(),
+        1,
+        "the prompt effect ran once"
+    );
+}
+
+#[test]
+fn f10_resolution_advances_without_reexecuting_the_prompt_effect() {
+    let fixture = Fixture::new();
+    let run = fixture.failed_prompt();
+    let feature_head = fixture.worktree_git(&["rev-parse", "HEAD"]);
+    fixture.write(
+        "resolution.json",
+        &canonical_text(&object(vec![
+            ("feature_head", string(&feature_head)),
+            ("branch", string("issue-5")),
+            (
+                "pull_request",
+                object(vec![
+                    ("repository", string("acme/widgets")),
+                    ("number", integer(131)),
+                ]),
+            ),
+            (
+                "checks",
+                Val::Arr(vec![object(vec![
+                    ("name", string("focused")),
+                    ("status", string("passed")),
+                ])]),
+            ),
+        ])),
+    );
+
+    let resolved = fixture.ok(&[
+        "run",
+        "resolve",
+        "--run",
+        &run,
+        "--step",
+        "p4-5",
+        "--recorder",
+        "operator",
+        "--evidence",
+        fixture.path("resolution.json").to_str().unwrap(),
+    ]);
+    assert_eq!(text(&resolved, &["schema"]), "hf-run-resolution/v1");
+    assert_eq!(
+        field(&resolved, &["resolution", "effect_reexecuted"]),
+        &Val::Bool(false)
+    );
+    assert_eq!(text(&resolved, &["resolution", "prior_status"]), "failed");
+
+    let collected = fixture.ok(&[
+        "run",
+        "dispatch",
+        "--run",
+        &run,
+        "--step",
+        "p5-5",
+        "--param",
+        "requires_delta=false",
+    ]);
+    succeeded(&collected);
+    assert_eq!(fixture.prompt_invocations(), 1, "resolution is data-only");
+    let status = fixture.ok(&["run", "status", "--run", &run]);
+    assert_eq!(field(&status, &["boundary", "in_flight_step"]), &Val::Null);
 }

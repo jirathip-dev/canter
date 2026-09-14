@@ -2519,7 +2519,10 @@ fn observed_worktree_branch(
     if branch.is_empty() {
         return Err(refusal(
             code::OUTPUT_LOCATION,
-            format!("worker output location {} has no branch", worktree.display()),
+            format!(
+                "worker output location {} has no branch",
+                worktree.display()
+            ),
         ));
     }
     if let Some(expected) = expected

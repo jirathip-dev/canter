@@ -168,6 +168,9 @@ pub enum RunAction {
     /// Authorize ONE bounded re-dispatch of ONE diagnosed step:
     /// `run retry`.
     Retry(RunRetryArgs),
+    /// Resolve ONE diagnosed prompt from recorder-attributed artifact evidence
+    /// without issuing its effect again: `run resolve`.
+    Resolve(RunResolveArgs),
     /// Dispatch ONE committed-spine step with the operator's own step inputs:
     /// `run dispatch`.
     Dispatch(RunDispatchArgs),
@@ -208,6 +211,23 @@ pub struct RunRetryArgs {
     pub run: String,
     /// The exact plan step id being retried.
     pub step: String,
+    /// `--idempotency-key`: replay-safe automation key.
+    pub idempotency_key: Option<String>,
+    /// Explicit daemon socket override.
+    pub socket: Option<String>,
+}
+
+/// `run resolve`: one diagnosed prompt plus a closed artifact-evidence file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunResolveArgs {
+    /// Explicit run id (`run-` + 16 hex).
+    pub run: String,
+    /// The exact diagnosed prompt step.
+    pub step: String,
+    /// Identity of the operator/agent recording the evidence.
+    pub recorder: String,
+    /// Readable JSON evidence object (feature head, branch, PR and checks).
+    pub evidence: PathBuf,
     /// `--idempotency-key`: replay-safe automation key.
     pub idempotency_key: Option<String>,
     /// Explicit daemon socket override.
@@ -1489,6 +1509,7 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
         "pause" => "run pause",
         "resume" => "run resume",
         "retry" => "run retry",
+        "resolve" => "run resolve",
         "dispatch" => "run dispatch",
         "status" => "run status",
         "-h" | "--help" => return Err(ParseError::Help(help_request("run"))),
@@ -1509,6 +1530,8 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
     let mut step_params: Vec<(String, Val)> = Vec::new();
     let mut topology = None;
     let mut admission = None;
+    let mut recorder: Option<String> = None;
+    let mut evidence: Option<PathBuf> = None;
     let rest = &args[1..];
     let mut index = 0;
     while index < rest.len() {
@@ -1570,6 +1593,23 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
                 } else {
                     admission = Some(value);
                 }
+            }
+            "--recorder" if action.as_str() == "resolve" => {
+                let value = flag_value(rest, &mut index, command, "--recorder")?;
+                if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+                    return Err(ParseError::Usage(
+                        "run resolve: --recorder must be 1-128 printable characters".to_string(),
+                    ));
+                }
+                recorder = Some(value);
+            }
+            "--evidence" if action.as_str() == "resolve" => {
+                evidence = Some(PathBuf::from(flag_value(
+                    rest,
+                    &mut index,
+                    command,
+                    "--evidence",
+                )?));
             }
             "--param" => {
                 let value = flag_value(rest, &mut index, command, "--param")?;
@@ -1665,6 +1705,36 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
             RunAction::Retry(RunRetryArgs {
                 run,
                 step,
+                idempotency_key,
+                socket,
+            })
+        }
+        "resolve" => {
+            if reason.is_some() || digest.is_some() || !step_params.is_empty() {
+                return Err(ParseError::Usage(
+                    "run resolve takes --run, --step, --recorder and --evidence only".to_string(),
+                ));
+            }
+            let Some(step) = step else {
+                return Err(ParseError::Usage(
+                    "run resolve: --step STEP is required (the diagnosed prompt)".to_string(),
+                ));
+            };
+            let Some(recorder) = recorder else {
+                return Err(ParseError::Usage(
+                    "run resolve: --recorder IDENTITY is required".to_string(),
+                ));
+            };
+            let Some(evidence) = evidence else {
+                return Err(ParseError::Usage(
+                    "run resolve: --evidence FILE is required".to_string(),
+                ));
+            };
+            RunAction::Resolve(RunResolveArgs {
+                run,
+                step,
+                recorder,
+                evidence,
                 idempotency_key,
                 socket,
             })
@@ -4974,6 +5044,7 @@ fn execute_run(action: RunAction, invocation: &Invocation) -> CmdResult {
         RunAction::Pause(args) => execute_run_pause(&args, invocation),
         RunAction::Resume(args) => execute_run_resume(&args, invocation),
         RunAction::Retry(args) => execute_run_retry(&args, invocation),
+        RunAction::Resolve(args) => execute_run_resolve(&args, invocation),
         RunAction::Dispatch(args) => execute_run_dispatch(&args, invocation),
         RunAction::Status(args) => execute_run_status(&args, invocation),
     }
@@ -5059,6 +5130,46 @@ fn execute_run_retry(args: &RunRetryArgs, invocation: &Invocation) -> CmdResult 
         }
         Err(RpcError { code, message }) => {
             lane_error(&code, format!("run retry: {message}"), false)
+        }
+    }
+}
+
+/// `run resolve`: commit recorder-attributed evidence for one diagnosed
+/// prompt. Reading the evidence file is the only local action; the daemon
+/// validates and records the no-effect resolution.
+fn execute_run_resolve(args: &RunResolveArgs, invocation: &Invocation) -> CmdResult {
+    let paths = match run_control_paths(args.socket.as_deref(), invocation) {
+        Ok(paths) => paths,
+        Err(result) => return result,
+    };
+    let evidence = match std::fs::read_to_string(&args.evidence)
+        .map_err(|err| err.to_string())
+        .and_then(|text| Val::parse_json(&text))
+    {
+        Ok(value @ Val::Obj(_)) => value,
+        _ => {
+            return lane_error(
+                "usage.run_resolve",
+                "run resolve: --evidence requires a readable JSON object".to_string(),
+                false,
+            );
+        }
+    };
+    let key = args.idempotency_key.clone().unwrap_or_else(fresh_run_key);
+    let params = crate::run_control::resolution_params(
+        &key,
+        &args.run,
+        &args.step,
+        &args.recorder,
+        evidence,
+    );
+    match client::call(&paths.socket_path, "run.resolve", Some(&params)) {
+        Ok(result) => {
+            let human = crate::run_control::render_human(&result);
+            ok_result(result, human)
+        }
+        Err(RpcError { code, message }) => {
+            lane_error(&code, format!("run resolve: {message}"), false)
         }
     }
 }
