@@ -1384,13 +1384,14 @@ pub fn run_grouped(spec: ProcSpec<'_>) -> ProcOut {
         }
     };
 
-    // The child is gone, but its descendants may still hold the inherited
-    // stdout/stderr write ends (a survivor the deadline could not reach), so
-    // the post-exit path is bounded by the documented grace (issue #92 rounds
-    // 2-3): deterministic group reaping first, then the bounded read. The op
-    // never blocks past `deadline + PIPE_READ_GRACE`, and whatever arrived
-    // inside the bound is kept.
-    let deadline_exceeded = started.elapsed() >= spec.timeout;
+    // The child is gone; the post-exit path is bounded by the documented grace
+    // measured from THIS moment (issue #92 rounds 2-3): deterministic group
+    // reaping first, then the bounded read. The child's exit is itself inside
+    // the deadline, so the AC's `deadline + grace` outer bound holds, and a
+    // descendant that lingers on the inherited pipes can never stall the op
+    // for the rest of the deadline window.
+    let child_exit = Instant::now();
+    let deadline_exceeded = child_exit.duration_since(started) >= spec.timeout;
     let group_reap = if deadline_exceeded {
         // Issue #92 round 3: the group signal alone is not a guarantee — the
         // helper's CLI form is not portable (Linux `kill` rejects the
@@ -1398,13 +1399,13 @@ pub fn run_grouped(spec: ProcSpec<'_>) -> ProcOut {
         // and emptied by positive pid inside a bounded window.
         Some(reap_group(
             group,
-            started + spec.timeout + GROUP_REAP_WINDOW,
+            child_exit + GROUP_REAP_WINDOW,
             group_signal.clone(),
         ))
     } else {
         None
     };
-    let read_deadline = started + spec.timeout + PIPE_READ_GRACE;
+    let read_deadline = child_exit + PIPE_READ_GRACE;
     let stdout_pipe = BoundedPipe::read(child.stdout.take());
     let stderr_pipe = BoundedPipe::read(child.stderr.take());
     let stdout = stdout_pipe.take_within(read_deadline);

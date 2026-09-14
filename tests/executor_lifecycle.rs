@@ -255,6 +255,61 @@ fn the_group_signal_never_depends_on_the_childs_allowlisted_path() {
 }
 
 #[test]
+fn a_child_that_exits_while_a_descendant_holds_the_pipes_returns_promptly() {
+    // The other half of the bound (issue #92 round 3): the child itself
+    // completes, but a descendant that escaped into its own process group
+    // keeps the inherited pipe write ends open. The post-exit bound is
+    // measured from the child's exit, so the op returns within the documented
+    // grace with the partial capture — it must never wait out the rest of the
+    // deadline window for a descendant that is not even reachable.
+    let dir = Dir::new("exit-pipe-holder");
+    let bin = dir.path("fakebin");
+    let pid_file = dir.path("survivor.pid");
+    let lane = dir.write_executable(
+        "fakebin/exit-holder",
+        "printf 'partial'\nset -m\nsleep 20 &\necho $! > \"$LANE_SURVIVOR_PID\"\nexit 0",
+    );
+    let env = runner_env(&bin, &[("LANE_SURVIVOR_PID", &pid_file.to_string_lossy())]);
+
+    let timeout = Duration::from_secs(30);
+    let started = Instant::now();
+    let out = run_grouped(ProcSpec {
+        program: lane.to_str().expect("utf8 path"),
+        args: &[],
+        env: &env,
+        cwd: None,
+        timeout,
+    });
+    let elapsed = started.elapsed();
+    let survivor = read_pid(&pid_file, Duration::from_secs(15));
+    let _ = Command::new("kill")
+        .args(["-9", &survivor.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    assert_eq!(
+        out.status,
+        ProcStatus::Exit(0),
+        "the child completed inside its deadline: {}",
+        describe(&out)
+    );
+    assert!(
+        elapsed < canter::adapters::PIPE_READ_GRACE + Duration::from_secs(2),
+        "a child that exits leaves only the documented grace ({:?}) for its descendants' pipes, \
+         took {elapsed:?} of a {timeout:?} deadline: {}",
+        canter::adapters::PIPE_READ_GRACE,
+        describe(&out)
+    );
+    assert_eq!(
+        out.stdout,
+        "partial",
+        "the capture inside the bound is kept: {}",
+        describe(&out)
+    );
+}
+
+#[test]
 fn a_descendant_that_holds_the_pipe_never_blocks_the_deadline() {
     let dir = Dir::new("pipe-survivor");
     let bin = dir.path("fakebin");
