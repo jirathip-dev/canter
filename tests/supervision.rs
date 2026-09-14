@@ -2548,6 +2548,14 @@ fn an_uncontained_worktree_dispatch_is_refused_before_any_git_mutation() {
     };
     let integration = fixture.dir.join("integration");
     init_repo(&integration);
+    std::fs::create_dir_all(fixture.dir.join("worktrees/lane-p2"))
+        .expect("existing worktree target");
+    let status = Command::new("git")
+        .args(["branch", "issue-92-original", "staging"])
+        .current_dir(&integration)
+        .status()
+        .expect("git creates the conflicting branch");
+    assert!(status.success(), "the diagnosed fixture branch exists");
     let fakebin = write_fake_gh(&fixture.dir);
     let host_path = std::env::var("PATH").unwrap_or_default();
     let daemon = fixture.spawn_with_path(&format!("{}:{host_path}", fakebin.display()));
@@ -2587,8 +2595,9 @@ fn an_uncontained_worktree_dispatch_is_refused_before_any_git_mutation() {
         canter::canonical::canonical_text(&applied)
     );
 
-    // The diagnosis a bounded retry authorization addresses: `p2`'s committed
-    // params carry no `branch`, so the operator may authorize one re-dispatch.
+    // Record one real diagnosed attempt before authorizing a correction. The
+    // committed params are complete, but the pre-existing target/branch make
+    // the adapter fail after the attempt is claimed.
     let refusal = rpc_refusal(
         &fixture.socket,
         &fresh_id(3),
@@ -2604,11 +2613,13 @@ fn an_uncontained_worktree_dispatch_is_refused_before_any_git_mutation() {
         )),
     );
     assert!(
-        refusal.contains("worktree_create requires a slug branch"),
-        "the diagnosis is the effect's own contract: {refusal}"
+        refusal.contains("adapter.exit"),
+        "the adapter failure is the recorded diagnosis: {refusal}"
     );
     let diagnosed = attempts_for(&fixture, &run, "p2");
     assert!(diagnosed > 0, "the diagnosis is recorded: {diagnosed}");
+    std::fs::remove_dir(fixture.dir.join("worktrees/lane-p2"))
+        .expect("remove the fixture obstruction before the corrected retry");
     let (exit, stdout, stderr) = run_cli(&fixture, &["retry", "--run", &run, "--step", "p2"]);
     assert_eq!(exit, 0, "retry exit; stdout: {stdout}; stderr: {stderr}");
 
