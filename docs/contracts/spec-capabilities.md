@@ -81,6 +81,26 @@ can run with **no harness credentials** (AC7).
   invocation rows are a v1 candidate contract: their real-world parity is
   [awaiting-evidence] until the human-gated clean-host smokes (AC6), and
   fakes pin the exact argv shape in tests.
+- **Role-bound session lifecycle (issue #92 F2)**: a harness step runs the
+  **declared role binding** — the harness profile key is the run's
+  `role_config` key (there is no default profile and none is inferred), the
+  declared provider/model pair is passed through on the kind's documented
+  flags, and the session identity the run bound is carried from
+  `harness_start` into every `prompt` of that run:
+  - Hermes: `hermes -p <role-key> [--provider <p> -m <model>] chat
+    --continue <session> --create-if-missing -q <payload>` (the global
+    flags are handled by the launcher's pre-parse; the continuation pair is
+    the documented create-if-missing row). Pi/Jcode carry the provider/model
+    pair on their own documented rows; no role-key flag is fabricated for a
+    kind that has none;
+  - the session identity of a queue run is derived ONCE from the run
+    identity (`lane-` + 16 hex of the sha256 over `hf-run-session/v1|<run>`),
+    so `start` binds it and every prompt continues exactly that session; a
+    prompt that declares another session refuses `refusal.stale.identity`,
+    a partial identity refuses `refusal.identity.incomplete`, and a prompt
+    whose run never bound one refuses `refusal.session.unbound`;
+  - the real child stdout is the step result (`result.transcript`); no
+    transcript is synthesized and no binding is invented at the adapter.
 - **Stable agent identity (AC3)**: an agent identity binds the Herdr
   workspace session id + a stable terminal/native-session identity + a
   generation counter. A mutable pane label is not part of the identity and
@@ -97,8 +117,17 @@ can run with **no harness credentials** (AC7).
   inferred and no fallback model is substituted, issue #80),
   `refusal.malformed.output` (unparsable structured output),
   `refusal.stale.identity`, `refusal.identity.incomplete`,
-  `refusal.request.malformed`, `adapter.timeout` (deadline exceeded, the
-  child is killed; outcome class `ambiguous`), `adapter.process_death`
+  `refusal.request.malformed`, `refusal.session.unbound` (a harness step
+  addressed the run's bound session but the run bound none; issue #92 F2),
+  `adapter.timeout` (deadline exceeded, and the child's process group is
+  verified empty by the bounded reaping loop — a best-effort
+  `kill -9 -<pgid>` helper attempt first, then the group's live members
+  terminated by positive pid until none remain; helpers are resolved from the
+  ambient environment plus the standard system directories, never the child's
+  allowlisted PATH, and one diagnostic line names what the whole termination
+  did; the post-exit pipe read is bounded by the documented grace, so a
+  surviving descendant can never extend the op — outcome class `ambiguous`),
+  `adapter.process_death`
   (`ambiguous`), and `adapter.exit` (ordinary non-zero exit).
 - **Boundaries**: adapters pass only the explicit environment allowlist
   (`env_allow`, spec-config.md), never read the host environment

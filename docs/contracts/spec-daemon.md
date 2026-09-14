@@ -72,6 +72,17 @@ remain usable without it; SQLite owns state; no network control API).
   without a key is refused at parse time (`rpc/request.malformed.json`).
   Replaying the same request id + idempotency key returns the recorded
   response instead of re-dispatching (daemon replay table).
+- A harness step (`harness_start` / `prompt`) of a run with a committed
+  submission runs the run's DECLARED role configuration and only that one
+  (issue #92 F2): the full reviewed `hf-profile-binding/v1` document rides
+  as the presented `params.profile`, verified against the durable
+  `role_key`/`role_revision` the approval bound — a foreign or tampered
+  binding refuses `refusal.profile.revision`, an absent one refuses
+  `refusal.profile.binding` (there is no default profile), and a step that
+  names another `harness_key` than the run's role refuses
+  `refusal.profile.binding`. The run's session identity is derived from the
+  run itself; a `prompt` whose run recorded no succeeded `harness_start`
+  refuses `refusal.session.unbound`.
 - Unknown methods are refused with a typed refusal (never guessed).
 
 ## Lifecycle methods (issue #9)
@@ -348,12 +359,19 @@ clears a repository/fleet-level hold or bypasses a gate.
   fenced on the exact instance id (`WHERE instance_id = ? AND paused = 1`)
   and consumes the digest on success: an unrelated run's pause — or any
   fleet-level hold expressed as paused runs — is NEVER cleared.
+- The run's retry frontier derives from the RECORDED attempt ledger (issue
+  #92 F3): it is the first bound-spine step whose latest recorded attempt is
+  not `succeeded`, so a diagnosed `ambiguous` (timed-out) or failed attempt
+  is addressable even when the run's recorded node fell behind; the
+  node-derived frontier stays the other input and the FURTHER of the two
+  wins (a stale ledger never rewinds the frontier, a stale node never hides
+  a diagnosed step).
 - `run.retry` requires `params.instance_id` and `params.step` (a plan step
   id). It refuses: a terminal run (`refusal.run.terminal`), a paused or
   pause-requested run (`refusal.run.paused` — resume first), a run without
   a committed submission spine (`refusal.run.scope`), a step outside the
   bound spine (`refusal.run.step_unknown`), a step that is not the run's
-  current unachieved frontier step (`refusal.run.step_order`), a step that
+  frontier step (`refusal.run.step_order`), a step that
   already succeeded or whose last recorded attempt succeeded
   (`refusal.run.step_done`), a step with no recorded terminal failed
   attempt (`refusal.run.step_undiagnosed` — a retry is for a DIAGNOSED
@@ -424,10 +442,28 @@ clears a repository/fleet-level hold or bypasses a gate.
   continuation window. Only a recorded observation that is genuinely older
   than the explicit `progress_timeout_secs` policy is `continuation-eligible`
   with reason `supervision.progress_timeout`.
-- `continuation-eligible` is a REPORT: supervision never continues work on
-  a stalled run, and an idle/done agent alone is neither completion (a
-  `done` run without passing review evidence stays unknown) nor permission
-  to resume (a paused run is never eligible).
+- **Armed continuation dispatch (issue #92 F4)**: an explicitly `armed`
+  run whose authorization still matches its committed submission is
+  advanced by the driver itself — the check hands the run's NEXT UNACHIEVED
+  step to the merged `apply` engine, which re-derives every gate
+  (capability, grant, admission, ownership, journal, idempotency) and
+  journals the intent before any effect. The dispatch exists only when the
+  run is live (not paused/pause-requested/human-queued/blocked/invalidated/
+  done, no terminal blocker), has no step claim in flight, has a committed
+  spine, has already dispatched at least one step (the durable topology and
+  admission inputs a dispatch re-presents come from the run's own applies —
+  none is invented), and either never attempted that step or holds an
+  unconsumed bounded `run.retry` authorization for it (consumed exactly
+  once by the dispatch). A fan-out step still needs the caller-presented
+  admission inputs: supervision re-presents the run's committed caps and
+  occupancy but never fabricates a host-resource measurement, so the
+  admission gate refuses `refusal.admission.proof_missing` when no fresh
+  proof exists. Non-armed/unknown supervision keeps its classification-only,
+  zero-effect guarantee verbatim: without a row the run is never even read.
+- `continuation-eligible` remains a REPORT (the classification half), and
+  an idle/done agent alone is neither completion (a `done` run without
+  passing review evidence stays unknown) nor permission to resume (a paused
+  run is never eligible and is never dispatched).
 - **Completion-to-next-work (issue #96)**: a fresh VERIFIED delivery of an
   armed run — reviewed `pass` with every named check `passed` at one exact
   head, bound to the run's own workflow/policy pins, no durable hold and no

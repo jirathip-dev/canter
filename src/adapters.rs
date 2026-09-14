@@ -63,10 +63,13 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::formats::{is_actor, parse_semver};
-use crate::process::{ProcSpec, ProcStatus, run};
+use crate::process::{ProcOut, ProcSpec, ProcStatus, run};
 use crate::redact::redact;
 use crate::schema::{Family, validate_doc};
 use crate::value::{Val, bool_, integer, null, object, string};
@@ -1036,9 +1039,42 @@ pub fn new_session(
 /// and is never interpolated. Workspace operations (observe/interrupt/
 /// outcome/identity) run against the workspace executable with typed
 /// session addressing.
-fn prompt_args(profile: &Profile) -> Result<Vec<String>, AdapterError> {
+///
+/// Issue #92 F2: the row runs the **declared role binding** and continues
+/// the session `harness_start` bound.
+/// - The bound harness profile key is the run's declared role configuration
+///   key. Hermes selects a named profile with the documented global flag
+///   `-p <key>` (verified against the installed CLI: the flag is handled by
+///   the launcher's pre-parse, `hermes_cli/main.py`), and the declared
+///   provider/model pair is passed through on the documented global flags
+///   `--provider <p>` / `-m <model>` when the profile declares one (never
+///   invented, never defaulted). The other official kinds carry the pair on
+///   their own documented rows (Pi, Jcode) and no role-key flag exists for
+///   them — nothing is fabricated.
+/// - Session continuity is the documented `chat --continue <session>
+///   --create-if-missing` pair (`hermes chat --help`: continue a session by
+///   name, creating it when it does not exist yet), so the first prompt of a
+///   run creates the session `harness_start` bound and every later prompt
+///   continues that exact same session by name.
+fn prompt_args(profile: &Profile, session_id: &str) -> Result<Vec<String>, AdapterError> {
     match profile.kind {
-        HarnessKind::Hermes => Ok(vec!["chat".to_string(), "-q".to_string()]),
+        HarnessKind::Hermes => {
+            let mut args = vec!["-p".to_string(), profile.key.clone()];
+            if let (Some(provider), Some(model)) =
+                (profile.provider.as_deref(), profile.model.as_deref())
+            {
+                args.push("--provider".to_string());
+                args.push(provider.to_string());
+                args.push("-m".to_string());
+                args.push(model.to_string());
+            }
+            args.push("chat".to_string());
+            args.push("--continue".to_string());
+            args.push(session_id.to_string());
+            args.push("--create-if-missing".to_string());
+            args.push("-q".to_string());
+            Ok(args)
+        }
         HarnessKind::ClaudeCode => Ok(vec!["-p".to_string()]),
         HarnessKind::Codex => Ok(vec!["exec".to_string()]),
         // One-shot `--print` row (issue #33, measured against pi v0.85.1 on
@@ -1254,6 +1290,467 @@ pub fn execute_op_in_worktree(
     execute_op_at(profile, request, env, Some(cwd))
 }
 
+/// Run one bounded invocation whose child leads its **own process group**
+/// (issue #92 F1): the deadline terminates the whole group, so a harness or
+/// effect child that forked helpers can never leave an orphan behind.
+///
+/// This is the runner for the effect-class children (the harness prompt rows
+/// and the git/gh effect rows). The read adapters keep
+/// [`crate::process::run`] (a direct-child deadline); the group semantics
+/// need spawn-time group creation plus a group signal, so the effect runner
+/// lives here rather than in the read-adapter module.
+///
+/// Group termination signals the child's process group through a `kill`
+/// helper resolved from the ambient environment plus the standard system
+/// directories — never from the child's allowlisted PATH, which a Linux
+/// image can lack `kill` in (issue #92 round 2: that is how the group signal
+/// silently failed and left a descendant behind). The helper's negative-pid
+/// form is only a cheap best-effort first attempt, though: its parsing is not
+/// portable (Linux `kill` rejects the form the BSD one accepts), so the
+/// GUARANTEE comes from [`reap_group`] — after the deadline the group is
+/// verified and emptied by POSITIVE pid inside a bounded window. One
+/// diagnostic line describing all of it is appended to the captured stderr,
+/// so the step outcome/evidence names what happened instead of discarding it.
+/// The post-exit path is bounded by [`PIPE_READ_GRACE`], so a descendant that
+/// survives the reaping and holds the inherited write ends can never extend
+/// the op past `deadline + PIPE_READ_GRACE`; `ProcStatus::TimedOut` is
+/// reported either way.
+pub fn run_grouped(spec: ProcSpec<'_>) -> ProcOut {
+    let started = std::time::Instant::now();
+    let mut command = std::process::Command::new(spec.program);
+    command
+        .args(spec.args)
+        .env_clear()
+        .envs(spec.env)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // The child becomes the leader of its own process group (its pid is the
+    // group id), so every descendant inherits a group we can terminate.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    if let Some(cwd) = spec.cwd {
+        command.current_dir(cwd);
+    }
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            return ProcOut {
+                status: ProcStatus::SpawnFailed(err.to_string()),
+                stdout: String::new(),
+                stderr: String::new(),
+                elapsed_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            };
+        }
+    };
+    let group = child.id();
+
+    // The deadline signals the group ONCE (a helper that cannot deliver the
+    // signal is reported, never silently retried); the direct child is always
+    // also killed through the std API.
+    let mut group_signal: Option<String> = None;
+    let mut group_signalled = false;
+    let status = loop {
+        if started.elapsed() >= spec.timeout {
+            if !group_signalled {
+                group_signal = signal_group(group);
+                group_signalled = true;
+            }
+            let _ = child.kill();
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(err) => {
+                // The signal is attempted ONCE: a failure recorded by the
+                // deadline branch above is reported here too, never replaced by
+                // "delivered" (issue #92 round 5 — `None` means delivered, so
+                // the already-attempted failure must be handed on, not dropped).
+                let failure = if group_signalled {
+                    group_signal.clone()
+                } else {
+                    signal_group(group)
+                };
+                let _ = child.kill();
+                return ProcOut {
+                    status: ProcStatus::SpawnFailed(err.to_string()),
+                    stdout: String::new(),
+                    stderr: failure.map_or_else(String::new, |reason| {
+                        group_signal_diagnostic(group, &reason)
+                    }),
+                    elapsed_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                };
+            }
+        }
+    };
+
+    // The child is gone; the post-exit path is bounded by the documented grace
+    // measured from THIS moment (issue #92 rounds 2-3): deterministic group
+    // reaping first, then the bounded read. The child's exit is itself inside
+    // the deadline, so the AC's `deadline + grace` outer bound holds, and a
+    // descendant that lingers on the inherited pipes can never stall the op
+    // for the rest of the deadline window.
+    let child_exit = Instant::now();
+    let deadline_exceeded = child_exit.duration_since(started) >= spec.timeout;
+    let group_reap = if deadline_exceeded {
+        // Issue #92 round 3: the group signal alone is not a guarantee — the
+        // helper's CLI form is not portable (Linux `kill` rejects the
+        // negative-pid form the BSD one accepts) — so the group is verified
+        // and emptied by positive pid inside a bounded window.
+        Some(reap_group(
+            group,
+            child_exit + GROUP_REAP_WINDOW,
+            group_signal.clone(),
+        ))
+    } else {
+        None
+    };
+    let read_deadline = child_exit + PIPE_READ_GRACE;
+    let stdout_pipe = BoundedPipe::read(child.stdout.take());
+    let stderr_pipe = BoundedPipe::read(child.stderr.take());
+    let stdout = stdout_pipe.take_within(read_deadline);
+    let mut stderr = stderr_pipe.take_within(read_deadline);
+    let diagnostic = match (&group_reap, &group_signal) {
+        (Some(report), _) => Some(group_reap_diagnostic(group, report)),
+        (None, Some(reason)) => Some(group_signal_diagnostic(group, reason)),
+        (None, None) => None,
+    };
+    if let Some(diagnostic) = diagnostic {
+        // Observable diagnostics (never discarded): the step outcome/evidence
+        // names what the deadline kill did.
+        if !stderr.is_empty() && !stderr.ends_with('\n') {
+            stderr.push('\n');
+        }
+        stderr.push_str(&diagnostic);
+    }
+    let _ = child.wait();
+
+    let timed_out = started.elapsed() >= spec.timeout;
+    let final_status = if timed_out && !status.success() && status.code().is_none() {
+        ProcStatus::TimedOut
+    } else {
+        ProcStatus::Exit(status.code().unwrap_or(-1))
+    };
+
+    ProcOut {
+        status: final_status,
+        stdout,
+        stderr,
+        elapsed_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+    }
+}
+
+/// The bounded grace this runner allows a child's captured pipes to drain
+/// after the child itself is gone (issue #92 round 2). A descendant the
+/// deadline could not terminate can hold the inherited stdout/stderr write
+/// ends for its whole lifetime, so the post-exit read is bounded by this
+/// grace: the op's elapsed stays within `deadline + PIPE_READ_GRACE` (never
+/// the descendant's lifetime), and whatever arrived inside the bound is kept.
+pub const PIPE_READ_GRACE: Duration = Duration::from_millis(750);
+
+/// One child pipe read under a bound (issue #92 round 2). The read runs on a
+/// worker thread that appends whatever arrives into shared state;
+/// [`BoundedPipe::take_within`] stops waiting at the deadline and returns the
+/// capture so far, so a pipe held open by a survivor can never block the op.
+/// The worker ends when the last writer closes the pipe — on a survivor it
+/// simply stops being waited for (the thread is detached and holds nothing
+/// the op needs, so the op's elapsed stays bounded either way).
+struct BoundedPipe {
+    text: Arc<Mutex<String>>,
+    done: Arc<AtomicBool>,
+}
+
+impl BoundedPipe {
+    fn read(pipe: Option<impl std::io::Read + Send + 'static>) -> BoundedPipe {
+        let text = Arc::new(Mutex::new(String::new()));
+        let done = Arc::new(AtomicBool::new(false));
+        let Some(mut pipe) = pipe else {
+            done.store(true, Ordering::SeqCst);
+            return BoundedPipe { text, done };
+        };
+        let sink = Arc::clone(&text);
+        let finished = Arc::clone(&done);
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 8192];
+            loop {
+                match std::io::Read::read(&mut pipe, &mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        if let Ok(mut text) = sink.lock() {
+                            text.push_str(&String::from_utf8_lossy(&buffer[..read]));
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            finished.store(true, Ordering::SeqCst);
+        });
+        BoundedPipe { text, done }
+    }
+
+    /// Wait for the reader at most until `deadline`, then take the capture
+    /// (the documented lossy-UTF-8 text) that arrived inside the bound.
+    fn take_within(self, deadline: Instant) -> String {
+        while !self.done.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.text
+            .lock()
+            .map(|text| text.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// The one-line runner diagnostic that names a process-group signal that
+/// could not be delivered (issue #92 round 2): it rides on the captured
+/// stderr of the run, so the step outcome/evidence can name it.
+fn group_signal_diagnostic(group: u32, reason: &str) -> String {
+    format!(
+        "[canter] the process group (-{group}) could not be signalled by the kill helper: {reason}\n"
+    )
+}
+
+/// The slice of the post-exit grace the deterministic group-reaping loop may
+/// use (issue #92 round 3): reaping fits inside `deadline + PIPE_READ_GRACE`,
+/// so the bounded capture always keeps part of the grace even when a member
+/// cannot be reached.
+pub const GROUP_REAP_WINDOW: Duration = Duration::from_millis(375);
+
+/// The PATH the group helper runs under: the standard system directories
+/// first, then the ambient PATH. The helpers are system utilities, not
+/// children under test, so they never depend on the child's allowlisted
+/// environment (issue #92 round 2).
+fn group_helper_path() -> String {
+    const SYSTEM_DIRS: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+    match std::env::var("PATH") {
+        Ok(ambient) if !ambient.is_empty() => format!("{SYSTEM_DIRS}:{ambient}"),
+        _ => SYSTEM_DIRS.to_string(),
+    }
+}
+
+/// The absolute candidates for a system helper, `/bin` first (present on both
+/// platforms), then `/usr/bin`, with the bare name last (resolved through
+/// [`group_helper_path`]).
+const GROUP_HELPER_CANDIDATES: [&str; 3] = ["kill", "/bin/kill", "/usr/bin/kill"];
+const PS_HELPER_CANDIDATES: [&str; 3] = ["ps", "/bin/ps", "/usr/bin/ps"];
+
+/// Run one helper attempt under [`group_helper_path`], trying each candidate
+/// until one launches and exits zero (issue #92 round 3). `None` means the
+/// attempt was delivered; `Some(reason)` lists what every candidate did, so
+/// the caller can report it instead of discarding it.
+fn helper_attempt(candidates: &[&str], args: &[&str], label: &str) -> Option<String> {
+    let path = group_helper_path();
+    let mut failures: Vec<String> = Vec::new();
+    for candidate in candidates {
+        let launched = std::process::Command::new(candidate)
+            .args(args)
+            .env_clear()
+            .env("PATH", &path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        match launched {
+            Ok(status) if status.success() => return None,
+            Ok(status) => failures.push(format!(
+                "{label} `{candidate} {}` exited {}",
+                args.join(" "),
+                status
+                    .code()
+                    .map_or_else(|| "without a code".to_string(), |code| code.to_string())
+            )),
+            Err(err) => failures.push(format!("{label} `{candidate}`: {err}")),
+        }
+    }
+    Some(failures.join("; "))
+}
+
+/// Best-effort group signal: `kill -9 -<pgid>`. The form is not portable:
+/// procps returned zero for a nonexistent group where BSD kill failed.
+/// Exit status alone is not proof of delivery on either platform;
+/// [`reap_group`] verifies and finishes the job by positive pid.
+fn signal_group(group: u32) -> Option<String> {
+    signal_group_with(&GROUP_HELPER_CANDIDATES, group)
+}
+
+fn signal_group_with(candidates: &[&str], group: u32) -> Option<String> {
+    helper_attempt(candidates, &["-9", &format!("-{group}")], "group signal")
+}
+
+/// Terminate one process by POSITIVE pid (unambiguous on both platforms).
+/// Same contract as [`signal_group`]: `None` means the kill was delivered,
+/// `Some(reason)` means it was not ([`reap_group`] must never count that as a
+/// reap — issue #92 round 5).
+fn kill_pid(pid: u32) -> Option<String> {
+    kill_pid_with(&GROUP_HELPER_CANDIDATES, pid)
+}
+
+fn kill_pid_with(candidates: &[&str], pid: u32) -> Option<String> {
+    helper_attempt(candidates, &["-9", &pid.to_string()], "reap")
+}
+
+/// The live members of one process group, through the portable
+/// `ps -A -o pid=,pgid=,stat=` form (issue #92 round 3). Zombies are excluded
+/// (a dead-but-unreaped member is not a live process; reaping it belongs to
+/// its parent), and our own pid is always excluded. `None` when `ps` could
+/// not be run or its output could not be read, so the caller can report that
+/// instead of guessing.
+fn group_members(group: u32) -> Option<Vec<u32>> {
+    let path = group_helper_path();
+    let mut last = "ps not found".to_string();
+    for candidate in PS_HELPER_CANDIDATES {
+        let output = std::process::Command::new(candidate)
+            .args(["-A", "-o", "pid=,pgid=,stat="])
+            .env_clear()
+            .env("PATH", &path)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output();
+        let output = match output {
+            Ok(output) if output.status.success() => output,
+            Ok(output) => {
+                last = format!("`{candidate}` exited {:?}", output.status.code());
+                continue;
+            }
+            Err(err) => {
+                last = format!("`{candidate}`: {err}");
+                continue;
+            }
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut members = Vec::new();
+        for line in text.lines() {
+            let mut fields = line.split_whitespace();
+            let (Some(pid), Some(pgid), Some(stat)) = (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            let (Ok(pid), Ok(pgid)) = (pid.parse::<u32>(), pgid.parse::<u32>()) else {
+                continue;
+            };
+            if pgid == group && pid != std::process::id() && !stat.starts_with('Z') {
+                members.push(pid);
+            }
+        }
+        return Some(members);
+    }
+    let _ = last;
+    None
+}
+
+/// What one deadline's group termination did (issue #92 round 3): the outcome
+/// of the best-effort group signal, how many members were reaped by positive
+/// pid, which members no kill could reach (so they were still live at the last
+/// enumeration), and any failure reason worth naming.
+struct GroupReap {
+    signal: Option<String>,
+    reaped: usize,
+    remaining: Vec<u32>,
+    notes: Vec<String>,
+}
+
+/// Empty one child's process group inside a bounded window (issue #92 rounds
+/// 1–3). The guarantee is the verification loop, not any single CLI form:
+/// enumerate the group's live members with [`group_members`], kill them by
+/// POSITIVE pid with [`kill_pid`], re-enumerate until the group is empty or
+/// `deadline` expires. Never signals our own pid and never a pid outside the
+/// target group; a descendant that left the group (its own session or process
+/// group) is unreachable by construction and is reported instead of blocking.
+///
+/// Every number this loop reports is derived from the attempt results
+/// (issue #92 round 5): `kill_pid` → `None` (delivered) is the only way a
+/// member is counted as reaped, and only members no kill could reach are
+/// carried into [`GroupReap::remaining`] as live survivors — a reported
+/// failure is never evidence of delivery.
+fn reap_group(group: u32, deadline: Instant, signal: Option<String>) -> GroupReap {
+    let mut report = GroupReap {
+        signal,
+        reaped: 0,
+        remaining: Vec::new(),
+        notes: Vec::new(),
+    };
+    // Members whose positive-pid kill was delivered, once each: the
+    // diagnostic counts members, never repeat attempts against a member that
+    // is still dying.
+    let mut killed: Vec<u32> = Vec::new();
+    loop {
+        match group_members(group) {
+            None => {
+                report
+                    .notes
+                    .push("ps could not enumerate the group".to_string());
+                break;
+            }
+            Some(members) if members.is_empty() => {
+                report.remaining.clear();
+                break;
+            }
+            Some(members) => {
+                let mut survivors = Vec::new();
+                for pid in &members {
+                    match kill_pid(*pid) {
+                        None => {
+                            if !killed.contains(pid) {
+                                killed.push(*pid);
+                            }
+                        }
+                        Some(reason) => {
+                            survivors.push(*pid);
+                            if report.notes.len() < 3 && !report.notes.contains(&reason) {
+                                report.notes.push(reason);
+                            }
+                        }
+                    }
+                }
+                report.reaped = killed.len();
+                report.remaining = survivors;
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    report
+}
+
+/// The one-line diagnostic of one deadline's group termination, so a failure
+/// is self-diagnosing: what the best-effort signal did (a signal that was not
+/// delivered is named with its reason — never rendered as delivered), how many
+/// members were reaped by pid, which members no kill could reach, and any
+/// failure reason (issue #92 round 5).
+fn group_reap_diagnostic(group: u32, report: &GroupReap) -> String {
+    let mut line = format!("[canter] deadline kill of process group -{group}: ");
+    match &report.signal {
+        None => line.push_str("the group-signal helper delivered"),
+        Some(reason) => line.push_str(&format!(
+            "the group-signal helper did not deliver ({reason})"
+        )),
+    }
+    line.push_str(&format!(
+        "; reaped {} member(s) by positive pid",
+        report.reaped
+    ));
+    if !report.remaining.is_empty() {
+        line.push_str(&format!(
+            "; {} member(s) could not be killed by positive pid and were still live at the last \
+             enumeration (pids {:?}; a descendant that left the process group is not reachable by \
+             design)",
+            report.remaining.len(),
+            report.remaining
+        ));
+    }
+    for note in &report.notes {
+        line.push_str(&format!("; {note}"));
+    }
+    line.push('\n');
+    line
+}
+
 fn execute_op_at(
     profile: &Profile,
     request: &OpRequest<'_>,
@@ -1312,22 +1809,46 @@ fn execute_op_inner(
         );
     }
     match request.op {
-        Op::Start => op_result(
-            profile,
-            request,
-            "succeeded",
-            None,
-            None,
-            Some(object(vec![
-                ("session_id", string(&session_id)),
-                (
-                    "generation",
-                    integer(request.session.identity.generation as i64),
-                ),
-            ])),
-            None,
-            started,
-        ),
+        Op::Start => {
+            // Issue #92 F2: a declarative `argv` profile may declare its own
+            // session-bind row. When it does, START really runs it (bounded,
+            // worktree-confined) and the typed result is the real one; the
+            // official kinds bind their documented session handle without a
+            // subprocess, and nothing is invented for a profile that
+            // declares no row.
+            if let Some(row) = profile.op_args.get("start") {
+                let out = run_typed_grouped(&profile.executable, row, request.timeout, env, cwd);
+                if let ProcessOutcome::Failed(err) = out {
+                    return op_result(
+                        profile,
+                        request,
+                        err.status(),
+                        Some(err.code),
+                        Some(err.message),
+                        None,
+                        Some(err.detail),
+                        started,
+                    );
+                }
+            }
+            op_result(
+                profile,
+                request,
+                "succeeded",
+                None,
+                None,
+                Some(object(vec![
+                    ("session_id", string(&session_id)),
+                    (
+                        "generation",
+                        integer(request.session.identity.generation as i64),
+                    ),
+                    ("profile_key", string(&profile.key)),
+                ])),
+                None,
+                started,
+            )
+        }
         Op::Prompt => {
             let payload = match request.payload {
                 Some(payload) => payload,
@@ -1344,7 +1865,7 @@ fn execute_op_inner(
                     );
                 }
             };
-            let mut args = match prompt_args(profile) {
+            let mut args = match prompt_args(profile, &session_id) {
                 Ok(args) => args,
                 Err(err) => {
                     return op_result(
@@ -1362,7 +1883,7 @@ fn execute_op_inner(
             // Data-last rule (AC5): the payload is appended as one literal
             // argv element; nothing else in the argv depends on it.
             args.push(payload.to_string());
-            let out = run_typed(&profile.executable, &args, request.timeout, env, cwd);
+            let out = run_typed_grouped(&profile.executable, &args, request.timeout, env, cwd);
             match out {
                 ProcessOutcome::Ok(text) => {
                     let payload = prompt_result_payload(profile, text);
@@ -2538,6 +3059,32 @@ fn run_typed(
     env: &BTreeMap<String, String>,
     cwd: Option<&Path>,
 ) -> ProcessOutcome {
+    run_typed_with(program, args, timeout, env, cwd, false)
+}
+
+/// Issue #92 round 4 (blast radius): the group runner is for the effect-class
+/// harness invocations only — the prompt row and a declared start row. Their
+/// child leads its own process group and a deadline reaps the group. Every
+/// other adapter operation (the workspace protocol rows) keeps the
+/// pre-existing spawn path, byte for byte.
+fn run_typed_grouped(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+    env: &BTreeMap<String, String>,
+    cwd: Option<&Path>,
+) -> ProcessOutcome {
+    run_typed_with(program, args, timeout, env, cwd, true)
+}
+
+fn run_typed_with(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+    env: &BTreeMap<String, String>,
+    cwd: Option<&Path>,
+    grouped: bool,
+) -> ProcessOutcome {
     let resolved = match resolve_executable(program, env) {
         Ok(path) => path,
         Err(err) => {
@@ -2548,13 +3095,18 @@ fn run_typed(
             });
         }
     };
-    let out = run(ProcSpec {
+    let spec = ProcSpec {
         program: resolved.to_str().unwrap_or_default(),
         args,
         env,
         cwd,
         timeout,
-    });
+    };
+    let out = if grouped {
+        run_grouped(spec)
+    } else {
+        run(spec)
+    };
     match out.status {
         ProcStatus::Exit(0) => {
             let text = redact(&out.stdout);
@@ -2587,12 +3139,24 @@ fn run_typed(
         ProcStatus::TimedOut => ProcessOutcome::Failed(ProcessFailure {
             code: CODE_TIMEOUT,
             message: "the operation exceeded its deadline and was cancelled".to_string(),
-            detail: format!("deadline {:?}", timeout),
+            detail: {
+                // Issue #92 round 2: a group signal that could not be
+                // delivered rides on the captured stderr, so the failure
+                // detail names it instead of hiding it.
+                let reason = diagnostics(&out.stderr);
+                if reason.is_empty() {
+                    format!("deadline {timeout:?}")
+                } else {
+                    format!("deadline {timeout:?} | {reason}")
+                }
+            },
         }),
         ProcStatus::SpawnFailed(message) => ProcessOutcome::Failed(ProcessFailure {
             code: CODE_UNAVAILABLE,
             message: format!("could not spawn {program:?}: {message}"),
-            detail: format!("while spawning {program:?}"),
+            // The OS error rides in the detail too: the round-3 Linux log
+            // named only the site, and the cause was unrecoverable from it.
+            detail: format!("while spawning {program:?}: {message}"),
         }),
     }
 }
@@ -3158,7 +3722,7 @@ mod tests {
             .with_binding("example-provider", "example-model")
             .expect("binding");
         assert_eq!(
-            prompt_args(&pi).expect("args"),
+            prompt_args(&pi, "sess-test").expect("args"),
             vec![
                 "--provider".to_string(),
                 "example-provider".to_string(),
@@ -3173,7 +3737,7 @@ mod tests {
             .with_binding("example-provider", "example-model")
             .expect("binding");
         assert_eq!(
-            prompt_args(&jcode).expect("args"),
+            prompt_args(&jcode, "sess-test").expect("args"),
             vec![
                 "run".to_string(),
                 "--provider".to_string(),
@@ -3186,7 +3750,7 @@ mod tests {
         );
         for kind in [HarnessKind::Pi, HarnessKind::Jcode] {
             let bare = Profile::official(kind, kind.name()).expect("profile");
-            let err = prompt_args(&bare).expect_err("unbound prompt refused");
+            let err = prompt_args(&bare, "sess-test").expect_err("unbound prompt refused");
             assert_eq!(err.code, CODE_BINDING, "{}", kind.name());
             assert!(!err.retryable);
         }
@@ -3366,6 +3930,65 @@ mod tests {
 
     fn evidence_doc(json: &str) -> Val {
         Val::parse_json(json).expect("evidence doc")
+    }
+
+    #[test]
+    fn the_workspace_protocol_rows_keep_the_pre_existing_spawn_path() {
+        // Issue #92 round 4: the group runner (own process group, group reap)
+        // is for the effect-class harness invocations only. A workspace
+        // protocol row must spawn exactly as it did before the group runner
+        // existed — the child inherits the runner's process group. Hosted CI
+        // caught the opposite on a loaded Linux runner at the test below, so
+        // this pin lives beside it.
+        let fake = FakeWorkspace::new(
+            "group-shape",
+            "pg=$(ps -o pgid= -p $$ | tr -d ' ')\n\
+             if [ \"$pg\" = \"$$\" ]; then echo self > \"$(dirname \"$0\")/group-shape.txt\"; \
+             else echo inherited > \"$(dirname \"$0\")/group-shape.txt\"; fi\n\
+             echo '{\"interrupted\":true}'",
+        );
+        let target = retirement_target();
+        let profile = Profile::official(HarnessKind::Pi, "pi").expect("profile");
+        let result = retirement_stop(&profile, &target, &fake.env(), ADAPTER_TIMEOUT);
+
+        assert_eq!(result.status, "succeeded", "{:?}", result.detail);
+        let shape = std::fs::read_to_string(fake.dir.join("group-shape.txt")).unwrap_or_default();
+        assert_eq!(
+            shape.trim(),
+            "inherited",
+            "a workspace protocol row must keep the pre-existing spawn path"
+        );
+    }
+
+    #[test]
+    fn a_failed_group_reap_attempt_is_reported_not_discarded() {
+        // A NUL in the executable name prevents launch on every platform;
+        // no kill runs, and no platform-specific exit status is the oracle.
+        let candidates = ["invalid\0kill-helper"];
+        let signal = helper_attempt(&candidates, &["-9", "-7"], "group signal");
+        assert!(
+            signal
+                .as_deref()
+                .is_some_and(|reason| reason.contains("group signal")),
+            "the unlaunchable helper must report its failure: {signal:?}"
+        );
+        assert_eq!(
+            signal_group_with(&candidates, 7),
+            signal,
+            "the group-signal wrapper must preserve the failure unchanged"
+        );
+
+        let kill = helper_attempt(&candidates, &["-9", "7"], "reap");
+        assert!(
+            kill.as_deref()
+                .is_some_and(|reason| reason.contains("reap")),
+            "the unlaunchable helper must report its failure: {kill:?}"
+        );
+        assert_eq!(
+            kill_pid_with(&candidates, 7),
+            kill,
+            "the positive-pid wrapper must preserve the failure unchanged"
+        );
     }
 
     #[test]

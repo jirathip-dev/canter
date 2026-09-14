@@ -1628,3 +1628,126 @@ fn wire_interrupted_control_claim_commits_nothing_and_reconciles_on_restart() {
 
     shutdown(daemon);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #92 F3 (wire): the retry frontier derives from the recorded attempt
+// ledger, so an `ambiguous` timed-out attempt whose node fell behind is
+// addressable — and the authorization is still consumed exactly once.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wire_retry_addresses_the_ledger_frontier_not_a_stale_node() {
+    let fixture = DaemonFixture::new("retry-ledger");
+    let run = {
+        let state = fixture.seed();
+        let runs = seed_submission(&state, &[(5, GRANT_5)]);
+        // The F3 defect shape, recorded durably: `p1` succeeded, `p2` was
+        // dispatched and timed out (`ambiguous`), and the run's recorded
+        // node never left the start (a stale node). The node-derived
+        // frontier would name `p1` (already succeeded) and refuse the step
+        // that actually needs the retry.
+        seed_attempt(
+            &state,
+            &runs[0],
+            "p1",
+            &idem_key("ledger-0001"),
+            Some("succeeded"),
+        );
+        seed_attempt(
+            &state,
+            &runs[0],
+            "p2",
+            &idem_key("ledger-0002"),
+            Some("ambiguous"),
+        );
+        runs[0].clone()
+    };
+    let daemon = fixture.spawn(None);
+    wait_ready(&fixture);
+
+    // A step already recorded succeeded stays a terminal-success refusal.
+    let (code, _) = rpc_err(
+        &fixture.socket,
+        &fresh_id(1),
+        "run.retry",
+        Some(retry_params(&idem_key("ledger-done-0001"), &run, "p1")),
+    );
+    assert_eq!(code, "refusal.run.step_done");
+
+    // The diagnosed `ambiguous` attempt IS the frontier and is addressable.
+    let retry = rpc_ok(
+        &fixture.socket,
+        &fresh_id(2),
+        "run.retry",
+        Some(retry_params(&idem_key("ledger-retry-0001"), &run, "p2")),
+    );
+    assert_eq!(text(&retry, &["retry", "step_id"]), "p2");
+    assert_eq!(text(&retry, &["retry", "status"]), "authorized");
+    assert_eq!(
+        retry
+            .get("spine")
+            .and_then(|spine| spine.get("next_step"))
+            .and_then(Val::as_str),
+        Some("p2"),
+        "the rendered frontier is the ledger frontier"
+    );
+    // The duplicate stays refused while the authorization is unconsumed.
+    let (code, _) = rpc_err(
+        &fixture.socket,
+        &fresh_id(3),
+        "run.retry",
+        Some(retry_params(&idem_key("ledger-retry-0002"), &run, "p2")),
+    );
+    assert_eq!(code, "refusal.run.retry_pending");
+
+    // ONE re-dispatch consumes it (the effect itself fails on the missing
+    // integration repo — the attempt is what matters).
+    let (code, _) = rpc_err(
+        &fixture.socket,
+        &fresh_id(4),
+        "apply",
+        Some(apply_params(&run, "p2", &idem_key("ledger-apply-0001"), 5)),
+    );
+    assert_ne!(code, "refusal.run.retry_required");
+    // ...and the SECOND re-dispatch without one is refused BEFORE any effect.
+    let (code, _) = rpc_err(
+        &fixture.socket,
+        &fresh_id(5),
+        "apply",
+        Some(apply_params(&run, "p2", &idem_key("ledger-apply-0002"), 5)),
+    );
+    assert_eq!(code, "refusal.run.retry_required");
+    // Replaying the FIRST dispatch (same request id + same key) replays the
+    // recorded claim: no further attempt row appears (no duplicate effect).
+    let before = {
+        let state = fixture.seed();
+        state
+            .run_step_attempts(&run)
+            .expect("attempts")
+            .iter()
+            .filter(|(step, _)| step == "p2")
+            .count()
+    };
+    let _ = rpc(
+        &fixture.socket,
+        &fresh_id(4),
+        "apply",
+        Some(apply_params(&run, "p2", &idem_key("ledger-apply-0001"), 5)),
+    );
+    // Exactly one authorization row exists, and it is consumed once.
+    let state = fixture.seed();
+    let attempts = state.run_step_attempts(&run).expect("attempts");
+    assert_eq!(
+        attempts.iter().filter(|(step, _)| step == "p2").count(),
+        before,
+        "the replay never adds an attempt: {attempts:?}"
+    );
+    let retries = state.run_retries(&run).expect("retry rows");
+    assert_eq!(retries.len(), 1, "one bounded authorization per request");
+    assert!(
+        !retries[0].consumed_at.is_empty(),
+        "the authorization was consumed by the single re-dispatch"
+    );
+
+    shutdown(daemon);
+}

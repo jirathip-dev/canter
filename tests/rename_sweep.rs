@@ -129,8 +129,8 @@ const ALLOWED: &[(&str, usize, &str)] = &[
     ("src/main.rs", 2, "doc comment naming the alias binary"),
     (
         "src/mutation.rs",
-        2,
-        "retained live default lane/session name",
+        1,
+        "the issue #92 F2 comment naming the retired pre-fix default session identity",
     ),
     (
         "tests/harness_adapters.rs",

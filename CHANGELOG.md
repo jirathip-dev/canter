@@ -656,6 +656,71 @@ release process activates (docs/RELEASING.md), then semver applies.
   documented legacy set) and `tests/rename_compat.rs` (alias binary, legacy
   tree adoption, legacy config discovery, legacy env var).
 
+### Fixed (issue #92 — executor lifecycle: deadlines, role-bound sessions, ledger retry frontier, executable supervision)
+
+- Bounded, explicit, cancellable per-effect deadlines: no call site reads a
+  bare timeout constant any more. A documented per-kind table (prompt
+  1800 s, harness_start 300 s, other subprocess kinds 60 s, hard ceiling
+  3600 s) plus an optional reviewed `deadline_secs` plan policy; the
+  effective deadline rides on the step result, and a deadline terminates
+  the child AND its process group.
+- Group termination is confined to the effect-class harness invocations (the
+  prompt row and a declared start row): every other adapter operation — the
+  workspace protocol rows — spawns byte-for-byte as it did before the group
+  runner existed, so the blast radius of the deadline fix stays on the
+  audited effect path (issue #92 round 4).
+- The harness prompt row runs the run's declared role binding (`-p <role>`,
+  the declared provider/model pair, `chat --continue <session>
+  --create-if-missing`) instead of a bare one-shot invocation; the session
+  is derived once per run, bound by `harness_start` and continued by every
+  prompt, and the retired pre-fix default session identity is never
+  substituted (a step whose run bound no session, and that declares none
+  either, is refused instead): a step never invents a binding or a session
+  (`refusal.profile.binding`, `refusal.stale.identity`,
+  `refusal.session.unbound`).
+- The retry frontier derives from the recorded attempt ledger, so an
+  `ambiguous` (timed-out) attempt is addressable by `run.retry` even when
+  the run's recorded node fell behind; the single-use authorization, the
+  fail-closed refusals and the no-duplicate-effect replay guarantees are
+  unchanged.
+- Armed supervision can advance its run: the driver hands the next
+  unachieved step to the merged `apply` engine under every existing gate
+  (journaled before effect, consumed retry authorizations respected, holds
+  never cleared); non-armed supervision keeps its classification-only
+  zero-effect contract verbatim.
+- Round-5 diagnostic-truthfulness fix (found by the independent round-3
+  review, finding V1): the group-signal and positive-pid-kill wrappers hand
+  the helper attempt's result on unchanged — `None` means the attempt was
+  delivered, `Some(reason)` means every candidate failed — so the one
+  diagnostic line names a group signal that could NOT be delivered (with its
+  reason) instead of rendering it as delivered, and the reap count and the
+  survivor list are derived from delivered attempts only (a member no kill
+  could reach is never counted as reaped). Pinned by
+  `adapters::tests::a_failed_group_reap_attempt_is_reported_not_discarded`
+  (raw exit 101 at the pre-fix head, 0 with the fix).
+- Round-3 platform fix (found by hosted CI on Linux: the round-2 helper form
+  does not deliver the group signal there, so both no-orphan tests failed with
+  the helpers alive and the assertions did not print the runner's own
+  diagnosis): the deadline now VERIFIES the group instead of trusting one CLI
+  form — a best-effort `kill -9 -<pgid>` attempt, then the group's live
+  members enumerated with the portable `ps -A -o pid=,pgid=,stat=` and killed
+  by POSITIVE pid, re-enumerated until the group is empty or the bounded
+  `GROUP_REAP_WINDOW` (375 ms) expires; the captured stderr carries one
+  diagnostic line (helper attempt result, members reaped by pid, members that
+  survived), and every group assertion in the suite prints the status and that
+  stderr, so a CI failure is self-diagnosing.
+- Round-2 platform fix (found by hosted CI on Linux, not visible on macOS):
+  the group signal no longer depends on the child's allowlisted PATH — the
+  `kill` helper is resolved from the ambient environment plus the standard
+  system directories (absolute candidates included), and a signal that could
+  not be delivered is named on the captured stderr (observable in the step
+  outcome/evidence) instead of being discarded. The post-exit read of the
+  captured pipes is bounded by the documented grace (`PIPE_READ_GRACE`,
+  750 ms), so a descendant that survives the signal and holds the inherited
+  write ends can never extend an effect past `deadline + grace` (the Linux
+  failure: a timed-out `hermes` step with a surviving helper blocked the read
+  for the descendant's lifetime and blew a 300 s bound).
+
 ### Changed
 
 - Documentation polish (issue #12, PR #13): security recipe doc line fix

@@ -351,6 +351,41 @@ pub fn next_step_of(spine: &[String], current_node: &str) -> Option<String> {
     spine.get(index + 1).cloned()
 }
 
+/// The retry frontier of one run, derived from the RECORDED attempt ledger
+/// (issue #92 F3): the first bound-spine step whose latest recorded attempt
+/// is not `succeeded` — an `ambiguous` (timed-out) or `failed` attempt IS
+/// the frontier, which is exactly the step `run.retry` must be able to
+/// address. The node-derived frontier ([`next_step_of`]) is kept as the
+/// other input and the FURTHER of the two wins, so:
+/// - a stale ledger can never rewind the frontier below the recorded node;
+/// - a stale node can never hide a diagnosed step the ledger knows about.
+///
+/// `None` only when neither input establishes one (empty spine).
+///
+/// Fail-closed by construction: this only decides WHICH step is the
+/// frontier; every eligibility check (diagnosis, bound, epoch, grant,
+/// consumption) stays where it was.
+pub fn frontier_of(
+    spine: &[String],
+    attempts: &[(String, String)],
+    current_node: &str,
+) -> Option<String> {
+    let ledger = spine.iter().position(|step| {
+        let latest = attempts
+            .iter()
+            .rfind(|(id, _)| id == step)
+            .map(|(_, status)| status.as_str());
+        latest != Some("succeeded")
+    });
+    let node = next_step_of(spine, current_node).and_then(|step| step_index_of(spine, &step));
+    match (ledger, node) {
+        (Some(ledger), Some(node)) => spine.get(ledger.max(node)).cloned(),
+        (Some(ledger), None) => spine.get(ledger).cloned(),
+        (None, Some(node)) => spine.get(node).cloned(),
+        (None, None) => None,
+    }
+}
+
 /// The position of one step in the bound spine (`None` when it is not a
 /// spine step).
 pub fn step_index_of(spine: &[String], step: &str) -> Option<usize> {

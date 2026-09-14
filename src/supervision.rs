@@ -203,6 +203,9 @@ pub mod codes {
     pub const PROGRESS_UNOBSERVED: &str = "supervision.progress_unobserved";
     /// Recorded evidence moved within the policy window.
     pub const RECENT_PROGRESS: &str = "supervision.recent_progress";
+    /// The committed check dispatched the run's next unachieved step through
+    /// the apply engine (issue #92 F4).
+    pub const DISPATCH: &str = "supervision.dispatch.next_step";
 }
 
 /// A typed supervision error/refusal (fail closed; stable codes).
@@ -509,6 +512,104 @@ fn newest_verdict(evidence: &SupervisionEvidence) -> &str {
 /// eligible.
 pub fn authorization_bound(evidence: &SupervisionEvidence, authorization_digest: &str) -> bool {
     evidence.submission_digest.as_deref() == Some(authorization_digest)
+}
+
+/// ONE dispatch intent of a supervision check (issue #92 F4): the next
+/// unachieved step of an explicitly armed run, to be dispatched through the
+/// merged apply engine. The intent carries NO authority of its own — every
+/// gate (capability, grant, admission, ownership, journal, idempotency) is
+/// re-derived by the apply path, which refuses without them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DispatchIntent {
+    /// The supervised run.
+    pub instance_id: String,
+    /// The bound-spine step to dispatch.
+    pub step_id: String,
+    /// That step's kind.
+    pub kind: String,
+    /// Why this dispatch is the run's continuation (stable reason code).
+    pub reason: &'static str,
+}
+
+/// The dispatch hook the driver calls AFTER a check commits (issue #92 F4).
+/// The daemon implements it with the merged apply engine; the driver itself
+/// never runs an effect, and a refused or failed dispatch is logged and
+/// never retried inside the same check.
+pub trait SupervisedDispatch: Send + Sync {
+    /// Dispatch ONE step through the apply engine. `Ok(word)` describes the
+    /// recorded outcome; `Err(message)` is a refusal that only logs.
+    fn dispatch(&self, intent: &DispatchIntent) -> Result<String, String>;
+}
+
+/// Derive the ONE continuation dispatch of a check (issue #92 F4).
+///
+/// `Some(intent)` only when every condition holds:
+/// - the row is explicitly `armed` and its authorization still matches the
+///   run's committed submission;
+/// - the run is live: not paused, no pause request, no human queue, no
+///   terminal blocker, not blocked/invalidated/done;
+/// - no step dispatch is in flight (a run mid-effect is never advanced);
+/// - the run still has a next unachieved step;
+/// - that step has never been dispatched, or it is a recorded non-success
+///   WITH an unconsumed bounded retry authorization (the operator's
+///   `run.retry`): a diagnosed step is re-dispatched only under that
+///   authorization, which the dispatch consumes exactly once.
+///
+/// Non-armed/unknown supervision therefore keeps its classification-only,
+/// zero-effect guarantee verbatim: this function returns `None` for every
+/// row that is not explicitly armed.
+pub fn dispatch_intent(
+    row: &SupervisionRow,
+    evidence: &SupervisionEvidence,
+) -> Option<DispatchIntent> {
+    if row.desired != "armed" {
+        return None;
+    }
+    if !authorization_bound(evidence, &row.authorization_digest) {
+        return None;
+    }
+    let run = &evidence.run;
+    if run.paused
+        || run.pause_requested
+        || run.human_queue
+        || run.terminal_blockers > 0
+        || matches!(run.status.as_str(), "blocked" | "invalidated" | "done")
+    {
+        return None;
+    }
+    if evidence.in_flight.is_some() {
+        return None;
+    }
+    // A run that never dispatched a step carries no durable dispatch context
+    // (the topology and admission inputs its own applies presented), so its
+    // FIRST dispatch belongs to the caller who holds them: supervision never
+    // invents a topology or a measurement for it.
+    if evidence.attempts.is_empty() {
+        return None;
+    }
+    let (step_id, kind) = next_unachieved_step(evidence)?;
+    match latest_attempt_for(evidence, &step_id) {
+        // Never dispatched: the plain continuation of an armed run.
+        None => {}
+        // A diagnosed step (failed/refused/ambiguous) is re-dispatched ONLY
+        // under an unconsumed bounded retry authorization.
+        Some((_, status, _)) if status != "succeeded" => {
+            let authorized = evidence
+                .retries
+                .iter()
+                .any(|retry| retry.step_id == step_id && retry.consumed_at.is_empty());
+            if !authorized {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    Some(DispatchIntent {
+        instance_id: run.instance_id.clone(),
+        step_id,
+        kind,
+        reason: codes::DISPATCH,
+    })
 }
 
 /// One run whose recorded evidence is a fresh VERIFIED delivery (issue #96):
@@ -1091,16 +1192,22 @@ pub fn status_doc(
 
 /// Optional knobs of the driver thread (`now` always comes from
 /// `crate::time`, exactly like every other daemon loop).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 pub struct SupervisorOptions {
     /// Upper bound on one wait between ticks (seconds).
     pub max_wait_secs: i64,
+    /// The dispatch hook of an armed run's continuation (issue #92 F4). The
+    /// daemon implements it with the merged apply engine; `None` keeps the
+    /// driver classification-only (no effect ever leaves this crate's
+    /// pre-#92 supervision contract).
+    pub dispatch: Option<Arc<dyn SupervisedDispatch>>,
 }
 
 impl Default for SupervisorOptions {
     fn default() -> SupervisorOptions {
         SupervisorOptions {
             max_wait_secs: DEFAULT_MAX_WAIT_SECS,
+            dispatch: None,
         }
     }
 }
@@ -1114,6 +1221,8 @@ pub struct SupervisorWake {
     condvar: Condvar,
     ticks: AtomicU64,
     checks: AtomicU64,
+    /// Dispatches handed to the daemon's apply engine (issue #92 F4).
+    dispatches: AtomicU64,
     /// Whether the driver is blocked inside its wait RIGHT NOW (test
     /// observability: the wake is set strictly AFTER any guard the caller
     /// chose to hold, so an observer that sees `true` sees the driver's
@@ -1129,6 +1238,7 @@ impl SupervisorWake {
             condvar: Condvar::new(),
             ticks: AtomicU64::new(0),
             checks: AtomicU64::new(0),
+            dispatches: AtomicU64::new(0),
             waiting: AtomicBool::new(false),
         }
     }
@@ -1163,6 +1273,11 @@ impl SupervisorWake {
     /// Run-scoped reconciliations performed (test observability).
     pub fn checks(&self) -> u64 {
         self.checks.load(Ordering::SeqCst)
+    }
+
+    /// Dispatches handed to the apply engine so far (test observability).
+    pub fn dispatches(&self) -> u64 {
+        self.dispatches.load(Ordering::SeqCst)
     }
 
     /// Whether the driver is blocked in its wait right now (test
@@ -1313,11 +1428,26 @@ impl SupervisorCore {
             (row, evidence, trigger)
         };
         let plan = check_plan(&row, &evidence, trigger.as_ref(), boot, now_unix);
-        let state = match self.state.lock() {
-            Ok(state) => state,
-            Err(_) => return false,
+        let committed = {
+            let state = match self.state.lock() {
+                Ok(state) => state,
+                Err(_) => return false,
+            };
+            state.commit_supervision_check(&plan).is_ok()
         };
-        state.commit_supervision_check(&plan).is_ok()
+        if !committed {
+            return false;
+        }
+        // Issue #92 F4: the committed check may carry ONE continuation
+        // dispatch. It runs through the daemon's apply engine (every gate
+        // re-derives there) AFTER the check is durable and OUTSIDE the state
+        // guard; a refused or failed dispatch is the daemon's record — the
+        // driver never retries it inside the same check.
+        if let (Some(intent), Some(dispatcher)) = (&plan.dispatch, self.options.dispatch.as_ref()) {
+            let _ = dispatcher.dispatch(intent);
+            self.wake.dispatches.fetch_add(1, Ordering::SeqCst);
+        }
+        true
     }
 
     /// The nearest wake instant: the smallest scheduled check (bounded).
@@ -1390,6 +1520,11 @@ pub fn check_plan(
             None => "timer",
         }
     };
+    // Issue #92 F4: the ONE continuation dispatch of this check. The intent
+    // is derived from the same snapshot the classification used, and the
+    // caller (the daemon) runs it through the merged apply engine — the
+    // driver itself runs no effect.
+    let dispatch = dispatch_intent(row, evidence);
     SupervisionCheckPlan {
         instance_id: row.instance_id.clone(),
         now_unix,
@@ -1409,6 +1544,7 @@ pub fn check_plan(
         next_check_unix: next_check_unix(now_unix, &policy),
         next_check_reason: codes::RECENT_PROGRESS,
         advance,
+        dispatch,
     }
 }
 
@@ -1977,6 +2113,7 @@ mod tests {
                 next_check_unix: next_unix,
                 next_check_reason: codes::RECENT_PROGRESS,
                 advance: None,
+                dispatch: None,
             };
         state
             .commit_supervision_check(&check(armed_at + 10, 0, "boot"))
@@ -2070,6 +2207,7 @@ mod tests {
                 next_check_unix: now_unix + 10,
                 next_check_reason: codes::RECENT_PROGRESS,
                 advance: None,
+                dispatch: None,
             }
         };
         let first = state
@@ -2331,6 +2469,7 @@ mod tests {
             next_check_unix: now_unix + 10,
             next_check_reason: codes::RECENT_PROGRESS,
             advance: None,
+            dispatch: None,
         };
         let first = state
             .commit_supervision_check(&plan(1_800_000_000, true, "continuation-eligible"))
@@ -2574,6 +2713,7 @@ mod tests {
             Arc::clone(&state),
             SupervisorOptions {
                 max_wait_secs: 3600,
+                dispatch: None,
             },
         );
         // The driver must reach its wait WITHOUT the state guard: wait until
@@ -2599,6 +2739,14 @@ mod tests {
             std::thread::yield_now();
         }
         handle.wake_handle().signal_stop();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !handle.thread.as_ref().expect("driver thread").is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "the supervision driver did not exit after its stop signal"
+            );
+            std::thread::yield_now();
+        }
         let joined = handle.join();
         assert!(
             acquired,

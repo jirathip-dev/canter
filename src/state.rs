@@ -2501,6 +2501,163 @@ impl State {
         Ok(row)
     }
 
+    /// The committed canonical bound-input line of one run (`None` for a run
+    /// without a committed queue submission). Read from the durable
+    /// submission — never from a caller.
+    fn committed_bound_input(&self, instance_id: &str) -> Result<Option<String>, StateError> {
+        let conn = self.lock("committed_bound_input")?;
+        conn.query_row(
+            "SELECT s.request_line FROM queue_submissions s
+               JOIN queue_submission_items i ON i.submission_id = s.submission_id
+              WHERE i.instance_id = ?1 AND i.status = 'admitted'",
+            params![instance_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|err| StateError::from_sqlite("committed_bound_input: query", err))
+    }
+
+    /// The run's committed role identity (issue #92 F2): the reviewed
+    /// `role_config` key and revision the submission bound, read from the
+    /// durable bound-input line as `(key, revision)`. `None` when the run has
+    /// no committed submission (or its `role_config` carries no key) — a
+    /// harness step is then never bound to a profile, because there is no
+    /// default profile to fall back to.
+    pub fn run_role_identity(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<(String, String)>, StateError> {
+        let Some(line) = self.committed_bound_input(instance_id)? else {
+            return Ok(None);
+        };
+        let doc = Val::parse_json(&line).map_err(|message| {
+            state_error(
+                "state.corrupt",
+                format!("the committed bound-input line of {instance_id} is unreadable: {message}"),
+            )
+        })?;
+        let role = doc.get("role_config").cloned().unwrap_or_else(null);
+        let key = role.get("key").and_then(Val::as_str);
+        let revision = role.get("revision").and_then(Val::as_str);
+        match (key, revision) {
+            (Some(key), Some(revision)) if !key.is_empty() && !revision.is_empty() => {
+                Ok(Some((key.to_string(), revision.to_string())))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The committed executable spine of one run as raw step documents
+    /// (`None` for a run without a committed queue submission). The spine is
+    /// the reviewed bound-input `steps` array — never a caller's.
+    pub fn run_step_documents(&self, instance_id: &str) -> Result<Option<Vec<Val>>, StateError> {
+        let Some(line) = self.committed_bound_input(instance_id)? else {
+            return Ok(None);
+        };
+        let doc = Val::parse_json(&line).map_err(|message| {
+            state_error(
+                "state.corrupt",
+                format!("the committed bound-input line of {instance_id} is unreadable: {message}"),
+            )
+        })?;
+        Ok(Some(
+            doc.get("steps")
+                .and_then(Val::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        ))
+    }
+
+    /// The newest recorded dispatch context of one run (issue #92 F4): the
+    /// exact `topology` block and the admission inputs (`caps`, occupancy)
+    /// one of the run's own applies presented. Durable caller-attested
+    /// inputs — a supervision dispatch re-presents them and never invents a
+    /// topology or a measurement. `None` when the run has no recorded
+    /// dispatch at all.
+    pub fn run_dispatch_context(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<RecordedDispatch>, StateError> {
+        let conn = self.lock("run_dispatch_context")?;
+        let mut statement = conn
+            .prepare(
+                "SELECT request_line FROM idempotency
+                  WHERE method = 'apply' AND outcome IS NOT NULL
+                  ORDER BY claimed_at, key",
+            )
+            .map_err(|err| StateError::from_sqlite("run_dispatch_context: prepare", err))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|err| StateError::from_sqlite("run_dispatch_context: query", err))?;
+        let mut out = None;
+        for row in rows {
+            let line =
+                row.map_err(|err| StateError::from_sqlite("run_dispatch_context: row", err))?;
+            let Ok(request) = Val::parse_json(&line) else {
+                continue;
+            };
+            let params = request.get("params").cloned().unwrap_or_else(null);
+            if params.get("instance_id").and_then(Val::as_str) != Some(instance_id) {
+                continue;
+            }
+            let Some(topology) = params.get("topology") else {
+                continue;
+            };
+            let admission = params
+                .get("flags")
+                .and_then(|flags| flags.get("admission"))
+                .cloned();
+            out = Some(RecordedDispatch {
+                topology: topology.clone(),
+                caps: admission
+                    .as_ref()
+                    .and_then(|admission| admission.get("caps"))
+                    .cloned(),
+                harness_lanes: admission
+                    .as_ref()
+                    .and_then(|admission| admission.get("harness_lanes"))
+                    .and_then(Val::as_int),
+            });
+        }
+        Ok(out)
+    }
+
+    /// The `harness_start` step of one run whose dispatch is recorded as
+    /// succeeded — the step that bound the run's session (issue #92 F2).
+    /// `None` when the run has no committed submission, its spine names no
+    /// `harness_start` step, or none of them is recorded succeeded: a prompt
+    /// then continues nothing and is refused.
+    pub fn run_bound_start_step(&self, instance_id: &str) -> Result<Option<String>, StateError> {
+        let Some(line) = self.committed_bound_input(instance_id)? else {
+            return Ok(None);
+        };
+        let doc = Val::parse_json(&line).map_err(|message| {
+            state_error(
+                "state.corrupt",
+                format!("the committed bound-input line of {instance_id} is unreadable: {message}"),
+            )
+        })?;
+        let steps = doc
+            .get("steps")
+            .and_then(Val::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let start_steps: Vec<String> = steps
+            .iter()
+            .filter(|step| step.get("kind").and_then(Val::as_str) == Some("harness_start"))
+            .filter_map(|step| step.get("id").and_then(Val::as_str).map(str::to_string))
+            .collect();
+        if start_steps.is_empty() {
+            return Ok(None);
+        }
+        let attempts = self.run_step_attempts(instance_id)?;
+        Ok(start_steps.into_iter().find(|step| {
+            attempts
+                .iter()
+                .any(|(id, status)| id == step && status == "succeeded")
+        }))
+    }
+
     /// The bound step spine of one run (`None` for a run without a
     /// committed queue submission). The spine is read from the committed
     /// submission's canonical bound-input line — never from a caller.
@@ -10542,6 +10699,20 @@ pub struct SupervisionEvidence {
     pub newest_evidence: Option<EvidenceRow>,
 }
 
+/// The newest recorded dispatch context of one run (issue #92 F4): the
+/// caller-attested inputs a supervision dispatch re-presents, because the
+/// daemon holds no topology of its own.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecordedDispatch {
+    /// The `topology` object the run's own dispatch presented.
+    pub topology: Val,
+    /// The recorded `flags.admission.caps` object, when that dispatch
+    /// carried an admission block (fan-out steps do).
+    pub caps: Option<Val>,
+    /// The recorded `flags.admission.harness_lanes` occupancy attestation.
+    pub harness_lanes: Option<i64>,
+}
+
 /// The plan of one committed supervision check (built by the driver from the
 /// snapshot it read; the transaction re-reads the row and fences the wake
 /// slot on `consumed_seq`).
@@ -10580,6 +10751,11 @@ pub struct SupervisionCheckPlan {
     /// the queue cursor exactly once per delivered item. `None` = the check
     /// has no effect beyond its own durable record.
     pub advance: Option<crate::supervision::VerifiedDelivery>,
+    /// The ONE continuation dispatch of this check (issue #92 F4): the run's
+    /// next unachieved step, handed to the daemon's apply engine AFTER the
+    /// check commits. `None` = this check dispatches nothing (non-armed
+    /// supervision keeps its classification-only guarantee verbatim).
+    pub dispatch: Option<crate::supervision::DispatchIntent>,
 }
 
 /// The outcome of one bounded event-fold pass.

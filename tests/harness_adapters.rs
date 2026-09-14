@@ -233,7 +233,14 @@ fn executable_name(kind: HarnessKind) -> &'static str {
 /// - `exit-n`: exits with a plain non-zero code.
 fn harness_body(kind: HarnessKind, action: &str, version: &str) -> String {
     let prompt_check = match kind {
-        HarnessKind::Hermes => "[ \"$1\" = \"chat\" ] && [ \"$2\" = \"-q\" ]".to_string(),
+        // Issue #92 F2: the prompt row runs the declared role binding (the
+        // profile key on the documented global flag) and continues the
+        // session `harness_start` bound (`chat --continue <session>
+        // --create-if-missing`), with the payload as the final data element.
+        HarnessKind::Hermes => format!(
+            "[ \"$1\" = \"-p\" ] && [ \"$2\" = \"{}\" ] && [ \"$3\" = \"chat\" ] && [ \"$4\" = \"--continue\" ] && [ \"$5\" = \"{SESSION_ID}\" ] && [ \"$6\" = \"--create-if-missing\" ] && [ \"$7\" = \"-q\" ]",
+            HarnessKind::Hermes.name()
+        ),
         HarnessKind::ClaudeCode => "[ \"$1\" = \"-p\" ]".to_string(),
         HarnessKind::Codex => "[ \"$1\" = \"exec\" ]".to_string(),
         // The pinned one-shot row: the provider/model pair comes from the
@@ -253,7 +260,7 @@ fn harness_body(kind: HarnessKind, action: &str, version: &str) -> String {
         HarnessKind::Argv => "true".to_string(),
     };
     let payload = match kind {
-        HarnessKind::Hermes => "\"$3\"",
+        HarnessKind::Hermes => "\"$8\"",
         HarnessKind::ClaudeCode => "\"$2\"",
         HarnessKind::Codex => "\"$2\"",
         HarnessKind::Pi => "\"$7\"",
@@ -305,9 +312,13 @@ fn sample_identity() -> AgentIdentity {
 /// lifetime of one test binary.
 fn session_ref() -> &'static canter::adapters::SessionHandle {
     Box::leak(Box::new(
-        new_session("sess-20260906-0001", sample_identity()).expect("session handle"),
+        new_session(SESSION_ID, sample_identity()).expect("session handle"),
     ))
 }
+
+/// The session id the fake prompt rows pin (the session the bound identity
+/// belongs to; issue #92 F2).
+const SESSION_ID: &str = "sess-20260906-0001";
 
 fn prompt_request<'a>(payload: &'a str, timeout: Duration) -> OpRequest<'a> {
     OpRequest {

@@ -140,6 +140,48 @@ runs control-plane effects:
   refused/ambiguous) plus the exact external read-back; ambiguous effects
   (timeout, process death, post-effect record failure) resolve the claim as
   `ambiguous` — external reconciliation is required before a new key.
+- **Per-effect deadlines (issue #92 F1)**: every effect that spawns has an
+  explicit, documented, bounded deadline, resolved from a per-kind table —
+  never a bare constant at the effect site:
+  - `prompt` 1800 s, `harness_start` 300 s, every other
+    kind 60 s (`EFFECT_DEADLINE_DEFAULT_SECS`), and the hard ceiling is
+    3600 s (`EFFECT_DEADLINE_CEILING_SECS`);
+  - a reviewed plan step may declare its own `deadline_secs` (policy, bound
+    by the plan digest); a value outside `1..=ceiling` — or a non-integer —
+    refuses `refusal.request.malformed` (`effect_deadline_secs` validates
+    the override; `refusal.plan.malformed` is bind-time only) before the
+    effect runs;
+  - the EFFECTIVE value rides on the step's `result` as `deadline_secs`, so
+    the step outcome/evidence always names the deadline the effect used;
+  - the child of an effect leads its own process group and a deadline
+    EMPTIES that group (no orphan), reporting `adapter.timeout` as the typed
+    `ambiguous` outcome. Group semantics are confined to the effect-class
+    harness invocations — the prompt row and a declared start row — because
+    that is the audited defect path; every other adapter operation (the
+    workspace protocol rows: observe/identity/interrupt/outcome/retirement)
+    keeps the pre-existing spawn path unchanged, so a workspace row that
+    existed before the group runner spawns byte-for-byte as it did
+    (issue #92 round 4). The guarantee is verification, not one CLI form: a
+    `kill -9 -<pgid>` helper attempt is made first (best-effort — the
+    negative-pid form is not portable), then the group's live members are
+    enumerated with a portable `ps -A -o pid=,pgid=,stat=` and terminated by
+    POSITIVE pid, re-enumerated until the group is empty or the bounded
+    window expires (`GROUP_REAP_WINDOW`, 375 ms). Our own pid and any pid
+    outside the group are never signalled; a descendant that left the group
+    (its own session or process group) is unreachable by design and is
+    reported rather than waited for. The helpers are resolved from the
+    ambient environment plus the standard system directories — never from the
+    child's allowlisted PATH — and the whole termination is named in one
+    diagnostic line on the captured stderr (what the helper attempt did, how
+    many members were reaped by positive pid, which members no kill could
+    reach): a failed attempt is named with its reason and is never counted as
+    a reap nor rendered as delivered, so the step outcome/evidence explains a
+    failure instead of hiding it;
+  - the post-exit path of the captured pipes is bounded by a documented grace
+    (`PIPE_READ_GRACE`, 750 ms, which contains the reap window): a descendant
+    that survives the reaping and holds the inherited write ends can never
+    extend an effect past `deadline + grace`, and whatever arrived inside the
+    bound is kept (the capture may be empty or partial in that case).
 
 ## 5. Typed outcomes: `hf-outcome/v1`
 
