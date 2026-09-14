@@ -2739,6 +2739,14 @@ mod tests {
             std::thread::yield_now();
         }
         handle.wake_handle().signal_stop();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !handle.thread.as_ref().expect("driver thread").is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "the supervision driver did not exit after its stop signal"
+            );
+            std::thread::yield_now();
+        }
         let joined = handle.join();
         assert!(
             acquired,
