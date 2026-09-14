@@ -5616,10 +5616,14 @@ inputs are derived daemon-side from the run's committed submission and the
 run's own recorded dispatch context, so no `hf-plan/v1` is ever hand-built.
 The operator's inputs are merged over the step's committed params and
 validated against the step kind's existing param contract BEFORE anything
-is journaled: a request that is not well-formed enough to be attempted
-refuses typed (e.g. `refusal.request.malformed`) and leaves a pending
-bounded retry authorization unconsumed for the correction. A re-dispatch of
-a diagnosed step consumes exactly one unconsumed authorization.
+is journaled. That pre-screen is TOTAL over the step kinds: each kind's own
+param contract, the request-level observed read-backs and the topology
+gates its effect reads are all resolved up front, and a kind with no
+registered contract refuses as well — so a request that is not well-formed
+enough to be attempted refuses typed (e.g. `refusal.request.malformed`)
+whatever its kind and leaves a pending bounded retry authorization
+unconsumed for the correction. A re-dispatch of a diagnosed step consumes
+exactly one unconsumed authorization.
 
 status reads the control state back read-only (daemon `run.status`):
 active / pause_requested (request durable, in-flight work still running) /

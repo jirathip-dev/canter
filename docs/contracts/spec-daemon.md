@@ -399,10 +399,15 @@ clears a repository/fleet-level hold or bypasses a gate.
   `refusal.run.scope` (the first dispatch of a run belongs to the caller that
   holds the topology), a step outside the spine refuses
   `refusal.run.step_unknown`, and the merged params are checked against the
-  step kind's existing param contract BEFORE anything is journaled: a request
-  that is not well-formed enough to be attempted refuses typed (e.g.
-  `refusal.request.malformed`, `refusal.push_policy`) and leaves any pending
-  bounded retry authorization UNCONSUMED. The resulting dispatch runs through
+  step kind's existing param contract BEFORE anything is journaled. That
+  pre-screen is TOTAL over the closed step-kind set: each kind's own param
+  contract, the request-level observed read-backs (`review_evidence`,
+  `post_merge_verify`) and the topology gates its effect reads (the archive
+  root) are resolved up front, and a kind with no registered contract refuses
+  as well — so a request that is not well-formed enough to be attempted
+  refuses typed (e.g. `refusal.request.malformed`, `refusal.push_policy`)
+  whatever its kind and leaves any pending bounded retry authorization
+  UNCONSUMED. The resulting dispatch runs through
   the same `apply` engine, so every gate re-derives there and exactly one
   unconsumed authorization is consumed by a re-dispatch of a diagnosed step.
   It renders `hf-run-dispatch/v1` (the addressed run/step, the params the

@@ -363,6 +363,27 @@ fn rpc_err(socket: &Path, id: &str, method: &str, params: Option<Val>) -> String
         .to_string()
 }
 
+/// The refusal text of one RPC (`<code>: <message>`), for the F7 cases: the
+/// pinned reason is the effect's OWN contract, not a generic refusal.
+fn rpc_refusal(socket: &Path, id: &str, method: &str, params: Option<Val>) -> String {
+    let doc = rpc(socket, id, method, params);
+    assert_eq!(
+        doc.get("ok").and_then(Val::as_bool),
+        Some(false),
+        "expected a refusal for {method}: {}",
+        canter::canonical::canonical_text(&doc)
+    );
+    let error = doc.get("error").cloned().unwrap_or_else(null);
+    format!(
+        "{}: {}",
+        error.get("code").and_then(Val::as_str).unwrap_or_default(),
+        error
+            .get("message")
+            .and_then(Val::as_str)
+            .unwrap_or_default()
+    )
+}
+
 fn shutdown(mut daemon: Child) {
     let _ = daemon.kill();
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -2149,6 +2170,261 @@ fn a_malformed_dispatch_refuses_typed_and_keeps_the_authorization_unconsumed() {
     );
 
     shutdown(daemon);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #92 F7: the fail-closed pre-screen is TOTAL over the step kinds
+// ---------------------------------------------------------------------------
+
+/// One parameterised case of the F7 regression: ONE fixture shape driven over
+/// a different step kind, because the earlier suite pinned `worktree_create`
+/// alone and the authorization burn survived on every other kind — the
+/// reviewer's witness was `collect_outcome` with the required `worktree`
+/// missing (`refusal.request.malformed`), whose single-use authorization was
+/// burned by the malformed re-dispatch, making the operator's corrected
+/// dispatch refuse `retry_required`.
+struct ParamCase {
+    /// The step kind under test (fixture label + assertion text).
+    kind: &'static str,
+    /// The run's committed spine: `p1` (well-formed, the caller dispatches it)
+    /// plus `p2` (the malformed shape this case diagnoses).
+    steps: Vec<qp::PlannedStep>,
+    /// The effect's OWN reason for refusing the malformed shape.
+    reason: &'static str,
+    /// The operator's correction (`--param KEY=VALUE`).
+    correction: Vec<&'static str>,
+}
+
+/// The parameterised cases: the reviewer's `collect_outcome` witness, the
+/// pre-existing `worktree_create` shape, and the multi-key `hosted_check`
+/// shape whose correction needs more than one `--param`.
+fn param_cases() -> Vec<ParamCase> {
+    let step = |id: &str, kind: &str, params: Val| qp::PlannedStep {
+        id: id.to_string(),
+        kind: kind.to_string(),
+        params: Some(params),
+    };
+    vec![
+        ParamCase {
+            kind: "worktree_create",
+            steps: vec![
+                step("p1", "checkout", object(vec![("ref", string("staging"))])),
+                // The required `branch` is missing (the committed shape).
+                step(
+                    "p2",
+                    "worktree_create",
+                    object(vec![("worktree", string("lane-p2"))]),
+                ),
+            ],
+            reason: "worktree_create requires a slug branch",
+            correction: vec!["branch=issue-92-f7-lane"],
+        },
+        ParamCase {
+            kind: "collect_outcome",
+            steps: vec![
+                // `p1` creates the lane `p2` collects from, so the CORRECTED
+                // dispatch has a real worktree to read.
+                step(
+                    "p1",
+                    "worktree_create",
+                    object(vec![
+                        ("branch", string("issue-92-f7-lane")),
+                        ("worktree", string("lane-p2")),
+                    ]),
+                ),
+                // The witness shape: the required `worktree` is missing.
+                step("p2", "collect_outcome", object(vec![])),
+            ],
+            reason: "step params missing \"worktree\"",
+            correction: vec!["worktree=lane-p2"],
+        },
+        ParamCase {
+            kind: "hosted_check",
+            steps: vec![
+                step("p1", "checkout", object(vec![("ref", string("staging"))])),
+                // A multi-key correction: no repo, no number.
+                step("p2", "hosted_check", object(vec![])),
+            ],
+            reason: "hosted_check requires an owner/name repo",
+            correction: vec!["repo=example-org/widgets", "number=33"],
+        },
+    ]
+}
+
+/// Drive ONE case end to end with supervision OFF — every dispatch is the
+/// operator's own:
+///
+///   1. the caller's first attempt at `p2` carries the committed malformed
+///      params, refuses typed (`refusal.request.malformed`, the effect's own
+///      reason) and records the diagnosis `run retry` addresses;
+///   2. `canter run retry` mints the single-use authorization;
+///   3. the SAME malformed dispatch through the supported surface refuses
+///      typed and consumes NOTHING (at 43abbc9d only worktree_create was
+///      screened, so this step burned the authorization for every other kind
+///      and the operator's correction was refused `retry_required`);
+///   4. the corrected dispatch succeeds and consumes the authorization
+///      exactly once.
+fn run_param_case(case: &ParamCase) {
+    // One `ik_`-safe label per kind (the key vocabulary is [a-z0-9-] only).
+    let label = format!("f7-{}", case.kind.replace('_', "-"));
+    let fixture = DaemonFixture::new(&label);
+    let (bound, digest) = {
+        let state = fixture.seed();
+        seed_grant(&state, "gr_0000000000000095", 5);
+        let mut request = request_lane_steps(vec![selected("#5", REV_A)]);
+        request.steps = case.steps.clone();
+        render_bound(&state, &request)
+    };
+    let integration = fixture.dir.join("integration");
+    init_repo(&integration);
+    let fakebin = write_fake_gh(&fixture.dir);
+    let host_path = std::env::var("PATH").unwrap_or_default();
+    let daemon = fixture.spawn_with_path(&format!("{}:{host_path}", fakebin.display()));
+    wait_ready(&fixture);
+
+    // Supervision is OFF: nothing but the operator dispatches this run.
+    let params = params_doc(
+        &idem_key(&label),
+        &bound,
+        &digest,
+        &role_revision(),
+        "gr_0000000000000095",
+        None,
+    );
+    let result = rpc_ok(&fixture.socket, &fresh_id(1), "queue.submit", Some(params));
+    let run = instance_of(&result, 5);
+    let applied = rpc_ok(
+        &fixture.socket,
+        &fresh_id(2),
+        "apply",
+        Some(caller_apply_params(
+            &fixture,
+            &integration,
+            &bound,
+            &run,
+            "gr_0000000000000095",
+            ("p1", 5),
+            &idem_key(&format!("{label}-p1")),
+        )),
+    );
+    assert!(
+        applied.get("refused").is_none(),
+        "p1 ({}) applied: {}",
+        case.steps[0].kind,
+        canter::canonical::canonical_text(&applied)
+    );
+    let p1 = fixture
+        .seed()
+        .run_step_attempts(&run)
+        .expect("attempts")
+        .into_iter()
+        .find(|(step, _)| step == "p1")
+        .unwrap_or_else(|| panic!("p1 recorded no attempt"));
+    assert_eq!(p1.1, "succeeded", "p1 landed: {p1:?}");
+
+    // (1) The operator's first attempt at p2 carries the malformed shape.
+    let refusal = rpc_refusal(
+        &fixture.socket,
+        &fresh_id(3),
+        "apply",
+        Some(caller_apply_params(
+            &fixture,
+            &integration,
+            &bound,
+            &run,
+            "gr_0000000000000095",
+            ("p2", 5),
+            &idem_key(&format!("{label}-p2-bad")),
+        )),
+    );
+    assert!(
+        refusal.contains("refusal.request.malformed"),
+        "the first attempt refuses typed: {refusal}"
+    );
+    assert!(
+        refusal.contains(case.reason),
+        "the reason is the effect's own contract: {refusal}"
+    );
+    let attempts = fixture.seed().run_step_attempts(&run).expect("attempts");
+    assert!(
+        attempts
+            .iter()
+            .any(|(step, status)| step == "p2" && status == "refused"),
+        "the first attempt is recorded as the diagnosis: {attempts:?}"
+    );
+    let diagnosed = attempts_for(&fixture, &run, "p2");
+
+    // (2) `run retry` mints the bounded authorization — and nothing else.
+    let (exit, stdout, stderr) = run_cli(&fixture, &["retry", "--run", &run, "--step", "p2"]);
+    assert_eq!(exit, 0, "retry exit; stdout: {stdout}; stderr: {stderr}");
+    assert_eq!(
+        picked(&cli_envelope(&stdout), &["data", "retry", "status"]),
+        "authorized",
+        "the minted authorization is unconsumed: {stdout}"
+    );
+
+    // (3) The malformed dispatch through the supported surface: typed
+    // refusal, no claim, no attempt, nothing burned.
+    let (exit, stdout, stderr) = run_cli(&fixture, &["dispatch", "--run", &run, "--step", "p2"]);
+    assert_eq!(
+        exit, 4,
+        "malformed {label} dispatch exit; stdout: {stdout}; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("refusal.request.malformed"),
+        "the refusal is typed: {stderr}"
+    );
+    assert!(
+        stderr.contains(case.reason),
+        "the reason is the effect's own contract: {stderr}"
+    );
+    let retries = fixture.seed().run_retries(&run).expect("retries");
+    assert!(
+        retries.iter().all(|retry| retry.consumed_at.is_empty()),
+        "the refused {label} dispatch burns nothing: {retries:?}"
+    );
+    assert_eq!(
+        attempts_for(&fixture, &run, "p2"),
+        diagnosed,
+        "the refused {label} dispatch attempts nothing"
+    );
+
+    // (4) The corrected dispatch succeeds and consumes exactly once.
+    let mut argv = vec!["dispatch", "--run", &run, "--step", "p2"];
+    for correction in &case.correction {
+        argv.push("--param");
+        argv.push(correction);
+    }
+    let (exit, stdout, stderr) = run_cli(&fixture, &argv);
+    assert_eq!(
+        exit, 0,
+        "corrected {label} dispatch exit; stdout: {stdout}; stderr: {stderr}"
+    );
+    let retries = fixture.seed().run_retries(&run).expect("retries");
+    assert_eq!(
+        retries
+            .iter()
+            .filter(|retry| !retry.consumed_at.is_empty())
+            .count(),
+        1,
+        "exactly one {label} authorization consumed: {retries:?}"
+    );
+    let attempts = fixture.seed().run_step_attempts(&run).expect("attempts");
+    assert!(
+        attempts
+            .iter()
+            .any(|(step, status)| step == "p2" && status == "succeeded"),
+        "the corrected {label} dispatch landed: {attempts:?}"
+    );
+
+    shutdown(daemon);
+}
+
+#[test]
+fn every_kind_refuses_a_malformed_dispatch_before_the_authorization_is_burned() {
+    for case in param_cases() {
+        run_param_case(&case);
+    }
 }
 
 // ---------------------------------------------------------------------------

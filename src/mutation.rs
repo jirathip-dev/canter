@@ -1129,6 +1129,22 @@ pub struct EffectOutcome {
     pub result: Val,
 }
 
+impl<'a> EffectContext<'a> {
+    /// The param-contract view of this effect's caller-presented inputs (issue
+    /// #92): the ONE place the pre-screen and the effects agree on what "the
+    /// request's params" are.
+    pub fn param_contract(&self) -> ParamContract<'a> {
+        ParamContract {
+            integration_branch: self.integration_branch,
+            production_branches: self.production_branches,
+            observed_feature_head: self.observed_feature_head,
+            observed_integration_base: self.observed_integration_base,
+            has_archive_root: self.archive_root.is_some(),
+            worktrees_root: Some(self.worktrees_root),
+        }
+    }
+}
+
 /// Context for one effect execution.
 pub struct EffectContext<'a> {
     /// Bound plan.
@@ -1403,15 +1419,624 @@ fn effect_checkout(ctx: &EffectContext<'_>) -> EffectOutcome {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Step param contracts (issue #92): every params-caused refusal an effect can
+// raise is resolved HERE — before the bounded-retry fence can consume a
+// single-use authorization. Each effect calls the SAME `*_inputs` function
+// the pre-screen calls, so the two can never drift and no step kind inherits
+// the burn.
+// ---------------------------------------------------------------------------
+
+/// The caller-presented inputs one step kind's param contract resolves
+/// against besides the step params themselves: the topology fields the branch
+/// classification and the archive gate read, and the request-level `observed`
+/// read-backs `review_evidence` / `post_merge_verify` require. Pure values —
+/// resolving a contract reads no state and runs no subprocess.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ParamContract<'a> {
+    /// Integration branch of the repository (topology).
+    pub integration_branch: &'a str,
+    /// Configured production branches (topology).
+    pub production_branches: &'a [String],
+    /// The request's freshly observed feature head (`None` when absent).
+    pub observed_feature_head: Option<&'a str>,
+    /// The request's freshly observed integration base (`None` when absent).
+    pub observed_integration_base: Option<&'a str>,
+    /// Whether the request presented a daemon-owned archive root.
+    pub has_archive_root: bool,
+    /// The daemon-owned worktrees root the request presented (`None` only
+    /// when the request presented none — the apply path always parses one).
+    pub worktrees_root: Option<&'a Path>,
+}
+
+/// The containment screen the worktree-reading kinds run (issue #92): the
+/// presented relative path must stay inside the request's worktrees root.
+/// [`contained_path`] is the effect's own check, so the pre-screen and the
+/// effect agree.
+fn screened_containment<'a>(
+    contract: &ParamContract<'a>,
+    relative: &str,
+) -> Result<(), EffectOutcome> {
+    let Some(root) = contract.worktrees_root else {
+        return Ok(());
+    };
+    contained_path(root, relative)
+        .map(|_| ())
+        .map_err(|err| refusal(err.code, err.message))
+}
+
+/// The declared harness role inputs of `harness_start` / `prompt`: the
+/// role-binding key, the bare executable and the closed harness kind. The
+/// run's committed role configuration is NOT part of this contract — it is
+/// durable state, not a step param.
+#[derive(Clone, Debug)]
+pub struct HarnessInputs {
+    /// The declared role-binding key (`params.harness_key`).
+    pub key: String,
+    /// The declared bare executable (`''` when absent).
+    pub executable: String,
+    /// The declared harness kind string (`argv` when absent).
+    pub kind: String,
+    /// The parsed closed-set kind.
+    pub parsed_kind: crate::adapters::HarnessKind,
+}
+
+/// Resolve the declared harness role inputs from the step params alone. There
+/// is no default profile: a step that names no role binding refuses.
+pub fn harness_inputs(params: &Val) -> Result<HarnessInputs, EffectOutcome> {
+    let Some(key) = param_str_opt(Some(params), "harness_key") else {
+        return Err(refusal(
+            crate::config::CODE_PROFILE_BINDING,
+            "the harness step declares no role binding (step params.harness_key = the run's \
+             role_config key); there is no default profile and none is inferred",
+        ));
+    };
+    let executable = param_str_opt(Some(params), "executable").unwrap_or("");
+    if executable.contains('/') || executable.contains('\\') {
+        return Err(refusal(
+            code::BAD_PARAMS,
+            "harness executable must be a bare name resolved through the allowlisted PATH",
+        ));
+    }
+    let kind = param_str_opt(Some(params), "kind").unwrap_or("argv");
+    let parsed_kind = crate::adapters::HarnessKind::parse(kind)
+        .ok_or_else(|| refusal(code::BAD_PARAMS, format!("unknown harness kind {kind:?}")))?;
+    // An official kind carries its own executable: a declared one must match.
+    if let Some(spec) = crate::adapters::official_spec(parsed_kind)
+        && !executable.is_empty()
+        && executable != spec.executable
+    {
+        return Err(refusal(
+            code::BAD_PARAMS,
+            format!(
+                "the step declares executable {executable:?}, which is not the official {kind:?} \
+                 executable {:?}",
+                spec.executable
+            ),
+        ));
+    }
+    Ok(HarnessInputs {
+        key: key.to_string(),
+        executable: executable.to_string(),
+        kind: kind.to_string(),
+        parsed_kind,
+    })
+}
+
+/// Resolve the declared session identity of one step (issue #92): `None` when
+/// the step declares none, the bound handle otherwise. A partial identity or
+/// a negative generation refuses — the adapter never completes an identity
+/// with a default.
+pub fn declared_session(
+    params: Option<&Val>,
+    what: &str,
+) -> Result<Option<crate::adapters::SessionHandle>, EffectOutcome> {
+    match (
+        param_str_opt(params, "session_id"),
+        param_str_opt(params, "herdr_session"),
+        param_str_opt(params, "terminal_session"),
+    ) {
+        (None, None, None) => Ok(None),
+        (session_id, herdr_session, terminal_session) => {
+            let (session_id, herdr_session, terminal_session) =
+                match (session_id, herdr_session, terminal_session) {
+                    (Some(session_id), Some(herdr_session), Some(terminal_session)) => {
+                        (session_id, herdr_session, terminal_session)
+                    }
+                    _ => {
+                        return Err(refusal(
+                            crate::adapters::CODE_INCOMPLETE_IDENTITY,
+                            format!(
+                                "{what} declares an incomplete session identity: session_id, \
+                                 herdr_session and terminal_session are all required (a partial \
+                                 identity is never completed by a default)"
+                            ),
+                        ));
+                    }
+                };
+            let generation = param_int(params, "generation").unwrap_or(1);
+            if generation < 0 {
+                return Err(refusal(code::BAD_PARAMS, "generation must be non-negative"));
+            }
+            let identity =
+                crate::adapters::bind_identity(herdr_session, terminal_session, generation as u64)
+                    .map_err(|err| refusal(err.code, err.message))?;
+            let session = crate::adapters::new_session(session_id, identity)
+                .map_err(|err| refusal(err.code, err.message))?;
+            Ok(Some(session))
+        }
+    }
+}
+
+/// The params-caused inputs of `harness_start`.
+#[derive(Clone, Debug)]
+pub struct HarnessStartInputs {
+    /// The declared harness role inputs.
+    pub harness: HarnessInputs,
+    /// The identity the step declares, when it declares one.
+    pub declared: Option<crate::adapters::SessionHandle>,
+}
+
+/// Resolve the params-caused inputs of `harness_start` (params required; the
+/// declared role key, executable and kind; the declared session identity).
+pub fn harness_start_inputs(params: Option<&Val>) -> Result<HarnessStartInputs, EffectOutcome> {
+    let Some(params) = params else {
+        return Err(refusal(code::BAD_PARAMS, "harness_start requires params"));
+    };
+    let declared = declared_session(Some(params), "harness_start")?;
+    Ok(HarnessStartInputs {
+        harness: harness_inputs(params)?,
+        declared,
+    })
+}
+
+/// The params-caused inputs of `prompt`.
+#[derive(Clone, Debug)]
+pub struct PromptInputs {
+    /// The declared harness role inputs.
+    pub harness: HarnessInputs,
+    /// The identity the step declares, when it declares one.
+    pub declared: Option<crate::adapters::SessionHandle>,
+    /// The bounded prompt payload.
+    pub payload: String,
+    /// The relative lane worktree the prompt runs inside.
+    pub worktree: String,
+}
+
+/// Resolve the params-caused inputs of `prompt` (params required; payload and
+/// worktree required; the declared role key, executable and kind; the
+/// declared session identity).
+pub fn prompt_inputs(
+    params: Option<&Val>,
+    contract: &ParamContract<'_>,
+) -> Result<PromptInputs, EffectOutcome> {
+    let Some(params) = params else {
+        return Err(refusal(code::BAD_PARAMS, "prompt requires params"));
+    };
+    let payload = param_str(Some(params), "payload")?.to_string();
+    let worktree = param_str(Some(params), "worktree")?.to_string();
+    screened_containment(contract, &worktree)?;
+    let declared = declared_session(Some(params), "prompt")?;
+    Ok(PromptInputs {
+        harness: harness_inputs(params)?,
+        declared,
+        payload,
+        worktree,
+    })
+}
+
+/// The params-caused inputs of `collect_outcome`.
+#[derive(Clone, Debug)]
+pub struct CollectOutcomeInputs {
+    /// The relative lane worktree to collect from.
+    pub worktree: String,
+    /// The declared integration base (`params.base_head`), when present.
+    pub base_head: Option<String>,
+}
+
+/// Resolve the params-caused inputs of `collect_outcome` (worktree required;
+/// a declared `base_head` must be 40-hex).
+pub fn collect_outcome_inputs(
+    params: Option<&Val>,
+    contract: &ParamContract<'_>,
+) -> Result<CollectOutcomeInputs, EffectOutcome> {
+    let worktree = param_str(params, "worktree")?.to_string();
+    screened_containment(contract, &worktree)?;
+    let base_head = match param_str_opt(params, "base_head") {
+        Some(head) if is_hex40(head) => Some(head.to_string()),
+        Some(_) => return Err(refusal(code::BAD_PARAMS, "base_head must be 40-hex")),
+        None => None,
+    };
+    Ok(CollectOutcomeInputs {
+        worktree,
+        base_head,
+    })
+}
+
+/// The params-caused inputs of `review_evidence`.
+#[derive(Clone, Debug)]
+pub struct ReviewEvidenceInputs {
+    /// The reviewer identity.
+    pub reviewer: String,
+    /// The implementer identity.
+    pub implementer: String,
+    /// The verdict (`pass` | `fail`).
+    pub verdict: String,
+    /// The non-empty named-check list.
+    pub checks: Val,
+    /// The exact reviewed feature head (request-level read-back).
+    pub feature_head: String,
+    /// The observed integration base (request-level read-back).
+    pub integration_base: String,
+}
+
+/// Resolve the params-caused inputs of `review_evidence` (params required;
+/// reviewer/implementer/verdict/checks; the reviewer must differ from the
+/// implementer; both observed read-backs are required and 40-hex).
+pub fn review_evidence_inputs(
+    params: Option<&Val>,
+    contract: &ParamContract<'_>,
+) -> Result<ReviewEvidenceInputs, EffectOutcome> {
+    let Some(params) = params else {
+        return Err(refusal(code::BAD_PARAMS, "review_evidence requires params"));
+    };
+    let reviewer = param_str(Some(params), "reviewer")?.to_string();
+    let implementer = param_str(Some(params), "implementer")?.to_string();
+    let verdict = match param_str(Some(params), "verdict") {
+        Ok(value) if matches!(value, "pass" | "fail") => value.to_string(),
+        _ => {
+            return Err(refusal(
+                code::BAD_PARAMS,
+                "review_evidence verdict must be pass|fail",
+            ));
+        }
+    };
+    let feature_head = match contract.observed_feature_head {
+        Some(value) if is_hex40(value) => value.to_string(),
+        _ => {
+            return Err(refusal(
+                code::BAD_PARAMS,
+                "review_evidence requires observed.feature_head (fresh exact-head read-back)",
+            ));
+        }
+    };
+    let integration_base = match contract.observed_integration_base {
+        Some(value) if is_hex40(value) => value.to_string(),
+        _ => {
+            return Err(refusal(
+                code::BAD_PARAMS,
+                "review_evidence requires observed.integration_base (fresh read-back)",
+            ));
+        }
+    };
+    check_reviewer_distinct(&reviewer, &implementer)
+        .map_err(|err| refusal(err.code, err.message))?;
+    let checks = match params.get("checks") {
+        Some(Val::Arr(items)) if !items.is_empty() => Val::Arr(items.clone()),
+        _ => {
+            return Err(refusal(
+                code::BAD_PARAMS,
+                "review_evidence requires a non-empty checks list",
+            ));
+        }
+    };
+    Ok(ReviewEvidenceInputs {
+        reviewer,
+        implementer,
+        verdict,
+        checks,
+        feature_head,
+        integration_base,
+    })
+}
+
+/// Resolve the params-caused inputs of `merge` (a slug FEATURE branch).
+pub fn merge_inputs(
+    params: Option<&Val>,
+    contract: &ParamContract<'_>,
+) -> Result<String, EffectOutcome> {
+    let branch = match param_str(params, "branch") {
+        Ok(value) if is_slug(value) => value.to_string(),
+        _ => {
+            return Err(refusal(
+                code::BAD_PARAMS,
+                "merge requires a slug feature branch",
+            ));
+        }
+    };
+    let kind = classify_branch(
+        &branch,
+        contract.integration_branch,
+        contract.production_branches,
+    );
+    if kind != BranchKind::Feature {
+        return Err(refusal(
+            code::PUSH_POLICY,
+            format!("only feature branches merge to the integration branch, got {branch:?}"),
+        ));
+    }
+    Ok(branch)
+}
+
+/// The params-caused inputs of `branch_push`.
+#[derive(Clone, Debug)]
+pub struct BranchPushInputs {
+    /// The slug feature branch.
+    pub branch: String,
+    /// The allowlisted remote name.
+    pub remote: String,
+    /// The declared force flag (never allowed).
+    pub force: bool,
+}
+
+/// Resolve the params-caused inputs of `branch_push` (branch slug, remote,
+/// and the push policy).
+pub fn branch_push_inputs(
+    params: Option<&Val>,
+    contract: &ParamContract<'_>,
+) -> Result<BranchPushInputs, EffectOutcome> {
+    let branch = match param_str(params, "branch") {
+        Ok(value) if is_slug(value) => value.to_string(),
+        _ => {
+            return Err(refusal(
+                code::BAD_PARAMS,
+                "branch_push requires a slug branch",
+            ));
+        }
+    };
+    let remote = param_str(params, "remote")?.to_string();
+    let force = param_bool(params, "force");
+    check_push_policy(
+        &branch,
+        force,
+        contract.integration_branch,
+        contract.production_branches,
+    )
+    .map_err(|err| refusal(err.code, err.message))?;
+    Ok(BranchPushInputs {
+        branch,
+        remote,
+        force,
+    })
+}
+
+/// The params-caused inputs of `publish` / `pr_update`.
+#[derive(Clone, Debug)]
+pub struct PrUpdateInputs {
+    /// The action (`create` | `comment`).
+    pub action: String,
+    /// The owner/name repository identity.
+    pub repo: String,
+    /// The head branch.
+    pub head: String,
+    /// The base branch (`create` only).
+    pub base: Option<String>,
+    /// The PR title.
+    pub title: String,
+    /// The PR body / comment text.
+    pub body: String,
+    /// The PR number (`comment`; `0` when absent).
+    pub number: i64,
+}
+
+/// Resolve the params-caused inputs of `publish` / `pr_update` (params
+/// required; action, owner/name repo, head; `create` additionally requires a
+/// base and passes the main-PR-origin and external-contributor policy).
+pub fn pr_update_inputs(
+    params: Option<&Val>,
+    contract: &ParamContract<'_>,
+) -> Result<PrUpdateInputs, EffectOutcome> {
+    let Some(params) = params else {
+        return Err(refusal(code::BAD_PARAMS, "pr_update requires params"));
+    };
+    let action = match param_str(Some(params), "action") {
+        Ok(value @ ("create" | "comment")) => value.to_string(),
+        _ => {
+            return Err(refusal(
+                code::BAD_PARAMS,
+                "pr_update action must be create|comment",
+            ));
+        }
+    };
+    let repo = match param_str(Some(params), "repo") {
+        Ok(value) if is_repository_identity(value) => value.to_string(),
+        _ => {
+            return Err(refusal(
+                code::BAD_PARAMS,
+                "pr_update requires an owner/name repo",
+            ));
+        }
+    };
+    let head = param_str(Some(params), "head")?.to_string();
+    let base = if action == "create" {
+        let base = param_str(Some(params), "base")?.to_string();
+        check_main_pr_origin(
+            &head,
+            &base,
+            contract.integration_branch,
+            contract.production_branches,
+        )
+        .map_err(|err| refusal(err.code, err.message))?;
+        let head_repo_matches =
+            param_str_opt(Some(params), "head_repo").is_none_or(|hr| hr == repo);
+        check_external_contributor(
+            head_repo_matches,
+            param_bool(Some(params), "maintainer_approval"),
+        )
+        .map_err(|err| refusal(err.code, err.message))?;
+        Some(base)
+    } else {
+        None
+    };
+    Ok(PrUpdateInputs {
+        action,
+        repo,
+        head,
+        base,
+        title: param_str_opt(Some(params), "title")
+            .unwrap_or("")
+            .to_string(),
+        body: param_str_opt(Some(params), "body")
+            .unwrap_or("")
+            .to_string(),
+        number: param_int(Some(params), "number").unwrap_or(0),
+    })
+}
+
+/// The params-caused inputs of `issue_update`.
+#[derive(Clone, Debug)]
+pub struct IssueUpdateInputs {
+    /// The action (`comment` | `close`).
+    pub action: String,
+    /// The owner/name repository identity.
+    pub repo: String,
+}
+
+/// Resolve the params-caused inputs of `issue_update` (params required;
+/// action and owner/name repo).
+pub fn issue_update_inputs(params: Option<&Val>) -> Result<IssueUpdateInputs, EffectOutcome> {
+    let Some(params) = params else {
+        return Err(refusal(code::BAD_PARAMS, "issue_update requires params"));
+    };
+    let action = match param_str(Some(params), "action") {
+        Ok("comment") | Ok("close") => param_str(Some(params), "action")
+            .unwrap_or("comment")
+            .to_string(),
+        _ => {
+            return Err(refusal(
+                code::BAD_PARAMS,
+                "issue_update action must be comment|close",
+            ));
+        }
+    };
+    let repo = match param_str(Some(params), "repo") {
+        Ok(value) if is_repository_identity(value) => value.to_string(),
+        _ => {
+            return Err(refusal(
+                code::BAD_PARAMS,
+                "issue_update requires an owner/name repo",
+            ));
+        }
+    };
+    Ok(IssueUpdateInputs { action, repo })
+}
+
+/// Resolve the params-caused input of `hosted_check` (params required; an
+/// owner/name repo).
+pub fn hosted_check_inputs(params: Option<&Val>) -> Result<String, EffectOutcome> {
+    let Some(params) = params else {
+        return Err(refusal(code::BAD_PARAMS, "hosted_check requires params"));
+    };
+    match param_str(Some(params), "repo") {
+        Ok(value) if is_repository_identity(value) => Ok(value.to_string()),
+        _ => Err(refusal(
+            code::BAD_PARAMS,
+            "hosted_check requires an owner/name repo",
+        )),
+    }
+}
+
+/// Resolve the params-caused input of `post_merge_verify` (the exact reviewed
+/// feature head from the request's observed block).
+pub fn post_merge_verify_inputs(contract: &ParamContract<'_>) -> Result<String, EffectOutcome> {
+    match contract.observed_feature_head {
+        Some(value) if is_hex40(value) => Ok(value.to_string()),
+        _ => Err(refusal(
+            code::BAD_PARAMS,
+            "post_merge_verify requires observed.feature_head (exact reviewed head)",
+        )),
+    }
+}
+
+/// The params-caused inputs of `cleanup`.
+#[derive(Clone, Debug)]
+pub struct CleanupInputs {
+    /// The relative lane worktree to clean up.
+    pub worktree: String,
+    /// The slug branch the worktree carries.
+    pub branch: String,
+}
+
+/// Resolve the params-caused inputs of `cleanup` (worktree and slug branch
+/// required; a declared `archive` needs the daemon-owned archive root).
+pub fn cleanup_inputs(
+    params: Option<&Val>,
+    contract: &ParamContract<'_>,
+) -> Result<CleanupInputs, EffectOutcome> {
+    let worktree = param_str(params, "worktree")?.to_string();
+    screened_containment(contract, &worktree)?;
+    let branch = match param_str(params, "branch") {
+        Ok(value) if is_slug(value) => value.to_string(),
+        _ => return Err(refusal(code::BAD_PARAMS, "cleanup requires a slug branch")),
+    };
+    if param_bool(params, "archive") && !contract.has_archive_root {
+        return Err(refusal(
+            code::BAD_PARAMS,
+            "cleanup archive requires topology.archive_root (daemon-owned)",
+        ));
+    }
+    Ok(CleanupInputs { worktree, branch })
+}
+
+/// Resolve the params-caused inputs of `branch_delete` (a slug FEATURE
+/// branch).
+pub fn branch_delete_inputs(
+    params: Option<&Val>,
+    contract: &ParamContract<'_>,
+) -> Result<String, EffectOutcome> {
+    let branch = match param_str(params, "branch") {
+        Ok(value) if is_slug(value) => value.to_string(),
+        _ => {
+            return Err(refusal(
+                code::BAD_PARAMS,
+                "branch_delete requires a slug branch",
+            ));
+        }
+    };
+    let kind = classify_branch(
+        &branch,
+        contract.integration_branch,
+        contract.production_branches,
+    );
+    if kind != BranchKind::Feature {
+        return Err(refusal(
+            code::PUSH_POLICY,
+            format!("branch_delete only removes feature lanes, got {branch:?}"),
+        ));
+    }
+    Ok(branch)
+}
+
+/// Resolve the params-caused inputs of `approve` (params required; a 64-hex
+/// digest; the interactive confirmation).
+pub fn approve_inputs(params: Option<&Val>) -> Result<String, EffectOutcome> {
+    let Some(params) = params else {
+        return Err(refusal(code::BAD_PARAMS, "approve requires params"));
+    };
+    let digest = match param_str(Some(params), "digest") {
+        Ok(value) if is_hex64(value) => value.to_string(),
+        _ => {
+            return Err(refusal(
+                code::BAD_PARAMS,
+                "approve requires a 64-hex digest",
+            ));
+        }
+    };
+    if !param_bool(Some(params), "interactive") {
+        return Err(refusal(
+            code::APPROVAL_NOT_INTERACTIVE,
+            "the first-real-write approval must be an interactive TTY confirmation",
+        ));
+    }
+    Ok(digest)
+}
+
 /// The `worktree_create` lane inputs — the branch and the relative worktree
 /// path — resolved from the step params. The ONE authoring of this step
-/// kind's param contract (issue #92): the effect and the daemon-side
-/// well-formedness check ([`check_step_params`]) both read it, so a request
-/// is refused for exactly the reason (and code) the effect would refuse it.
+/// kind's param contract: the effect and the pre-screen both read it.
 pub fn worktree_create_inputs(
     params: Option<&Val>,
-    integration_branch: &str,
-    production_branches: &[String],
+    contract: &ParamContract<'_>,
 ) -> Result<(String, String), EffectOutcome> {
     let branch = match param_str(params, "branch") {
         Ok(branch) if is_slug(branch) => branch.to_string(),
@@ -1422,30 +2047,37 @@ pub fn worktree_create_inputs(
             ));
         }
     };
-    let kind = classify_branch(&branch, integration_branch, production_branches);
+    let kind = classify_branch(
+        &branch,
+        contract.integration_branch,
+        contract.production_branches,
+    );
     if kind != BranchKind::Feature {
         return Err(refusal(
             code::PUSH_POLICY,
             format!("worktree branches must be feature lanes, got {branch:?}"),
         ));
     }
-    match param_str(params, "worktree") {
-        Ok(relative) => Ok((branch, relative.to_string())),
-        Err(outcome) => Err(outcome),
-    }
+    let relative = param_str(params, "worktree")?.to_string();
+    screened_containment(contract, &relative)?;
+    Ok((branch, relative))
 }
 
-/// The daemon-side param contract of one step kind (issue #92): `Ok(())` when
-/// the presented params are well-formed enough for the effect to be
-/// ATTEMPTED, a typed refusal otherwise. Pure: no state, no subprocess, no
-/// side effect. The dispatch path evaluates it BEFORE any retry
-/// authorization is consumed, so a malformed re-dispatch refuses typed and
-/// never burns the operator's single-use authorization.
+/// The daemon-side param contract of one step kind: `Ok(())` when the
+/// presented params are well-formed enough for the effect to be ATTEMPTED, a
+/// typed refusal otherwise. TOTAL and fail-closed over the closed step-kind
+/// set: every params-caused refusal the effect body resolves (step params,
+/// the request-level `observed` read-backs, the topology gates) is raised
+/// here, BEFORE the bounded-retry fence can consume a single-use
+/// authorization. A kind with no registered contract refuses too — no
+/// unregistered kind ever inherits the burn. Pure: no state, no subprocess,
+/// no side effect. The dispatch path evaluates it before anything is
+/// journaled, so a malformed re-dispatch refuses typed and never burns the
+/// operator's single-use authorization.
 pub fn check_step_params(
     kind: &str,
     params: Option<&Val>,
-    integration_branch: &str,
-    production_branches: &[String],
+    contract: &ParamContract<'_>,
 ) -> Result<(), (String, String)> {
     let typed = |outcome: EffectOutcome| -> (String, String) {
         (
@@ -1456,19 +2088,76 @@ pub fn check_step_params(
         )
     };
     match kind {
+        // The effect reads no param and refuses none.
+        "checkout" => {}
         "worktree_create" => {
-            worktree_create_inputs(params, integration_branch, production_branches)
+            worktree_create_inputs(params, contract)
                 .map(|_| ())
                 .map_err(typed)?;
         }
-        // Both kinds run a child and refuse a missing params block.
-        "harness_start" | "prompt" if params.is_none() => {
+        "harness_start" => {
+            harness_start_inputs(params).map(|_| ()).map_err(typed)?;
+        }
+        "prompt" => {
+            prompt_inputs(params, contract).map(|_| ()).map_err(typed)?;
+        }
+        "collect_outcome" => {
+            collect_outcome_inputs(params, contract)
+                .map(|_| ())
+                .map_err(typed)?;
+        }
+        "review_evidence" => {
+            review_evidence_inputs(params, contract)
+                .map(|_| ())
+                .map_err(typed)?;
+        }
+        "merge" => {
+            merge_inputs(params, contract).map(|_| ()).map_err(typed)?;
+        }
+        "cleanup" => {
+            cleanup_inputs(params, contract)
+                .map(|_| ())
+                .map_err(typed)?;
+        }
+        "publish" | "pr_update" => {
+            pr_update_inputs(params, contract)
+                .map(|_| ())
+                .map_err(typed)?;
+        }
+        "branch_push" => {
+            branch_push_inputs(params, contract)
+                .map(|_| ())
+                .map_err(typed)?;
+        }
+        "issue_update" => {
+            issue_update_inputs(params).map(|_| ()).map_err(typed)?;
+        }
+        "hosted_check" => {
+            hosted_check_inputs(params).map(|_| ()).map_err(typed)?;
+        }
+        "post_merge_verify" => {
+            post_merge_verify_inputs(contract)
+                .map(|_| ())
+                .map_err(typed)?;
+        }
+        "branch_delete" => {
+            branch_delete_inputs(params, contract)
+                .map(|_| ())
+                .map_err(typed)?;
+        }
+        "approve" => {
+            approve_inputs(params).map(|_| ()).map_err(typed)?;
+        }
+        other => {
             return Err((
-                code::BAD_PARAMS.to_string(),
-                format!("{kind} requires params"),
+                code::UNKNOWN_KIND.to_string(),
+                format!(
+                    "step kind {other:?} has no registered param contract; a dispatch of an \
+                     unsupported kind is refused before any bounded retry authorization is \
+                     consumed"
+                ),
             ));
         }
-        _ => {}
     }
     // A declared bounded deadline is part of the same contract.
     effect_deadline_secs(kind, params)
@@ -1479,11 +2168,10 @@ pub fn check_step_params(
 /// `worktree_create`: create an isolated lane worktree + branch off the
 /// current integration head (path-contained under the lane root).
 fn effect_worktree_create(ctx: &EffectContext<'_>) -> EffectOutcome {
-    let (branch, relative) =
-        match worktree_create_inputs(ctx.params, ctx.integration_branch, ctx.production_branches) {
-            Ok(inputs) => inputs,
-            Err(outcome) => return outcome,
-        };
+    let (branch, relative) = match worktree_create_inputs(ctx.params, &ctx.param_contract()) {
+        Ok(inputs) => inputs,
+        Err(outcome) => return outcome,
+    };
     let worktree = match contained_path(ctx.worktrees_root, &relative) {
         Ok(path) => path,
         Err(err) => return refusal(err.code, err.message),
@@ -1547,11 +2235,15 @@ fn effect_worktree_create(ctx: &EffectContext<'_>) -> EffectOutcome {
 /// inside the assigned worktree); a declarative `argv` profile that declares
 /// its own `start` row really runs it, bounded.
 fn effect_harness_start(ctx: &EffectContext<'_>) -> EffectOutcome {
+    let inputs = match harness_start_inputs(ctx.params) {
+        Ok(inputs) => inputs,
+        Err(outcome) => return outcome,
+    };
     let params = match ctx.params {
         Some(params) => params,
         None => return refusal(code::BAD_PARAMS, "harness_start requires params"),
     };
-    let session = match resolve_session(ctx, Some(params), "harness_start") {
+    let session = match resolve_session(ctx, inputs.declared, "harness_start") {
         Ok(session) => session,
         Err(outcome) => return outcome,
     };
@@ -1617,53 +2309,17 @@ fn session_binding_result(
     ])
 }
 
-/// Resolve the session identity one harness step runs under (issue #92 F2).
-/// The run's bound session is authoritative when the run has one (it is what
-/// `harness_start` bound); a presented plan may declare the identity instead
-/// (`session_id` + `herdr_session` + `terminal_session`, all three — a
-/// partial identity is refused) and the two must AGREE. When neither exists
-/// the step is refused: the adapter never invents a session identity and
-/// never substitutes a default.
+/// The session one harness step runs under (issue #92 F2): the run's BOUND
+/// session is authoritative when the run has one (it is what `harness_start`
+/// bound); the identity the step declares (resolved by [`declared_session`],
+/// the params-only half both the pre-screen and this function read) must
+/// AGREE with it. When neither exists the step is refused: the adapter never
+/// invents a session identity and never substitutes a default.
 fn resolve_session(
     ctx: &EffectContext<'_>,
-    params: Option<&Val>,
+    declared: Option<crate::adapters::SessionHandle>,
     what: &str,
 ) -> Result<crate::adapters::SessionHandle, EffectOutcome> {
-    let declared = match (
-        param_str_opt(params, "session_id"),
-        param_str_opt(params, "herdr_session"),
-        param_str_opt(params, "terminal_session"),
-    ) {
-        (None, None, None) => None,
-        (session_id, herdr_session, terminal_session) => {
-            let (session_id, herdr_session, terminal_session) =
-                match (session_id, herdr_session, terminal_session) {
-                    (Some(session_id), Some(herdr_session), Some(terminal_session)) => {
-                        (session_id, herdr_session, terminal_session)
-                    }
-                    _ => {
-                        return Err(refusal(
-                            crate::adapters::CODE_INCOMPLETE_IDENTITY,
-                            format!(
-                                "{what} declares an incomplete session identity: session_id, \
-                                 herdr_session and terminal_session are all required (a partial \
-                                 identity is never completed by a default)"
-                            ),
-                        ));
-                    }
-                };
-            let generation = param_int(params, "generation").unwrap_or(1);
-            if generation < 0 {
-                return Err(refusal(code::BAD_PARAMS, "generation must be non-negative"));
-            }
-            let identity =
-                crate::adapters::bind_identity(herdr_session, terminal_session, generation as u64)
-                    .map_err(|err| refusal(err.code, err.message))?;
-            let session = crate::adapters::new_session(session_id, identity)
-                .map_err(|err| refusal(err.code, err.message))?;
-            Some(session)
-        }
-    };
     match (ctx.session, declared) {
         (Some(bound), Some(declared)) => {
             if bound != &declared {
@@ -1715,15 +2371,12 @@ fn effect_prompt(ctx: &EffectContext<'_>) -> EffectOutcome {
         Some(params) => params,
         None => return refusal(code::BAD_PARAMS, "prompt requires params"),
     };
-    let payload = match param_str(Some(params), "payload") {
-        Ok(value) => value,
+    let inputs = match prompt_inputs(ctx.params, &ctx.param_contract()) {
+        Ok(inputs) => inputs,
         Err(outcome) => return outcome,
     };
-    let relative = match param_str(Some(params), "worktree") {
-        Ok(value) => value,
-        Err(outcome) => return outcome,
-    };
-    let worktree = match contained_path(ctx.worktrees_root, relative) {
+    let payload = inputs.payload.as_str();
+    let worktree = match contained_path(ctx.worktrees_root, &inputs.worktree) {
         Ok(path) => path,
         Err(err) => return refusal(err.code, err.message),
     };
@@ -1742,7 +2395,7 @@ fn effect_prompt(ctx: &EffectContext<'_>) -> EffectOutcome {
     // reviewed plan declares. A partial or absent identity is refused; the
     // adapter never invents one (the pre-fix default "herdr-fleet-lane" is
     // gone).
-    let session = match resolve_session(ctx, Some(params), "prompt") {
+    let session = match resolve_session(ctx, inputs.declared, "prompt") {
         Ok(session) => session,
         Err(outcome) => return outcome,
     };
@@ -1785,16 +2438,16 @@ fn effect_prompt(ctx: &EffectContext<'_>) -> EffectOutcome {
 /// base and read the harness terminal outcome through the workspace
 /// protocol (herdr workspace executable; fake-pinned in tests).
 fn effect_collect_outcome(ctx: &EffectContext<'_>) -> EffectOutcome {
-    let relative = match param_str(ctx.params, "worktree") {
-        Ok(value) => value,
+    let inputs = match collect_outcome_inputs(ctx.params, &ctx.param_contract()) {
+        Ok(inputs) => inputs,
         Err(outcome) => return outcome,
     };
-    let worktree = match contained_path(ctx.worktrees_root, relative) {
+    let worktree = match contained_path(ctx.worktrees_root, &inputs.worktree) {
         Ok(path) => path,
         Err(err) => return refusal(err.code, err.message),
     };
-    let base_head = match param_str_opt(ctx.params, "base_head") {
-        Some(head) => head.to_string(),
+    let base_head = match inputs.base_head {
+        Some(head) => head,
         None => match run_git(
             ctx,
             ctx.integration_repo,
@@ -1848,65 +2501,18 @@ fn effect_collect_outcome(ctx: &EffectContext<'_>) -> EffectOutcome {
 /// record values the daemon stores durably (AC4 bindings; reviewer distinct
 /// from implementer). No subprocess runs.
 fn effect_review_evidence(ctx: &EffectContext<'_>) -> EffectOutcome {
-    let params = match ctx.params {
-        Some(params) => params,
-        None => return refusal(code::BAD_PARAMS, "review_evidence requires params"),
-    };
-    let reviewer = match param_str(Some(params), "reviewer") {
-        Ok(value) => value.to_string(),
+    let inputs = match review_evidence_inputs(ctx.params, &ctx.param_contract()) {
+        Ok(inputs) => inputs,
         Err(outcome) => return outcome,
-    };
-    let implementer = match param_str(Some(params), "implementer") {
-        Ok(value) => value.to_string(),
-        Err(outcome) => return outcome,
-    };
-    let verdict = match param_str(Some(params), "verdict") {
-        Ok(value) if matches!(value, "pass" | "fail") => value.to_string(),
-        _ => {
-            return refusal(
-                code::BAD_PARAMS,
-                "review_evidence verdict must be pass|fail",
-            );
-        }
-    };
-    let feature_head = match ctx.observed_feature_head {
-        Some(value) if is_hex40(value) => value.to_string(),
-        _ => {
-            return refusal(
-                code::BAD_PARAMS,
-                "review_evidence requires observed.feature_head (fresh exact-head read-back)",
-            );
-        }
-    };
-    let integration_base = match ctx.observed_integration_base {
-        Some(value) if is_hex40(value) => value.to_string(),
-        _ => {
-            return refusal(
-                code::BAD_PARAMS,
-                "review_evidence requires observed.integration_base (fresh read-back)",
-            );
-        }
-    };
-    if let Err(err) = check_reviewer_distinct(&reviewer, &implementer) {
-        return refusal(err.code, err.message);
-    }
-    let checks = match params.get("checks") {
-        Some(Val::Arr(items)) if !items.is_empty() => Val::Arr(items.clone()),
-        _ => {
-            return refusal(
-                code::BAD_PARAMS,
-                "review_evidence requires a non-empty checks list",
-            );
-        }
     };
     ok(object(vec![
         ("repository", string(ctx.repository)),
-        ("feature_head", string(&feature_head)),
-        ("integration_base", string(&integration_base)),
+        ("feature_head", string(&inputs.feature_head)),
+        ("integration_base", string(&inputs.integration_base)),
         ("workflow_hash", string(&ctx.plan.workflow_hash)),
-        ("verdict", string(&verdict)),
-        ("reviewer", string(&reviewer)),
-        ("checks", checks),
+        ("verdict", string(&inputs.verdict)),
+        ("reviewer", string(&inputs.reviewer)),
+        ("checks", inputs.checks),
     ]))
 }
 
@@ -1914,17 +2520,10 @@ fn effect_review_evidence(ctx: &EffectContext<'_>) -> EffectOutcome {
 /// checkout (fast-forward only — a moved base refuses deterministically).
 /// The evidence gate runs daemon-side before this effect.
 fn effect_merge(ctx: &EffectContext<'_>) -> EffectOutcome {
-    let branch = match param_str(ctx.params, "branch") {
-        Ok(value) if is_slug(value) => value.to_string(),
-        _ => return refusal(code::BAD_PARAMS, "merge requires a slug feature branch"),
+    let branch = match merge_inputs(ctx.params, &ctx.param_contract()) {
+        Ok(branch) => branch,
+        Err(outcome) => return outcome,
     };
-    let kind = classify_branch(&branch, ctx.integration_branch, ctx.production_branches);
-    if kind != BranchKind::Feature {
-        return refusal(
-            code::PUSH_POLICY,
-            format!("only feature branches merge to the integration branch, got {branch:?}"),
-        );
-    }
     // The integration checkout must sit on the integration branch.
     let current = match run_git(ctx, ctx.integration_repo, &["branch", "--show-current"]) {
         Ok(out) => out.stdout.trim().to_string(),
@@ -1968,14 +2567,9 @@ fn effect_merge(ctx: &EffectContext<'_>) -> EffectOutcome {
 /// `post_merge_verify`: prove the merged integration head contains the
 /// reviewed feature head (exact git ancestry; AC7's verification step).
 fn effect_post_merge_verify(ctx: &EffectContext<'_>) -> EffectOutcome {
-    let feature_head = match ctx.observed_feature_head {
-        Some(value) if is_hex40(value) => value.to_string(),
-        _ => {
-            return refusal(
-                code::BAD_PARAMS,
-                "post_merge_verify requires observed.feature_head (exact reviewed head)",
-            );
-        }
+    let feature_head = match post_merge_verify_inputs(&ctx.param_contract()) {
+        Ok(head) => head,
+        Err(outcome) => return outcome,
     };
     let ancestor = run_git(
         ctx,
@@ -2013,22 +2607,12 @@ fn effect_post_merge_verify(ctx: &EffectContext<'_>) -> EffectOutcome {
 /// force; never integration/production). Read-back verifies the remote ref
 /// equals the local head (exact external read-back, AC1).
 fn effect_branch_push(ctx: &EffectContext<'_>) -> EffectOutcome {
-    let branch = match param_str(ctx.params, "branch") {
-        Ok(value) if is_slug(value) => value.to_string(),
-        _ => return refusal(code::BAD_PARAMS, "branch_push requires a slug branch"),
-    };
-    let remote = match param_str(ctx.params, "remote") {
-        Ok(value) => value.to_string(),
+    let inputs = match branch_push_inputs(ctx.params, &ctx.param_contract()) {
+        Ok(inputs) => inputs,
         Err(outcome) => return outcome,
     };
-    if let Err(err) = check_push_policy(
-        &branch,
-        param_bool(ctx.params, "force"),
-        ctx.integration_branch,
-        ctx.production_branches,
-    ) {
-        return refusal(err.code, err.message);
-    }
+    let branch = inputs.branch;
+    let remote = inputs.remote;
     // Push from the integration checkout (the branch ref is shared with the
     // lane worktree; git resolves it from the common object store).
     match run_git(ctx, ctx.integration_repo, &["push", &remote, &branch]) {
@@ -2071,49 +2655,17 @@ fn effect_branch_push(ctx: &EffectContext<'_>) -> EffectOutcome {
 /// (`gh`); policy probes run first (main-PR origin, external-contributor
 /// approval). The fake `gh` pins the argv shape in tests.
 fn effect_pr_update(ctx: &EffectContext<'_>) -> EffectOutcome {
-    let params = match ctx.params {
-        Some(params) => params,
-        None => return refusal(code::BAD_PARAMS, "pr_update requires params"),
-    };
-    let action = match param_str(Some(params), "action") {
-        Ok("create") | Ok("comment") => param_str(Some(params), "action")
-            .unwrap_or("create")
-            .to_string(),
-        _ => return refusal(code::BAD_PARAMS, "pr_update action must be create|comment"),
-    };
-    let repo = match param_str(Some(params), "repo") {
-        Ok(value) if is_repository_identity(value) => value.to_string(),
-        _ => return refusal(code::BAD_PARAMS, "pr_update requires an owner/name repo"),
-    };
-    let head = match param_str(Some(params), "head") {
-        Ok(value) => value.to_string(),
+    let inputs = match pr_update_inputs(ctx.params, &ctx.param_contract()) {
+        Ok(inputs) => inputs,
         Err(outcome) => return outcome,
     };
-    if action == "create" {
-        let base = match param_str(Some(params), "base") {
-            Ok(value) => value.to_string(),
-            Err(outcome) => return outcome,
-        };
-        if let Err(err) = check_main_pr_origin(
-            &head,
-            &base,
-            ctx.integration_branch,
-            ctx.production_branches,
-        ) {
-            return refusal(err.code, err.message);
-        }
-        let head_repo_matches =
-            param_str_opt(Some(params), "head_repo").is_none_or(|hr| hr == repo);
-        if let Err(err) = check_external_contributor(
-            head_repo_matches,
-            param_bool(Some(params), "maintainer_approval"),
-        ) {
-            return refusal(err.code, err.message);
-        }
-    }
-    let title = param_str_opt(Some(params), "title").unwrap_or("");
-    let body = param_str_opt(Some(params), "body").unwrap_or("");
-    let number = param_int(Some(params), "number").unwrap_or(0);
+    let action = inputs.action;
+    let repo = inputs.repo;
+    let head = inputs.head;
+    let title = inputs.title;
+    let body = inputs.body;
+    let number = inputs.number;
+    let base = inputs.base;
     let args = if action == "create" {
         vec![
             "pr".to_string(),
@@ -2121,7 +2673,7 @@ fn effect_pr_update(ctx: &EffectContext<'_>) -> EffectOutcome {
             "--repo".to_string(),
             repo.clone(),
             "--base".to_string(),
-            param_str(Some(params), "base").unwrap_or("").to_string(),
+            base.clone().unwrap_or_default(),
             "--head".to_string(),
             head.clone(),
             "--title".to_string(),
@@ -2172,27 +2724,14 @@ fn effect_pr_update(ctx: &EffectContext<'_>) -> EffectOutcome {
 /// Closing requires the AC7 gate (merge + post-merge verification), which
 /// the daemon evaluates with [`check_issue_closure`] before this effect.
 fn effect_issue_update(ctx: &EffectContext<'_>) -> EffectOutcome {
-    let params = match ctx.params {
-        Some(params) => params,
-        None => return refusal(code::BAD_PARAMS, "issue_update requires params"),
+    let inputs = match issue_update_inputs(ctx.params) {
+        Ok(inputs) => inputs,
+        Err(outcome) => return outcome,
     };
-    let action = match param_str(Some(params), "action") {
-        Ok("comment") | Ok("close") => param_str(Some(params), "action")
-            .unwrap_or("comment")
-            .to_string(),
-        _ => {
-            return refusal(
-                code::BAD_PARAMS,
-                "issue_update action must be comment|close",
-            );
-        }
-    };
-    let repo = match param_str(Some(params), "repo") {
-        Ok(value) if is_repository_identity(value) => value.to_string(),
-        _ => return refusal(code::BAD_PARAMS, "issue_update requires an owner/name repo"),
-    };
-    let number = param_int(Some(params), "number").unwrap_or(0);
-    let body = param_str_opt(Some(params), "body").unwrap_or("");
+    let action = inputs.action;
+    let repo = inputs.repo;
+    let number = param_int(ctx.params, "number").unwrap_or(0);
+    let body = param_str_opt(ctx.params, "body").unwrap_or("");
     let args = if action == "close" {
         vec![
             "issue".to_string(),
@@ -2240,15 +2779,11 @@ fn effect_issue_update(ctx: &EffectContext<'_>) -> EffectOutcome {
 /// `hosted_check`: observe hosted checks for a PR through the forge adapter
 /// (read-only; `gh pr checks` pinned by the fake in tests).
 fn effect_hosted_check(ctx: &EffectContext<'_>) -> EffectOutcome {
-    let params = match ctx.params {
-        Some(params) => params,
-        None => return refusal(code::BAD_PARAMS, "hosted_check requires params"),
+    let repo = match hosted_check_inputs(ctx.params) {
+        Ok(repo) => repo,
+        Err(outcome) => return outcome,
     };
-    let repo = match param_str(Some(params), "repo") {
-        Ok(value) if is_repository_identity(value) => value.to_string(),
-        _ => return refusal(code::BAD_PARAMS, "hosted_check requires an owner/name repo"),
-    };
-    let number = param_int(Some(params), "number").unwrap_or(0);
+    let number = param_int(ctx.params, "number").unwrap_or(0);
     let args = vec![
         "pr".to_string(),
         "checks".to_string(),
@@ -2288,10 +2823,11 @@ fn effect_hosted_check(ctx: &EffectContext<'_>) -> EffectOutcome {
 /// (AC8). The daemon journals the salvage evidence (`mutate.salvage`)
 /// before invoking this effect.
 fn effect_cleanup(ctx: &EffectContext<'_>) -> EffectOutcome {
-    let relative = match param_str(ctx.params, "worktree") {
-        Ok(value) => value,
+    let inputs = match cleanup_inputs(ctx.params, &ctx.param_contract()) {
+        Ok(inputs) => inputs,
         Err(outcome) => return outcome,
     };
+    let relative = inputs.worktree.as_str();
     let worktree = match contained_path(ctx.worktrees_root, relative) {
         Ok(path) => path,
         Err(err) => return refusal(err.code, err.message),
@@ -2313,10 +2849,7 @@ fn effect_cleanup(ctx: &EffectContext<'_>) -> EffectOutcome {
             ),
         );
     }
-    let branch = match param_str(ctx.params, "branch") {
-        Ok(value) if is_slug(value) => value.to_string(),
-        _ => return refusal(code::BAD_PARAMS, "cleanup requires a slug branch"),
-    };
+    let branch = inputs.branch;
     if !worktree.exists() {
         return failed(
             code::CLEANUP_UNKNOWN,
@@ -2449,17 +2982,10 @@ fn effect_cleanup(ctx: &EffectContext<'_>) -> EffectOutcome {
 /// `branch_delete`: delete a lane branch after its head is verified merged
 /// into the integration branch (no force path; AC6/AC8).
 fn effect_branch_delete(ctx: &EffectContext<'_>) -> EffectOutcome {
-    let branch = match param_str(ctx.params, "branch") {
-        Ok(value) if is_slug(value) => value.to_string(),
-        _ => return refusal(code::BAD_PARAMS, "branch_delete requires a slug branch"),
+    let branch = match branch_delete_inputs(ctx.params, &ctx.param_contract()) {
+        Ok(branch) => branch,
+        Err(outcome) => return outcome,
     };
-    let kind = classify_branch(&branch, ctx.integration_branch, ctx.production_branches);
-    if kind != BranchKind::Feature {
-        return refusal(
-            code::PUSH_POLICY,
-            format!("branch_delete only removes feature lanes, got {branch:?}"),
-        );
-    }
     let branch_head = match run_git(
         ctx,
         ctx.integration_repo,
@@ -2504,21 +3030,10 @@ fn effect_branch_delete(ctx: &EffectContext<'_>) -> EffectOutcome {
 /// daemon stores the durable approval row; this effect only validates the
 /// typed digest/interactive flags (interactive TTY confirmation required).
 fn effect_approve(ctx: &EffectContext<'_>) -> EffectOutcome {
-    let params = match ctx.params {
-        Some(params) => params,
-        None => return refusal(code::BAD_PARAMS, "approve requires params"),
+    let digest = match approve_inputs(ctx.params) {
+        Ok(digest) => digest,
+        Err(outcome) => return outcome,
     };
-    let digest = match param_str(Some(params), "digest") {
-        Ok(value) if is_hex64(value) => value.to_string(),
-        _ => return refusal(code::BAD_PARAMS, "approve requires a 64-hex digest"),
-    };
-    let interactive = param_bool(Some(params), "interactive");
-    if !interactive {
-        return refusal(
-            code::APPROVAL_NOT_INTERACTIVE,
-            "the first-real-write approval must be an interactive TTY confirmation",
-        );
-    }
     ok(object(vec![
         ("scope", string("first-write-canary")),
         ("digest", string(&digest)),
@@ -2540,23 +3055,14 @@ fn harness_profile(
     ctx: &EffectContext<'_>,
     params: &Val,
 ) -> Result<crate::adapters::Profile, EffectOutcome> {
-    let Some(key) = param_str_opt(Some(params), "harness_key") else {
-        return Err(refusal(
-            crate::config::CODE_PROFILE_BINDING,
-            "the harness step declares no role binding (step params.harness_key = the run's \
-             role_config key); there is no default profile and none is inferred",
-        ));
-    };
-    let executable = param_str_opt(Some(params), "executable").unwrap_or("");
-    if executable.contains('/') || executable.contains('\\') {
-        return Err(refusal(
-            code::BAD_PARAMS,
-            "harness executable must be a bare name resolved through the allowlisted PATH",
-        ));
-    }
-    let kind = param_str_opt(Some(params), "kind").unwrap_or("argv");
-    let parsed_kind = crate::adapters::HarnessKind::parse(kind)
-        .ok_or_else(|| refusal(code::BAD_PARAMS, format!("unknown harness kind {kind:?}")))?;
+    // The params-only half is the SAME authoring the pre-screen reads
+    // ([`harness_inputs`]); this function adds the durable-state agreement.
+    let HarnessInputs {
+        key,
+        executable,
+        kind,
+        parsed_kind,
+    } = harness_inputs(params)?;
     // The run's committed role configuration is authoritative when present.
     if let Some(role) = ctx.role {
         if role.key != key {
@@ -2580,22 +3086,12 @@ fn harness_profile(
             ));
         }
         let profile = match crate::adapters::official_spec(parsed_kind) {
-            Some(spec) => {
-                if !executable.is_empty() && executable != spec.executable {
-                    return Err(refusal(
-                        code::BAD_PARAMS,
-                        format!(
-                            "the step declares executable {executable:?}, which is not the \
-                             official {:?} executable {:?}",
-                            kind, spec.executable
-                        ),
-                    ));
-                }
-                crate::adapters::Profile::official(parsed_kind, &role.key)
-            }
+            // The declared executable was already screened against the
+            // official spec by `harness_inputs` (the params-only half).
+            Some(_spec) => crate::adapters::Profile::official(parsed_kind, &role.key),
             None => crate::adapters::Profile::argv(
                 &role.key,
-                executable,
+                &executable,
                 &crate::adapters::HARNESS_CAPS,
                 BTreeMap::new(),
             ),
@@ -2612,8 +3108,8 @@ fn harness_profile(
     // defaulted but the declarative kind.
     if parsed_kind == crate::adapters::HarnessKind::Argv {
         crate::adapters::Profile::argv(
-            key,
-            executable,
+            &key,
+            &executable,
             &crate::adapters::HARNESS_CAPS,
             BTreeMap::new(),
         )
@@ -2621,7 +3117,7 @@ fn harness_profile(
     } else {
         // Official kinds carry their own metadata (executable must match
         // the official name; fake executables in tests use those names).
-        crate::adapters::Profile::official(parsed_kind, key)
+        crate::adapters::Profile::official(parsed_kind, &key)
             .map_err(|err| refusal(err.code, err.message))
     }
 }
@@ -2673,6 +3169,171 @@ mod tests {
             Some(PROMPT_DEADLINE_DEFAULT_SECS)
         );
         assert_eq!(bounded_effect_deadline("approve", None), None);
+    }
+
+    /// Issue #92 F7: the pre-screen is TOTAL over the closed step-kind set.
+    /// Every kind that requires params refuses a param-less and an empty-object
+    /// dispatch HERE (before the fence can consume a single-use
+    /// authorization), a kind with no registered contract refuses instead of
+    /// inheriting the burn, and a well-formed shape of each kind still passes
+    /// — so the pre-screen is fail-closed without being blanket-refusing.
+    #[test]
+    fn the_param_pre_screen_is_total_over_every_step_kind() {
+        let empty = ParamContract::default();
+        let declared = Val::parse_json("{}").expect("an empty object parses");
+
+        // A kind that requires params refuses with NO params and with `{}`.
+        for kind in EFFECT_KINDS {
+            if kind == "checkout" {
+                // `checkout` reads no param (the integration branch is
+                // topology), so it legitimately passes both shapes.
+                assert!(check_step_params(kind, None, &empty).is_ok());
+                assert!(check_step_params(kind, Some(&declared), &empty).is_ok());
+                continue;
+            }
+            for params in [None, Some(&declared)] {
+                let refused = check_step_params(kind, params, &empty).expect_err(&format!(
+                    "{kind} must refuse a malformed dispatch before the fence"
+                ));
+                assert!(
+                    !refused.0.is_empty() && !refused.1.is_empty(),
+                    "{kind} refuses typed: {refused:?}"
+                );
+            }
+        }
+
+        // An unregistered kind never inherits the burn: it refuses too.
+        let unregistered =
+            check_step_params("no_such_kind", None, &empty).expect_err("unregistered kind");
+        assert_eq!(unregistered.0, code::UNKNOWN_KIND);
+
+        // Well-formed shapes of every kind pass (the table is not blanket).
+        let feature = object(vec![
+            ("branch", string("lane-7")),
+            ("worktree", string("lane-7")),
+        ]);
+        let harness = object(vec![("harness_key", string("lane"))]);
+        let prompt = object(vec![
+            ("harness_key", string("lane")),
+            ("payload", string("continue the lane")),
+            ("worktree", string("lane-7")),
+        ]);
+        let review = object(vec![
+            ("reviewer", string("r1")),
+            ("implementer", string("i1")),
+            ("verdict", string("pass")),
+            ("checks", Val::Arr(vec![string("c1")])),
+        ]);
+        let publish = object(vec![
+            ("action", string("create")),
+            ("repo", string("example-org/widgets")),
+            ("head", string("lane-7")),
+            ("base", string("staging")),
+        ]);
+        let push = object(vec![
+            ("branch", string("lane-7")),
+            ("remote", string("origin")),
+        ]);
+        let pr_comment = object(vec![
+            ("action", string("comment")),
+            ("repo", string("example-org/widgets")),
+            ("head", string("lane-7")),
+        ]);
+        let issue = object(vec![
+            ("action", string("comment")),
+            ("repo", string("example-org/widgets")),
+        ]);
+        let hosted = object(vec![("repo", string("example-org/widgets"))]);
+        let approve = object(vec![
+            (
+                "digest",
+                string("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"),
+            ),
+            ("interactive", bool_(true)),
+        ]);
+        let observed = ParamContract {
+            observed_feature_head: Some("1111111111111111111111111111111111111111"),
+            observed_integration_base: Some("2222222222222222222222222222222222222222"),
+            ..ParamContract::default()
+        };
+        let accepted: Vec<(&str, Option<&Val>, &ParamContract<'_>)> = vec![
+            ("checkout", None, &empty),
+            ("worktree_create", Some(&feature), &empty),
+            ("harness_start", Some(&harness), &empty),
+            ("prompt", Some(&prompt), &empty),
+            ("collect_outcome", Some(&feature), &empty),
+            ("review_evidence", Some(&review), &observed),
+            ("merge", Some(&feature), &empty),
+            ("cleanup", Some(&feature), &empty),
+            ("publish", Some(&publish), &empty),
+            ("branch_push", Some(&push), &empty),
+            ("pr_update", Some(&pr_comment), &empty),
+            ("issue_update", Some(&issue), &empty),
+            ("hosted_check", Some(&hosted), &empty),
+            ("post_merge_verify", None, &observed),
+            ("branch_delete", Some(&feature), &empty),
+            ("approve", Some(&approve), &empty),
+        ];
+        assert_eq!(
+            accepted.len(),
+            EFFECT_KINDS.len(),
+            "every kind has one accepted witness"
+        );
+        for (kind, params, contract) in accepted {
+            assert!(
+                check_step_params(kind, params, contract).is_ok(),
+                "a well-formed {kind} dispatch passes the pre-screen"
+            );
+        }
+    }
+
+    /// Issue #92 F7: the containment screen and the official-executable
+    /// screen are part of the same pre-fence contract — an escaping worktree
+    /// path and a foreign official executable are refused BEFORE the fence,
+    /// never after it.
+    #[test]
+    fn the_param_pre_screen_screens_containment_and_official_executables() {
+        let contained = ParamContract {
+            worktrees_root: Some(Path::new("/tmp/canter-lanes")),
+            ..ParamContract::default()
+        };
+        let escaping_lane = object(vec![
+            ("branch", string("lane-7")),
+            ("worktree", string("/tmp/escape")),
+        ]);
+        let escaping_prompt = object(vec![
+            ("harness_key", string("lane")),
+            ("payload", string("continue the lane")),
+            ("worktree", string("/tmp/escape")),
+        ]);
+        let escaping_collect = object(vec![("worktree", string("/tmp/escape"))]);
+        let cases: [(&str, &Val); 4] = [
+            ("worktree_create", &escaping_lane),
+            ("prompt", &escaping_prompt),
+            ("collect_outcome", &escaping_collect),
+            ("cleanup", &escaping_lane),
+        ];
+        for (kind, params) in cases {
+            let (code, _) =
+                check_step_params(kind, Some(params), &contained).expect_err("escaping path");
+            assert_eq!(code, code::UNCONTAINED, "{kind} screens containment");
+        }
+        // The same shapes pass when they stay inside the presented root.
+        let inside = object(vec![
+            ("branch", string("lane-7")),
+            ("worktree", string("lane-7")),
+        ]);
+        assert!(check_step_params("worktree_create", Some(&inside), &contained).is_ok());
+
+        let foreign = object(vec![
+            ("harness_key", string("lane")),
+            ("kind", string("codex")),
+            ("executable", string("not-codex")),
+        ]);
+        let (code, message) =
+            check_step_params("harness_start", Some(&foreign), &ParamContract::default())
+                .expect_err("foreign official executable");
+        assert_eq!(code, code::BAD_PARAMS, "{message}");
     }
 
     // Issue #92 F2: the session identity of a run is derived ONCE, so the

@@ -2016,13 +2016,20 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
     // bounded-retry fence: a request that is not well-formed enough to be
     // attempted refuses typed here and leaves the operator's single-use
     // retry authorization UNCONSUMED, so a corrected re-dispatch stays
-    // possible. The check is the same code the effect itself resolves its
-    // inputs with, so the refusal reason never diverges.
+    // possible. The contract is TOTAL over the closed step-kind set and the
+    // check is the same code the effect itself resolves its inputs with, so
+    // the refusal reason never diverges and no kind inherits the burn.
     if let Err((code, message)) = crate::mutation::check_step_params(
         &kind,
         params,
-        &parsed.integration_branch,
-        &parsed.production_branches,
+        &crate::mutation::ParamContract {
+            integration_branch: &parsed.integration_branch,
+            production_branches: &parsed.production_branches,
+            observed_feature_head: parsed.feature_head.as_deref(),
+            observed_integration_base: parsed.integration_base.as_deref(),
+            has_archive_root: parsed.archive_root.is_some(),
+            worktrees_root: Some(parsed.worktrees_root.as_path()),
+        },
     ) {
         return resolve_apply_refusal(shared, request, &key, &code, message);
     }
@@ -3556,11 +3563,30 @@ fn method_run_dispatch(shared: &Arc<Shared>, request: &Request) -> String {
     // Fail closed BEFORE anything is journaled or claimed: a request that is
     // not well-formed enough to be attempted refuses typed here, so the
     // operator's single-use retry authorization survives for the correction.
+    // The contract is built from the SAME topology/observed read-backs the
+    // derived dispatch presents (`observed.feature_head`/`integration_base`
+    // are null on this path, exactly as the run's own dispatch presents
+    // them), so the pre-screen and the derived apply agree by construction.
+    let has_archive_root = material
+        .topology
+        .get("archive_root")
+        .is_some_and(|value| value.as_str().is_some());
+    let worktrees_root = material
+        .topology
+        .get("worktrees_root")
+        .and_then(Val::as_str)
+        .map(std::path::PathBuf::from);
     if let Err((code, message)) = crate::mutation::check_step_params(
         &kind,
         effective.as_ref(),
-        &integration_branch,
-        &production_branches,
+        &crate::mutation::ParamContract {
+            integration_branch: &integration_branch,
+            production_branches: &production_branches,
+            observed_feature_head: None,
+            observed_integration_base: None,
+            has_archive_root,
+            worktrees_root: worktrees_root.as_deref(),
+        },
     ) {
         return err_response(&request.id, &code, message);
     }
