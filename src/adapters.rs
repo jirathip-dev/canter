@@ -63,7 +63,10 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::formats::{is_actor, parse_semver};
 use crate::process::{ProcOut, ProcSpec, ProcStatus, run};
@@ -1297,12 +1300,17 @@ pub fn execute_op_in_worktree(
 /// need spawn-time group creation plus a group signal, so the effect runner
 /// lives here rather than in the read-adapter module.
 ///
-/// Group termination uses the system `kill` utility under the SAME
-/// allowlisted environment as the child (the crate forbids unsafe raw
-/// syscalls, so a `kill(2)` group signal is not available): `kill -9
-/// -<pgid>`. When that helper is not resolvable in the allowlisted PATH the
-/// runner still kills the direct child (`ProcessStatus::TimedOut` is
-/// reported either way), so a degraded PATH can never wedge the deadline.
+/// Group termination signals the child's process group through a `kill`
+/// helper resolved from the ambient environment plus the standard system
+/// directories — never from the child's allowlisted PATH, which a Linux
+/// image can lack `kill` in (issue #92 round 2: that is how the group signal
+/// silently failed and left a descendant behind). A signal that could not be
+/// delivered is reported on the captured stderr, so it stays observable in
+/// the step outcome/evidence instead of being discarded. The post-exit read
+/// of the captured pipes is bounded by [`PIPE_READ_GRACE`], so a descendant
+/// that survives the signal and holds the inherited write ends can never
+/// extend the op past `deadline + PIPE_READ_GRACE`; `ProcStatus::TimedOut`
+/// is reported either way.
 pub fn run_grouped(spec: ProcSpec<'_>) -> ProcOut {
     let started = std::time::Instant::now();
     let mut command = std::process::Command::new(spec.program);
@@ -1337,34 +1345,58 @@ pub fn run_grouped(spec: ProcSpec<'_>) -> ProcOut {
     };
     let group = child.id();
 
+    // The deadline signals the group ONCE (a helper that cannot deliver the
+    // signal is reported, never silently retried); the direct child is always
+    // also killed through the std API.
+    let mut group_signal: Option<String> = None;
+    let mut group_signalled = false;
     let status = loop {
         if started.elapsed() >= spec.timeout {
-            terminate_group(group, spec.env);
+            if !group_signalled {
+                group_signal = terminate_group(group);
+                group_signalled = true;
+            }
             let _ = child.kill();
         }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
             Err(err) => {
-                terminate_group(group, spec.env);
+                let failure = if group_signalled {
+                    None
+                } else {
+                    terminate_group(group)
+                };
                 let _ = child.kill();
                 return ProcOut {
                     status: ProcStatus::SpawnFailed(err.to_string()),
                     stdout: String::new(),
-                    stderr: String::new(),
+                    stderr: failure.map_or_else(String::new, |reason| {
+                        group_signal_diagnostic(group, &reason)
+                    }),
                     elapsed_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
                 };
             }
         }
     };
 
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        let _ = std::io::Read::read_to_string(&mut pipe, &mut stdout);
-    }
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = std::io::Read::read_to_string(&mut pipe, &mut stderr);
+    // The child is gone, but its descendants may still hold the inherited
+    // stdout/stderr write ends (a survivor that outlived the group signal), so
+    // the post-exit read is bounded by the documented grace (issue #92 round
+    // 2): the op never blocks past `deadline + PIPE_READ_GRACE`, and whatever
+    // arrived inside the bound is kept.
+    let read_deadline = started + spec.timeout + PIPE_READ_GRACE;
+    let stdout_pipe = BoundedPipe::read(child.stdout.take());
+    let stderr_pipe = BoundedPipe::read(child.stderr.take());
+    let stdout = stdout_pipe.take_within(read_deadline);
+    let mut stderr = stderr_pipe.take_within(read_deadline);
+    if let Some(reason) = &group_signal {
+        // Observable diagnostics (never discarded): the step outcome/evidence
+        // names why the group could not be signalled.
+        if !stderr.is_empty() && !stderr.ends_with('\n') {
+            stderr.push('\n');
+        }
+        stderr.push_str(&group_signal_diagnostic(group, reason));
     }
     let _ = child.wait();
 
@@ -1383,21 +1415,125 @@ pub fn run_grouped(spec: ProcSpec<'_>) -> ProcOut {
     }
 }
 
-/// Terminate one child process group by signalling its leader's group id
-/// (`kill -9 -<pgid>`) through the system `kill` helper, then fall back to
-/// the direct child. `kill(2)` is not reachable from this crate (it forbids
-/// unsafe code); the helper runs under the child's own allowlisted
-/// environment and its own output is discarded. Best effort by design: the
-/// caller always also kills the direct child with the std API.
-fn terminate_group(group: u32, env: &BTreeMap<String, String>) {
-    let _ = std::process::Command::new("kill")
-        .args(["-9", &format!("-{group}")])
-        .env_clear()
-        .envs(env)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+/// The bounded grace this runner allows a child's captured pipes to drain
+/// after the child itself is gone (issue #92 round 2). A descendant the
+/// deadline could not terminate can hold the inherited stdout/stderr write
+/// ends for its whole lifetime, so the post-exit read is bounded by this
+/// grace: the op's elapsed stays within `deadline + PIPE_READ_GRACE` (never
+/// the descendant's lifetime), and whatever arrived inside the bound is kept.
+pub const PIPE_READ_GRACE: Duration = Duration::from_millis(750);
+
+/// One child pipe read under a bound (issue #92 round 2). The read runs on a
+/// worker thread that appends whatever arrives into shared state;
+/// [`BoundedPipe::take_within`] stops waiting at the deadline and returns the
+/// capture so far, so a pipe held open by a survivor can never block the op.
+/// The worker ends when the last writer closes the pipe — on a survivor it
+/// simply stops being waited for (the thread is detached and holds nothing
+/// the op needs, so the op's elapsed stays bounded either way).
+struct BoundedPipe {
+    text: Arc<Mutex<String>>,
+    done: Arc<AtomicBool>,
+}
+
+impl BoundedPipe {
+    fn read(pipe: Option<impl std::io::Read + Send + 'static>) -> BoundedPipe {
+        let text = Arc::new(Mutex::new(String::new()));
+        let done = Arc::new(AtomicBool::new(false));
+        let Some(mut pipe) = pipe else {
+            done.store(true, Ordering::SeqCst);
+            return BoundedPipe { text, done };
+        };
+        let sink = Arc::clone(&text);
+        let finished = Arc::clone(&done);
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 8192];
+            loop {
+                match std::io::Read::read(&mut pipe, &mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        if let Ok(mut text) = sink.lock() {
+                            text.push_str(&String::from_utf8_lossy(&buffer[..read]));
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            finished.store(true, Ordering::SeqCst);
+        });
+        BoundedPipe { text, done }
+    }
+
+    /// Wait for the reader at most until `deadline`, then take the capture
+    /// (the documented lossy-UTF-8 text) that arrived inside the bound.
+    fn take_within(self, deadline: Instant) -> String {
+        while !self.done.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.text
+            .lock()
+            .map(|text| text.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// The one-line runner diagnostic that names a process-group signal that
+/// could not be delivered (issue #92 round 2): it rides on the captured
+/// stderr of the run, so the step outcome/evidence can name it.
+fn group_signal_diagnostic(group: u32, reason: &str) -> String {
+    format!(
+        "[canter] the process group (-{group}) could not be signalled by the kill helper: {reason}\n"
+    )
+}
+
+/// The PATH the group-signal helper runs under: the standard system
+/// directories first, then the ambient PATH. The helper is a system utility,
+/// not a child under test, so it never depends on the child's allowlisted
+/// environment (issue #92 round 2).
+fn group_helper_path() -> String {
+    const SYSTEM_DIRS: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+    match std::env::var("PATH") {
+        Ok(ambient) if !ambient.is_empty() => format!("{SYSTEM_DIRS}:{ambient}"),
+        _ => SYSTEM_DIRS.to_string(),
+    }
+}
+
+/// Terminate one child's whole process group (`kill -9 -<pgid>`). `kill(2)`
+/// is unreachable from this crate (it forbids unsafe), so the signal goes
+/// through a `kill` helper resolved robustly: the ambient PATH resolution
+/// plus the absolute candidates `/bin/kill` and `/usr/bin/kill`, run with
+/// [`group_helper_path`]. The previous shape inherited the child's allowlisted
+/// PATH, and a Linux image can lack `kill` there — which is how the group
+/// signal silently failed and left a descendant behind (issue #92 round 2).
+/// The first candidate that launches and exits zero wins; when none does, the
+/// reason is RETURNED so the runner reports it on the captured stderr instead
+/// of discarding it. The caller still kills the direct child through the std
+/// API, and the bounded post-exit read keeps the deadline honoured even when
+/// no group signal could be delivered.
+fn terminate_group(group: u32) -> Option<String> {
+    let target = format!("-{group}");
+    let path = group_helper_path();
+    let mut failures: Vec<String> = Vec::new();
+    for candidate in ["kill", "/bin/kill", "/usr/bin/kill"] {
+        let launched = std::process::Command::new(candidate)
+            .args(["-9", &target])
+            .env_clear()
+            .env("PATH", &path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        match launched {
+            Ok(status) if status.success() => return None,
+            Ok(status) => failures.push(format!(
+                "{candidate}: exited with {}",
+                status
+                    .code()
+                    .map_or_else(|| "no exit code".to_string(), |code| code.to_string())
+            )),
+            Err(err) => failures.push(format!("{candidate}: {err}")),
+        }
+    }
+    Some(failures.join("; "))
 }
 
 fn execute_op_at(
@@ -2757,7 +2893,17 @@ fn run_typed(
         ProcStatus::TimedOut => ProcessOutcome::Failed(ProcessFailure {
             code: CODE_TIMEOUT,
             message: "the operation exceeded its deadline and was cancelled".to_string(),
-            detail: format!("deadline {:?}", timeout),
+            detail: {
+                // Issue #92 round 2: a group signal that could not be
+                // delivered rides on the captured stderr, so the failure
+                // detail names it instead of hiding it.
+                let reason = diagnostics(&out.stderr);
+                if reason.is_empty() {
+                    format!("deadline {timeout:?}")
+                } else {
+                    format!("deadline {timeout:?} | {reason}")
+                }
+            },
         }),
         ProcStatus::SpawnFailed(message) => ProcessOutcome::Failed(ProcessFailure {
             code: CODE_UNAVAILABLE,

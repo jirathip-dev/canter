@@ -120,7 +120,12 @@ can run with **no harness credentials** (AC7).
   `refusal.request.malformed`, `refusal.session.unbound` (a harness step
   addressed the run's bound session but the run bound none; issue #92 F2),
   `adapter.timeout` (deadline exceeded, the child and its process group are
-  killed; outcome class `ambiguous`), `adapter.process_death`
+  killed — the `kill` helper is resolved from the ambient environment plus
+  the standard system directories, never the child's allowlisted PATH, and a
+  signal that could not be delivered is named on the captured stderr; the
+  post-exit pipe read is bounded by the documented grace, so a surviving
+  descendant can never extend the op — outcome class `ambiguous`),
+  `adapter.process_death`
   (`ambiguous`), and `adapter.exit` (ordinary non-zero exit).
 - **Boundaries**: adapters pass only the explicit environment allowlist
   (`env_allow`, spec-config.md), never read the host environment

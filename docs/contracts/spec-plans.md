@@ -155,7 +155,17 @@ runs control-plane effects:
     the step outcome/evidence always names the deadline the effect used;
   - the child of an effect leads its own process group and a deadline
     terminates the whole group (no orphan), reporting `adapter.timeout` as
-    the typed `ambiguous` outcome.
+    the typed `ambiguous` outcome; the `kill` helper that signals the group
+    is resolved from the ambient environment plus the standard system
+    directories — never from the child's allowlisted PATH, which need not
+    contain it — and a signal that could not be delivered is named on the
+    captured stderr (observable in the step outcome/evidence, never
+    discarded);
+  - the post-exit read of the captured pipes is bounded by a documented
+    grace (`PIPE_READ_GRACE`, 750 ms): a descendant that survives the signal
+    and holds the inherited write ends can never extend an effect past
+    `deadline + grace`, and whatever arrived inside the bound is kept (the
+    capture may be empty or partial in that case).
 
 ## 5. Typed outcomes: `hf-outcome/v1`
 

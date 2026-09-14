@@ -683,6 +683,17 @@ release process activates (docs/RELEASING.md), then semver applies.
   (journaled before effect, consumed retry authorizations respected, holds
   never cleared); non-armed supervision keeps its classification-only
   zero-effect contract verbatim.
+- Round-2 platform fix (found by hosted CI on Linux, not visible on macOS):
+  the group signal no longer depends on the child's allowlisted PATH — the
+  `kill` helper is resolved from the ambient environment plus the standard
+  system directories (absolute candidates included), and a signal that could
+  not be delivered is named on the captured stderr (observable in the step
+  outcome/evidence) instead of being discarded. The post-exit read of the
+  captured pipes is bounded by the documented grace (`PIPE_READ_GRACE`,
+  750 ms), so a descendant that survives the signal and holds the inherited
+  write ends can never extend an effect past `deadline + grace` (the Linux
+  failure: a timed-out `hermes` step with a surviving helper blocked the read
+  for the descendant's lifetime and blew a 300 s bound).
 
 ### Changed
 

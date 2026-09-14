@@ -1219,12 +1219,22 @@ fn outcome_from_run(out: &crate::process::ProcOut, label: &str) -> Result<(), Ef
                 diagnostics(&out.stdout, &out.stderr)
             ),
         )),
-        ProcStatus::TimedOut => Err(EffectOutcome {
-            status: "ambiguous",
-            code: Some(code::TIMEOUT.to_string()),
-            message: Some(format!("{label} exceeded its deadline and was cancelled")),
-            result: null(),
-        }),
+        ProcStatus::TimedOut => {
+            // Issue #92 round 2: the captured stderr carries the runner's
+            // diagnostics (a group signal that could not be delivered, so a
+            // descendant may have survived); the ambiguous outcome names it.
+            let detail = diagnostics(&out.stdout, &out.stderr);
+            Err(EffectOutcome {
+                status: "ambiguous",
+                code: Some(code::TIMEOUT.to_string()),
+                message: Some(if detail.is_empty() {
+                    format!("{label} exceeded its deadline and was cancelled")
+                } else {
+                    format!("{label} exceeded its deadline and was cancelled: {detail}")
+                }),
+                result: null(),
+            })
+        }
         ProcStatus::SpawnFailed(message) => Err(EffectOutcome {
             status: "refused",
             code: Some(code::UNAVAILABLE.to_string()),

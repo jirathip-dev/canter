@@ -159,7 +159,10 @@ fn deadline_kills_the_child_and_its_process_group() {
         args: &[],
         env: &env,
         cwd: None,
-        timeout: Duration::from_millis(1500),
+        // Generous on purpose: the fixture must record its helper pid before
+        // the deadline fires, and a loaded host must never lose that race
+        // (the assertion under test is the no-orphan kill, not the precision).
+        timeout: Duration::from_secs(5),
     });
     let elapsed = started.elapsed();
 
@@ -168,11 +171,112 @@ fn deadline_kills_the_child_and_its_process_group() {
         elapsed < Duration::from_secs(10),
         "the deadline kill is bounded, took {elapsed:?}"
     );
-    let helper = read_pid(&pid_file, Duration::from_secs(5));
+    let helper = read_pid(&pid_file, Duration::from_secs(15));
     assert!(
         wait_pid_gone(helper, Duration::from_secs(5)),
         "the forked helper (pid {helper}) survived the deadline: the process group was not \
          terminated"
+    );
+}
+
+#[test]
+fn the_group_signal_never_depends_on_the_childs_allowlisted_path() {
+    // The exact Linux shape hosted CI caught (run 34807920125): the child's
+    // allowlisted PATH cannot resolve `kill`, the pre-fix helper inherited
+    // that PATH, and the group signal silently failed while the descendant
+    // survived. The helper is now resolved from the ambient environment plus
+    // the standard system directories, so the group dies even when the
+    // child's PATH carries neither `kill` nor `sleep` (the fixture's helper
+    // is spawned by absolute path, so only the group signal depends on the
+    // resolution under test).
+    let dir = Dir::new("starved-path");
+    let bin = dir.path("fakebin");
+    let pid_file = dir.path("helper.pid");
+    let lane = dir.write_executable(
+        "fakebin/starved-lane",
+        "/bin/sleep 300 & echo $! > \"$LANE_HELPER_PID\"\nwait",
+    );
+    let mut env = runner_env(&bin, &[("LANE_HELPER_PID", &pid_file.to_string_lossy())]);
+    // Only the fixture's own directory: no system directory is on it.
+    env.insert("PATH".to_string(), bin.to_string_lossy().to_string());
+
+    let started = Instant::now();
+    let out = run_grouped(ProcSpec {
+        program: lane.to_str().expect("utf8 path"),
+        args: &[],
+        env: &env,
+        cwd: None,
+        // Generous on purpose: the fixture must record its helper pid before
+        // the deadline fires, and a loaded host must never lose that race
+        // (the assertion under test is the no-orphan kill, not the precision).
+        timeout: Duration::from_secs(5),
+    });
+    let elapsed = started.elapsed();
+
+    assert_eq!(out.status, ProcStatus::TimedOut, "deadline enforced");
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the deadline kill is bounded, took {elapsed:?}"
+    );
+    let helper = read_pid(&pid_file, Duration::from_secs(15));
+    assert!(
+        wait_pid_gone(helper, Duration::from_secs(5)),
+        "the forked helper (pid {helper}) survived a deadline whose child PATH cannot resolve \
+         `kill`: the group signal depended on the child's allowlisted PATH"
+    );
+}
+
+#[test]
+fn a_descendant_that_holds_the_pipe_never_blocks_the_deadline() {
+    let dir = Dir::new("pipe-survivor");
+    let bin = dir.path("fakebin");
+    let pid_file = dir.path("survivor.pid");
+    // The lane script writes a partial line, then forks a helper into its OWN
+    // process group (`set -m`, job control) so the deadline's group signal
+    // cannot reach it, and waits: the survivor holds the inherited stdout and
+    // stderr write ends for its whole lifetime. This is the shape hosted CI
+    // caught on Linux (a descendant outliving the child keeps a read-to-EOF
+    // blocked), made deterministic on every platform. The helper's life is
+    // deliberately short (20 s): long past the deadline + grace, far short of
+    // stalling a failing run.
+    let lane = dir.write_executable(
+        "fakebin/pipe-holder",
+        "printf 'partial'\nset -m\nsleep 20 &\necho $! > \"$LANE_SURVIVOR_PID\"\nwait",
+    );
+    let env = runner_env(&bin, &[("LANE_SURVIVOR_PID", &pid_file.to_string_lossy())]);
+
+    // Generous on purpose (as in the group-kill cases): the fixture must
+    // record its survivor pid before the deadline fires.
+    let timeout = Duration::from_secs(5);
+    let started = Instant::now();
+    let out = run_grouped(ProcSpec {
+        program: lane.to_str().expect("utf8 path"),
+        args: &[],
+        env: &env,
+        cwd: None,
+        timeout,
+    });
+    let elapsed = started.elapsed();
+    // The survivor escapes this runner's group by construction, so the test
+    // owns its lifetime: reap it by its recorded pid before asserting.
+    let survivor = read_pid(&pid_file, Duration::from_secs(15));
+    let _ = Command::new("kill")
+        .args(["-9", &survivor.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    assert_eq!(out.status, ProcStatus::TimedOut, "deadline enforced");
+    assert!(
+        elapsed < timeout + canter::adapters::PIPE_READ_GRACE + Duration::from_secs(2),
+        "a descendant holding the pipes must never extend the op past the deadline plus the \
+         documented grace ({:?}), took {elapsed:?}",
+        canter::adapters::PIPE_READ_GRACE
+    );
+    assert!(
+        out.stdout.is_empty() || out.stdout == "partial",
+        "the capture stays whatever arrived inside the bound: {:?}",
+        out.stdout
     );
 }
 
