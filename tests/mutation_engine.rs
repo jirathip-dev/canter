@@ -786,6 +786,218 @@ impl Drop for Scenario {
     }
 }
 
+// Issue #133: bounded wire probes must still inspect status and the durable
+// claim after an apply times out, and Scenario's Drop must reap the wedged child.
+fn bounded_rpc(socket: &Path, id: &str, method: &str, params: Option<Val>) -> Result<Val, String> {
+    use std::io::{BufRead, BufReader, Write};
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).map_err(|e| e.to_string())?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .map_err(|e| e.to_string())?;
+    let request = object(vec![
+        ("schema", string("hf-rpc-request/v1")),
+        ("id", string(id)),
+        ("method", string(method)),
+        ("params", params.unwrap_or_else(null)),
+    ]);
+    writeln!(stream, "{}", canter::canonical::canonical_text(&request))
+        .map_err(|e| e.to_string())?;
+    let mut line = String::new();
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .map_err(|e| e.to_string())?;
+    Val::parse_json(line.trim())
+}
+
+#[test]
+fn apply_refusal_keeps_daemon_responsive_and_records_attempt() {
+    let scenario = Scenario::new(
+        "f13",
+        "2999-01-01T00:00:00Z",
+        vec![step(
+            "r1",
+            "review_evidence",
+            Some(object(vec![
+                ("reviewer", string("reviewer-1")),
+                ("implementer", string("implementer-1")),
+                ("verdict", string("pass")),
+                (
+                    "checks",
+                    Val::Arr(vec![string("policy=pass"), string("rust-macos=pass")]),
+                ),
+            ])),
+        )],
+    );
+    let params = scenario.params(133, "r1", Some(REVISION), Some(REVISION), None, false);
+    let key = params.get("idempotency_key").and_then(Val::as_str).unwrap();
+    let started = Instant::now();
+    let apply = bounded_rpc(
+        &scenario.fixture.socket,
+        &fresh_id(133),
+        "apply",
+        Some(params.clone()),
+    );
+    let status = bounded_rpc(&scenario.fixture.socket, &fresh_id(134), "status", None);
+    let state = State::open(&scenario.fixture.paths().db_path, Retention::default()).unwrap();
+    let claim = state
+        .claim(key)
+        .unwrap()
+        .expect("apply claimed before the post-effect refusal");
+    eprintln!(
+        "apply={apply:?}\nstatus={status:?}\nclaim_status={} outcome={:?}",
+        claim.status, claim.outcome
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "wire probes exceeded their bounds"
+    );
+    let apply = apply.expect("post-effect refusal must return, not deadlock");
+    assert_eq!(apply.get("ok").and_then(Val::as_bool), Some(false));
+    let error = apply.get("error").unwrap();
+    assert_eq!(
+        error.get("code").and_then(Val::as_str),
+        Some("state.evidence_invalid")
+    );
+    assert_eq!(status.unwrap().get("ok").and_then(Val::as_bool), Some(true));
+    // Preserve the existing post-effect ambiguity semantics and exact reason.
+    assert_eq!(claim.status, "ambiguous");
+    let outcome = Val::parse_json(
+        claim
+            .outcome
+            .as_deref()
+            .expect("recorded outcome, not NULL"),
+    )
+    .unwrap();
+    assert_eq!(outcome.get("error"), Some(error));
+    assert_eq!(
+        outcome.get("status").and_then(Val::as_str),
+        Some("ambiguous")
+    );
+    assert_eq!(
+        Val::parse_json(claim.response.as_deref().unwrap()).unwrap(),
+        apply
+    );
+    assert!(state.in_flight_run_step(INSTANCE_ID).unwrap().is_none());
+    assert!(state.evidence_for_instance(INSTANCE_ID).unwrap().is_empty());
+    let replay = bounded_rpc(
+        &scenario.fixture.socket,
+        &fresh_id(133),
+        "apply",
+        Some(params),
+    )
+    .unwrap();
+    assert_eq!(
+        replay, apply,
+        "replay preserves the typed refusal without another effect"
+    );
+}
+
+#[test]
+fn apply_profile_refusal_resolves_its_claim_without_restart() {
+    let scenario = Scenario::new("f13p", "2999-01-01T00:00:00Z", flow_steps());
+    let mut params = scenario.params(135, "r1", Some(REVISION), Some(REVISION), None, false);
+    if let Val::Obj(fields) = &mut params {
+        fields.insert("profile".to_string(), string("not-a-profile"));
+    }
+    let key = params.get("idempotency_key").and_then(Val::as_str).unwrap();
+    let response = bounded_rpc(
+        &scenario.fixture.socket,
+        &fresh_id(135),
+        "apply",
+        Some(params.clone()),
+    )
+    .unwrap();
+    assert_eq!(response.get("ok").and_then(Val::as_bool), Some(false));
+    let state = State::open(&scenario.fixture.paths().db_path, Retention::default()).unwrap();
+    let claim = state.claim(key).unwrap().unwrap();
+    assert_eq!(
+        claim.status, "spent",
+        "pre-effect profile refusal must not orphan the claim"
+    );
+    let outcome = Val::parse_json(claim.outcome.as_deref().unwrap()).unwrap();
+    assert_eq!(outcome.get("error"), response.get("error"));
+    assert!(state.in_flight_run_step(INSTANCE_ID).unwrap().is_none());
+}
+
+#[test]
+fn disconnected_apply_is_resolved_after_its_effect_deadline_without_restart() {
+    let scenario = Scenario::new(
+        "f13d",
+        "2999-01-01T00:00:00Z",
+        vec![step(
+            "c1",
+            "checkout",
+            Some(object(vec![
+                ("ref", string("staging")),
+                ("deadline_secs", integer(1)),
+            ])),
+        )],
+    );
+    let marker = scenario.sandbox.path("effect-started");
+    scenario.sandbox.write(
+        "fakebin/git",
+        &format!(
+            "#!/bin/sh\nprintf started > '{}'\nexec /bin/sleep 30\n",
+            marker.display()
+        ),
+    );
+    scenario.sandbox.chmod_x("fakebin/git");
+    let params = scenario.params(136, "c1", None, None, None, false);
+    let key = params.get("idempotency_key").and_then(Val::as_str).unwrap();
+    let mut client = Connection::open(&scenario.fixture.socket).unwrap();
+    client
+        .send_request(&fresh_id(136), "apply", Some(&params))
+        .unwrap();
+    let state = State::open(&scenario.fixture.paths().db_path, Retention::default()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(Instant::now() < deadline, "effect never started");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(state.claim(key).unwrap().unwrap().status, "claimed");
+    drop(client); // Peer disappeared mid-effect; no response reader remains.
+    let status = bounded_rpc(&scenario.fixture.socket, &fresh_id(137), "status", None).unwrap();
+    assert_eq!(status.get("ok").and_then(Val::as_bool), Some(true));
+    let claim = loop {
+        let claim = state.claim(key).unwrap().unwrap();
+        if claim.status != "claimed" {
+            break claim;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "disconnected apply claim was never resolved"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let outcome = Val::parse_json(claim.outcome.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        outcome
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(Val::as_str),
+        Some("adapter.timeout")
+    );
+    assert!(state.in_flight_run_step(INSTANCE_ID).unwrap().is_none());
+    let replay = bounded_rpc(
+        &scenario.fixture.socket,
+        &fresh_id(136),
+        "apply",
+        Some(params),
+    )
+    .unwrap();
+    assert_eq!(
+        replay,
+        Val::parse_json(claim.response.as_deref().unwrap()).unwrap()
+    );
+    eprintln!(
+        "disconnected caller: claim={} code=adapter.timeout; no in-flight step; replay recorded",
+        claim.status
+    );
+}
+
 // ---------------------------------------------------------------------------
 // AC1: plan RPC + digest binding + idempotent replay; duplicate suppression
 // ---------------------------------------------------------------------------
