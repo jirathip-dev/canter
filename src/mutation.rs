@@ -43,12 +43,68 @@ use crate::canonical::{canonical_bytes, sha256_hex};
 use crate::config::adapter_environment;
 use crate::engine::grant_binding_valid;
 use crate::formats::{is_hex40, is_hex64, is_repository_identity, is_slug};
-use crate::process::{ProcSpec, ProcStatus, run};
+use crate::process::{ProcSpec, ProcStatus};
 use crate::schema::{Family, validate_doc};
 use crate::value::{Val, bool_, integer, null, object, string};
 
-/// Per-effect subprocess deadline (bounded; the daemon never waits forever).
-pub const MUTATION_TIMEOUT: Duration = Duration::from_secs(60);
+/// Hard ceiling (seconds) on any single effect subprocess deadline: the
+/// per-kind table and every policy override are clamped by it, so no plan
+/// can make the daemon wait without an explicit bound (issue #92 F1).
+pub const EFFECT_DEADLINE_CEILING_SECS: u64 = 3600;
+
+/// Documented default deadline (seconds) for the bounded I/O effects (git
+/// and gh rows) — the per-kind default table of issue #92 F1.
+pub const EFFECT_DEADLINE_DEFAULT_SECS: u64 = 60;
+
+/// Documented default deadline (seconds) for one lane prompt turn: a real
+/// worker turn (a harness running a bounded work item) outlives a bare I/O
+/// bound, which is why the effect kind owns its own documented default
+/// instead of inheriting the shortest one (issue #92 F1, F2).
+pub const PROMPT_DEADLINE_DEFAULT_SECS: u64 = 1800;
+
+/// Documented default deadline (seconds) for the harness session-bind
+/// effect (`harness_start`): a session bind may resolve/probe a harness, so
+/// it is bounded above the plain I/O default and far below the ceiling.
+pub const HARNESS_START_DEADLINE_DEFAULT_SECS: u64 = 300;
+
+/// The effective, bounded deadline (seconds) of one effect step (issue #92
+/// F1). Policy surface: a reviewed plan step may carry `deadline_secs` for
+/// its own effect, bounded by [`EFFECT_DEADLINE_CEILING_SECS`]; a value
+/// outside `1..=ceiling` refuses typed. Without a declared value the
+/// documented per-kind default applies. Call sites never read a bare
+/// constant.
+pub fn effect_deadline_secs(kind: &str, params: Option<&Val>) -> Result<u64, EffectOutcome> {
+    if let Some(declared) = params.and_then(|params| params.get("deadline_secs")) {
+        let Some(secs) = declared.as_int() else {
+            return Err(refusal(
+                code::BAD_PARAMS,
+                "step params.deadline_secs must be an integer number of seconds",
+            ));
+        };
+        if secs < 1 || secs as u64 > EFFECT_DEADLINE_CEILING_SECS {
+            return Err(refusal(
+                code::BAD_PARAMS,
+                format!(
+                    "step params.deadline_secs must be 1..={EFFECT_DEADLINE_CEILING_SECS} \
+                     (the documented effect deadline ceiling)"
+                ),
+            ));
+        }
+        return Ok(secs as u64);
+    }
+    Ok(default_deadline_secs(kind))
+}
+
+/// The documented per-kind default deadline (seconds). Every effect kind
+/// resolves to a bound; `prompt` and `harness_start` carry their own
+/// documented rows (see the constants above).
+pub fn default_deadline_secs(kind: &str) -> u64 {
+    match kind {
+        "prompt" => PROMPT_DEADLINE_DEFAULT_SECS,
+        "harness_start" => HARNESS_START_DEADLINE_DEFAULT_SECS,
+        _ => EFFECT_DEADLINE_DEFAULT_SECS,
+    }
+}
 
 /// Error codes produced by this engine (typed, never downgraded).
 pub mod code {
@@ -135,6 +191,10 @@ pub mod code {
     pub const PROCESS_DEATH: &str = "adapter.process_death";
     /// Ordinary non-zero child exit.
     pub const EXIT: &str = "adapter.exit";
+    /// A harness step addressed the run's bound session but the run bound
+    /// none (no recorded `harness_start` dispatch): the step never invents a
+    /// session identity (issue #92 F2).
+    pub const SESSION_UNBOUND: &str = "refusal.session.unbound";
     /// Malformed structured output from a child.
     pub const MALFORMED_OUTPUT: &str = "refusal.malformed.output";
 }
@@ -1096,6 +1156,18 @@ pub struct EffectContext<'a> {
     pub observed_integration_base: Option<&'a str>,
     /// Allowlisted environment for children.
     pub env: &'a BTreeMap<String, String>,
+    /// The run's declared role configuration (issue #92 F2): the reviewed
+    /// `hf-profile-binding/v1` document the run's admission bound. When it
+    /// is present the harness profile (key/kind/provider/model) comes from
+    /// it — never from a step param default and never invented. `None` for a
+    /// run without a committed role configuration (a presented plan then
+    /// declares its own profile explicitly).
+    pub role: Option<&'a crate::config::ProfileBinding>,
+    /// The session identity the run bound (issue #92 F2): `harness_start`
+    /// binds it and every prompt of the run continues exactly this session.
+    /// `None` for a run without one (a presented plan then declares the
+    /// identity itself; the adapter never invents one).
+    pub session: Option<&'a crate::adapters::SessionHandle>,
     /// Daemon-owned archive/salvage root (issue #9 AC7; archive cleanup
     /// steps require it).
     pub archive_root: Option<&'a Path>,
@@ -1190,12 +1262,13 @@ fn run_git(
     } else {
         adapter_environment()
     };
-    let out = run(ProcSpec {
+    let deadline = effect_deadline_secs(ctx.kind, ctx.params)?;
+    let out = crate::adapters::run_grouped(ProcSpec {
         program: "git",
         args: &args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
         env: &git_env,
         cwd: Some(cwd),
-        timeout: MUTATION_TIMEOUT,
+        timeout: Duration::from_secs(deadline),
     });
     outcome_from_run(&out, &format!("git (cwd {})", cwd.display()))?;
     Ok(out)
@@ -1232,7 +1305,7 @@ fn param_bool(params: Option<&Val>, key: &str) -> bool {
 /// state lock and must resolve with an exact read-back so the outcome can
 /// be recorded durably).
 pub fn execute_step(ctx: &EffectContext<'_>) -> EffectOutcome {
-    match ctx.kind {
+    let mut outcome = match ctx.kind {
         "checkout" => effect_checkout(ctx),
         "worktree_create" => effect_worktree_create(ctx),
         "harness_start" => effect_harness_start(ctx),
@@ -1255,7 +1328,47 @@ pub fn execute_step(ctx: &EffectContext<'_>) -> EffectOutcome {
             code::BAD_PARAMS,
             format!("no effect is routable for step kind {other:?}"),
         ),
+    };
+    // Issue #92 F1: the effective bounded deadline this effect used is part
+    // of the step outcome/evidence (the documented per-kind table plus any
+    // `deadline_secs` the reviewed plan declared). One place, every
+    // subprocess-bearing kind — never a bare constant at a call site.
+    if let Val::Obj(fields) = &mut outcome.result
+        && let Some(secs) = bounded_effect_deadline(ctx.kind, ctx.params)
+    {
+        fields.insert("deadline_secs".to_string(), integer(secs as i64));
     }
+    outcome
+}
+
+/// The effective bounded deadline (seconds) of one effect kind that runs a
+/// bounded subprocess; `None` for the effects that spawn nothing (the
+/// deadline table only applies where a child exists). The value is exactly
+/// what the effect used: the reviewed step's `deadline_secs` when declared
+/// (bounded by [`EFFECT_DEADLINE_CEILING_SECS`]), else the documented
+/// per-kind default ([`default_deadline_secs`]).
+pub fn bounded_effect_deadline(kind: &str, params: Option<&Val>) -> Option<u64> {
+    const SUBPROCESS_KINDS: [&str; 15] = [
+        "checkout",
+        "worktree_create",
+        "harness_start",
+        "prompt",
+        "collect_outcome",
+        "review_evidence",
+        "merge",
+        "publish",
+        "pr_update",
+        "branch_push",
+        "issue_update",
+        "hosted_check",
+        "post_merge_verify",
+        "cleanup",
+        "branch_delete",
+    ];
+    if !SUBPROCESS_KINDS.contains(&kind) {
+        return None;
+    }
+    effect_deadline_secs(kind, params).ok()
 }
 
 /// `checkout`: read the exact current head of the integration branch on the
@@ -1353,48 +1466,37 @@ fn effect_worktree_create(ctx: &EffectContext<'_>) -> EffectOutcome {
 }
 
 /// `harness_start`: bind a lane harness session (identity triple + session
-/// handle). No child is spawned by start (the adapter contract binds the
-/// handle; prompt spawns inside the assigned worktree).
+/// handle). The profile is the run's declared role configuration (issue #92
+/// F2: the harness key is the role binding key — there is no default
+/// profile), and the bound session is the run's session identity, which the
+/// prompts of this run then continue. No child is spawned by start for the
+/// official kinds (the adapter contract binds the handle; prompt spawns
+/// inside the assigned worktree); a declarative `argv` profile that declares
+/// its own `start` row really runs it, bounded.
 fn effect_harness_start(ctx: &EffectContext<'_>) -> EffectOutcome {
     let params = match ctx.params {
         Some(params) => params,
         None => return refusal(code::BAD_PARAMS, "harness_start requires params"),
     };
-    let herdr_session = match param_str(Some(params), "herdr_session") {
-        Ok(value) => value,
-        Err(outcome) => return outcome,
-    };
-    let terminal_session = match param_str(Some(params), "terminal_session") {
-        Ok(value) => value,
-        Err(outcome) => return outcome,
-    };
-    let generation = param_int(Some(params), "generation").unwrap_or(1);
-    if generation < 0 {
-        return refusal(code::BAD_PARAMS, "generation must be non-negative");
-    }
-    let identity =
-        match crate::adapters::bind_identity(herdr_session, terminal_session, generation as u64) {
-            Ok(identity) => identity,
-            Err(err) => return refusal(err.code, err.message),
-        };
-    let session_id = match param_str(Some(params), "session_id") {
-        Ok(value) => value,
-        Err(outcome) => return outcome,
-    };
-    let session = match crate::adapters::new_session(session_id, identity) {
+    let session = match resolve_session(ctx, Some(params), "harness_start") {
         Ok(session) => session,
-        Err(err) => return refusal(err.code, err.message),
+        Err(outcome) => return outcome,
     };
-    // The start operation validates the capability set without spawning.
+    // The start operation validates the capability set; a declared
+    // declarative start row runs as the real session bind.
     let profile = match harness_profile(ctx, params) {
         Ok(profile) => profile,
+        Err(outcome) => return outcome,
+    };
+    let deadline = match effect_deadline_secs(ctx.kind, ctx.params) {
+        Ok(secs) => secs,
         Err(outcome) => return outcome,
     };
     let request = crate::adapters::OpRequest {
         op: crate::adapters::Op::Start,
         session: &session,
         payload: None,
-        timeout: MUTATION_TIMEOUT,
+        timeout: Duration::from_secs(deadline),
     };
     let result =
         crate::adapters::execute_op_in_worktree(&profile, &request, ctx.env, ctx.integration_repo);
@@ -1406,11 +1508,130 @@ fn effect_harness_start(ctx: &EffectContext<'_>) -> EffectOutcome {
             result: null(),
         };
     }
-    ok(object(vec![
-        ("session_id", string(session_id)),
-        ("generation", integer(generation)),
+    ok(session_binding_result(ctx, &profile, &session))
+}
+
+/// The recorded binding of one session effect (issue #92 F2): the session
+/// identity the step bound, the role/profile key it ran under and, when the
+/// run carries one, the revision of the declared role configuration. This is
+/// what a later prompt continues, so it is part of the step outcome.
+fn session_binding_result(
+    ctx: &EffectContext<'_>,
+    profile: &crate::adapters::Profile,
+    session: &crate::adapters::SessionHandle,
+) -> Val {
+    object(vec![
+        ("session_id", string(&session.session_id)),
+        (
+            "generation",
+            integer(session.identity.generation.min(i64::MAX as u64) as i64),
+        ),
+        ("herdr_session", string(&session.identity.herdr_session)),
+        (
+            "terminal_session",
+            string(&session.identity.terminal_session),
+        ),
+        ("role_key", string(&profile.key)),
+        ("role_kind", string(profile.kind.name())),
+        (
+            "role_revision",
+            match ctx.role {
+                Some(role) => string(&role.revision),
+                None => null(),
+            },
+        ),
         ("worktree_confined", bool_(true)),
-    ]))
+    ])
+}
+
+/// Resolve the session identity one harness step runs under (issue #92 F2).
+/// The run's bound session is authoritative when the run has one (it is what
+/// `harness_start` bound); a presented plan may declare the identity instead
+/// (`session_id` + `herdr_session` + `terminal_session`, all three — a
+/// partial identity is refused) and the two must AGREE. When neither exists
+/// the step is refused: the adapter never invents a session identity and
+/// never substitutes a default.
+fn resolve_session(
+    ctx: &EffectContext<'_>,
+    params: Option<&Val>,
+    what: &str,
+) -> Result<crate::adapters::SessionHandle, EffectOutcome> {
+    let declared = match (
+        param_str_opt(params, "session_id"),
+        param_str_opt(params, "herdr_session"),
+        param_str_opt(params, "terminal_session"),
+    ) {
+        (None, None, None) => None,
+        (session_id, herdr_session, terminal_session) => {
+            let (session_id, herdr_session, terminal_session) =
+                match (session_id, herdr_session, terminal_session) {
+                    (Some(session_id), Some(herdr_session), Some(terminal_session)) => {
+                        (session_id, herdr_session, terminal_session)
+                    }
+                    _ => {
+                        return Err(refusal(
+                            crate::adapters::CODE_INCOMPLETE_IDENTITY,
+                            format!(
+                                "{what} declares an incomplete session identity: session_id, \
+                                 herdr_session and terminal_session are all required (a partial \
+                                 identity is never completed by a default)"
+                            ),
+                        ));
+                    }
+                };
+            let generation = param_int(params, "generation").unwrap_or(1);
+            if generation < 0 {
+                return Err(refusal(code::BAD_PARAMS, "generation must be non-negative"));
+            }
+            let identity =
+                crate::adapters::bind_identity(herdr_session, terminal_session, generation as u64)
+                    .map_err(|err| refusal(err.code, err.message))?;
+            let session = crate::adapters::new_session(session_id, identity)
+                .map_err(|err| refusal(err.code, err.message))?;
+            Some(session)
+        }
+    };
+    match (ctx.session, declared) {
+        (Some(bound), Some(declared)) => {
+            if bound != &declared {
+                return Err(refusal(
+                    crate::adapters::CODE_STALE_IDENTITY,
+                    format!(
+                        "{what} declares session {:?}, which is not the session this run bound \
+                         ({:?}); a step continues the bound session and never re-binds another",
+                        declared.session_id, bound.session_id
+                    ),
+                ));
+            }
+            Ok(declared)
+        }
+        (Some(bound), None) => Ok(bound.clone()),
+        (None, Some(declared)) => Ok(declared),
+        (None, None) => Err(refusal(
+            crate::adapters::CODE_INCOMPLETE_IDENTITY,
+            format!(
+                "{what} requires the session identity (session_id + herdr_session + \
+                 terminal_session) and this run bound none: the adapter never invents one"
+            ),
+        )),
+    }
+}
+
+/// The session identity of one queue run (issue #92 F2): derived ONCE from
+/// the run identity, so `harness_start` binds it and every prompt of the run
+/// continues exactly that same session — deterministic across restarts, and
+/// never a caller-supplied or default identity. The derivation is the first
+/// 16 hex of sha256 over the domain-separated run identity.
+pub fn run_session_handle(
+    instance_id: &str,
+) -> Result<crate::adapters::SessionHandle, EffectOutcome> {
+    let digest =
+        crate::canonical::sha256_hex(format!("hf-run-session/v1|{instance_id}").as_bytes());
+    let session_id = format!("lane-{}", &digest[..16]);
+    let identity = crate::adapters::bind_identity(&session_id, &session_id, 1)
+        .map_err(|err| refusal(err.code, err.message))?;
+    crate::adapters::new_session(&session_id, identity)
+        .map_err(|err| refusal(err.code, err.message))
 }
 
 /// `prompt`: deliver the bounded prompt as data to the lane harness with the
@@ -1420,10 +1641,6 @@ fn effect_prompt(ctx: &EffectContext<'_>) -> EffectOutcome {
     let params = match ctx.params {
         Some(params) => params,
         None => return refusal(code::BAD_PARAMS, "prompt requires params"),
-    };
-    let session_id = match param_str(Some(params), "session_id") {
-        Ok(value) => value,
-        Err(outcome) => return outcome,
     };
     let payload = match param_str(Some(params), "payload") {
         Ok(value) => value,
@@ -1447,26 +1664,24 @@ fn effect_prompt(ctx: &EffectContext<'_>) -> EffectOutcome {
         Ok(profile) => profile,
         Err(outcome) => return outcome,
     };
-    // Default session names keep the pre-rename identifier: a live Herdr
-    // lane/terminal session name is external identity and is not renamed
-    // (docs/contracts/compatibility.md, "Product rename (issue #106)").
-    let identity = match crate::adapters::bind_identity(
-        param_str_opt(Some(params), "herdr_session").unwrap_or("herdr-fleet-lane"),
-        param_str_opt(Some(params), "terminal_session").unwrap_or("herdr-fleet-lane"),
-        param_int(Some(params), "generation").unwrap_or(1).max(0) as u64,
-    ) {
-        Ok(identity) => identity,
-        Err(err) => return refusal(err.code, err.message),
-    };
-    let session = match crate::adapters::new_session(session_id, identity) {
+    // Issue #92 F2: the prompt continues the session `harness_start` bound —
+    // the run's bound session when the run carries one, else the identity the
+    // reviewed plan declares. A partial or absent identity is refused; the
+    // adapter never invents one (the pre-fix default "herdr-fleet-lane" is
+    // gone).
+    let session = match resolve_session(ctx, Some(params), "prompt") {
         Ok(session) => session,
-        Err(err) => return refusal(err.code, err.message),
+        Err(outcome) => return outcome,
+    };
+    let prompt_deadline = match effect_deadline_secs(ctx.kind, ctx.params) {
+        Ok(secs) => secs,
+        Err(outcome) => return outcome,
     };
     let request = crate::adapters::OpRequest {
         op: crate::adapters::Op::Prompt,
         session: &session,
         payload: Some(payload),
-        timeout: MUTATION_TIMEOUT,
+        timeout: Duration::from_secs(prompt_deadline),
     };
     let result = crate::adapters::execute_op_in_worktree(&profile, &request, ctx.env, &worktree);
     if result.status != "succeeded" {
@@ -1477,17 +1692,20 @@ fn effect_prompt(ctx: &EffectContext<'_>) -> EffectOutcome {
             result: null(),
         };
     }
-    ok(object(vec![
-        ("session_id", string(session_id)),
-        (
-            "transcript",
-            result
-                .payload
-                .as_ref()
-                .and_then(|payload| payload.get("transcript").cloned())
-                .unwrap_or_else(null),
-        ),
-    ]))
+    let mut fields = match session_binding_result(ctx, &profile, &session) {
+        Val::Obj(fields) => fields,
+        _ => unreachable!("the session binding result is an object"),
+    };
+    fields.remove("worktree_confined");
+    fields.insert(
+        "transcript".to_string(),
+        result
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("transcript").cloned())
+            .unwrap_or_else(null),
+    );
+    ok(Val::Obj(fields))
 }
 
 /// `collect_outcome`: collect the lane's commits/head since the integration
@@ -1849,12 +2067,16 @@ fn effect_pr_update(ctx: &EffectContext<'_>) -> EffectOutcome {
             body.to_string(),
         ]
     };
-    let out = run(ProcSpec {
+    let deadline = match effect_deadline_secs(ctx.kind, ctx.params) {
+        Ok(secs) => secs,
+        Err(outcome) => return outcome,
+    };
+    let out = crate::adapters::run_grouped(ProcSpec {
         program: "gh",
         args: &args,
         env: ctx.env,
         cwd: Some(ctx.integration_repo),
-        timeout: MUTATION_TIMEOUT,
+        timeout: Duration::from_secs(deadline),
     });
     if let Err(outcome) = outcome_from_run(&out, "gh") {
         return outcome;
@@ -1919,12 +2141,16 @@ fn effect_issue_update(ctx: &EffectContext<'_>) -> EffectOutcome {
             body.to_string(),
         ]
     };
-    let out = run(ProcSpec {
+    let deadline = match effect_deadline_secs(ctx.kind, ctx.params) {
+        Ok(secs) => secs,
+        Err(outcome) => return outcome,
+    };
+    let out = crate::adapters::run_grouped(ProcSpec {
         program: "gh",
         args: &args,
         env: ctx.env,
         cwd: Some(ctx.integration_repo),
-        timeout: MUTATION_TIMEOUT,
+        timeout: Duration::from_secs(deadline),
     });
     if let Err(outcome) = outcome_from_run(&out, "gh") {
         return outcome;
@@ -1959,12 +2185,16 @@ fn effect_hosted_check(ctx: &EffectContext<'_>) -> EffectOutcome {
         "--json".to_string(),
         "name,state,conclusion".to_string(),
     ];
-    let out = run(ProcSpec {
+    let deadline = match effect_deadline_secs(ctx.kind, ctx.params) {
+        Ok(secs) => secs,
+        Err(outcome) => return outcome,
+    };
+    let out = crate::adapters::run_grouped(ProcSpec {
         program: "gh",
         args: &args,
         env: ctx.env,
         cwd: Some(ctx.integration_repo),
-        timeout: MUTATION_TIMEOUT,
+        timeout: Duration::from_secs(deadline),
     });
     if let Err(outcome) = outcome_from_run(&out, "gh") {
         return outcome;
@@ -2223,14 +2453,28 @@ fn effect_approve(ctx: &EffectContext<'_>) -> EffectOutcome {
     ]))
 }
 
-/// Build the harness profile for a lane harness step from typed params
-/// (bare executable only; C1's resolution witness is exercised by the
-/// adapter layer).
+/// Build the harness profile for a lane harness step (issue #92 F2).
+///
+/// The declared role binding is the profile: a step names the run's
+/// `role_config` key (`harness_key`) and there is **no default profile** —
+/// a step that names none is refused. When the run carries its committed
+/// role configuration, the profile's key/kind/provider/model come from that
+/// reviewed document and the step must AGREE with it (a mismatch is refused,
+/// never silently overridden); the executable is the official name for an
+/// official kind and the step's declared bare executable for the declarative
+/// `argv` kind.
 fn harness_profile(
-    _ctx: &EffectContext<'_>,
+    ctx: &EffectContext<'_>,
     params: &Val,
 ) -> Result<crate::adapters::Profile, EffectOutcome> {
-    let executable = param_str(Some(params), "executable")?;
+    let Some(key) = param_str_opt(Some(params), "harness_key") else {
+        return Err(refusal(
+            crate::config::CODE_PROFILE_BINDING,
+            "the harness step declares no role binding (step params.harness_key = the run's \
+             role_config key); there is no default profile and none is inferred",
+        ));
+    };
+    let executable = param_str_opt(Some(params), "executable").unwrap_or("");
     if executable.contains('/') || executable.contains('\\') {
         return Err(refusal(
             code::BAD_PARAMS,
@@ -2238,8 +2482,62 @@ fn harness_profile(
         ));
     }
     let kind = param_str_opt(Some(params), "kind").unwrap_or("argv");
-    let key = param_str_opt(Some(params), "harness_key").unwrap_or("lane");
-    if kind == "argv" {
+    let parsed_kind = crate::adapters::HarnessKind::parse(kind)
+        .ok_or_else(|| refusal(code::BAD_PARAMS, format!("unknown harness kind {kind:?}")))?;
+    // The run's committed role configuration is authoritative when present.
+    if let Some(role) = ctx.role {
+        if role.key != key {
+            return Err(refusal(
+                crate::config::CODE_PROFILE_BINDING,
+                format!(
+                    "the step declares harness key {key:?}, which is not the run's reviewed role \
+                     configuration ({:?}, revision {}); a step never runs another role binding",
+                    role.key, role.revision
+                ),
+            ));
+        }
+        if role.kind != kind {
+            return Err(refusal(
+                crate::config::CODE_PROFILE_BINDING,
+                format!(
+                    "the step declares harness kind {kind:?}, which is not the kind of the run's \
+                     reviewed role configuration ({:?})",
+                    role.kind
+                ),
+            ));
+        }
+        let profile = match crate::adapters::official_spec(parsed_kind) {
+            Some(spec) => {
+                if !executable.is_empty() && executable != spec.executable {
+                    return Err(refusal(
+                        code::BAD_PARAMS,
+                        format!(
+                            "the step declares executable {executable:?}, which is not the \
+                             official {:?} executable {:?}",
+                            kind, spec.executable
+                        ),
+                    ));
+                }
+                crate::adapters::Profile::official(parsed_kind, &role.key)
+            }
+            None => crate::adapters::Profile::argv(
+                &role.key,
+                executable,
+                &crate::adapters::HARNESS_CAPS,
+                BTreeMap::new(),
+            ),
+        }
+        .map_err(|err| refusal(err.code, err.message))?;
+        // The declared provider/model pair rides from the reviewed role
+        // configuration (never from a step param, never a default id).
+        return profile
+            .with_binding(&role.provider, &role.model)
+            .map_err(|err| refusal(err.code, err.message));
+    }
+    // No committed role configuration (a presented plan outside the queue
+    // executor): the plan declares the binding itself and nothing is
+    // defaulted but the declarative kind.
+    if parsed_kind == crate::adapters::HarnessKind::Argv {
         crate::adapters::Profile::argv(
             key,
             executable,
@@ -2250,9 +2548,7 @@ fn harness_profile(
     } else {
         // Official kinds carry their own metadata (executable must match
         // the official name; fake executables in tests use those names).
-        let parsed = crate::adapters::HarnessKind::parse(kind)
-            .ok_or_else(|| refusal(code::BAD_PARAMS, format!("unknown harness kind {kind:?}")))?;
-        crate::adapters::Profile::official(parsed, key)
+        crate::adapters::Profile::official(parsed_kind, key)
             .map_err(|err| refusal(err.code, err.message))
     }
 }
@@ -2260,6 +2556,66 @@ fn harness_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Issue #92 F1: the documented per-effect deadline table, the reviewed
+    // policy override and the hard ceiling.
+    #[test]
+    fn effect_deadlines_are_documented_per_kind_and_bounded() {
+        assert_eq!(
+            effect_deadline_secs("checkout", None).expect("default"),
+            EFFECT_DEADLINE_DEFAULT_SECS
+        );
+        assert_eq!(
+            effect_deadline_secs("hosted_check", None).expect("default"),
+            EFFECT_DEADLINE_DEFAULT_SECS
+        );
+        assert_eq!(
+            effect_deadline_secs("harness_start", None).expect("default"),
+            HARNESS_START_DEADLINE_DEFAULT_SECS
+        );
+        assert_eq!(
+            effect_deadline_secs("prompt", None).expect("default"),
+            PROMPT_DEADLINE_DEFAULT_SECS
+        );
+        // A reviewed plan may declare its own bounded deadline...
+        let declared = object(vec![("deadline_secs", integer(120))]);
+        assert_eq!(
+            effect_deadline_secs("prompt", Some(&declared)).expect("declared"),
+            120
+        );
+        // ...within the documented ceiling, never beyond it.
+        let over = object(vec![(
+            "deadline_secs",
+            integer(EFFECT_DEADLINE_CEILING_SECS as i64 + 1),
+        )]);
+        let refusal = effect_deadline_secs("prompt", Some(&over)).expect_err("over the ceiling");
+        assert_eq!(refusal.code.as_deref(), Some(code::BAD_PARAMS));
+        let zero = object(vec![("deadline_secs", integer(0))]);
+        assert!(effect_deadline_secs("prompt", Some(&zero)).is_err());
+        let malformed = object(vec![("deadline_secs", string("soon"))]);
+        assert!(effect_deadline_secs("prompt", Some(&malformed)).is_err());
+        // The evidence helper answers for the subprocess-bearing kinds only.
+        assert_eq!(
+            bounded_effect_deadline("prompt", None),
+            Some(PROMPT_DEADLINE_DEFAULT_SECS)
+        );
+        assert_eq!(bounded_effect_deadline("approve", None), None);
+    }
+
+    // Issue #92 F2: the session identity of a run is derived ONCE, so the
+    // bind and every prompt of that run agree — and two runs never do.
+    #[test]
+    fn run_session_identity_is_deterministic_and_run_scoped() {
+        let first = run_session_handle("run-0123456789abcdef").expect("session");
+        let again = run_session_handle("run-0123456789abcdef").expect("session");
+        let other = run_session_handle("run-fedcba9876543210").expect("session");
+        assert_eq!(first, again, "the derivation is deterministic");
+        assert_ne!(first.session_id, other.session_id, "run scoped");
+        assert!(first.session_id.starts_with("lane-"));
+        assert_eq!(first.identity.herdr_session, first.session_id);
+        assert_eq!(first.identity.terminal_session, first.session_id);
+        assert_eq!(first.identity.generation, 1);
+    }
 
     fn grant_snapshot(expires_at: &str) -> GrantSnapshot {
         GrantSnapshot {

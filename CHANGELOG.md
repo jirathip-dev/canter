@@ -656,6 +656,34 @@ release process activates (docs/RELEASING.md), then semver applies.
   documented legacy set) and `tests/rename_compat.rs` (alias binary, legacy
   tree adoption, legacy config discovery, legacy env var).
 
+### Fixed (issue #92 — executor lifecycle: deadlines, role-bound sessions, ledger retry frontier, executable supervision)
+
+- Bounded, explicit, cancellable per-effect deadlines: no call site reads a
+  bare timeout constant any more. A documented per-kind table (prompt
+  1800 s, harness_start 300 s, other subprocess kinds 60 s, hard ceiling
+  3600 s) plus an optional reviewed `deadline_secs` plan policy; the
+  effective deadline rides on the step result, and a deadline terminates
+  the child AND its process group.
+- The harness prompt row runs the run's declared role binding (`-p <role>`,
+  the declared provider/model pair, `chat --continue <session>
+  --create-if-missing`) instead of a bare one-shot invocation; the session
+  is derived once per run, bound by `harness_start` and continued by every
+  prompt, and the retired pre-fix default session identity is never
+  substituted (a step whose run bound no session, and that declares none
+  either, is refused instead): a step never invents a binding or a session
+  (`refusal.profile.binding`, `refusal.stale.identity`,
+  `refusal.session.unbound`).
+- The retry frontier derives from the recorded attempt ledger, so an
+  `ambiguous` (timed-out) attempt is addressable by `run.retry` even when
+  the run's recorded node fell behind; the single-use authorization, the
+  fail-closed refusals and the no-duplicate-effect replay guarantees are
+  unchanged.
+- Armed supervision can advance its run: the driver hands the next
+  unachieved step to the merged `apply` engine under every existing gate
+  (journaled before effect, consumed retry authorizations respected, holds
+  never cleared); non-armed supervision keeps its classification-only
+  zero-effect contract verbatim.
+
 ### Changed
 
 - Documentation polish (issue #12, PR #13): security recipe doc line fix

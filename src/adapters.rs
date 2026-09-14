@@ -66,7 +66,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::formats::{is_actor, parse_semver};
-use crate::process::{ProcSpec, ProcStatus, run};
+use crate::process::{ProcOut, ProcSpec, ProcStatus, run};
 use crate::redact::redact;
 use crate::schema::{Family, validate_doc};
 use crate::value::{Val, bool_, integer, null, object, string};
@@ -1036,9 +1036,42 @@ pub fn new_session(
 /// and is never interpolated. Workspace operations (observe/interrupt/
 /// outcome/identity) run against the workspace executable with typed
 /// session addressing.
-fn prompt_args(profile: &Profile) -> Result<Vec<String>, AdapterError> {
+///
+/// Issue #92 F2: the row runs the **declared role binding** and continues
+/// the session `harness_start` bound.
+/// - The bound harness profile key is the run's declared role configuration
+///   key. Hermes selects a named profile with the documented global flag
+///   `-p <key>` (verified against the installed CLI: the flag is handled by
+///   the launcher's pre-parse, `hermes_cli/main.py`), and the declared
+///   provider/model pair is passed through on the documented global flags
+///   `--provider <p>` / `-m <model>` when the profile declares one (never
+///   invented, never defaulted). The other official kinds carry the pair on
+///   their own documented rows (Pi, Jcode) and no role-key flag exists for
+///   them — nothing is fabricated.
+/// - Session continuity is the documented `chat --continue <session>
+///   --create-if-missing` pair (`hermes chat --help`: continue a session by
+///   name, creating it when it does not exist yet), so the first prompt of a
+///   run creates the session `harness_start` bound and every later prompt
+///   continues that exact same session by name.
+fn prompt_args(profile: &Profile, session_id: &str) -> Result<Vec<String>, AdapterError> {
     match profile.kind {
-        HarnessKind::Hermes => Ok(vec!["chat".to_string(), "-q".to_string()]),
+        HarnessKind::Hermes => {
+            let mut args = vec!["-p".to_string(), profile.key.clone()];
+            if let (Some(provider), Some(model)) =
+                (profile.provider.as_deref(), profile.model.as_deref())
+            {
+                args.push("--provider".to_string());
+                args.push(provider.to_string());
+                args.push("-m".to_string());
+                args.push(model.to_string());
+            }
+            args.push("chat".to_string());
+            args.push("--continue".to_string());
+            args.push(session_id.to_string());
+            args.push("--create-if-missing".to_string());
+            args.push("-q".to_string());
+            Ok(args)
+        }
         HarnessKind::ClaudeCode => Ok(vec!["-p".to_string()]),
         HarnessKind::Codex => Ok(vec!["exec".to_string()]),
         // One-shot `--print` row (issue #33, measured against pi v0.85.1 on
@@ -1254,6 +1287,119 @@ pub fn execute_op_in_worktree(
     execute_op_at(profile, request, env, Some(cwd))
 }
 
+/// Run one bounded invocation whose child leads its **own process group**
+/// (issue #92 F1): the deadline terminates the whole group, so a harness or
+/// effect child that forked helpers can never leave an orphan behind.
+///
+/// This is the runner for the effect-class children (the harness prompt rows
+/// and the git/gh effect rows). The read adapters keep
+/// [`crate::process::run`] (a direct-child deadline); the group semantics
+/// need spawn-time group creation plus a group signal, so the effect runner
+/// lives here rather than in the read-adapter module.
+///
+/// Group termination uses the system `kill` utility under the SAME
+/// allowlisted environment as the child (the crate forbids unsafe raw
+/// syscalls, so a `kill(2)` group signal is not available): `kill -9
+/// -<pgid>`. When that helper is not resolvable in the allowlisted PATH the
+/// runner still kills the direct child (`ProcessStatus::TimedOut` is
+/// reported either way), so a degraded PATH can never wedge the deadline.
+pub fn run_grouped(spec: ProcSpec<'_>) -> ProcOut {
+    let started = std::time::Instant::now();
+    let mut command = std::process::Command::new(spec.program);
+    command
+        .args(spec.args)
+        .env_clear()
+        .envs(spec.env)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // The child becomes the leader of its own process group (its pid is the
+    // group id), so every descendant inherits a group we can terminate.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    if let Some(cwd) = spec.cwd {
+        command.current_dir(cwd);
+    }
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            return ProcOut {
+                status: ProcStatus::SpawnFailed(err.to_string()),
+                stdout: String::new(),
+                stderr: String::new(),
+                elapsed_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            };
+        }
+    };
+    let group = child.id();
+
+    let status = loop {
+        if started.elapsed() >= spec.timeout {
+            terminate_group(group, spec.env);
+            let _ = child.kill();
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(err) => {
+                terminate_group(group, spec.env);
+                let _ = child.kill();
+                return ProcOut {
+                    status: ProcStatus::SpawnFailed(err.to_string()),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    elapsed_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                };
+            }
+        }
+    };
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = std::io::Read::read_to_string(&mut pipe, &mut stdout);
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = std::io::Read::read_to_string(&mut pipe, &mut stderr);
+    }
+    let _ = child.wait();
+
+    let timed_out = started.elapsed() >= spec.timeout;
+    let final_status = if timed_out && !status.success() && status.code().is_none() {
+        ProcStatus::TimedOut
+    } else {
+        ProcStatus::Exit(status.code().unwrap_or(-1))
+    };
+
+    ProcOut {
+        status: final_status,
+        stdout,
+        stderr,
+        elapsed_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+    }
+}
+
+/// Terminate one child process group by signalling its leader's group id
+/// (`kill -9 -<pgid>`) through the system `kill` helper, then fall back to
+/// the direct child. `kill(2)` is not reachable from this crate (it forbids
+/// unsafe code); the helper runs under the child's own allowlisted
+/// environment and its own output is discarded. Best effort by design: the
+/// caller always also kills the direct child with the std API.
+fn terminate_group(group: u32, env: &BTreeMap<String, String>) {
+    let _ = std::process::Command::new("kill")
+        .args(["-9", &format!("-{group}")])
+        .env_clear()
+        .envs(env)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
 fn execute_op_at(
     profile: &Profile,
     request: &OpRequest<'_>,
@@ -1312,22 +1458,46 @@ fn execute_op_inner(
         );
     }
     match request.op {
-        Op::Start => op_result(
-            profile,
-            request,
-            "succeeded",
-            None,
-            None,
-            Some(object(vec![
-                ("session_id", string(&session_id)),
-                (
-                    "generation",
-                    integer(request.session.identity.generation as i64),
-                ),
-            ])),
-            None,
-            started,
-        ),
+        Op::Start => {
+            // Issue #92 F2: a declarative `argv` profile may declare its own
+            // session-bind row. When it does, START really runs it (bounded,
+            // worktree-confined) and the typed result is the real one; the
+            // official kinds bind their documented session handle without a
+            // subprocess, and nothing is invented for a profile that
+            // declares no row.
+            if let Some(row) = profile.op_args.get("start") {
+                let out = run_typed(&profile.executable, row, request.timeout, env, cwd);
+                if let ProcessOutcome::Failed(err) = out {
+                    return op_result(
+                        profile,
+                        request,
+                        err.status(),
+                        Some(err.code),
+                        Some(err.message),
+                        None,
+                        Some(err.detail),
+                        started,
+                    );
+                }
+            }
+            op_result(
+                profile,
+                request,
+                "succeeded",
+                None,
+                None,
+                Some(object(vec![
+                    ("session_id", string(&session_id)),
+                    (
+                        "generation",
+                        integer(request.session.identity.generation as i64),
+                    ),
+                    ("profile_key", string(&profile.key)),
+                ])),
+                None,
+                started,
+            )
+        }
         Op::Prompt => {
             let payload = match request.payload {
                 Some(payload) => payload,
@@ -1344,7 +1514,7 @@ fn execute_op_inner(
                     );
                 }
             };
-            let mut args = match prompt_args(profile) {
+            let mut args = match prompt_args(profile, &session_id) {
                 Ok(args) => args,
                 Err(err) => {
                     return op_result(
@@ -2548,7 +2718,7 @@ fn run_typed(
             });
         }
     };
-    let out = run(ProcSpec {
+    let out = run_grouped(ProcSpec {
         program: resolved.to_str().unwrap_or_default(),
         args,
         env,
@@ -3158,7 +3328,7 @@ mod tests {
             .with_binding("example-provider", "example-model")
             .expect("binding");
         assert_eq!(
-            prompt_args(&pi).expect("args"),
+            prompt_args(&pi, "sess-test").expect("args"),
             vec![
                 "--provider".to_string(),
                 "example-provider".to_string(),
@@ -3173,7 +3343,7 @@ mod tests {
             .with_binding("example-provider", "example-model")
             .expect("binding");
         assert_eq!(
-            prompt_args(&jcode).expect("args"),
+            prompt_args(&jcode, "sess-test").expect("args"),
             vec![
                 "run".to_string(),
                 "--provider".to_string(),
@@ -3186,7 +3356,7 @@ mod tests {
         );
         for kind in [HarnessKind::Pi, HarnessKind::Jcode] {
             let bare = Profile::official(kind, kind.name()).expect("profile");
-            let err = prompt_args(&bare).expect_err("unbound prompt refused");
+            let err = prompt_args(&bare, "sess-test").expect_err("unbound prompt refused");
             assert_eq!(err.code, CODE_BINDING, "{}", kind.name());
             assert!(!err.retryable);
         }

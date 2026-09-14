@@ -140,6 +140,20 @@ runs control-plane effects:
   refused/ambiguous) plus the exact external read-back; ambiguous effects
   (timeout, process death, post-effect record failure) resolve the claim as
   `ambiguous` — external reconciliation is required before a new key.
+- **Per-effect deadlines (issue #92 F1)**: every effect that spawns has an
+  explicit, documented, bounded deadline, resolved from a per-kind table —
+  never a bare constant at the effect site:
+  - `prompt` 1800 s, `harness_start` 300 s, every other
+    kind 60 s (`EFFECT_DEADLINE_DEFAULT_SECS`), and the hard ceiling is
+    3600 s (`EFFECT_DEADLINE_CEILING_SECS`);
+  - a reviewed plan step may declare its own `deadline_secs` (policy, bound
+    by the plan digest); a value outside `1..=ceiling` — or a non-integer —
+    refuses `refusal.plan.malformed` before the effect runs;
+  - the EFFECTIVE value rides on the step's `result` as `deadline_secs`, so
+    the step outcome/evidence always names the deadline the effect used;
+  - the child of an effect leads its own process group and a deadline
+    terminates the whole group (no orphan), reporting `adapter.timeout` as
+    the typed `ambiguous` outcome.
 
 ## 5. Typed outcomes: `hf-outcome/v1`
 

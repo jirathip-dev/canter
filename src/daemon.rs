@@ -360,9 +360,18 @@ pub fn serve(paths: &DaemonPaths) -> Result<(), DaemonError> {
     // boot reconciliation above (schedule recovery, claim reconciliation,
     // pause boundaries) and runs ONE fresh snapshot reconciliation per armed
     // run before it waits for semantic wakes or its bounded timer deadline.
+    // Issue #92 F4: the supervision driver's dispatch hook. It is created
+    // before `Shared` (the driver starts first) and completed right after, so
+    // a dispatch always sees the same handle the request handlers use.
+    let dispatch = Arc::new(DaemonDispatch {
+        shared: std::sync::OnceLock::new(),
+    });
     let supervisor = crate::supervision::start(
         Arc::clone(&state),
-        crate::supervision::SupervisorOptions::default(),
+        crate::supervision::SupervisorOptions {
+            dispatch: Some(dispatch.clone()),
+            ..crate::supervision::SupervisorOptions::default()
+        },
     );
     let shared = Arc::new(Shared {
         state,
@@ -374,6 +383,7 @@ pub fn serve(paths: &DaemonPaths) -> Result<(), DaemonError> {
         running: AtomicBool::new(true),
         supervisor: supervisor.wake_handle(),
     });
+    let _ = dispatch.shared.set(Arc::clone(&shared));
     shared.log.write(
         "info",
         "daemon.ready",
@@ -1109,6 +1119,112 @@ fn apply_params(request: &Request) -> Result<ApplyParams, (String, String)> {
     })
 }
 
+/// The role binding and the bound session one harness step runs under
+/// (issue #92 F2), resolved from DURABLE state only.
+#[derive(Clone, Debug)]
+struct RunBinding {
+    /// The run's committed role configuration, when the run has one.
+    role: Option<crate::config::ProfileBinding>,
+    /// The session identity the run bound (`harness_start`), when it has one.
+    session: Option<crate::adapters::SessionHandle>,
+}
+
+/// Resolve the role binding + session of a harness step of one run (issue
+/// #92 F2). A run without a committed submission keeps `(None, None)`: its
+/// presented plan declares its own profile/session explicitly. A queue run
+/// resolves BOTH from durable state — the reviewed `hf-profile-binding/v1`
+/// document the submission bound, and the session identity derived once from
+/// the run — and a `prompt` whose `harness_start` step has no recorded
+/// succeeded dispatch is refused (`refusal.session.unbound`): the prompt
+/// continues the session start bound and never binds one itself.
+fn resolve_run_binding(
+    shared: &Arc<Shared>,
+    instance_id: &str,
+    kind: &str,
+    presented: Option<&crate::config::ProfileBinding>,
+) -> Result<RunBinding, (String, String)> {
+    if !matches!(kind, "harness_start" | "prompt") {
+        return Ok(RunBinding {
+            role: None,
+            session: None,
+        });
+    }
+    let state = match shared.lock_state() {
+        Ok(state) => state,
+        Err(message) => return Err(("state.unavailable".to_string(), message)),
+    };
+    let identity = state
+        .run_role_identity(instance_id)
+        .map_err(|err| (err.code.to_string(), err.message))?;
+    let Some((key, revision)) = identity else {
+        // A run without a committed submission has no reviewed role
+        // configuration: its presented plan declares its own binding, and
+        // there is no default profile.
+        return Ok(RunBinding {
+            role: None,
+            session: None,
+        });
+    };
+    // The run's committed role configuration is the ONLY binding its harness
+    // steps run under. The full reviewed binding document is PRESENTED and
+    // verified here against the durable revision the approval bound: a
+    // tampered or foreign binding refuses, an absent one refuses (there is
+    // no default profile and none is inferred).
+    let Some(binding) = presented else {
+        return Err((
+            crate::config::CODE_PROFILE_BINDING.to_string(),
+            format!(
+                "the harness step of run {instance_id} presents no reviewed role configuration \
+                 (params.profile); the run's role {key:?} (revision {revision}) is never defaulted"
+            ),
+        ));
+    };
+    if binding.key != key || binding.revision != revision {
+        return Err((
+            crate::config::CODE_PROFILE_REVISION.to_string(),
+            format!(
+                "the presented role configuration ({}, revision {}) is not the one run \
+                 {instance_id} was approved under ({key}, revision {revision})",
+                binding.key, binding.revision
+            ),
+        ));
+    }
+    let role = binding.clone();
+    let role = Some(role);
+    let derived = || {
+        crate::mutation::run_session_handle(instance_id).map_err(|outcome| {
+            (
+                crate::mutation::code::SESSION_UNBOUND.to_string(),
+                outcome
+                    .message
+                    .unwrap_or_else(|| "the run session could not be derived".to_string()),
+            )
+        })
+    };
+    let session = match kind {
+        "harness_start" => Some(derived()?),
+        _ => {
+            let bound = state
+                .run_bound_start_step(instance_id)
+                .map_err(|err| (err.code.to_string(), err.message))?;
+            match bound {
+                Some(_) => Some(derived()?),
+                None => {
+                    return Err((
+                        crate::mutation::code::SESSION_UNBOUND.to_string(),
+                        format!(
+                            "run {instance_id} has no recorded harness_start bind; a prompt \
+                             continues the session its harness_start bound and never binds one \
+                             itself"
+                        ),
+                    ));
+                }
+            }
+        }
+    };
+    Ok(RunBinding { role, session })
+}
+
 /// `apply`: bind the plan digest, revalidate every binding freshly under
 /// the state lock, journal the intent, execute the typed effect, and
 /// resolve with a typed outcome + exact read-back (issue #8 AC1/AC2/AC4).
@@ -1225,6 +1341,203 @@ fn admission_gate(
         time::unix_now(),
     )
     .map_err(|err| err_response(&request.id, err.code, err.message))
+}
+
+/// The daemon-side dispatch hook of the supervision driver (issue #92 F4).
+///
+/// It holds a `Weak`-free `OnceLock` of the shared daemon handle because the
+/// driver is started before `Shared` exists; every dispatch runs through
+/// [`method_apply`], so capability, grant, admission, ownership, journal and
+/// idempotency gates all re-derive exactly as they do for a client request.
+struct DaemonDispatch {
+    shared: std::sync::OnceLock<Arc<Shared>>,
+}
+
+impl crate::supervision::SupervisedDispatch for DaemonDispatch {
+    fn dispatch(&self, intent: &crate::supervision::DispatchIntent) -> Result<String, String> {
+        let Some(shared) = self.shared.get() else {
+            return Err("the daemon dispatch hook is not wired yet".to_string());
+        };
+        let request = build_dispatch_request(shared, intent)?;
+        let response = method_apply(shared, &request);
+        let doc = Val::parse_json(response.trim())
+            .map_err(|message| format!("the dispatch response is unreadable ({message})"))?;
+        if doc.get("ok").and_then(Val::as_bool) == Some(true) {
+            shared.log.write(
+                "info",
+                "supervision.dispatch",
+                &format!(
+                    "run {} dispatched step {} ({})",
+                    intent.instance_id, intent.step_id, intent.reason
+                ),
+            );
+            return Ok(format!("dispatched {}", intent.step_id));
+        }
+        let code = doc
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Val::as_str)
+            .unwrap_or("error");
+        let message = doc
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Val::as_str)
+            .unwrap_or("the dispatch was refused");
+        shared.log.write(
+            "warn",
+            "supervision.dispatch_refused",
+            &format!(
+                "run {} step {}: {code}: {message}",
+                intent.instance_id, intent.step_id
+            ),
+        );
+        Err(format!("{code}: {message}"))
+    }
+}
+
+/// Build the `apply` request one supervision dispatch presents (issue #92
+/// F4). Every input is READ from durable state: the run's own committed
+/// step spine (params included), the run row (grant, epoch, issue revision,
+/// workflow pins) and the topology + admission occupancy one of the run's own
+/// applies presented. Nothing is invented: an absent dispatch context, plan
+/// or spine refuses before any request exists.
+fn build_dispatch_request(
+    shared: &Arc<Shared>,
+    intent: &crate::supervision::DispatchIntent,
+) -> Result<Request, String> {
+    let state = shared.lock_state()?;
+    let instance = state
+        .instance_by_id(&intent.instance_id)
+        .map_err(|err| format!("{}: {}", err.code, err.message))?
+        .ok_or_else(|| format!("no instance {} exists", intent.instance_id))?;
+    let steps = state
+        .run_step_documents(&intent.instance_id)
+        .map_err(|err| format!("{}: {}", err.code, err.message))?
+        .ok_or_else(|| {
+            format!(
+                "run {} has no committed queue submission spine; supervision dispatches \
+                 committed runs only",
+                intent.instance_id
+            )
+        })?;
+    let recorded = state
+        .run_dispatch_context(&intent.instance_id)
+        .map_err(|err| format!("{}: {}", err.code, err.message))?
+        .ok_or_else(|| {
+            format!(
+                "run {} has no recorded dispatch topology; the first dispatch of a run belongs \
+                 to the caller that holds it",
+                intent.instance_id
+            )
+        })?;
+    let plan = dispatch_plan_doc(&instance, &steps);
+    let plan = match crate::mutation::bind_plan(&plan) {
+        Ok(plan) => plan,
+        Err(err) => return Err(format!("{}: {}", err.code, err.message)),
+    };
+    // Admission inputs are re-presented exactly as the run's own dispatch
+    // attested them; a fresh host-resource measurement is deliberately NOT
+    // fabricated here, so the admission gate still decides for fan-out steps.
+    let mut flags = vec![
+        ("interactive", bool_(false)),
+        ("digest_confirmed", bool_(false)),
+        ("scheduled", bool_(false)),
+    ];
+    if let Some(caps) = recorded.caps {
+        let mut admission = vec![("caps", caps)];
+        if let Some(lanes) = recorded.harness_lanes {
+            admission.push(("harness_lanes", integer(lanes)));
+        }
+        flags.push(("admission", object(admission)));
+    }
+    let params = object(vec![
+        (
+            "idempotency_key",
+            string(&dispatch_key(instance_id_and_step(intent))),
+        ),
+        ("plan", plan.doc.clone()),
+        ("step", string(&intent.step_id)),
+        ("grant_id", string(&instance.grant_id)),
+        ("instance_id", string(&instance.instance_id)),
+        (
+            "observed",
+            object(vec![
+                ("issue_revision", string(&instance.issue_revision)),
+                ("policy_hash", string(&instance.policy_hash)),
+                ("feature_head", null()),
+                ("integration_base", null()),
+            ]),
+        ),
+        ("topology", recorded.topology),
+        ("flags", object(flags)),
+    ]);
+    let id = format!("sup_{}", intent.step_id);
+    // The journaled claim must carry a canonical request line: the durable
+    // attempt ledger (retry frontier, supervision evidence, readbacks) parses
+    // it, so a line-less dispatch would record an unreadable attempt.
+    let line = crate::canonical::canonical_text(&object(vec![
+        ("schema", string("hf-rpc-request/v1")),
+        ("id", string(&id)),
+        ("method", string("apply")),
+        ("params", params.clone()),
+    ]));
+    Ok(Request {
+        id,
+        method: "apply".to_string(),
+        params: Some(params),
+        line,
+    })
+}
+
+/// The `hf-plan/v1` document one supervision dispatch binds (issue #92 F4):
+/// the run's OWN reviewed inputs — repository, issue identity/revision, the
+/// workflow pins the run was admitted under, the live state epoch and the
+/// committed step spine with its reviewed params. The content-addressed plan
+/// id follows the documented derivation (docs/contracts/spec-plans.md); the
+/// engine's own `bind_plan` re-derives and verifies it.
+fn dispatch_plan_doc(instance: &crate::state::InstanceRow, steps: &[Val]) -> Val {
+    let placeholder = object(vec![
+        ("schema", string("hf-plan/v1")),
+        ("plan_id", string("hf_plan_0000000000000000")),
+        ("workflow_id", string(&instance.workflow_id)),
+        ("workflow_hash", string(&instance.workflow_hash)),
+        ("state_epoch", integer(instance.state_epoch)),
+        ("repository", string(&instance.repository)),
+        (
+            "issue",
+            object(vec![
+                ("number", integer(instance.issue_number)),
+                ("revision", string(&instance.issue_revision)),
+            ]),
+        ),
+        ("steps", Val::Arr(steps.to_vec())),
+    ]);
+    let digest = crate::canonical::sha256_hex(&crate::canonical::canonical_bytes(&placeholder));
+    let plan_id = format!("hf_plan_{}", &digest[..16]);
+    match placeholder {
+        Val::Obj(mut map) => {
+            map.insert("plan_id".to_string(), string(&plan_id));
+            Val::Obj(map)
+        }
+        _ => unreachable!("the plan seed is an object"),
+    }
+}
+
+/// One dispatch idempotency key: `ik_` + the run-local step identity + the
+/// current second, so a re-dispatch (a `run.retry`-authorized attempt, or a
+/// later check) is a FRESH claim while a same-second duplicate can never
+/// double-dispatch.
+fn instance_id_and_step(intent: &crate::supervision::DispatchIntent) -> String {
+    format!("{}-{}", intent.instance_id, intent.step_id)
+}
+
+fn dispatch_key(target: String) -> String {
+    let sanitized: String = target
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let tail = format!("{sanitized}-{}", crate::time::unix_now());
+    format!("ik_{}", &tail[..tail.len().min(64)])
 }
 
 fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
@@ -1643,6 +1956,23 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
     // Execute the effect OUTSIDE the state lock (bounded subprocesses never
     // stall other daemon work; the claim already journals the intent).
     let effect_env = crate::config::adapter_environment();
+    // Issue #92 F2: a harness step of a run with a committed submission runs
+    // the run's DECLARED role configuration and the session this run bound —
+    // both resolved from durable state here, never from a step-param default
+    // and never from a profile the caller names.
+    let presented_profile = match presented_profile(request.params.as_ref()) {
+        Ok(profile) => profile,
+        Err((code, message)) => return err_response(&request.id, code, &message),
+    };
+    let run_binding = match resolve_run_binding(
+        shared,
+        &parsed.instance_id,
+        &kind,
+        presented_profile.as_ref(),
+    ) {
+        Ok(binding) => binding,
+        Err((code, message)) => return err_response(&request.id, &code, &message),
+    };
     let ctx = crate::mutation::EffectContext {
         plan: &plan,
         step_id: &parsed.step,
@@ -1657,6 +1987,8 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
         observed_feature_head: parsed.feature_head.as_deref(),
         observed_integration_base: parsed.integration_base.as_deref(),
         env: &effect_env,
+        role: run_binding.role.as_ref(),
+        session: run_binding.session.as_ref(),
     };
     let effect = crate::mutation::execute_step(&ctx);
     let mut result = effect.result;
@@ -2845,14 +3177,26 @@ fn method_run_retry(shared: &Arc<Shared>, request: &Request) -> String {
                 ),
             ));
         }
-        let next_step = crate::run_control::next_step_of(&spine, &run.current_node);
+        // The diagnosis ledger, read BEFORE the frontier decision: issue #92
+        // F3 derives the frontier from it (an `ambiguous` timed-out attempt
+        // is the frontier), so a step that needs a retry is addressable.
+        let attempts = state
+            .run_step_attempts(&parsed.instance_id)
+            .map_err(|err| (err.code, err.message))?;
+        let latest_of = |step: &str| -> Option<String> {
+            attempts
+                .iter()
+                .rfind(|(id, _)| id == step)
+                .map(|(_, status)| status.clone())
+        };
+        let next_step = crate::run_control::frontier_of(&spine, &attempts, &run.current_node);
         let current_index = crate::run_control::step_index_of(&spine, &run.current_node);
         let named_index = crate::run_control::step_index_of(&spine, &parsed.step);
         if next_step.as_deref() != Some(parsed.step.as_str()) {
             let already_done = match (named_index, current_index) {
                 (Some(named), Some(current)) => named <= current,
                 _ => false,
-            };
+            } || latest_of(&parsed.step).as_deref() == Some("succeeded");
             let (code, message) = if already_done {
                 (
                     crate::run_control::codes::STEP_DONE,
@@ -2877,13 +3221,7 @@ fn method_run_retry(shared: &Arc<Shared>, request: &Request) -> String {
         // The diagnosis: a recorded terminal non-success attempt for THIS
         // run and THIS step. A step that never ran, or whose last attempt
         // succeeded, is never retried.
-        let attempts = state
-            .run_step_attempts(&parsed.instance_id)
-            .map_err(|err| (err.code, err.message))?;
-        let latest = attempts
-            .iter()
-            .rfind(|(step, _)| step == &parsed.step)
-            .map(|(_, status)| status.clone());
+        let latest = latest_of(&parsed.step);
         match latest.as_deref() {
             Some("failed") | Some("refused") | Some("ambiguous") => {}
             Some("succeeded") => {

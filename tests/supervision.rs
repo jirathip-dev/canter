@@ -83,6 +83,7 @@ fn request_with(issues: Vec<qp::SelectedIssue>) -> qp::QueueRequest {
                 "read".to_string(),
                 "worktree".to_string(),
                 "spawn".to_string(),
+                "prompt".to_string(),
                 "merge".to_string(),
             ],
         },
@@ -120,7 +121,7 @@ fn grant_doc_at(grant_id: &str, number: i64, revision: &str, epoch: i64) -> Val 
             "issue":{{"number":{number},"revision":"{revision}"}},
             "workflow_hash":"{WORKFLOW_HASH}","policy_hash":"{POLICY_HASH}",
             "phase":"merge","scope":"worktrees/issues/{number}",
-            "caps":["read","worktree","spawn","merge"],
+            "caps":["read","worktree","spawn","prompt","merge"],
             "expires_at":"2999-01-01T00:00:00Z","state_epoch":{epoch},
             "created_at":"2026-09-06T00:00:00Z"}}"#
     ))
@@ -235,6 +236,24 @@ impl DaemonFixture {
     fn seed(&self) -> State {
         std::fs::create_dir_all(self.state_dir.join("canter")).expect("state dir");
         State::open(&self.db(), Retention::default()).expect("open state")
+    }
+
+    /// Spawn the daemon with an explicit `PATH` (the fake harness/forge
+    /// executables the dispatched effects must resolve).
+    fn spawn_with_path(&self, path: &str) -> Child {
+        std::fs::create_dir_all(&self.state_dir).expect("state home");
+        Command::new(env!("CARGO_BIN_EXE_canter"))
+            .args(["daemon", "run", "--socket"])
+            .arg(&self.socket)
+            .env("XDG_STATE_HOME", &self.state_dir)
+            .env("HOME", &self.dir)
+            .env("PATH", path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(
+                std::fs::File::create(self.dir.join("daemon.stderr.log")).expect("stderr log"),
+            ))
+            .spawn()
+            .expect("spawn daemon")
     }
 
     fn spawn(&self) -> Child {
@@ -1201,4 +1220,818 @@ fn unapproved_plan_binding_is_held_and_never_eligible() {
         .supervision_evidence("run-0000000000000009")
         .expect("read");
     assert!(evidence.is_none(), "no evidence, no evaluation");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #92 F4: the armed continuation dispatch
+// ---------------------------------------------------------------------------
+
+/// Two committed steps: the `checkout` the caller dispatches, plus the
+/// `hosted_check` a continuation is expected to dispatch next (issue #92 F4).
+fn request_two_steps(issues: Vec<qp::SelectedIssue>) -> qp::QueueRequest {
+    let mut request = request_with(issues);
+    request.steps.push(qp::PlannedStep {
+        id: "p2".to_string(),
+        kind: "hosted_check".to_string(),
+        params: Some(object(vec![("repo", string(REPO)), ("number", integer(5))])),
+    });
+    request
+}
+
+/// Seed one recorded `apply` attempt of (run, step) into the durable claim
+/// table with a terminal outcome (the shape the driver's evidence reads).
+fn seed_attempt(state: &State, run: &str, step: &str, key: &str, status: &str) {
+    let request_id = fresh_id(0x9200);
+    let line = canter::canonical::canonical_text(&object(vec![
+        ("schema", string("hf-rpc-request/v1")),
+        ("id", string(&request_id)),
+        ("method", string("apply")),
+        (
+            "params",
+            object(vec![
+                ("idempotency_key", string(key)),
+                ("instance_id", string(run)),
+                ("step", string(step)),
+            ]),
+        ),
+    ]));
+    state
+        .journal_intent(
+            "mutate.checkout",
+            &format!("{REPO}:{run}:{step}"),
+            key,
+            &request_id,
+            "apply",
+            None,
+            None,
+            &line,
+        )
+        .expect("claim the attempt");
+    let outcome = canter::canonical::canonical_text(&object(vec![
+        ("schema", string("hf-outcome/v1")),
+        ("plan_id", string("hf_plan_0000000000000000")),
+        ("step_id", string(step)),
+        ("status", string(status)),
+        ("idempotency_key", string(key)),
+        ("observed_at", string("2026-09-14T00:00:00Z")),
+        ("result", Val::Null),
+        ("error", Val::Null),
+    ]));
+    // The claim status is the closed claim vocabulary (the recorded OUTCOME
+    // document carries the typed step status the evidence reads).
+    let claim_status = if status == "ambiguous" {
+        "ambiguous"
+    } else {
+        "spent"
+    };
+    state
+        .resolve_claim(key, "apply", claim_status, &outcome, Some("{}"))
+        .expect("resolve the attempt");
+}
+
+/// A library-level `State` fixture (no daemon): the F4 rule tests read and
+/// write durable state directly, so nothing races their own writes.
+struct Fixture {
+    dir: PathBuf,
+}
+
+impl Fixture {
+    fn new(name: &str) -> Fixture {
+        let dir =
+            std::env::temp_dir().join(format!("hf-supervision-95-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        Fixture { dir }
+    }
+
+    fn open(&self) -> State {
+        std::fs::create_dir_all(self.dir.join("state").join("canter")).expect("state dir");
+        State::open(
+            &self.dir.join("state").join("canter").join("state.db"),
+            Retention::default(),
+        )
+        .expect("open state")
+    }
+}
+
+/// The admitted membership row of one issue.
+fn item_row_of(
+    items: &[canter::state::QueueSubmissionItemRow],
+    number: i64,
+) -> canter::state::QueueSubmissionItemRow {
+    items
+        .iter()
+        .find(|item| item.issue_number == number)
+        .cloned()
+        .unwrap_or_else(|| panic!("no item for issue {number}"))
+}
+
+/// The durable submission plan for one fixture (the daemon builds the
+/// identical plan from the presented params): lets the F4 rule tests drive
+/// the armed row WITHOUT a live daemon, so nothing races their own writes.
+fn submission_plan_for(
+    state: &State,
+    key: &str,
+    bound: &Val,
+    digest: &str,
+    grant_id: &str,
+    supervision_block: Option<supervision::Authorization>,
+) -> canter::state::QueueSubmissionPlan {
+    let material = qx::parse_params(&params_doc(
+        key,
+        bound,
+        digest,
+        &role_revision(),
+        grant_id,
+        supervision_block,
+    ))
+    .expect("params parse");
+    let revalidated = qx::revalidate(state, &material).expect("revalidate");
+    assert_eq!(revalidated.preview.digest, material.digest);
+    let submission_id = qx::submission_id(&material.digest, &material.idempotency_key);
+    let request_line = canter::canonical::canonical_text(
+        &revalidated
+            .preview
+            .doc
+            .get("request")
+            .cloned()
+            .unwrap_or_else(|| material.preview.clone()),
+    );
+    canter::state::QueueSubmissionPlan {
+        submission_id,
+        repository: revalidated.request.repository.clone(),
+        state_epoch: material.epoch,
+        digest: material.digest.clone(),
+        role_key: revalidated.request.harness_key.clone(),
+        role_revision: material.role_revision.clone(),
+        workflow_id: revalidated.request.workflow_id.clone(),
+        workflow_hash: revalidated.request.workflow_hash.clone(),
+        boundary_phase: revalidated.request.boundary.phase.clone(),
+        integration_branch: revalidated.request.boundary.integration_branch.clone(),
+        completion_branch: revalidated.request.boundary.completion_branch.clone(),
+        boundary_caps: revalidated.request.boundary.caps.clone(),
+        request_line,
+        admission_caps: material.caps,
+        harness_lanes: material.harness_lanes,
+        supervision: material.supervision.as_ref().map(|authorization| {
+            canter::state::SupervisionAuthorizationPlan {
+                desired: authorization.desired.clone(),
+                check_interval_secs: authorization.policy.check_interval_secs,
+                progress_timeout_secs: authorization.policy.progress_timeout_secs,
+            }
+        }),
+        items: revalidated
+            .items
+            .iter()
+            .enumerate()
+            .map(|(ordinal, item)| canter::state::QueueSubmissionItemPlan {
+                ordinal: ordinal as i64,
+                work_item: item.work_item.clone(),
+                issue_number: item.issue_number,
+                issue_revision: item.revision.clone(),
+                grant_id: item.grant_id.clone(),
+                resume_digest: item.resume_digest.clone(),
+                verdict: item.verdict.clone(),
+            })
+            .collect(),
+        at: canter::time::rfc3339_now(),
+    }
+}
+
+/// The pure dispatch intent of one run, read from its durable row + evidence.
+fn dispatch_intent_of(state: &State, run: &str) -> Option<supervision::DispatchIntent> {
+    let row = state
+        .supervision_by_id(run)
+        .expect("query row")
+        .expect("supervision row");
+    let evidence = state
+        .supervision_evidence(run)
+        .expect("query evidence")
+        .expect("evidence");
+    supervision::dispatch_intent(&row, &evidence)
+}
+
+#[test]
+fn an_armed_run_is_dispatched_only_while_it_is_live_and_underway() {
+    let fixture = Fixture::new("dispatch-rule");
+    let state = fixture.open();
+    seed_grant(&state, "gr_0000000000000095", 5);
+    let (bound, digest) = render_bound(&state, &request_two_steps(vec![selected("#5", REV_A)]));
+    let plan = submission_plan_for(
+        &state,
+        &idem_key("dispatch-rule"),
+        &bound,
+        &digest,
+        "gr_0000000000000095",
+        Some(armed(30, 60)),
+    );
+    let (_, items) = state.submit_queue_run(&plan).expect("submit");
+    let run = item_row_of(&items, 5)
+        .instance_id
+        .expect("the admitted item carries its run");
+
+    // A run that never dispatched a step has no durable dispatch context: its
+    // FIRST dispatch belongs to the caller that holds the topology, so the
+    // armed run is not advanced yet (and the driver never invents one).
+    assert!(dispatch_intent_of(&state, &run).is_none());
+
+    // Underway: one recorded attempt, and the armed run's continuation is the
+    // next unachieved step of its own reviewed spine.
+    seed_attempt(&state, &run, "p1", "ik_95-dispatch-0001", "succeeded");
+    let intent = dispatch_intent_of(&state, &run).expect("armed continuation");
+    assert_eq!(intent.step_id, "p2");
+    assert_eq!(intent.reason, canter::supervision::codes::DISPATCH);
+    assert_eq!(intent.kind, "hosted_check");
+
+    // A paused run is never advanced by supervision.
+    state
+        .pause_instance(&run, "operator hold", "2026-09-14T00:00:00Z")
+        .expect("pause");
+    assert!(
+        dispatch_intent_of(&state, &run).is_none(),
+        "a held run keeps its hold: no dispatch"
+    );
+}
+
+#[test]
+fn a_run_without_armed_supervision_is_never_dispatched() {
+    let fixture = Fixture::new("dispatch-off");
+    let state = fixture.open();
+    seed_grant(&state, "gr_0000000000000095", 5);
+    let (bound, digest) = render_bound(&state, &request_two_steps(vec![selected("#5", REV_A)]));
+    // No supervision authorization at all: the run is admitted unarmed.
+    let plan = submission_plan_for(
+        &state,
+        &idem_key("dispatch-off"),
+        &bound,
+        &digest,
+        "gr_0000000000000095",
+        None,
+    );
+    let (_, items) = state.submit_queue_run(&plan).expect("submit");
+    let run = item_row_of(&items, 5)
+        .instance_id
+        .expect("the admitted item carries its run");
+    seed_attempt(&state, &run, "p1", "ik_95-dispatch-0002", "succeeded");
+    // No authorization row exists at all: the driver reconciles ARMED rows
+    // only, so an unarmed run is never even read, let alone advanced.
+    assert!(
+        state.supervision_by_id(&run).expect("query row").is_none(),
+        "an unarmed run carries no supervision row"
+    );
+    // With no row, `dispatch_intent` has nothing to read: the classification
+    // path itself refuses to name a continuation for an unauthorized run.
+    assert!(
+        state
+            .supervision_evidence(&run)
+            .expect("query evidence")
+            .is_none(),
+        "an unarmed run is never evaluated"
+    );
+}
+
+/// A minimal REAL git repository: the integration checkout the dispatches
+/// run their read effects against.
+fn init_repo(path: &Path) {
+    std::fs::create_dir_all(path).expect("repo dir");
+    for args in [
+        vec!["init", "-q", "-b", "staging"],
+        vec!["config", "user.email", "lane@example.invalid"],
+        vec!["config", "user.name", "lane"],
+        vec!["commit", "--allow-empty", "-q", "-m", "base"],
+    ] {
+        let status = Command::new("git")
+            .args(&args)
+            .current_dir(path)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {args:?}");
+    }
+}
+
+/// A fake `gh` answering the hosted-check row with a green check set (the
+/// continuation effect of the fixture spine).
+fn write_fake_gh(dir: &Path) -> PathBuf {
+    let bin = dir.join("fakebin");
+    std::fs::create_dir_all(&bin).expect("bin dir");
+    let path = bin.join("gh");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"checks\" ]; then\n\
+           printf '[{\"name\":\"hosted-ci\",\"state\":\"SUCCESS\",\"conclusion\":\"SUCCESS\"}]'\n\
+           exit 0\n\
+         fi\n\
+         echo \"unexpected argv: $*\" >&2\n\
+         exit 9\n",
+    )
+    .expect("write fake gh");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("chmod");
+    }
+    bin
+}
+
+/// The `hf-plan/v1` document for one committed spine (the derivation
+/// docs/contracts/spec-plans.md documents; the daemon's `bind_plan`
+/// re-verifies it, so a divergent derivation refuses rather than runs).
+fn plan_doc_for_bound(bound: &Val, number: i64) -> Val {
+    plan_doc_with_steps(bound.get("steps").cloned().unwrap_or_else(null), number)
+}
+
+/// [`plan_doc_for_bound`] over an explicit step spine (tamper cases).
+fn plan_doc_with_steps(steps: Val, number: i64) -> Val {
+    let placeholder = object(vec![
+        ("schema", string("hf-plan/v1")),
+        ("plan_id", string("hf_plan_0000000000000000")),
+        ("workflow_id", string(DOCTRINE_WORKFLOW_ID)),
+        ("workflow_hash", string(WORKFLOW_HASH)),
+        ("state_epoch", integer(1)),
+        ("repository", string(REPO)),
+        (
+            "issue",
+            object(vec![
+                ("number", integer(number)),
+                ("revision", string(REV_A)),
+            ]),
+        ),
+        ("steps", steps),
+    ]);
+    let digest = canter::canonical::sha256_hex(&canter::canonical::canonical_bytes(&placeholder));
+    match placeholder {
+        Val::Obj(mut map) => {
+            map.insert(
+                "plan_id".to_string(),
+                string(&format!("hf_plan_{}", &digest[..16])),
+            );
+            Val::Obj(map)
+        }
+        _ => unreachable!("the plan seed is an object"),
+    }
+}
+
+/// One caller-driven `apply` of a committed run step: the plan of the run's
+/// own spine, the run's grant, the caller's topology and its admission
+/// proof — exactly the dispatch the operator drives.
+fn caller_apply_params(
+    fixture: &DaemonFixture,
+    integration: &Path,
+    bound: &Val,
+    run: &str,
+    grant_id: &str,
+    target: (&str, i64),
+    key: &str,
+) -> Val {
+    let (step, number) = target;
+    object(vec![
+        ("idempotency_key", string(key)),
+        ("plan", plan_doc_for_bound(bound, number)),
+        ("step", string(step)),
+        ("grant_id", string(grant_id)),
+        ("instance_id", string(run)),
+        (
+            "observed",
+            object(vec![
+                ("issue_revision", string(REV_A)),
+                ("policy_hash", string(POLICY_HASH)),
+                ("feature_head", Val::Null),
+                ("integration_base", Val::Null),
+            ]),
+        ),
+        (
+            "topology",
+            object(vec![
+                ("integration_branch", string("staging")),
+                ("production_branches", Val::Arr(Vec::new())),
+                (
+                    "worktrees_root",
+                    string(&fixture.dir.join("worktrees").to_string_lossy()),
+                ),
+                (
+                    "archive_root",
+                    string(&fixture.dir.join("archive").to_string_lossy()),
+                ),
+                ("integration_repo", string(&integration.to_string_lossy())),
+            ]),
+        ),
+        (
+            "flags",
+            object(vec![
+                ("interactive", canter::value::bool_(true)),
+                ("digest_confirmed", canter::value::bool_(true)),
+                ("scheduled", canter::value::bool_(false)),
+                ("production_confirmation", string("tty")),
+                (
+                    "admission",
+                    object(vec![
+                        (
+                            "caps",
+                            object(vec![
+                                ("global", integer(16)),
+                                ("repository", integer(8)),
+                                ("harness", integer(8)),
+                            ]),
+                        ),
+                        ("harness_lanes", integer(0)),
+                        (
+                            "host_proof",
+                            object(vec![("measured_at", string(&canter::time::rfc3339_now()))]),
+                        ),
+                    ]),
+                ),
+            ]),
+        ),
+    ])
+}
+
+#[test]
+fn an_armed_run_is_advanced_by_the_drivers_own_dispatch() {
+    let fixture = DaemonFixture::new("dispatch-live");
+    let (bound, digest) = {
+        let state = fixture.seed();
+        seed_grant(&state, "gr_0000000000000095", 5);
+        render_bound(&state, &request_two_steps(vec![selected("#5", REV_A)]))
+    };
+    let integration = fixture.dir.join("integration");
+    init_repo(&integration);
+    let fakebin = write_fake_gh(&fixture.dir);
+    let host_path = std::env::var("PATH").unwrap_or_default();
+    let daemon = fixture.spawn_with_path(&format!("{}:{host_path}", fakebin.display()));
+    wait_ready(&fixture);
+
+    let params = params_doc(
+        &idem_key("dispatch-live"),
+        &bound,
+        &digest,
+        &role_revision(),
+        "gr_0000000000000095",
+        Some(armed(5, 60)),
+    );
+    let result = rpc_ok(&fixture.socket, &fresh_id(1), "queue.submit", Some(params));
+    let run = instance_of(&result, 5);
+
+    // The caller dispatches the FIRST step (it holds the topology and the
+    // admission proof); the armed run is then underway.
+    let applied = rpc_ok(
+        &fixture.socket,
+        &fresh_id(2),
+        "apply",
+        Some(caller_apply_params(
+            &fixture,
+            &integration,
+            &bound,
+            &run,
+            "gr_0000000000000095",
+            ("p1", 5),
+            &idem_key("dispatch-live-0001"),
+        )),
+    );
+    assert!(
+        applied.get("integration_base").is_some(),
+        "the checkout step recorded its read-back: {}",
+        canter::canonical::canonical_text(&applied)
+    );
+
+    // AC-F4: the driver dispatches the next unachieved step by itself — no
+    // further client request — through the apply engine.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut attempts = Vec::new();
+    while Instant::now() < deadline {
+        attempts = fixture.seed().run_step_attempts(&run).expect("attempts");
+        if attempts.iter().any(|(step, _)| step == "p2") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let p2 = attempts
+        .iter()
+        .find(|(step, _)| step == "p2")
+        .unwrap_or_else(|| panic!("the driver never dispatched p2: {attempts:?}"));
+    assert_eq!(p2.1, "succeeded", "the continuation ran: {attempts:?}");
+    let log = std::fs::read_to_string(fixture.daemon_log()).unwrap_or_default();
+    assert!(
+        log.contains("\"event\":\"supervision.dispatch\""),
+        "the dispatch is recorded in the daemon log:\n{log}"
+    );
+
+    shutdown(daemon);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #92 F2: the role-bound session lifecycle on the run's own path
+// ---------------------------------------------------------------------------
+
+/// A fake `hermes` that refuses any row other than the documented role-bound
+/// prompt row: the run's declared role key (`-p <key>`), the declared
+/// provider/model binding, and the session the run's `harness_start` bound
+/// (`chat --continue <session> --create-if-missing`), payload last. Its real
+/// stdout carries the session it ran under, so the transcript proves which
+/// session the child was given.
+fn write_fake_hermes(dir: &Path) -> PathBuf {
+    let bin = dir.join("fakebin-hermes");
+    std::fs::create_dir_all(&bin).expect("bin dir");
+    let path = bin.join("hermes");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\n\
+         printf '%s\\n' \"$@\" > argv.txt\n\
+         [ \"$1\" = \"-p\" ] && [ \"$2\" = \"lane-1\" ] || { echo \"bad role: $*\" >&2; exit 7; }\n\
+         [ \"$3\" = \"--provider\" ] && [ \"$4\" = \"provider-a\" ] || { echo \"bad provider: $*\" >&2; exit 8; }\n\
+         [ \"$5\" = \"-m\" ] && [ \"$6\" = \"model-a\" ] || { echo \"bad model: $*\" >&2; exit 9; }\n\
+         [ \"$7\" = \"chat\" ] && [ \"$8\" = \"--continue\" ] || { echo \"bad row: $*\" >&2; exit 10; }\n\
+         [ \"${10}\" = \"--create-if-missing\" ] && [ \"${11}\" = \"-q\" ] || { echo \"bad continue: $*\" >&2; exit 11; }\n\
+         printf 'session:%s output:%s' \"$9\" \"${12}\"\n",
+    )
+    .expect("write fake hermes");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("chmod");
+    }
+    bin
+}
+
+/// The reviewed role configuration of the harness-lifecycle fixture: a
+/// `hermes` profile (the kind whose documented prompt row carries the role
+/// key, the declared provider/model pair and the session continuation).
+fn harness_binding_doc() -> Val {
+    let mut binding = ProfileBinding {
+        key: HARNESS.to_string(),
+        kind: "hermes".to_string(),
+        provider: "provider-a".to_string(),
+        model: "model-a".to_string(),
+        fallbacks: Vec::new(),
+        configured_limits: Vec::new(),
+        introspection: false,
+        secrets: Vec::new(),
+        revision: String::new(),
+    };
+    binding.revision = binding.revision_of();
+    binding.to_doc()
+}
+
+fn harness_role_revision() -> String {
+    harness_binding_doc()
+        .get("revision")
+        .and_then(Val::as_str)
+        .expect("binding revision")
+        .to_string()
+}
+
+/// `queue.submit` params under the fixture's own reviewed role configuration.
+fn harness_submit_params(key: &str, bound: &Val, digest: &str, grant_id: &str) -> Val {
+    let grants = vec![qx::ItemGrant {
+        id: "#5".to_string(),
+        grant_id: grant_id.to_string(),
+    }];
+    qx::submit_params(
+        key,
+        digest,
+        1,
+        bound,
+        &harness_binding_doc(),
+        &harness_role_revision(),
+        ConcurrencyCaps {
+            global: 4,
+            per_repository: 2,
+            per_harness: 2,
+        },
+        Some(true),
+        Some(0),
+        &grants,
+        &[],
+        None,
+    )
+}
+
+/// The committed spine of the harness-lifecycle fixture: the lane worktree,
+/// the run's session bind and the prompt that continues it.
+fn harness_steps(harness_key: &str) -> Vec<qp::PlannedStep> {
+    vec![
+        qp::PlannedStep {
+            id: "p1".to_string(),
+            kind: "worktree_create".to_string(),
+            params: Some(object(vec![
+                ("branch", string("issue-5")),
+                ("worktree", string("issues-5")),
+            ])),
+        },
+        qp::PlannedStep {
+            id: "p2".to_string(),
+            kind: "harness_start".to_string(),
+            params: Some(object(vec![
+                ("harness_key", string(harness_key)),
+                ("kind", string("hermes")),
+            ])),
+        },
+        qp::PlannedStep {
+            id: "p3".to_string(),
+            kind: "prompt".to_string(),
+            params: Some(object(vec![
+                ("harness_key", string(harness_key)),
+                ("kind", string("hermes")),
+                ("worktree", string("issues-5")),
+                ("payload", string("do the bounded work")),
+            ])),
+        },
+        // A second bind step that names ANOTHER role: the run's committed role
+        // configuration is the only profile any harness step runs under.
+        qp::PlannedStep {
+            id: "p4".to_string(),
+            kind: "harness_start".to_string(),
+            params: Some(object(vec![
+                ("harness_key", string("lane-9")),
+                ("kind", string("hermes")),
+            ])),
+        },
+    ]
+}
+
+#[test]
+fn the_prompt_runs_the_runs_declared_role_binding_and_continues_its_session() {
+    let fixture = DaemonFixture::new("role-bound");
+    let (bound, digest) = {
+        let state = fixture.seed();
+        seed_grant(&state, "gr_0000000000000095", 5);
+        let request = qp::QueueRequest {
+            steps: harness_steps("lane-1"),
+            role_config: harness_binding_doc(),
+            ..request_with(vec![selected("#5", REV_A)])
+        };
+        render_bound(&state, &request)
+    };
+    let integration = fixture.dir.join("integration");
+    init_repo(&integration);
+    let fakebin = write_fake_hermes(&fixture.dir);
+    let host_path = std::env::var("PATH").unwrap_or_default();
+    let daemon = fixture.spawn_with_path(&format!("{}:{host_path}", fakebin.display()));
+    wait_ready(&fixture);
+
+    let params = harness_submit_params(
+        &idem_key("role-bound"),
+        &bound,
+        &digest,
+        "gr_0000000000000095",
+    );
+    let result = rpc_ok(&fixture.socket, &fresh_id(1), "queue.submit", Some(params));
+    let run = instance_of(&result, 5);
+    let session = canter::mutation::run_session_handle(&run)
+        .expect("the run session derives")
+        .session_id;
+    assert!(session.starts_with("lane-"), "{session}");
+
+    let steps = bound.get("steps").cloned().unwrap_or_else(null);
+    let apply = |seed: u64, step: &str, plan: Val, key: String| {
+        rpc(
+            &fixture.socket,
+            &fresh_id(seed),
+            "apply",
+            Some({
+                let mut params = caller_apply_params(
+                    &fixture,
+                    &integration,
+                    &bound,
+                    &run,
+                    "gr_0000000000000095",
+                    (step, 5),
+                    &key,
+                );
+                if let Val::Obj(map) = &mut params {
+                    map.insert("plan".to_string(), plan);
+                    map.insert("profile".to_string(), harness_binding_doc());
+                }
+                params
+            }),
+        )
+    };
+
+    // The lane worktree first (the prompt's containment fence reads it).
+    let lane = apply(
+        2,
+        "p1",
+        plan_doc_with_steps(steps.clone(), 5),
+        idem_key("role-lane-0001"),
+    );
+    assert_eq!(
+        lane.get("ok").and_then(Val::as_bool),
+        Some(true),
+        "{}",
+        canter::canonical::canonical_text(&lane)
+    );
+
+    // A prompt BEFORE the run bound a session is refused: the prompt
+    // continues the session `harness_start` bound and never binds one.
+    let early = apply(
+        3,
+        "p3",
+        plan_doc_with_steps(steps.clone(), 5),
+        idem_key("role-early-0001"),
+    );
+    assert_eq!(
+        early
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Val::as_str),
+        Some("refusal.session.unbound"),
+        "{}",
+        canter::canonical::canonical_text(&early)
+    );
+
+    // A harness step naming another role binding is refused: the run's
+    // committed role configuration is the only profile it runs under.
+    let wrong = apply(
+        4,
+        "p4",
+        plan_doc_with_steps(steps.clone(), 5),
+        idem_key("role-wrong-0001"),
+    );
+    assert_eq!(
+        wrong
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Val::as_str),
+        Some("refusal.profile.binding"),
+        "{}",
+        canter::canonical::canonical_text(&wrong)
+    );
+
+    // The session bind of the run's declared role configuration.
+    let started = rpc_ok(
+        &fixture.socket,
+        &fresh_id(5),
+        "apply",
+        Some({
+            let mut params = caller_apply_params(
+                &fixture,
+                &integration,
+                &bound,
+                &run,
+                "gr_0000000000000095",
+                ("p2", 5),
+                &idem_key("role-bind-0001"),
+            );
+            if let Val::Obj(map) = &mut params {
+                map.insert("plan".to_string(), plan_doc_with_steps(steps.clone(), 5));
+                map.insert("profile".to_string(), harness_binding_doc());
+            }
+            params
+        }),
+    );
+    assert_eq!(
+        started.get("session_id").and_then(Val::as_str),
+        Some(session.as_str()),
+        "the start bound the run's session: {}",
+        canter::canonical::canonical_text(&started)
+    );
+    assert_eq!(
+        started.get("role_key").and_then(Val::as_str),
+        Some("lane-1")
+    );
+    assert_eq!(
+        started.get("role_revision").and_then(Val::as_str),
+        Some(harness_role_revision().as_str())
+    );
+
+    // The prompt continues that exact session, runs the declared role
+    // binding, and records the child's REAL stdout as the step result.
+    let prompted = rpc_ok(
+        &fixture.socket,
+        &fresh_id(6),
+        "apply",
+        Some({
+            let mut params = caller_apply_params(
+                &fixture,
+                &integration,
+                &bound,
+                &run,
+                "gr_0000000000000095",
+                ("p3", 5),
+                &idem_key("role-prompt-0001"),
+            );
+            if let Val::Obj(map) = &mut params {
+                map.insert("plan".to_string(), plan_doc_with_steps(steps.clone(), 5));
+                map.insert("profile".to_string(), harness_binding_doc());
+            }
+            params
+        }),
+    );
+    assert_eq!(
+        prompted.get("session_id").and_then(Val::as_str),
+        Some(session.as_str()),
+        "the prompt continued the bound session"
+    );
+    assert_eq!(
+        prompted.get("transcript").and_then(Val::as_str),
+        Some(format!("session:{session} output:do the bounded work").as_str()),
+        "the real child stdout is the step result: {}",
+        canter::canonical::canonical_text(&prompted)
+    );
+
+    shutdown(daemon);
 }
