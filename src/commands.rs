@@ -70,7 +70,8 @@ USAGE:
     canter run pause --run RUN_ID --reason TEXT [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run resume --run RUN_ID --digest HEX64 [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run retry --run RUN_ID --step STEP [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
-    canter run dispatch --run RUN_ID --step STEP [--param KEY=VALUE]... [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
+    canter run resolve --run RUN_ID --step STEP --recorder IDENTITY --evidence FILE [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
+    canter run dispatch --run RUN_ID --step STEP [--param KEY=VALUE]... [--topology FILE] [--admission FILE] [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run status --run RUN_ID [--socket PATH] [--config PATH] [--json]
     canter supervision status --run RUN_ID [--socket PATH] [--config PATH] [--json]
     canter grant issue --request FILE --issue N --expires-in SECS [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
@@ -98,8 +99,8 @@ COMMANDS:
     queue            Preview one reviewed run (the plan producer), submit one
                      approved selected-issue run, or read one committed
                      submission back (preview/status are read-only).
-    run              Pause, resume, retry, dispatch, or inspect exactly ONE
-                     run (pause/resume/retry/dispatch are typed controls;
+    run              Pause, resume, retry, resolve, dispatch, or inspect ONE
+                     run (pause/resume/retry/resolve/dispatch are typed controls;
                      status is read-only; the surface is run-scoped only).
     supervision      Read the versioned supervision status of exactly ONE
                      supervised run back (read-only; supervision is armed
@@ -1830,6 +1831,7 @@ fn parse_supervision(args: &[&String]) -> Result<Invocation, ParseError> {
                 }
                 run = Some(value);
             }
+            "-h" | "--help" => return Err(ParseError::Help(help_request("supervision"))),
             flag => {
                 return Err(ParseError::Usage(format!(
                     "{command}: unknown flag {flag:?}; run `canter supervision --help`"
@@ -5710,7 +5712,7 @@ state.not_found) · 5 config error.
 ";
 
 const RUN_USAGE: &str = "\
-canter run <pause|resume|retry|dispatch|status> — run-scoped controls for ONE run
+canter run <pause|resume|retry|resolve|dispatch|status> — run-scoped controls for ONE run
 
 USAGE:
     canter run pause --run RUN_ID --reason TEXT [--idempotency-key IK] \
@@ -5719,8 +5721,11 @@ USAGE:
 [--socket PATH] [--config PATH] [--json]
     canter run retry --run RUN_ID --step STEP [--idempotency-key IK] \
 [--socket PATH] [--config PATH] [--json]
+    canter run resolve --run RUN_ID --step STEP --recorder IDENTITY \
+--evidence FILE [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run dispatch --run RUN_ID --step STEP [--param KEY=VALUE]... \
-[--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
+[--topology FILE] [--admission FILE] [--idempotency-key IK] [--socket PATH] \
+[--config PATH] [--json]
     canter run status --run RUN_ID [--socket PATH] [--config PATH] [--json]
 
 The scope is the RUN only: --run names exactly one durable run record
@@ -5755,13 +5760,22 @@ WHOLE effect: nothing is dispatched, spawned or consumed by this command —
 the operator's own corrected dispatch of that exact step consumes it
 exactly once (single use).
 
+resolve records an explicit, recorder-attributed artifact for ONE diagnosed
+prompt (daemon `run.resolve`): a closed JSON object binds the delivered feature
+head, output branch, PR identity and named checks. It advances the attempt
+ledger without invoking the prompt effect again. It cannot resolve any other
+step kind, an in-flight effect, an unattempted/refused/succeeded step, or an
+artifact whose branch/repository differs from the run.
+
 dispatch performs that corrected dispatch (daemon `run.dispatch`): it takes
 the run, the committed-spine step and ONLY the step-specific inputs the
 operator actually knows (`--param KEY=VALUE`, repeatable; a value that is
 JSON keeps its type, everything else is the literal string). The plan
-document, the issue/grant/workflow pins, the topology and the admission
-inputs are derived daemon-side from the run's committed submission and the
-run's own recorded dispatch context, so no `hf-plan/v1` is ever hand-built.
+document and issue/grant/workflow pins are derived daemon-side from the run's
+committed submission. `--topology FILE` supplies the documented topology for
+the run's first dispatch; later dispatches reuse that immutable recorded
+topology. `--admission FILE` may provide a fresh caller-attested admission
+measurement. No `hf-plan/v1` is ever hand-built.
 The operator's inputs are merged over the step's committed params and
 validated against the step kind's existing param contract BEFORE anything
 is journaled. That pre-screen is TOTAL over the step kinds: each kind's own
@@ -6247,6 +6261,15 @@ pub fn cli_main() -> std::process::ExitCode {
     if args.is_empty() {
         eprintln!("{USAGE}");
         eprintln!("error: no arguments given; try `canter --help`");
+        return ExitCode::from(2);
+    }
+    if matches!(
+        args[0].split('=').next(),
+        Some("--config" | "--socket" | "--json")
+    ) {
+        eprintln!(
+            "error: --config/--socket/--json belong after the subcommand; for example: canter run status --run RUN_ID --config FILE --socket PATH"
+        );
         return ExitCode::from(2);
     }
     if args[0].starts_with('-') {
