@@ -14,7 +14,7 @@
 //!
 //! | level | identity | control surface | effect of a run control |
 //! | --- | --- | --- | --- |
-//! | run | one `run-` instance id | `run.pause` / `run.resume` / `run.retry` / `run.status` | exactly this run: stop admitting new steps (pause), lift this run's pause (resume), authorize one bounded re-dispatch of one diagnosed step (retry) |
+//! | run | one `run-` instance id | `run.pause` / `run.resume` / `run.retry` / `run.dispatch` / `run.status` | exactly this run: stop admitting new steps (pause), lift this run's pause (resume), authorize one bounded re-dispatch of one diagnosed step (retry, authorization only), dispatch ONE committed-spine step with the operator's own step inputs (dispatch, derived from the run's committed submission), read the control state back (status) |
 //! | fleet | the whole run population | NONE — no `fleet.*` method exists in the closed RPC set | a fleet-level hold is an operator policy expressed as the set of paused runs: every `run.resume` is fenced on the exact instance id, so it never lifts another run's pause and never re-enables anything fleet-wide |
 //! | lane | one handoff lane generation (replacement/checkpoint records) | `lane.*` only | run controls never touch lane records; a run control naming a non-run identity refuses typed |
 //!
@@ -36,6 +36,9 @@ pub const RUN_CONTROL_SCHEMA: &str = "hf-run-control/v1";
 /// The bounded-retry document schema id (module-local).
 pub const RUN_RETRY_SCHEMA: &str = "hf-run-retry/v1";
 
+/// The supported step-dispatch document schema id (module-local).
+pub const RUN_DISPATCH_SCHEMA: &str = "hf-run-dispatch/v1";
+
 /// Bound on the operator pause reason (same bound as the lane hold).
 pub const REASON_MAX: usize = 300;
 
@@ -43,8 +46,14 @@ pub const REASON_MAX: usize = 300;
 /// do.
 pub const CONTROL_STATEMENT: &str = "run-scoped control only: exactly one run is addressed; no other run's pause, no fleet-level hold and no lane handoff record is touched, nothing is killed or cleaned up, and no gate is bypassed";
 
-/// The statement every retry document carries.
-pub const RETRY_STATEMENT: &str = "bounded retry only: exactly ONE diagnosed step of this run is authorized for ONE re-dispatch; it spawns nothing by itself, never repeats the plan, and never widens the reviewed boundary";
+/// The statement every retry document carries: minting the authorization is
+/// the WHOLE effect — nothing is dispatched, spawned or consumed by it; the
+/// operator's own (corrected) dispatch of that step consumes it exactly once.
+pub const RETRY_STATEMENT: &str = "bounded retry only: exactly ONE diagnosed step of this run is authorized for ONE re-dispatch; minting the authorization dispatches nothing by itself, spawns nothing and consumes nothing — the operator's own corrected dispatch of that exact step consumes it exactly once (single use), and the retry never repeats the plan or widens the reviewed boundary";
+
+/// The statement every dispatch document carries: what the supported
+/// dispatch surface did and did NOT do.
+pub const DISPATCH_STATEMENT: &str = "step dispatch only: exactly ONE step of this run is dispatched, derived from the run's committed submission spine and the run's own recorded dispatch context — the caller presents only that step's own inputs (merged over the committed params, never a stale reconstruction); a request that is not well-formed enough to be attempted refuses typed BEFORE any bounded retry authorization is consumed, an unconsumed authorization of a diagnosed step is consumed by exactly this dispatch (single use), and nothing else is dispatched, spawned, resumed, cleaned up or widened";
 
 /// The closed control-state vocabulary rendered by the documents.
 pub const CONTROL_STATES: [&str; 3] = ["active", "pause_requested", "paused"];
@@ -132,6 +141,24 @@ pub struct RetryParams {
     pub instance_id: String,
     /// The exact diagnosed step id (plan-local slug).
     pub step: String,
+}
+
+/// `run.dispatch` params, fully shape-validated (issue #92): the run, the
+/// committed-spine step and ONLY the step-specific inputs the operator
+/// actually knows — every other input (plan, issue pins, grant, topology,
+/// admission) is derived from the run's committed submission and its own
+/// recorded dispatch context.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DispatchParams {
+    /// The presented idempotency key.
+    pub idempotency_key: String,
+    /// The exact run identity (`run-` + 16 hex).
+    pub instance_id: String,
+    /// The committed-spine step to dispatch (plan-local slug).
+    pub step: String,
+    /// The operator's step inputs, merged over the step's committed params.
+    /// `None` = the committed params as reviewed (no correction).
+    pub step_params: Option<Val>,
 }
 
 /// Validate one required key and return its closed key set check.
@@ -282,6 +309,58 @@ pub fn parse_retry_params(params: &Val) -> Result<RetryParams, ControlError> {
     })
 }
 
+/// Parse and shape-validate `run.dispatch` params (issue #92).
+pub fn parse_dispatch_params(params: &Val) -> Result<DispatchParams, ControlError> {
+    only_keys(
+        params,
+        &["idempotency_key", "instance_id", "step", "params"],
+        "run.dispatch",
+    )?;
+    let idempotency_key = required(params, "idempotency_key", "run.dispatch")?;
+    if !formats::is_idempotency_key(&idempotency_key) {
+        return Err(ControlError::new(
+            "refusal.malformed",
+            "run.dispatch params.idempotency_key must be `ik_` + 8-64 of [a-z0-9-]",
+        ));
+    }
+    let instance_id = required(params, "instance_id", "run.dispatch")?;
+    if !formats::is_run_id(&instance_id) {
+        return Err(ControlError::new(
+            codes::TARGET,
+            format!(
+                "run.dispatch addresses exactly ONE run (`run-` + 16 hex); {instance_id:?} is not \
+                 a run identity"
+            ),
+        ));
+    }
+    let step = required(params, "step", "run.dispatch")?;
+    if !formats::is_slug(&step) {
+        return Err(ControlError::new(
+            "refusal.malformed",
+            "run.dispatch params.step must be a committed plan step id (slug)",
+        ));
+    }
+    let step_params = match params.get("params") {
+        None | Some(Val::Null) => None,
+        Some(inputs @ Val::Obj(_)) => Some(inputs.clone()),
+        Some(other) => {
+            return Err(ControlError::new(
+                "refusal.malformed",
+                format!(
+                    "run.dispatch params.params must be an object of step inputs, got {}",
+                    other.type_name()
+                ),
+            ));
+        }
+    };
+    Ok(DispatchParams {
+        idempotency_key,
+        instance_id,
+        step,
+        step_params,
+    })
+}
+
 /// The canonical `run.pause` params document.
 pub fn pause_params(key: &str, instance_id: &str, reason: &str) -> Val {
     object(vec![
@@ -307,6 +386,21 @@ pub fn retry_params(key: &str, instance_id: &str, step: &str) -> Val {
         ("instance_id", string(instance_id)),
         ("step", string(step)),
     ])
+}
+
+/// The canonical `run.dispatch` params document: the run, the step and the
+/// operator's step inputs (omitted when the committed params are dispatched
+/// as reviewed).
+pub fn dispatch_params(key: &str, instance_id: &str, step: &str, step_params: Option<Val>) -> Val {
+    let mut fields = vec![
+        ("idempotency_key", string(key)),
+        ("instance_id", string(instance_id)),
+        ("step", string(step)),
+    ];
+    if let Some(inputs) = step_params {
+        fields.push(("params", inputs));
+    }
+    object(fields)
 }
 
 /// The canonical `run.status` params document.
@@ -537,6 +631,69 @@ impl RunRetryRow {
     }
 }
 
+/// Render the `hf-run-dispatch/v1` projection of one supported step dispatch
+/// (issue #92): the addressed run/step, the exact step params the dispatch
+/// presented (the operator's inputs over the committed ones), the recorded
+/// apply outcome and the bounded authorization this dispatch consumed.
+pub fn dispatch_doc(
+    run: &InstanceRow,
+    spine: &[String],
+    step: &str,
+    kind: &str,
+    params: Option<&Val>,
+    outcome: &Val,
+    retry: Option<&RunRetryRow>,
+) -> Val {
+    object(vec![
+        ("schema", string(RUN_DISPATCH_SCHEMA)),
+        ("run", run_block(run)),
+        (
+            "step",
+            object(vec![
+                ("step_id", string(step)),
+                ("kind", string(kind)),
+                (
+                    "params",
+                    match params {
+                        Some(params) => params.clone(),
+                        None => null(),
+                    },
+                ),
+            ]),
+        ),
+        ("dispatch", outcome.clone()),
+        (
+            "retry",
+            match retry {
+                Some(retry) => object(vec![
+                    ("retry_id", string(&retry.retry_id)),
+                    ("attempt", integer(retry.attempt)),
+                    ("bound", integer(RUN_RETRY_MAX)),
+                    ("status", string(&retry.status_word())),
+                    ("consumed_at", string(&retry.consumed_at)),
+                    ("consumed_key", string(&retry.consumed_key)),
+                ]),
+                None => null(),
+            },
+        ),
+        (
+            "spine",
+            object(vec![
+                (
+                    "steps",
+                    Val::Arr(spine.iter().map(|step| string(step)).collect()),
+                ),
+                (
+                    "step_index",
+                    integer(step_index_of(spine, step).unwrap_or(0) as i64),
+                ),
+            ]),
+        ),
+        ("scope", scope_block(&run.instance_id)),
+        ("statement", string(DISPATCH_STATEMENT)),
+    ])
+}
+
 /// The human rendering of one control document (a rendering of the same
 /// data, never a second contradicting contract).
 pub fn render_human(document: &Val) -> String {
@@ -551,6 +708,40 @@ pub fn render_human(document: &Val) -> String {
     let number =
         |value: &Val, key: &str| -> i64 { value.get(key).and_then(Val::as_int).unwrap_or(0) };
     let schema = text(document, "schema");
+    if schema == RUN_DISPATCH_SCHEMA {
+        let step = document.get("step").cloned().unwrap_or_else(null);
+        let dispatch = document.get("dispatch").cloned().unwrap_or_else(null);
+        let retry = document.get("retry").cloned().unwrap_or_else(null);
+        let outcome = if text(&dispatch, "status") == "succeeded" {
+            "succeeded".to_string()
+        } else {
+            format!(
+                "{} ({})",
+                text(&dispatch, "status"),
+                text(&dispatch.get("error").cloned().unwrap_or_else(null), "code")
+            )
+        };
+        let authorization = if retry.is_null() {
+            "none consumed (no unconsumed authorization was required)".to_string()
+        } else {
+            format!(
+                "{} {} consumed by {}",
+                text(&retry, "status"),
+                text(&retry, "retry_id"),
+                text(&retry, "consumed_key")
+            )
+        };
+        return format!(
+            "run {} dispatch: step {} ({})\nstep params: {}\ndispatch: {}\nauthorization: {}\nscope: run {} only; no fleet-level or lane effect\n",
+            text(&run, "instance_id"),
+            text(&step, "step_id"),
+            text(&step, "kind"),
+            crate::canonical::canonical_text(&step.get("params").cloned().unwrap_or_else(null)),
+            outcome,
+            authorization,
+            text(&run, "instance_id"),
+        );
+    }
     if schema == RUN_RETRY_SCHEMA {
         let retry = document.get("retry").cloned().unwrap_or_else(null);
         let spine = document.get("spine").cloned().unwrap_or_else(null);

@@ -1403,25 +1403,88 @@ fn effect_checkout(ctx: &EffectContext<'_>) -> EffectOutcome {
     }
 }
 
+/// The `worktree_create` lane inputs — the branch and the relative worktree
+/// path — resolved from the step params. The ONE authoring of this step
+/// kind's param contract (issue #92): the effect and the daemon-side
+/// well-formedness check ([`check_step_params`]) both read it, so a request
+/// is refused for exactly the reason (and code) the effect would refuse it.
+pub fn worktree_create_inputs(
+    params: Option<&Val>,
+    integration_branch: &str,
+    production_branches: &[String],
+) -> Result<(String, String), EffectOutcome> {
+    let branch = match param_str(params, "branch") {
+        Ok(branch) if is_slug(branch) => branch.to_string(),
+        _ => {
+            return Err(refusal(
+                code::BAD_PARAMS,
+                "worktree_create requires a slug branch",
+            ));
+        }
+    };
+    let kind = classify_branch(&branch, integration_branch, production_branches);
+    if kind != BranchKind::Feature {
+        return Err(refusal(
+            code::PUSH_POLICY,
+            format!("worktree branches must be feature lanes, got {branch:?}"),
+        ));
+    }
+    match param_str(params, "worktree") {
+        Ok(relative) => Ok((branch, relative.to_string())),
+        Err(outcome) => Err(outcome),
+    }
+}
+
+/// The daemon-side param contract of one step kind (issue #92): `Ok(())` when
+/// the presented params are well-formed enough for the effect to be
+/// ATTEMPTED, a typed refusal otherwise. Pure: no state, no subprocess, no
+/// side effect. The dispatch path evaluates it BEFORE any retry
+/// authorization is consumed, so a malformed re-dispatch refuses typed and
+/// never burns the operator's single-use authorization.
+pub fn check_step_params(
+    kind: &str,
+    params: Option<&Val>,
+    integration_branch: &str,
+    production_branches: &[String],
+) -> Result<(), (String, String)> {
+    let typed = |outcome: EffectOutcome| -> (String, String) {
+        (
+            outcome.code.unwrap_or_else(|| code::BAD_PARAMS.to_string()),
+            outcome
+                .message
+                .unwrap_or_else(|| "step params malformed".to_string()),
+        )
+    };
+    match kind {
+        "worktree_create" => {
+            worktree_create_inputs(params, integration_branch, production_branches)
+                .map(|_| ())
+                .map_err(typed)?;
+        }
+        // Both kinds run a child and refuse a missing params block.
+        "harness_start" | "prompt" if params.is_none() => {
+            return Err((
+                code::BAD_PARAMS.to_string(),
+                format!("{kind} requires params"),
+            ));
+        }
+        _ => {}
+    }
+    // A declared bounded deadline is part of the same contract.
+    effect_deadline_secs(kind, params)
+        .map(|_| ())
+        .map_err(typed)
+}
+
 /// `worktree_create`: create an isolated lane worktree + branch off the
 /// current integration head (path-contained under the lane root).
 fn effect_worktree_create(ctx: &EffectContext<'_>) -> EffectOutcome {
-    let branch = match param_str(ctx.params, "branch") {
-        Ok(branch) if is_slug(branch) => branch.to_string(),
-        _ => return refusal(code::BAD_PARAMS, "worktree_create requires a slug branch"),
-    };
-    let kind = classify_branch(&branch, ctx.integration_branch, ctx.production_branches);
-    if kind != BranchKind::Feature {
-        return refusal(
-            code::PUSH_POLICY,
-            format!("worktree branches must be feature lanes, got {branch:?}"),
-        );
-    }
-    let relative = match param_str(ctx.params, "worktree") {
-        Ok(relative) => relative,
-        Err(outcome) => return outcome,
-    };
-    let worktree = match contained_path(ctx.worktrees_root, relative) {
+    let (branch, relative) =
+        match worktree_create_inputs(ctx.params, ctx.integration_branch, ctx.production_branches) {
+            Ok(inputs) => inputs,
+            Err(outcome) => return outcome,
+        };
+    let worktree = match contained_path(ctx.worktrees_root, &relative) {
         Ok(path) => path,
         Err(err) => return refusal(err.code, err.message),
     };

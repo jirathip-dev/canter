@@ -1192,7 +1192,7 @@ pub const SUPPORTED_FAMILIES: [Family; 18] = [
 /// mint path for route grants: `params.grant` carries the exact
 /// `hf-grant/v1` document, issuance stays daemon-issued — the closed set
 /// grows by exactly the one method issuance needs).
-pub const RPC_METHODS: [&str; 37] = [
+pub const RPC_METHODS: [&str; 38] = [
     "capabilities",
     "doctor",
     "status",
@@ -1224,6 +1224,7 @@ pub const RPC_METHODS: [&str; 37] = [
     "run.pause",
     "run.resume",
     "run.retry",
+    "run.dispatch",
     "run.status",
     "supervision.status",
     "backup.create",

@@ -70,6 +70,7 @@ USAGE:
     canter run pause --run RUN_ID --reason TEXT [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run resume --run RUN_ID --digest HEX64 [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run retry --run RUN_ID --step STEP [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
+    canter run dispatch --run RUN_ID --step STEP [--param KEY=VALUE]... [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run status --run RUN_ID [--socket PATH] [--config PATH] [--json]
     canter supervision status --run RUN_ID [--socket PATH] [--config PATH] [--json]
     canter grant issue --request FILE --issue N --expires-in SECS [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
@@ -97,9 +98,9 @@ COMMANDS:
     queue            Preview one reviewed run (the plan producer), submit one
                      approved selected-issue run, or read one committed
                      submission back (preview/status are read-only).
-    run              Pause, resume, retry, or inspect exactly ONE run
-                     (pause/resume/retry are typed controls; status is
-                     read-only; the surface is run-scoped only).
+    run              Pause, resume, retry, dispatch, or inspect exactly ONE
+                     run (pause/resume/retry/dispatch are typed controls;
+                     status is read-only; the surface is run-scoped only).
     supervision      Read the versioned supervision status of exactly ONE
                      supervised run back (read-only; supervision is armed
                      with the run's queue submission and evaluated by the
@@ -157,7 +158,7 @@ pub struct Invocation {
 /// inspect exactly ONE run. Pause/resume/retry are typed controls (each
 /// journals its intent through the daemon claim machinery); status is
 /// read-only.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum RunAction {
     /// Record ONE durable pause request: `run pause`.
     Pause(RunPauseArgs),
@@ -167,6 +168,9 @@ pub enum RunAction {
     /// Authorize ONE bounded re-dispatch of ONE diagnosed step:
     /// `run retry`.
     Retry(RunRetryArgs),
+    /// Dispatch ONE committed-spine step with the operator's own step inputs:
+    /// `run dispatch`.
+    Dispatch(RunDispatchArgs),
     /// Read one run's control state back (read-only): `run status`.
     Status(RunStatusArgs),
 }
@@ -204,6 +208,23 @@ pub struct RunRetryArgs {
     pub run: String,
     /// The exact plan step id being retried.
     pub step: String,
+    /// `--idempotency-key`: replay-safe automation key.
+    pub idempotency_key: Option<String>,
+    /// Explicit daemon socket override.
+    pub socket: Option<String>,
+}
+
+/// `run dispatch`: the exact target, the committed-spine step and the
+/// operator's own step inputs (everything else is derived daemon-side).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunDispatchArgs {
+    /// Explicit run id (`run-` + 16 hex).
+    pub run: String,
+    /// The committed-spine plan step to dispatch.
+    pub step: String,
+    /// The operator's step-specific inputs (`--param KEY=VALUE`, repeatable);
+    /// merged over the step's committed params.
+    pub params: Vec<(String, Val)>,
     /// `--idempotency-key`: replay-safe automation key.
     pub idempotency_key: Option<String>,
     /// Explicit daemon socket override.
@@ -1464,6 +1485,7 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
         "pause" => "run pause",
         "resume" => "run resume",
         "retry" => "run retry",
+        "dispatch" => "run dispatch",
         "status" => "run status",
         "-h" | "--help" => return Err(ParseError::Help(help_request("run"))),
         other => {
@@ -1480,6 +1502,7 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
     let mut digest: Option<String> = None;
     let mut step: Option<String> = None;
     let mut idempotency_key: Option<String> = None;
+    let mut step_params: Vec<(String, Val)> = Vec::new();
     let rest = &args[1..];
     let mut index = 0;
     while index < rest.len() {
@@ -1533,6 +1556,24 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
                 }
                 step = Some(value);
             }
+            "--param" => {
+                let value = flag_value(rest, &mut index, command, "--param")?;
+                let Some((name, raw)) = value.split_once('=') else {
+                    return Err(ParseError::Usage(format!(
+                        "{command}: --param must be KEY=VALUE, got {value:?}"
+                    )));
+                };
+                if !crate::formats::is_slug(name) {
+                    return Err(ParseError::Usage(format!(
+                        "{command}: --param key must be a step param name (slug), got {name:?}"
+                    )));
+                }
+                // One deterministic typing rule: a value that IS JSON
+                // (number/bool/object/array) keeps its type, everything else
+                // is the literal string.
+                let typed = Val::parse_json(raw).unwrap_or_else(|_| string(raw));
+                step_params.push((name.to_string(), typed));
+            }
             "--idempotency-key" => {
                 let value = flag_value(rest, &mut index, command, "--idempotency-key")?;
                 if !crate::formats::is_idempotency_key(&value) {
@@ -1559,7 +1600,7 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
     };
     let action = match action.as_str() {
         "pause" => {
-            if digest.is_some() || step.is_some() {
+            if digest.is_some() || step.is_some() || !step_params.is_empty() {
                 return Err(ParseError::Usage(
                     "run pause takes --run and --reason only".to_string(),
                 ));
@@ -1577,7 +1618,7 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
             })
         }
         "resume" => {
-            if reason.is_some() || step.is_some() {
+            if reason.is_some() || step.is_some() || !step_params.is_empty() {
                 return Err(ParseError::Usage(
                     "run resume takes --run and --digest only".to_string(),
                 ));
@@ -1596,7 +1637,7 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
             })
         }
         "retry" => {
-            if reason.is_some() || digest.is_some() {
+            if reason.is_some() || digest.is_some() || !step_params.is_empty() {
                 return Err(ParseError::Usage(
                     "run retry takes --run and --step only".to_string(),
                 ));
@@ -1613,8 +1654,27 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
                 socket,
             })
         }
+        "dispatch" => {
+            if reason.is_some() || digest.is_some() {
+                return Err(ParseError::Usage(
+                    "run dispatch takes --run, --step and --param only".to_string(),
+                ));
+            }
+            let Some(step) = step else {
+                return Err(ParseError::Usage(
+                    "run dispatch: --step STEP is required (the committed-spine step)".to_string(),
+                ));
+            };
+            RunAction::Dispatch(RunDispatchArgs {
+                run,
+                step,
+                params: step_params,
+                idempotency_key,
+                socket,
+            })
+        }
         _ => {
-            if reason.is_some() || digest.is_some() || step.is_some() {
+            if reason.is_some() || digest.is_some() || step.is_some() || !step_params.is_empty() {
                 return Err(ParseError::Usage("run status takes --run only".to_string()));
             }
             if idempotency_key.is_some() {
@@ -4898,6 +4958,7 @@ fn execute_run(action: RunAction, invocation: &Invocation) -> CmdResult {
         RunAction::Pause(args) => execute_run_pause(&args, invocation),
         RunAction::Resume(args) => execute_run_resume(&args, invocation),
         RunAction::Retry(args) => execute_run_retry(&args, invocation),
+        RunAction::Dispatch(args) => execute_run_dispatch(&args, invocation),
         RunAction::Status(args) => execute_run_status(&args, invocation),
     }
 }
@@ -4982,6 +5043,40 @@ fn execute_run_retry(args: &RunRetryArgs, invocation: &Invocation) -> CmdResult 
         }
         Err(RpcError { code, message }) => {
             lane_error(&code, format!("run retry: {message}"), false)
+        }
+    }
+}
+
+/// `run dispatch`: dispatch ONE committed-spine step with the operator's own
+/// step inputs (daemon `run.dispatch`). The plan document, the issue/grant
+/// pins, the topology and the admission inputs are derived daemon-side from
+/// the run's committed submission — the caller never hand-builds `hf-plan/v1`
+/// params — and a request that is not well-formed enough to be attempted
+/// refuses typed before any bounded retry authorization is consumed.
+fn execute_run_dispatch(args: &RunDispatchArgs, invocation: &Invocation) -> CmdResult {
+    let paths = match run_control_paths(args.socket.as_deref(), invocation) {
+        Ok(paths) => paths,
+        Err(result) => return result,
+    };
+    let key = args.idempotency_key.clone().unwrap_or_else(fresh_run_key);
+    let supplied = if args.params.is_empty() {
+        None
+    } else {
+        Some(object(
+            args.params
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.clone()))
+                .collect(),
+        ))
+    };
+    let params = crate::run_control::dispatch_params(&key, &args.run, &args.step, supplied);
+    match client::call(&paths.socket_path, "run.dispatch", Some(&params)) {
+        Ok(result) => {
+            let human = crate::run_control::render_human(&result);
+            ok_result(result, human)
+        }
+        Err(RpcError { code, message }) => {
+            lane_error(&code, format!("run dispatch: {message}"), false)
         }
     }
 }
@@ -5467,7 +5562,7 @@ state.not_found) · 5 config error.
 ";
 
 const RUN_USAGE: &str = "\
-canter run <pause|resume|retry|status> — run-scoped controls for ONE run
+canter run <pause|resume|retry|dispatch|status> — run-scoped controls for ONE run
 
 USAGE:
     canter run pause --run RUN_ID --reason TEXT [--idempotency-key IK] \
@@ -5476,6 +5571,8 @@ USAGE:
 [--socket PATH] [--config PATH] [--json]
     canter run retry --run RUN_ID --step STEP [--idempotency-key IK] \
 [--socket PATH] [--config PATH] [--json]
+    canter run dispatch --run RUN_ID --step STEP [--param KEY=VALUE]... \
+[--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run status --run RUN_ID [--socket PATH] [--config PATH] [--json]
 
 The scope is the RUN only: --run names exactly one durable run record
@@ -5505,17 +5602,33 @@ retry authorizes exactly ONE bounded re-dispatch of ONE diagnosed step
 spine, its current unachieved frontier step, and must carry a recorded
 terminal non-success attempt. Invalid (unknown/undiagnosed/out-of-order),
 revoked (inactive grant), stale (moved epoch), already-succeeded and
-exhausted (bounded attempts used) retries refuse; the authorization is
-consumed by the next dispatch of that exact step. Nothing is spawned by
-this command.
+exhausted (bounded attempts used) retries refuse. The authorization is the
+WHOLE effect: nothing is dispatched, spawned or consumed by this command —
+the operator's own corrected dispatch of that exact step consumes it
+exactly once (single use).
+
+dispatch performs that corrected dispatch (daemon `run.dispatch`): it takes
+the run, the committed-spine step and ONLY the step-specific inputs the
+operator actually knows (`--param KEY=VALUE`, repeatable; a value that is
+JSON keeps its type, everything else is the literal string). The plan
+document, the issue/grant/workflow pins, the topology and the admission
+inputs are derived daemon-side from the run's committed submission and the
+run's own recorded dispatch context, so no `hf-plan/v1` is ever hand-built.
+The operator's inputs are merged over the step's committed params and
+validated against the step kind's existing param contract BEFORE anything
+is journaled: a request that is not well-formed enough to be attempted
+refuses typed (e.g. `refusal.request.malformed`) and leaves a pending
+bounded retry authorization unconsumed for the correction. A re-dispatch of
+a diagnosed step consumes exactly one unconsumed authorization.
 
 status reads the control state back read-only (daemon `run.status`):
 active / pause_requested (request durable, in-flight work still running) /
 paused (the safe boundary has been reached).
 
 EXIT CODES: 0 ok · 1 daemon/transport error · 2 usage · 4 refusal
-(refusal.run.*, refusal.state.epoch, refusal.grant.inactive,
-state.not_found, state.stale_resume, daemon refusals) · 5 config error.
+(refusal.run.*, refusal.request.malformed, refusal.state.epoch,
+refusal.grant.inactive, state.not_found, state.stale_resume, daemon
+refusals) · 5 config error.
 ";
 
 const SUPERVISION_USAGE: &str = "\

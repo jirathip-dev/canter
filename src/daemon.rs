@@ -608,6 +608,7 @@ fn dispatch(shared: &Arc<Shared>, request: &Request) -> String {
         "run.pause" => method_run_pause(shared, request),
         "run.resume" => method_run_resume(shared, request),
         "run.retry" => method_run_retry(shared, request),
+        "run.dispatch" => method_run_dispatch(shared, request),
         "run.status" => method_run_status(shared, request),
         "supervision.status" => method_supervision_status(shared, request),
         "schedules.list" => method_schedules(shared, request),
@@ -1358,7 +1359,13 @@ impl crate::supervision::SupervisedDispatch for DaemonDispatch {
         let Some(shared) = self.shared.get() else {
             return Err("the daemon dispatch hook is not wired yet".to_string());
         };
-        let request = build_dispatch_request(shared, intent)?;
+        let request = build_dispatch_request(
+            shared,
+            &intent.instance_id,
+            &intent.step_id,
+            None,
+            &dispatch_key(format!("{}-{}", intent.instance_id, intent.step_id)),
+        )?;
         let response = method_apply(shared, &request);
         let doc = Val::parse_json(response.trim())
             .map_err(|message| format!("the dispatch response is unreadable ({message})"))?;
@@ -1395,46 +1402,98 @@ impl crate::supervision::SupervisedDispatch for DaemonDispatch {
     }
 }
 
-/// Build the `apply` request one supervision dispatch presents (issue #92
-/// F4). Every input is READ from durable state: the run's own committed
-/// step spine (params included), the run row (grant, epoch, issue revision,
-/// workflow pins) and the topology + admission occupancy one of the run's own
-/// applies presented. Nothing is invented: an absent dispatch context, plan
-/// or spine refuses before any request exists.
-fn build_dispatch_request(
-    shared: &Arc<Shared>,
-    intent: &crate::supervision::DispatchIntent,
-) -> Result<Request, String> {
-    let state = shared.lock_state()?;
+/// The durable material of one committed-spine dispatch (issue #92), read
+/// once: the run row, its committed step spine, the spine's step documents
+/// and the run's own recorded dispatch context (topology + admission
+/// inputs). Every absence is typed — nothing is invented.
+struct DispatchMaterial {
+    instance: crate::state::InstanceRow,
+    spine: Vec<String>,
+    steps: Vec<Val>,
+    topology: Val,
+    caps: Option<Val>,
+    harness_lanes: Option<i64>,
+}
+
+/// Read the dispatch material of one run (issue #92 F4 and the operator
+/// dispatch surface). Typed failures: an unknown run (`state.not_found`), a
+/// run without a committed submission spine (`refusal.run.scope`) and a run
+/// whose own applies recorded no topology (`refusal.run.scope` — the first
+/// dispatch of a run belongs to the caller that holds it).
+fn read_dispatch_material(
+    state: &crate::state::State,
+    instance_id: &str,
+) -> Result<DispatchMaterial, (String, String)> {
     let instance = state
-        .instance_by_id(&intent.instance_id)
-        .map_err(|err| format!("{}: {}", err.code, err.message))?
-        .ok_or_else(|| format!("no instance {} exists", intent.instance_id))?;
-    let steps = state
-        .run_step_documents(&intent.instance_id)
-        .map_err(|err| format!("{}: {}", err.code, err.message))?
+        .instance_by_id(instance_id)
+        .map_err(|err| (err.code.to_string(), err.message))?
         .ok_or_else(|| {
-            format!(
-                "run {} has no committed queue submission spine; supervision dispatches \
-                 committed runs only",
-                intent.instance_id
+            (
+                "state.not_found".to_string(),
+                format!("no instance {instance_id}"),
             )
         })?;
-    let recorded = state
-        .run_dispatch_context(&intent.instance_id)
-        .map_err(|err| format!("{}: {}", err.code, err.message))?
-        .ok_or_else(|| {
+    let no_spine = || {
+        (
+            crate::run_control::codes::SCOPE.to_string(),
             format!(
-                "run {} has no recorded dispatch topology; the first dispatch of a run belongs \
-                 to the caller that holds it",
-                intent.instance_id
-            )
-        })?;
-    let plan = dispatch_plan_doc(&instance, &steps);
-    let plan = match crate::mutation::bind_plan(&plan) {
-        Ok(plan) => plan,
-        Err(err) => return Err(format!("{}: {}", err.code, err.message)),
+                "run {instance_id} has no committed queue submission spine; a dispatch derives \
+                 its plan from a committed run only"
+            ),
+        )
     };
+    let spine = state
+        .run_step_spine(instance_id)
+        .map_err(|err| (err.code.to_string(), err.message))?
+        .ok_or_else(no_spine)?;
+    let steps = state
+        .run_step_documents(instance_id)
+        .map_err(|err| (err.code.to_string(), err.message))?
+        .ok_or_else(no_spine)?;
+    let recorded = state
+        .run_dispatch_context(instance_id)
+        .map_err(|err| (err.code.to_string(), err.message))?
+        .ok_or_else(|| {
+            (
+                crate::run_control::codes::SCOPE.to_string(),
+                format!(
+                    "run {instance_id} has no recorded dispatch topology; the first dispatch of a \
+                     run belongs to the caller that holds it"
+                ),
+            )
+        })?;
+    Ok(DispatchMaterial {
+        instance,
+        spine,
+        steps,
+        topology: recorded.topology,
+        caps: recorded.caps,
+        harness_lanes: recorded.harness_lanes,
+    })
+}
+
+/// Build the `apply` request one committed-spine dispatch presents (issue #92
+/// F4 and the operator dispatch surface) from already-read durable material:
+/// the run's own committed step spine (params included), the run row (grant,
+/// epoch, issue revision, workflow pins) and the topology + admission
+/// occupancy one of the run's own applies presented.
+///
+/// `step_params` (when presented) are the OPERATOR's step-specific inputs:
+/// they are merged over the named step's committed params in the derived plan
+/// document, so a re-dispatch carries the corrected params — never a silent
+/// substitution of the stale ones — and the plan id follows the merged
+/// content. `key` is the idempotency key of THIS dispatch (the operator's on
+/// the dispatch surface, the driver's own on the continuation path).
+fn dispatch_request_from(
+    material: &DispatchMaterial,
+    step_id: &str,
+    step_params: Option<&Val>,
+    key: &str,
+) -> Result<Request, (String, String)> {
+    let instance = &material.instance;
+    let plan = dispatch_plan_doc(instance, &material.steps, step_id, step_params);
+    let plan =
+        crate::mutation::bind_plan(&plan).map_err(|err| (err.code.to_string(), err.message))?;
     // Admission inputs are re-presented exactly as the run's own dispatch
     // attested them; a fresh host-resource measurement is deliberately NOT
     // fabricated here, so the admission gate still decides for fan-out steps.
@@ -1443,20 +1502,17 @@ fn build_dispatch_request(
         ("digest_confirmed", bool_(false)),
         ("scheduled", bool_(false)),
     ];
-    if let Some(caps) = recorded.caps {
+    if let Some(caps) = material.caps.clone() {
         let mut admission = vec![("caps", caps)];
-        if let Some(lanes) = recorded.harness_lanes {
+        if let Some(lanes) = material.harness_lanes {
             admission.push(("harness_lanes", integer(lanes)));
         }
         flags.push(("admission", object(admission)));
     }
     let params = object(vec![
-        (
-            "idempotency_key",
-            string(&dispatch_key(instance_id_and_step(intent))),
-        ),
+        ("idempotency_key", string(key)),
         ("plan", plan.doc.clone()),
-        ("step", string(&intent.step_id)),
+        ("step", string(step_id)),
         ("grant_id", string(&instance.grant_id)),
         ("instance_id", string(&instance.instance_id)),
         (
@@ -1468,10 +1524,10 @@ fn build_dispatch_request(
                 ("integration_base", null()),
             ]),
         ),
-        ("topology", recorded.topology),
+        ("topology", material.topology.clone()),
         ("flags", object(flags)),
     ]);
-    let id = format!("sup_{}", intent.step_id);
+    let id = format!("disp_{step_id}");
     // The journaled claim must carry a canonical request line: the durable
     // attempt ledger (retry frontier, supervision evidence, readbacks) parses
     // it, so a line-less dispatch would record an unreadable attempt.
@@ -1489,13 +1545,51 @@ fn build_dispatch_request(
     })
 }
 
-/// The `hf-plan/v1` document one supervision dispatch binds (issue #92 F4):
-/// the run's OWN reviewed inputs — repository, issue identity/revision, the
-/// workflow pins the run was admitted under, the live state epoch and the
-/// committed step spine with its reviewed params. The content-addressed plan
-/// id follows the documented derivation (docs/contracts/spec-plans.md); the
-/// engine's own `bind_plan` re-derives and verifies it.
-fn dispatch_plan_doc(instance: &crate::state::InstanceRow, steps: &[Val]) -> Val {
+/// [`dispatch_request_from`] over a freshly read [`DispatchMaterial`]: the
+/// driver's continuation dispatch path.
+fn build_dispatch_request(
+    shared: &Arc<Shared>,
+    instance_id: &str,
+    step_id: &str,
+    step_params: Option<&Val>,
+    key: &str,
+) -> Result<Request, String> {
+    let state = shared.lock_state()?;
+    let material = read_dispatch_material(&state, instance_id)
+        .map_err(|(code, message)| format!("{code}: {message}"))?;
+    dispatch_request_from(&material, step_id, step_params, key)
+        .map_err(|(code, message)| format!("{code}: {message}"))
+}
+
+/// The `hf-plan/v1` document one committed-spine dispatch binds (issue #92
+/// F4 and the operator dispatch surface): the run's OWN reviewed inputs —
+/// repository, issue identity/revision, the workflow pins the run was
+/// admitted under, the live state epoch and the committed step spine. The
+/// content-addressed plan id follows the documented derivation
+/// (docs/contracts/spec-plans.md); the engine's own `bind_plan` re-derives and
+/// verifies it.
+///
+/// `step_params` (when presented) replace the named step's params — the
+/// operator's corrected inputs — so the derived plan carries exactly what the
+/// dispatch presents; every other step stays verbatim.
+fn dispatch_plan_doc(
+    instance: &crate::state::InstanceRow,
+    steps: &[Val],
+    step_id: &str,
+    step_params: Option<&Val>,
+) -> Val {
+    let steps: Vec<Val> = steps
+        .iter()
+        .map(|step| {
+            match (
+                step_params,
+                step.get("id").and_then(Val::as_str) == Some(step_id),
+            ) {
+                (Some(params), true) => step_with_params(step, params),
+                _ => step.clone(),
+            }
+        })
+        .collect();
     let placeholder = object(vec![
         ("schema", string("hf-plan/v1")),
         ("plan_id", string("hf_plan_0000000000000000")),
@@ -1510,7 +1604,7 @@ fn dispatch_plan_doc(instance: &crate::state::InstanceRow, steps: &[Val]) -> Val
                 ("revision", string(&instance.issue_revision)),
             ]),
         ),
-        ("steps", Val::Arr(steps.to_vec())),
+        ("steps", Val::Arr(steps)),
     ]);
     let digest = crate::canonical::sha256_hex(&crate::canonical::canonical_bytes(&placeholder));
     let plan_id = format!("hf_plan_{}", &digest[..16]);
@@ -1523,14 +1617,42 @@ fn dispatch_plan_doc(instance: &crate::state::InstanceRow, steps: &[Val]) -> Val
     }
 }
 
-/// One dispatch idempotency key: `ik_` + the run-local step identity + the
-/// current second, so a re-dispatch (a `run.retry`-authorized attempt, or a
-/// later check) is a FRESH claim while a same-second duplicate can never
-/// double-dispatch.
-fn instance_id_and_step(intent: &crate::supervision::DispatchIntent) -> String {
-    format!("{}-{}", intent.instance_id, intent.step_id)
+/// One plan step document with its `params` replaced by the presented ones
+/// (every other field preserved verbatim).
+fn step_with_params(step: &Val, params: &Val) -> Val {
+    match step {
+        Val::Obj(map) => {
+            let mut map = map.clone();
+            map.insert("params".to_string(), params.clone());
+            Val::Obj(map)
+        }
+        other => other.clone(),
+    }
 }
 
+/// The merged step params of one dispatch: the run's committed step params
+/// with the operator's step-specific inputs applied on top (issue #92: a
+/// re-dispatch carries the CORRECTED params, never a silent reconstruction of
+/// the stale ones). `None` when neither side declares any.
+fn merged_step_params(committed: Option<&Val>, supplied: Option<&Val>) -> Option<Val> {
+    let Some(supplied) = supplied else {
+        return committed.cloned();
+    };
+    let mut merged = match committed {
+        Some(Val::Obj(map)) => map.clone(),
+        _ => std::collections::BTreeMap::new(),
+    };
+    if let Val::Obj(overrides) = supplied {
+        for (key, value) in overrides {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    Some(Val::Obj(merged))
+}
+
+/// One dispatch idempotency key: `ik_` + the run-local step identity + the
+/// current second, so the driver's continuation dispatch of a step is a FRESH
+/// claim while a same-second duplicate can never double-dispatch.
 fn dispatch_key(target: String) -> String {
     let sanitized: String = target
         .chars()
@@ -1889,6 +2011,21 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
         return resolve_apply_refusal(shared, request, &key, err.code, err.message);
     }
     let _ = latest_evidence;
+
+    // The step's OWN param contract (issue #92) is checked BEFORE the
+    // bounded-retry fence: a request that is not well-formed enough to be
+    // attempted refuses typed here and leaves the operator's single-use
+    // retry authorization UNCONSUMED, so a corrected re-dispatch stays
+    // possible. The check is the same code the effect itself resolves its
+    // inputs with, so the refusal reason never diverges.
+    if let Err((code, message)) = crate::mutation::check_step_params(
+        &kind,
+        params,
+        &parsed.integration_branch,
+        &parsed.production_branches,
+    ) {
+        return resolve_apply_refusal(shared, request, &key, &code, message);
+    }
 
     // Bounded retry fence (issue #86), queue runs only: a re-dispatch of a
     // step whose recorded outcome was a terminal non-success requires (and
@@ -3316,6 +3453,169 @@ fn method_run_retry(shared: &Arc<Shared>, request: &Request) -> String {
             Some((code, message)),
         ),
     }
+}
+
+/// `run.dispatch` (issue #92): the SUPPORTED step-dispatch surface. The
+/// caller presents the run, the committed-spine step and only that step's own
+/// inputs; the plan document, the issue/grant/workflow pins, the topology and
+/// the admission inputs are DERIVED from the run's committed submission and
+/// its own recorded dispatch context (the same derivation the continuation
+/// dispatch uses). The merged step params are validated against the step
+/// kind's existing param contract BEFORE anything is journaled — a malformed
+/// request refuses typed and consumes no bounded retry authorization — and
+/// the resulting dispatch runs through the SAME apply engine as every other
+/// apply, so every gate (grant, epoch, admission, pause fence, bounded-retry
+/// fence, idempotency) re-derives there: a re-dispatch of a diagnosed step
+/// consumes exactly one unconsumed authorization, and the operator's own
+/// (corrected) params are what the effect receives.
+fn method_run_dispatch(shared: &Arc<Shared>, request: &Request) -> String {
+    let Some(params) = request.params.as_ref() else {
+        return err_response(
+            &request.id,
+            "refusal.malformed",
+            "run.dispatch requires params: idempotency_key, instance_id, step",
+        );
+    };
+    let parsed = match crate::run_control::parse_dispatch_params(params) {
+        Ok(parsed) => parsed,
+        Err(err) => return err_response(&request.id, err.code, err.message),
+    };
+    let (material, kind, effective, integration_branch, production_branches) = {
+        let state = match shared.lock_state() {
+            Ok(state) => state,
+            Err(message) => return err_response(&request.id, "state.unavailable", message),
+        };
+        let material = match read_dispatch_material(&state, &parsed.instance_id) {
+            Ok(material) => material,
+            Err((code, message)) => return err_response(&request.id, &code, message),
+        };
+        if !material.spine.iter().any(|step| step == &parsed.step) {
+            return err_response(
+                &request.id,
+                crate::run_control::codes::STEP_UNKNOWN,
+                format!(
+                    "step {:?} is not a step of run {} (spine {:?})",
+                    parsed.step, parsed.instance_id, material.spine
+                ),
+            );
+        }
+        let step = match material
+            .steps
+            .iter()
+            .find(|step| step.get("id").and_then(Val::as_str) == Some(parsed.step.as_str()))
+        {
+            Some(step) => step.clone(),
+            None => {
+                return err_response(
+                    &request.id,
+                    crate::run_control::codes::STEP_UNKNOWN,
+                    format!(
+                        "step {:?} is not a step of run {} (spine {:?})",
+                        parsed.step, parsed.instance_id, material.spine
+                    ),
+                );
+            }
+        };
+        let kind = match crate::mutation::step_kind(&step) {
+            Ok(kind) => kind,
+            Err(err) => return err_response(&request.id, err.code, err.message),
+        };
+        // The operator's inputs REPLACE/EXTEND the step's committed params:
+        // the dispatch carries the corrected params, never a reconstruction.
+        let effective = merged_step_params(step.get("params"), parsed.step_params.as_ref());
+        // The step's param contract, read from the SAME topology the
+        // dispatch re-presents (the run's own recorded one).
+        let mut production_branches: Vec<String> = Vec::new();
+        let mut integration_branch = String::new();
+        if let Some(branches) = material
+            .topology
+            .get("production_branches")
+            .and_then(Val::as_array)
+        {
+            production_branches = branches
+                .iter()
+                .filter_map(Val::as_str)
+                .map(str::to_string)
+                .collect();
+        }
+        if let Some(branch) = material
+            .topology
+            .get("integration_branch")
+            .and_then(Val::as_str)
+        {
+            integration_branch = branch.to_string();
+        }
+        (
+            material,
+            kind,
+            effective,
+            integration_branch,
+            production_branches,
+        )
+    };
+    // Fail closed BEFORE anything is journaled or claimed: a request that is
+    // not well-formed enough to be attempted refuses typed here, so the
+    // operator's single-use retry authorization survives for the correction.
+    if let Err((code, message)) = crate::mutation::check_step_params(
+        &kind,
+        effective.as_ref(),
+        &integration_branch,
+        &production_branches,
+    ) {
+        return err_response(&request.id, &code, message);
+    }
+    let key = parsed.idempotency_key.clone();
+    let dispatch = match dispatch_request_from(&material, &parsed.step, effective.as_ref(), &key) {
+        Ok(dispatch) => dispatch,
+        Err((code, message)) => return err_response(&request.id, &code, message),
+    };
+    let response = method_apply(shared, &dispatch);
+    let doc = match Val::parse_json(response.trim()) {
+        Ok(doc) => doc,
+        Err(message) => {
+            return err_response(
+                &request.id,
+                "refusal.malformed",
+                format!("the dispatch response is unreadable ({message})"),
+            );
+        }
+    };
+    if doc.get("ok").and_then(Val::as_bool) != Some(true) {
+        let error = doc.get("error").cloned().unwrap_or_else(null);
+        let code = error
+            .get("code")
+            .and_then(Val::as_str)
+            .unwrap_or("refusal.malformed")
+            .to_string();
+        let message = error
+            .get("message")
+            .and_then(Val::as_str)
+            .unwrap_or("the dispatch was refused")
+            .to_string();
+        return err_response(&request.id, &code, message);
+    }
+    let outcome = doc.get("result").cloned().unwrap_or_else(null);
+    // Read back the authorization THIS dispatch consumed (the fence records
+    // the presented key) so the document states the single use exactly.
+    let retry = match shared.lock_state() {
+        Ok(state) => state
+            .run_retries(&parsed.instance_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|row| row.step_id == parsed.step && row.consumed_key == key)
+            .max_by_key(|row| row.attempt),
+        Err(_) => None,
+    };
+    let document = crate::run_control::dispatch_doc(
+        &material.instance,
+        &material.spine,
+        &parsed.step,
+        &kind,
+        effective.as_ref(),
+        &outcome,
+        retry.as_ref(),
+    );
+    ok_response(&request.id, document)
 }
 
 /// `run.status`: read the control state of exactly one run back read-only —
