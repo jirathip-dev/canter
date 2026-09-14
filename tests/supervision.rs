@@ -2428,6 +2428,243 @@ fn every_kind_refuses_a_malformed_dispatch_before_the_authorization_is_burned() 
 }
 
 // ---------------------------------------------------------------------------
+// Issue #130: an uncontained worktree destination is refused BEFORE any git
+// mutation by the same pre-fence screen — so it burns no bounded retry
+// authorization, and no directory, worktree entry or branch is left behind.
+// ---------------------------------------------------------------------------
+
+/// The escape the review measured: resolved under the worktrees root,
+/// `../escaped-lane` lands OUTSIDE it. The pre-fix check evaluated the
+/// literal join, which cannot reveal the escape while the destination does
+/// not exist yet, so `git worktree add` created the lane and the escape came
+/// back as data (`contained: false`, exit 0).
+const ESCAPING_WORKTREE: &str = "../escaped-lane";
+
+/// One raw `git` invocation in a fixture repository.
+fn git_output(repo: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The number of worktrees git reports for one repository.
+fn worktree_count(repo: &Path) -> usize {
+    git_output(repo, &["worktree", "list", "--porcelain"])
+        .lines()
+        .filter(|line| line.starts_with("worktree "))
+        .count()
+}
+
+/// The branch names git reports for one repository.
+fn branches_of(repo: &Path) -> String {
+    git_output(
+        repo,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+    )
+}
+
+#[test]
+fn an_uncontained_worktree_dispatch_is_refused_before_any_git_mutation() {
+    let fixture = DaemonFixture::new("uncontained-130");
+    let (bound, digest) = {
+        let state = fixture.seed();
+        seed_grant(&state, "gr_0000000000000095", 5);
+        render_bound(&state, &request_lane_steps(vec![selected("#5", REV_A)]))
+    };
+    let integration = fixture.dir.join("integration");
+    init_repo(&integration);
+    let fakebin = write_fake_gh(&fixture.dir);
+    let host_path = std::env::var("PATH").unwrap_or_default();
+    let daemon = fixture.spawn_with_path(&format!("{}:{host_path}", fakebin.display()));
+    wait_ready(&fixture);
+
+    // Supervision is OFF: every dispatch below is the operator's own.
+    let params = params_doc(
+        &idem_key("uncontained-130"),
+        &bound,
+        &digest,
+        &role_revision(),
+        "gr_0000000000000095",
+        None,
+    );
+    let result = rpc_ok(&fixture.socket, &fresh_id(1), "queue.submit", Some(params));
+    let run = instance_of(&result, 5);
+
+    // `p1` (the checkout) records the run's durable dispatch context — the
+    // topology every later dispatch is derived from.
+    let applied = rpc_ok(
+        &fixture.socket,
+        &fresh_id(2),
+        "apply",
+        Some(caller_apply_params(
+            &fixture,
+            &integration,
+            &bound,
+            &run,
+            "gr_0000000000000095",
+            ("p1", 5),
+            &idem_key("uncontained-130-p1"),
+        )),
+    );
+    assert!(
+        applied.get("integration_base").is_some(),
+        "the checkout read back: {}",
+        canter::canonical::canonical_text(&applied)
+    );
+
+    // The diagnosis a bounded retry authorization addresses: `p2`'s committed
+    // params carry no `branch`, so the operator may authorize one re-dispatch.
+    let refusal = rpc_refusal(
+        &fixture.socket,
+        &fresh_id(3),
+        "apply",
+        Some(caller_apply_params(
+            &fixture,
+            &integration,
+            &bound,
+            &run,
+            "gr_0000000000000095",
+            ("p2", 5),
+            &idem_key("uncontained-130-p2-diagnosis"),
+        )),
+    );
+    assert!(
+        refusal.contains("worktree_create requires a slug branch"),
+        "the diagnosis is the effect's own contract: {refusal}"
+    );
+    let diagnosed = attempts_for(&fixture, &run, "p2");
+    assert!(diagnosed > 0, "the diagnosis is recorded: {diagnosed}");
+    let (exit, stdout, stderr) = run_cli(&fixture, &["retry", "--run", &run, "--step", "p2"]);
+    assert_eq!(exit, 0, "retry exit; stdout: {stdout}; stderr: {stderr}");
+
+    // (1) The ESCAPING dispatch: refused typed BEFORE any git mutation, with
+    // the operator's authorization left UNCONSUMED (the refusal is raised by
+    // the pre-fence screen, not by the fence).
+    let (exit, stdout, stderr) = run_cli(
+        &fixture,
+        &[
+            "dispatch",
+            "--run",
+            &run,
+            "--step",
+            "p2",
+            "--param",
+            "branch=issue-130-escaped-lane",
+            "--param",
+            &format!("worktree={ESCAPING_WORKTREE}"),
+        ],
+    );
+    assert_eq!(
+        exit, 4,
+        "escaping dispatch exit; stdout: {stdout}; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("refusal.path.uncontained"),
+        "the refusal is the containment code: {stderr}"
+    );
+
+    // No directory, no worktree entry and no branch may be left behind.
+    let escaped = fixture.dir.join("escaped-lane");
+    assert!(
+        !escaped.exists(),
+        "nothing is created outside the worktrees root: {escaped:?}"
+    );
+    assert_eq!(
+        worktree_count(&integration),
+        1,
+        "the integration checkout stays the only worktree: {}",
+        git_output(&integration, &["worktree", "list", "--porcelain"])
+    );
+    let branches = branches_of(&integration);
+    assert!(
+        !branches.contains("issue-130-escaped-lane"),
+        "no escaping branch exists: {branches}"
+    );
+
+    // Nothing burned, nothing attempted.
+    let retries = fixture.seed().run_retries(&run).expect("retries");
+    assert_eq!(retries.len(), 1, "still exactly one authorization");
+    assert!(
+        retries.iter().all(|retry| retry.consumed_at.is_empty()),
+        "the refused dispatch consumes no authorization: {retries:?}"
+    );
+    assert_eq!(
+        attempts_for(&fixture, &run, "p2"),
+        diagnosed,
+        "the refused dispatch attempts nothing"
+    );
+
+    // (2) The legitimate in-root shape still succeeds, reports
+    // `contained: true`, and consumes exactly the one authorization.
+    let (exit, stdout, stderr) = run_cli(
+        &fixture,
+        &[
+            "dispatch",
+            "--run",
+            &run,
+            "--step",
+            "p2",
+            "--param",
+            "branch=issue-130-lane",
+            "--param",
+            "worktree=issues/130",
+        ],
+    );
+    assert_eq!(
+        exit, 0,
+        "in-root dispatch exit; stdout: {stdout}; stderr: {stderr}"
+    );
+    let data = cli_envelope(&stdout)
+        .get("data")
+        .cloned()
+        .expect("the dispatch document");
+    assert_eq!(
+        path_of(&data, &["dispatch", "contained"]),
+        Val::Bool(true),
+        "the in-root lane reports containment: {stdout}"
+    );
+    let lane = fixture.dir.join("worktrees").join("issues").join("130");
+    assert!(lane.exists(), "the in-root lane exists: {lane:?}");
+    assert_eq!(
+        git_output(&lane, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+        "issue-130-lane",
+        "the lane carries the operator's branch"
+    );
+    assert_eq!(
+        worktree_count(&integration),
+        2,
+        "the lane is a real worktree: {}",
+        git_output(&integration, &["worktree", "list", "--porcelain"])
+    );
+    let retries = fixture.seed().run_retries(&run).expect("retries");
+    assert_eq!(
+        retries
+            .iter()
+            .filter(|retry| !retry.consumed_at.is_empty())
+            .count(),
+        1,
+        "the corrected dispatch consumes exactly one: {retries:?}"
+    );
+    let attempts = fixture.seed().run_step_attempts(&run).expect("attempts");
+    assert!(
+        attempts
+            .iter()
+            .any(|(step, status)| step == "p2" && status == "succeeded"),
+        "the corrected dispatch landed: {attempts:?}"
+    );
+
+    shutdown(daemon);
+}
+
+// ---------------------------------------------------------------------------
 // Issue #92 F2: the role-bound session lifecycle on the run's own path
 // ---------------------------------------------------------------------------
 
