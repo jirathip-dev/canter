@@ -154,18 +154,26 @@ runs control-plane effects:
   - the EFFECTIVE value rides on the step's `result` as `deadline_secs`, so
     the step outcome/evidence always names the deadline the effect used;
   - the child of an effect leads its own process group and a deadline
-    terminates the whole group (no orphan), reporting `adapter.timeout` as
-    the typed `ambiguous` outcome; the `kill` helper that signals the group
-    is resolved from the ambient environment plus the standard system
-    directories — never from the child's allowlisted PATH, which need not
-    contain it — and a signal that could not be delivered is named on the
-    captured stderr (observable in the step outcome/evidence, never
-    discarded);
-  - the post-exit read of the captured pipes is bounded by a documented
-    grace (`PIPE_READ_GRACE`, 750 ms): a descendant that survives the signal
-    and holds the inherited write ends can never extend an effect past
-    `deadline + grace`, and whatever arrived inside the bound is kept (the
-    capture may be empty or partial in that case).
+    EMPTIES that group (no orphan), reporting `adapter.timeout` as the typed
+    `ambiguous` outcome. The guarantee is verification, not one CLI form: a
+    `kill -9 -<pgid>` helper attempt is made first (best-effort — the
+    negative-pid form is not portable), then the group's live members are
+    enumerated with a portable `ps -A -o pid=,pgid=,stat=` and terminated by
+    POSITIVE pid, re-enumerated until the group is empty or the bounded
+    window expires (`GROUP_REAP_WINDOW`, 375 ms). Our own pid and any pid
+    outside the group are never signalled; a descendant that left the group
+    (its own session or process group) is unreachable by design and is
+    reported rather than waited for. The helpers are resolved from the
+    ambient environment plus the standard system directories — never from the
+    child's allowlisted PATH — and the whole termination is named in one
+    diagnostic line on the captured stderr (what the helper attempt did, how
+    many members were reaped by pid, which members survived), so the step
+    outcome/evidence explains a failure instead of hiding it;
+  - the post-exit path of the captured pipes is bounded by a documented grace
+    (`PIPE_READ_GRACE`, 750 ms, which contains the reap window): a descendant
+    that survives the reaping and holds the inherited write ends can never
+    extend an effect past `deadline + grace`, and whatever arrived inside the
+    bound is kept (the capture may be empty or partial in that case).
 
 ## 5. Typed outcomes: `hf-outcome/v1`
 

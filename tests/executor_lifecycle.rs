@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use canter::adapters::{
     Op, OpRequest, Profile, bind_identity, execute_op, new_session, run_grouped,
 };
-use canter::process::{ProcSpec, ProcStatus};
+use canter::process::{ProcOut, ProcSpec, ProcStatus};
 
 static DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -105,6 +105,13 @@ fn pid_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+/// The runner's own words about one op (issue #92 round 3): every assertion
+/// about the deadline kill prints the status and the captured stderr, so a CI
+/// failure self-diagnoses instead of only naming the symptom.
+fn describe(out: &ProcOut) -> String {
+    format!("status: {:?}; stderr: {:?}", out.status, out.stderr)
+}
+
 /// Poll `pid_alive` until it reports gone, bounded by `timeout`.
 fn wait_pid_gone(pid: u32, timeout: Duration) -> bool {
     let started = Instant::now();
@@ -166,16 +173,30 @@ fn deadline_kills_the_child_and_its_process_group() {
     });
     let elapsed = started.elapsed();
 
-    assert_eq!(out.status, ProcStatus::TimedOut, "deadline enforced");
+    assert_eq!(
+        out.status,
+        ProcStatus::TimedOut,
+        "deadline enforced: {}",
+        describe(&out)
+    );
     assert!(
         elapsed < Duration::from_secs(10),
-        "the deadline kill is bounded, took {elapsed:?}"
+        "the deadline kill is bounded, took {elapsed:?}: {}",
+        describe(&out)
+    );
+    // The deadline's own diagnosis must be part of the outcome (issue #92
+    // round 3): a CI failure can then say what the kill path did.
+    assert!(
+        out.stderr.contains("deadline kill of process group"),
+        "the runner must record what the deadline kill did: {}",
+        describe(&out)
     );
     let helper = read_pid(&pid_file, Duration::from_secs(15));
     assert!(
         wait_pid_gone(helper, Duration::from_secs(5)),
         "the forked helper (pid {helper}) survived the deadline: the process group was not \
-         terminated"
+         terminated: {}",
+        describe(&out)
     );
 }
 
@@ -213,16 +234,23 @@ fn the_group_signal_never_depends_on_the_childs_allowlisted_path() {
     });
     let elapsed = started.elapsed();
 
-    assert_eq!(out.status, ProcStatus::TimedOut, "deadline enforced");
+    assert_eq!(
+        out.status,
+        ProcStatus::TimedOut,
+        "deadline enforced: {}",
+        describe(&out)
+    );
     assert!(
         elapsed < Duration::from_secs(10),
-        "the deadline kill is bounded, took {elapsed:?}"
+        "the deadline kill is bounded, took {elapsed:?}: {}",
+        describe(&out)
     );
     let helper = read_pid(&pid_file, Duration::from_secs(15));
     assert!(
         wait_pid_gone(helper, Duration::from_secs(5)),
         "the forked helper (pid {helper}) survived a deadline whose child PATH cannot resolve \
-         `kill`: the group signal depended on the child's allowlisted PATH"
+         `kill`: the group signal depended on the child's allowlisted PATH: {}",
+        describe(&out)
     );
 }
 
@@ -266,17 +294,24 @@ fn a_descendant_that_holds_the_pipe_never_blocks_the_deadline() {
         .stderr(std::process::Stdio::null())
         .status();
 
-    assert_eq!(out.status, ProcStatus::TimedOut, "deadline enforced");
+    assert_eq!(
+        out.status,
+        ProcStatus::TimedOut,
+        "deadline enforced: {}",
+        describe(&out)
+    );
     assert!(
         elapsed < timeout + canter::adapters::PIPE_READ_GRACE + Duration::from_secs(2),
         "a descendant holding the pipes must never extend the op past the deadline plus the \
-         documented grace ({:?}), took {elapsed:?}",
-        canter::adapters::PIPE_READ_GRACE
+         documented grace ({:?}), took {elapsed:?}: {}",
+        canter::adapters::PIPE_READ_GRACE,
+        describe(&out)
     );
     assert!(
         out.stdout.is_empty() || out.stdout == "partial",
-        "the capture stays whatever arrived inside the bound: {:?}",
-        out.stdout
+        "the capture stays whatever arrived inside the bound: {:?} ({})",
+        out.stdout,
+        describe(&out)
     );
 }
 

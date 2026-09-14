@@ -683,6 +683,17 @@ release process activates (docs/RELEASING.md), then semver applies.
   (journaled before effect, consumed retry authorizations respected, holds
   never cleared); non-armed supervision keeps its classification-only
   zero-effect contract verbatim.
+- Round-3 platform fix (found by hosted CI on Linux: the round-2 helper form
+  does not deliver the group signal there, so both no-orphan tests failed with
+  the helpers alive and the assertions did not print the runner's own
+  diagnosis): the deadline now VERIFIES the group instead of trusting one CLI
+  form — a best-effort `kill -9 -<pgid>` attempt, then the group's live
+  members enumerated with the portable `ps -A -o pid=,pgid=,stat=` and killed
+  by POSITIVE pid, re-enumerated until the group is empty or the bounded
+  `GROUP_REAP_WINDOW` (375 ms) expires; the captured stderr carries one
+  diagnostic line (helper attempt result, members reaped by pid, members that
+  survived), and every group assertion in the suite prints the status and that
+  stderr, so a CI failure is self-diagnosing.
 - Round-2 platform fix (found by hosted CI on Linux, not visible on macOS):
   the group signal no longer depends on the child's allowlisted PATH — the
   `kill` helper is resolved from the ambient environment plus the standard

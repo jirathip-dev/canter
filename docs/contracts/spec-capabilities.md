@@ -119,12 +119,14 @@ can run with **no harness credentials** (AC7).
   `refusal.stale.identity`, `refusal.identity.incomplete`,
   `refusal.request.malformed`, `refusal.session.unbound` (a harness step
   addressed the run's bound session but the run bound none; issue #92 F2),
-  `adapter.timeout` (deadline exceeded, the child and its process group are
-  killed — the `kill` helper is resolved from the ambient environment plus
-  the standard system directories, never the child's allowlisted PATH, and a
-  signal that could not be delivered is named on the captured stderr; the
-  post-exit pipe read is bounded by the documented grace, so a surviving
-  descendant can never extend the op — outcome class `ambiguous`),
+  `adapter.timeout` (deadline exceeded, and the child's process group is
+  verified empty by the bounded reaping loop — a best-effort
+  `kill -9 -<pgid>` helper attempt first, then the group's live members
+  terminated by positive pid until none remain; helpers are resolved from the
+  ambient environment plus the standard system directories, never the child's
+  allowlisted PATH, and one diagnostic line names what the whole termination
+  did; the post-exit pipe read is bounded by the documented grace, so a
+  surviving descendant can never extend the op — outcome class `ambiguous`),
   `adapter.process_death`
   (`ambiguous`), and `adapter.exit` (ordinary non-zero exit).
 - **Boundaries**: adapters pass only the explicit environment allowlist

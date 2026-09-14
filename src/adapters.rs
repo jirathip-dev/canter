@@ -1304,13 +1304,17 @@ pub fn execute_op_in_worktree(
 /// helper resolved from the ambient environment plus the standard system
 /// directories — never from the child's allowlisted PATH, which a Linux
 /// image can lack `kill` in (issue #92 round 2: that is how the group signal
-/// silently failed and left a descendant behind). A signal that could not be
-/// delivered is reported on the captured stderr, so it stays observable in
-/// the step outcome/evidence instead of being discarded. The post-exit read
-/// of the captured pipes is bounded by [`PIPE_READ_GRACE`], so a descendant
-/// that survives the signal and holds the inherited write ends can never
-/// extend the op past `deadline + PIPE_READ_GRACE`; `ProcStatus::TimedOut`
-/// is reported either way.
+/// silently failed and left a descendant behind). The helper's negative-pid
+/// form is only a cheap best-effort first attempt, though: its parsing is not
+/// portable (Linux `kill` rejects the form the BSD one accepts), so the
+/// GUARANTEE comes from [`reap_group`] — after the deadline the group is
+/// verified and emptied by POSITIVE pid inside a bounded window. One
+/// diagnostic line describing all of it is appended to the captured stderr,
+/// so the step outcome/evidence names what happened instead of discarding it.
+/// The post-exit path is bounded by [`PIPE_READ_GRACE`], so a descendant that
+/// survives the reaping and holds the inherited write ends can never extend
+/// the op past `deadline + PIPE_READ_GRACE`; `ProcStatus::TimedOut` is
+/// reported either way.
 pub fn run_grouped(spec: ProcSpec<'_>) -> ProcOut {
     let started = std::time::Instant::now();
     let mut command = std::process::Command::new(spec.program);
@@ -1353,7 +1357,7 @@ pub fn run_grouped(spec: ProcSpec<'_>) -> ProcOut {
     let status = loop {
         if started.elapsed() >= spec.timeout {
             if !group_signalled {
-                group_signal = terminate_group(group);
+                group_signal = signal_group(group);
                 group_signalled = true;
             }
             let _ = child.kill();
@@ -1365,7 +1369,7 @@ pub fn run_grouped(spec: ProcSpec<'_>) -> ProcOut {
                 let failure = if group_signalled {
                     None
                 } else {
-                    terminate_group(group)
+                    signal_group(group)
                 };
                 let _ = child.kill();
                 return ProcOut {
@@ -1381,22 +1385,42 @@ pub fn run_grouped(spec: ProcSpec<'_>) -> ProcOut {
     };
 
     // The child is gone, but its descendants may still hold the inherited
-    // stdout/stderr write ends (a survivor that outlived the group signal), so
-    // the post-exit read is bounded by the documented grace (issue #92 round
-    // 2): the op never blocks past `deadline + PIPE_READ_GRACE`, and whatever
-    // arrived inside the bound is kept.
+    // stdout/stderr write ends (a survivor the deadline could not reach), so
+    // the post-exit path is bounded by the documented grace (issue #92 rounds
+    // 2-3): deterministic group reaping first, then the bounded read. The op
+    // never blocks past `deadline + PIPE_READ_GRACE`, and whatever arrived
+    // inside the bound is kept.
+    let deadline_exceeded = started.elapsed() >= spec.timeout;
+    let group_reap = if deadline_exceeded {
+        // Issue #92 round 3: the group signal alone is not a guarantee — the
+        // helper's CLI form is not portable (Linux `kill` rejects the
+        // negative-pid form the BSD one accepts) — so the group is verified
+        // and emptied by positive pid inside a bounded window.
+        Some(reap_group(
+            group,
+            started + spec.timeout + GROUP_REAP_WINDOW,
+            group_signal.clone(),
+        ))
+    } else {
+        None
+    };
     let read_deadline = started + spec.timeout + PIPE_READ_GRACE;
     let stdout_pipe = BoundedPipe::read(child.stdout.take());
     let stderr_pipe = BoundedPipe::read(child.stderr.take());
     let stdout = stdout_pipe.take_within(read_deadline);
     let mut stderr = stderr_pipe.take_within(read_deadline);
-    if let Some(reason) = &group_signal {
+    let diagnostic = match (&group_reap, &group_signal) {
+        (Some(report), _) => Some(group_reap_diagnostic(group, report)),
+        (None, Some(reason)) => Some(group_signal_diagnostic(group, reason)),
+        (None, None) => None,
+    };
+    if let Some(diagnostic) = diagnostic {
         // Observable diagnostics (never discarded): the step outcome/evidence
-        // names why the group could not be signalled.
+        // names what the deadline kill did.
         if !stderr.is_empty() && !stderr.ends_with('\n') {
             stderr.push('\n');
         }
-        stderr.push_str(&group_signal_diagnostic(group, reason));
+        stderr.push_str(&diagnostic);
     }
     let _ = child.wait();
 
@@ -1485,9 +1509,15 @@ fn group_signal_diagnostic(group: u32, reason: &str) -> String {
     )
 }
 
-/// The PATH the group-signal helper runs under: the standard system
-/// directories first, then the ambient PATH. The helper is a system utility,
-/// not a child under test, so it never depends on the child's allowlisted
+/// The slice of the post-exit grace the deterministic group-reaping loop may
+/// use (issue #92 round 3): reaping fits inside `deadline + PIPE_READ_GRACE`,
+/// so the bounded capture always keeps part of the grace even when a member
+/// cannot be reached.
+pub const GROUP_REAP_WINDOW: Duration = Duration::from_millis(375);
+
+/// The PATH the group helper runs under: the standard system directories
+/// first, then the ambient PATH. The helpers are system utilities, not
+/// children under test, so they never depend on the child's allowlisted
 /// environment (issue #92 round 2).
 fn group_helper_path() -> String {
     const SYSTEM_DIRS: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
@@ -1497,25 +1527,22 @@ fn group_helper_path() -> String {
     }
 }
 
-/// Terminate one child's whole process group (`kill -9 -<pgid>`). `kill(2)`
-/// is unreachable from this crate (it forbids unsafe), so the signal goes
-/// through a `kill` helper resolved robustly: the ambient PATH resolution
-/// plus the absolute candidates `/bin/kill` and `/usr/bin/kill`, run with
-/// [`group_helper_path`]. The previous shape inherited the child's allowlisted
-/// PATH, and a Linux image can lack `kill` there — which is how the group
-/// signal silently failed and left a descendant behind (issue #92 round 2).
-/// The first candidate that launches and exits zero wins; when none does, the
-/// reason is RETURNED so the runner reports it on the captured stderr instead
-/// of discarding it. The caller still kills the direct child through the std
-/// API, and the bounded post-exit read keeps the deadline honoured even when
-/// no group signal could be delivered.
-fn terminate_group(group: u32) -> Option<String> {
-    let target = format!("-{group}");
+/// The absolute candidates for a system helper, `/bin` first (present on both
+/// platforms), then `/usr/bin`, with the bare name last (resolved through
+/// [`group_helper_path`]).
+const GROUP_HELPER_CANDIDATES: [&str; 3] = ["kill", "/bin/kill", "/usr/bin/kill"];
+const PS_HELPER_CANDIDATES: [&str; 3] = ["ps", "/bin/ps", "/usr/bin/ps"];
+
+/// Run one helper attempt under [`group_helper_path`], trying each candidate
+/// until one launches and exits zero (issue #92 round 3). `None` means the
+/// attempt was delivered; `Some(reason)` lists what every candidate did, so
+/// the caller can report it instead of discarding it.
+fn helper_attempt(candidates: &[&str], args: &[&str], label: &str) -> Option<String> {
     let path = group_helper_path();
     let mut failures: Vec<String> = Vec::new();
-    for candidate in ["kill", "/bin/kill", "/usr/bin/kill"] {
+    for candidate in candidates {
         let launched = std::process::Command::new(candidate)
-            .args(["-9", &target])
+            .args(args)
             .env_clear()
             .env("PATH", &path)
             .stdin(std::process::Stdio::null())
@@ -1525,15 +1552,175 @@ fn terminate_group(group: u32) -> Option<String> {
         match launched {
             Ok(status) if status.success() => return None,
             Ok(status) => failures.push(format!(
-                "{candidate}: exited with {}",
+                "{label} `{candidate} {}` exited {}",
+                args.join(" "),
                 status
                     .code()
-                    .map_or_else(|| "no exit code".to_string(), |code| code.to_string())
+                    .map_or_else(|| "without a code".to_string(), |code| code.to_string())
             )),
-            Err(err) => failures.push(format!("{candidate}: {err}")),
+            Err(err) => failures.push(format!("{label} `{candidate}`: {err}")),
         }
     }
     Some(failures.join("; "))
+}
+
+/// Best-effort group signal (the cheap first attempt): `kill -9 -<pgid>`.
+/// The negative-pid form is NOT portable — the BSD `kill` accepts it while
+/// GNU/procps parses it as an option cluster and exits non-zero — so this is
+/// never the guarantee; [`reap_group`] verifies and finishes the job by
+/// positive pid (issue #92 round 3).
+fn signal_group(group: u32) -> Option<String> {
+    helper_attempt(
+        &GROUP_HELPER_CANDIDATES,
+        &["-9", &format!("-{group}")],
+        "group signal",
+    )?;
+    None
+}
+
+/// Terminate one process by POSITIVE pid (unambiguous on both platforms).
+fn kill_pid(pid: u32) -> Option<String> {
+    helper_attempt(&GROUP_HELPER_CANDIDATES, &["-9", &pid.to_string()], "reap")?;
+    None
+}
+
+/// The live members of one process group, through the portable
+/// `ps -A -o pid=,pgid=,stat=` form (issue #92 round 3). Zombies are excluded
+/// (a dead-but-unreaped member is not a live process; reaping it belongs to
+/// its parent), and our own pid is always excluded. `None` when `ps` could
+/// not be run or its output could not be read, so the caller can report that
+/// instead of guessing.
+fn group_members(group: u32) -> Option<Vec<u32>> {
+    let path = group_helper_path();
+    let mut last = "ps not found".to_string();
+    for candidate in PS_HELPER_CANDIDATES {
+        let output = std::process::Command::new(candidate)
+            .args(["-A", "-o", "pid=,pgid=,stat="])
+            .env_clear()
+            .env("PATH", &path)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output();
+        let output = match output {
+            Ok(output) if output.status.success() => output,
+            Ok(output) => {
+                last = format!("`{candidate}` exited {:?}", output.status.code());
+                continue;
+            }
+            Err(err) => {
+                last = format!("`{candidate}`: {err}");
+                continue;
+            }
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut members = Vec::new();
+        for line in text.lines() {
+            let mut fields = line.split_whitespace();
+            let (Some(pid), Some(pgid), Some(stat)) = (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            let (Ok(pid), Ok(pgid)) = (pid.parse::<u32>(), pgid.parse::<u32>()) else {
+                continue;
+            };
+            if pgid == group && pid != std::process::id() && !stat.starts_with('Z') {
+                members.push(pid);
+            }
+        }
+        return Some(members);
+    }
+    let _ = last;
+    None
+}
+
+/// What one deadline's group termination did (issue #92 round 3): the outcome
+/// of the best-effort group signal, how many members were reaped by positive
+/// pid, which members were still live when the bounded window expired, and
+/// any failure reason worth naming.
+struct GroupReap {
+    signal: Option<String>,
+    reaped: usize,
+    remaining: Vec<u32>,
+    notes: Vec<String>,
+}
+
+/// Empty one child's process group inside a bounded window (issue #92 rounds
+/// 1–3). The guarantee is the verification loop, not any single CLI form:
+/// enumerate the group's live members with [`group_members`], kill them by
+/// POSITIVE pid with [`kill_pid`], re-enumerate until the group is empty or
+/// `deadline` expires. Never signals our own pid and never a pid outside the
+/// target group; a descendant that left the group (its own session or process
+/// group) is unreachable by construction and is reported instead of blocking.
+fn reap_group(group: u32, deadline: Instant, signal: Option<String>) -> GroupReap {
+    let mut report = GroupReap {
+        signal,
+        reaped: 0,
+        remaining: Vec::new(),
+        notes: Vec::new(),
+    };
+    loop {
+        match group_members(group) {
+            None => {
+                report
+                    .notes
+                    .push("ps could not enumerate the group".to_string());
+                break;
+            }
+            Some(members) if members.is_empty() => {
+                report.remaining.clear();
+                break;
+            }
+            Some(members) => {
+                for pid in &members {
+                    match kill_pid(*pid) {
+                        None => report.reaped += 1,
+                        Some(reason) => {
+                            if report.notes.len() < 3 && !report.notes.contains(&reason) {
+                                report.notes.push(reason);
+                            }
+                        }
+                    }
+                }
+                report.remaining = members;
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    report
+}
+
+/// The one-line diagnostic of one deadline's group termination, so a failure
+/// is self-diagnosing: what the best-effort signal did, how many members were
+/// reaped by pid, which members were still live at the window's end, and any
+/// failure reason (issue #92 round 3).
+fn group_reap_diagnostic(group: u32, report: &GroupReap) -> String {
+    let mut line = format!("[canter] deadline kill of process group -{group}: ");
+    match &report.signal {
+        None => line.push_str("the group-signal helper delivered"),
+        Some(reason) => line.push_str(&format!(
+            "the group-signal helper did not deliver ({reason})"
+        )),
+    }
+    line.push_str(&format!(
+        "; reaped {} member(s) by positive pid",
+        report.reaped
+    ));
+    if !report.remaining.is_empty() {
+        line.push_str(&format!(
+            "; {} member(s) were still live when the bounded reap window expired (pids {:?}; a \
+             descendant that left the process group is not reachable by design)",
+            report.remaining.len(),
+            report.remaining
+        ));
+    }
+    for note in &report.notes {
+        line.push_str(&format!("; {note}"));
+    }
+    line.push('\n');
+    line
 }
 
 fn execute_op_at(
