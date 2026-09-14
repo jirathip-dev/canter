@@ -363,6 +363,27 @@ fn rpc_err(socket: &Path, id: &str, method: &str, params: Option<Val>) -> String
         .to_string()
 }
 
+/// The refusal text of one RPC (`<code>: <message>`), for the F7 cases: the
+/// pinned reason is the effect's OWN contract, not a generic refusal.
+fn rpc_refusal(socket: &Path, id: &str, method: &str, params: Option<Val>) -> String {
+    let doc = rpc(socket, id, method, params);
+    assert_eq!(
+        doc.get("ok").and_then(Val::as_bool),
+        Some(false),
+        "expected a refusal for {method}: {}",
+        canter::canonical::canonical_text(&doc)
+    );
+    let error = doc.get("error").cloned().unwrap_or_else(null);
+    format!(
+        "{}: {}",
+        error.get("code").and_then(Val::as_str).unwrap_or_default(),
+        error
+            .get("message")
+            .and_then(Val::as_str)
+            .unwrap_or_default()
+    )
+}
+
 fn shutdown(mut daemon: Child) {
     let _ = daemon.kill();
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -1719,6 +1740,691 @@ fn an_armed_run_is_advanced_by_the_drivers_own_dispatch() {
     );
 
     shutdown(daemon);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #92 (consolidated): `run retry` authorizes ONLY, and the operator's
+// own corrected dispatch — never a hand-built hf-plan/v1 — consumes the
+// single-use authorization.
+// ---------------------------------------------------------------------------
+
+/// One committed spine with the REAL malformed shape: `p1` is the checkout
+/// that records the run's dispatch context, `p2` is a `worktree_create`
+/// whose committed params carry NO `branch` (the conductor's `p2-127`
+/// refusal shape: `worktree_create requires a slug branch`).
+fn request_lane_steps(issues: Vec<qp::SelectedIssue>) -> qp::QueueRequest {
+    let mut request = request_with(issues);
+    request.steps = vec![
+        qp::PlannedStep {
+            id: "p1".to_string(),
+            kind: "checkout".to_string(),
+            params: Some(object(vec![("ref", string("staging"))])),
+        },
+        qp::PlannedStep {
+            id: "p2".to_string(),
+            kind: "worktree_create".to_string(),
+            params: Some(object(vec![("worktree", string("lane-p2"))])),
+        },
+    ];
+    request
+}
+
+/// One `hf-output/v1` envelope from one CLI stdout (the documented shape).
+fn cli_envelope(output: &str) -> Val {
+    let doc = Val::parse_json(output.trim_end()).expect("one JSON envelope");
+    let verdict = canter::schema::validate_doc(canter::schema::Family::Output, &doc);
+    assert!(verdict.is_accepted(), "envelope: {}", verdict.message());
+    doc
+}
+
+/// One nested key of a document, as text.
+fn picked(document: &Val, path: &[&str]) -> String {
+    let mut value = document.clone();
+    for key in path {
+        value = value.get(key).cloned().unwrap_or_else(null);
+    }
+    value.as_str().unwrap_or_default().to_string()
+}
+
+/// One `run <sub>` invocation of the real CLI against the fixture daemon.
+fn run_cli(fixture: &DaemonFixture, args: &[&str]) -> (i32, String, String) {
+    let socket = fixture.socket.display().to_string();
+    let mut argv = vec!["run"];
+    argv.extend_from_slice(args);
+    argv.extend_from_slice(&["--socket", &socket, "--json"]);
+    cli(fixture, &argv)
+}
+
+/// Recorded `p2` attempts of one run (the diagnosis ledger).
+fn attempts_for(fixture: &DaemonFixture, run: &str, step: &str) -> usize {
+    fixture
+        .seed()
+        .run_step_attempts(run)
+        .expect("attempts")
+        .iter()
+        .filter(|(id, _)| id == step)
+        .count()
+}
+
+/// The bounded quiet window every retry regression observes: the minted
+/// authorization must still be unconsumed and no attempt row may appear for
+/// the step. At 48e00df9 the armed driver re-dispatched the diagnosed step
+/// from the reconstructed (stale) params within this window and consumed the
+/// authorization (measured: authorized 14:13:17Z, consumed 14:13:22Z with the
+/// dispatch key `ik_run-<run>-p2-<unix>`).
+const RETRY_QUIET_WINDOW_SECS: u64 = 7;
+
+/// Observe the quiet window after `run retry` and assert the authorization
+/// survives it untouched.
+fn assert_retry_authorization_survives(fixture: &DaemonFixture, run: &str, step: &str) {
+    let before = attempts_for(fixture, run, step);
+    let until = Instant::now() + Duration::from_secs(RETRY_QUIET_WINDOW_SECS);
+    while Instant::now() < until {
+        let retries = fixture.seed().run_retries(run).expect("retries");
+        assert_eq!(retries.len(), 1, "one bounded authorization: {retries:?}");
+        assert!(
+            retries.iter().all(|retry| retry.consumed_at.is_empty()),
+            "the retry consumes nothing by itself: {retries:?}"
+        );
+        assert_eq!(
+            attempts_for(fixture, run, step),
+            before,
+            "the retry creates no attempt row of its own"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The shared scenario of the three regressions: an armed run whose `p1`
+/// succeeded (recording the durable dispatch context) and whose `p2` the
+/// driver dispatched once by itself — refused `refusal.request.malformed`
+/// because the committed params carry no `branch` — which is exactly the
+/// diagnosis `run.retry` addresses.
+fn retry_lane_scenario(name: &str) -> (DaemonFixture, Child, String) {
+    let fixture = DaemonFixture::new(name);
+    let (bound, digest) = {
+        let state = fixture.seed();
+        seed_grant(&state, "gr_0000000000000095", 5);
+        render_bound(&state, &request_lane_steps(vec![selected("#5", REV_A)]))
+    };
+    let integration = fixture.dir.join("integration");
+    init_repo(&integration);
+    let fakebin = write_fake_gh(&fixture.dir);
+    let host_path = std::env::var("PATH").unwrap_or_default();
+    let daemon = fixture.spawn_with_path(&format!("{}:{host_path}", fakebin.display()));
+    wait_ready(&fixture);
+
+    let params = params_doc(
+        &idem_key("lane-dispatch"),
+        &bound,
+        &digest,
+        &role_revision(),
+        "gr_0000000000000095",
+        Some(armed(5, 60)),
+    );
+    let result = rpc_ok(&fixture.socket, &fresh_id(1), "queue.submit", Some(params));
+    let run = instance_of(&result, 5);
+
+    // The caller dispatches p1 (it holds the topology and the admission
+    // proof): the run is underway and its dispatch context is durable.
+    let applied = rpc_ok(
+        &fixture.socket,
+        &fresh_id(2),
+        "apply",
+        Some(caller_apply_params(
+            &fixture,
+            &integration,
+            &bound,
+            &run,
+            "gr_0000000000000095",
+            ("p1", 5),
+            &idem_key("lane-apply-p1"),
+        )),
+    );
+    assert!(
+        applied.get("integration_base").is_some(),
+        "the checkout read back: {}",
+        canter::canonical::canonical_text(&applied)
+    );
+
+    // The driver continues by itself: `p2` was never dispatched, so its
+    // COMMITTED (branch-less) params are presented — the real malformed shape
+    // refuses and records the diagnosis.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut attempts = Vec::new();
+    while Instant::now() < deadline {
+        attempts = fixture.seed().run_step_attempts(&run).expect("attempts");
+        if attempts.iter().any(|(step, _)| step == "p2") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let p2 = attempts
+        .iter()
+        .find(|(step, _)| step == "p2")
+        .unwrap_or_else(|| panic!("the driver never dispatched p2: {attempts:?}"));
+    assert_eq!(
+        p2.1, "refused",
+        "the committed malformed params are refused (the diagnosis): {attempts:?}"
+    );
+    (fixture, daemon, run)
+}
+
+#[test]
+fn run_retry_authorizes_only_and_the_operators_dispatch_consumes_it_once() {
+    let (fixture, daemon, run) = retry_lane_scenario("retry-only");
+
+    // `run retry` mints the bounded authorization — and nothing else.
+    let (exit, stdout, stderr) = run_cli(&fixture, &["retry", "--run", &run, "--step", "p2"]);
+    assert_eq!(exit, 0, "retry exit; stdout: {stdout}; stderr: {stderr}");
+    assert_eq!(
+        picked(&cli_envelope(&stdout), &["data", "retry", "status"]),
+        "authorized",
+        "the minted authorization is unconsumed: {stdout}"
+    );
+
+    // Bounded quiet window: the armed driver must NOT re-dispatch the
+    // diagnosed step (at 48e00df9 it consumed the authorization within the
+    // window, with the stale reconstruction).
+    assert_retry_authorization_survives(&fixture, &run, "p2");
+
+    let log = std::fs::read_to_string(fixture.daemon_log()).unwrap_or_default();
+    assert_eq!(
+        log.matches("\"event\":\"supervision.dispatch_refused\"")
+            .count(),
+        1,
+        "exactly the one continuation dispatch, none from the retry:\n{log}"
+    );
+
+    // The journal-timestamped probe of the confirmed mechanism: the retry's
+    // own committed entries (`mutate.run.retry`) are the LAST thing it wrote,
+    // so no `mutate.worktree_create` attempt follows in the same second. At
+    // 48e00df9 the authorizing call was followed by seq57/58
+    // `mutate.worktree_create` (the reconstruction with no branch slug),
+    // which burned the authorization.
+    let journal = rpc_ok(
+        &fixture.socket,
+        &fresh_id(21),
+        "journal.tail",
+        Some(object(vec![
+            ("after_seq", integer(0)),
+            ("limit", integer(500)),
+        ])),
+    );
+    let records = journal
+        .get("records")
+        .and_then(Val::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let seq_of = |row: &Val, action: &str| -> Option<i64> {
+        (row.get("action").and_then(Val::as_str) == Some(action))
+            .then(|| row.get("seq").and_then(Val::as_int))
+            .flatten()
+    };
+    let retry_seq = records
+        .iter()
+        .filter_map(|row| seq_of(row, "mutate.run.retry"))
+        .max()
+        .expect("the retry journaled its intent");
+    let earlier_attempts: Vec<i64> = records
+        .iter()
+        .filter_map(|row| seq_of(row, "mutate.worktree_create"))
+        .filter(|seq| *seq < retry_seq)
+        .collect();
+    assert!(
+        !earlier_attempts.is_empty(),
+        "the driver's one continuation attempt is on record BEFORE the retry (the \
+         probe is not vacuous): {earlier_attempts:?} < {retry_seq}"
+    );
+    let later_attempts: Vec<i64> = records
+        .iter()
+        .filter_map(|row| seq_of(row, "mutate.worktree_create"))
+        .filter(|seq| *seq > retry_seq)
+        .collect();
+    assert!(
+        later_attempts.is_empty(),
+        "the retry produces no same-second worktree_create attempt (retry seq \
+         {retry_seq}, later worktree seqs {later_attempts:?})"
+    );
+
+    // A second retry while one authorization is pending refuses typed.
+    let (exit, stdout, stderr) = run_cli(&fixture, &["retry", "--run", &run, "--step", "p2"]);
+    assert_eq!(
+        exit, 4,
+        "second retry exit; stdout: {stdout}; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("refusal.run.retry_pending"),
+        "the duplicate is refused typed: {stderr}"
+    );
+
+    // The operator's own corrected dispatch consumes exactly one.
+    let (exit, stdout, stderr) = run_cli(
+        &fixture,
+        &[
+            "dispatch",
+            "--run",
+            &run,
+            "--step",
+            "p2",
+            "--param",
+            "branch=issue-92-retry-lane",
+        ],
+    );
+    assert_eq!(exit, 0, "dispatch exit; stdout: {stdout}; stderr: {stderr}");
+    let retries = fixture.seed().run_retries(&run).expect("retries");
+    assert_eq!(retries.len(), 1, "still exactly one authorization");
+    assert!(
+        !retries[0].consumed_at.is_empty(),
+        "consumed by the operator's dispatch: {retries:?}"
+    );
+
+    // ...and a SECOND dispatch of the same step is refused: single use.
+    let (exit, stdout, stderr) = run_cli(
+        &fixture,
+        &[
+            "dispatch",
+            "--run",
+            &run,
+            "--step",
+            "p2",
+            "--param",
+            "branch=issue-92-again",
+        ],
+    );
+    assert_eq!(
+        exit, 4,
+        "second dispatch exit; stdout: {stdout}; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("refusal.run.retry_required"),
+        "the spent authorization refuses the re-dispatch: {stderr}"
+    );
+
+    shutdown(daemon);
+}
+
+#[test]
+fn retry_redispatch_carries_the_operators_corrected_params() {
+    let (fixture, daemon, run) = retry_lane_scenario("retry-fix");
+
+    let (exit, stdout, stderr) = run_cli(&fixture, &["retry", "--run", &run, "--step", "p2"]);
+    assert_eq!(exit, 0, "retry exit; stdout: {stdout}; stderr: {stderr}");
+    assert_retry_authorization_survives(&fixture, &run, "p2");
+
+    // The operator presents ONLY the corrected `branch`; the plan document,
+    // the spine, the grant and the topology are derived daemon-side.
+    let (exit, stdout, stderr) = run_cli(
+        &fixture,
+        &[
+            "dispatch",
+            "--run",
+            &run,
+            "--step",
+            "p2",
+            "--param",
+            "branch=issue-92-retry-lane",
+        ],
+    );
+    assert_eq!(exit, 0, "dispatch exit; stdout: {stdout}; stderr: {stderr}");
+    let data = cli_envelope(&stdout)
+        .get("data")
+        .cloned()
+        .expect("the dispatch document");
+    assert_eq!(picked(&data, &["step", "kind"]), "worktree_create");
+    assert_eq!(
+        picked(&data, &["step", "params", "branch"]),
+        "issue-92-retry-lane",
+        "the presented step params are the merged ones: {stdout}"
+    );
+    assert_eq!(
+        picked(&data, &["dispatch", "branch"]),
+        "issue-92-retry-lane",
+        "the EFFECT received the corrected branch: {stdout}"
+    );
+    // ...and the REAL worktree is on the corrected lane.
+    let worktree = fixture.dir.join("worktrees").join("lane-p2");
+    let head = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(&worktree)
+        .output()
+        .expect("git runs");
+    assert!(head.status.success(), "the worktree exists: {worktree:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&head.stdout).trim(),
+        "issue-92-retry-lane",
+        "the created worktree is on the operator's corrected branch"
+    );
+
+    shutdown(daemon);
+}
+
+#[test]
+fn a_malformed_dispatch_refuses_typed_and_keeps_the_authorization_unconsumed() {
+    let (fixture, daemon, run) = retry_lane_scenario("retry-bad");
+    let before = attempts_for(&fixture, &run, "p2");
+
+    let (exit, stdout, stderr) = run_cli(&fixture, &["retry", "--run", &run, "--step", "p2"]);
+    assert_eq!(exit, 0, "retry exit; stdout: {stdout}; stderr: {stderr}");
+    assert_retry_authorization_survives(&fixture, &run, "p2");
+
+    // The malformed shape (no corrected `branch`) refuses typed BEFORE any
+    // authorization is consumed and before any claim exists.
+    let (exit, stdout, stderr) = run_cli(&fixture, &["dispatch", "--run", &run, "--step", "p2"]);
+    assert_eq!(
+        exit, 4,
+        "malformed dispatch exit; stdout: {stdout}; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("refusal.request.malformed"),
+        "the refusal is typed: {stderr}"
+    );
+    assert!(
+        stderr.contains("worktree_create requires a slug branch"),
+        "the reason is the effect's own contract: {stderr}"
+    );
+    let state = fixture.seed();
+    let retries = state.run_retries(&run).expect("retries");
+    assert!(
+        retries.iter().all(|retry| retry.consumed_at.is_empty()),
+        "the refused request burns nothing: {retries:?}"
+    );
+    assert_eq!(
+        attempts_for(&fixture, &run, "p2"),
+        before,
+        "the refused request dispatches nothing"
+    );
+
+    // The corrected dispatch then succeeds and consumes exactly one — here
+    // through the HUMAN rendering (no `--json`), so the non-JSON surface of
+    // the new command is exercised as well.
+    let socket_arg = fixture.socket.display().to_string();
+    let (exit, stdout, stderr) = cli(
+        &fixture,
+        &[
+            "run",
+            "dispatch",
+            "--run",
+            &run,
+            "--step",
+            "p2",
+            "--param",
+            "branch=issue-92-retry-lane",
+            "--socket",
+            &socket_arg,
+        ],
+    );
+    assert_eq!(exit, 0, "dispatch exit; stdout: {stdout}; stderr: {stderr}");
+    assert!(
+        stdout.contains("dispatch: step p2 (worktree_create)"),
+        "the human rendering names the dispatched step: {stdout}"
+    );
+    let retries = fixture.seed().run_retries(&run).expect("retries");
+    assert_eq!(
+        retries
+            .iter()
+            .filter(|retry| !retry.consumed_at.is_empty())
+            .count(),
+        1,
+        "exactly one authorization consumed: {retries:?}"
+    );
+
+    shutdown(daemon);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #92 F7: the fail-closed pre-screen is TOTAL over the step kinds
+// ---------------------------------------------------------------------------
+
+/// One parameterised case of the F7 regression: ONE fixture shape driven over
+/// a different step kind, because the earlier suite pinned `worktree_create`
+/// alone and the authorization burn survived on every other kind — the
+/// reviewer's witness was `collect_outcome` with the required `worktree`
+/// missing (`refusal.request.malformed`), whose single-use authorization was
+/// burned by the malformed re-dispatch, making the operator's corrected
+/// dispatch refuse `retry_required`.
+struct ParamCase {
+    /// The step kind under test (fixture label + assertion text).
+    kind: &'static str,
+    /// The run's committed spine: `p1` (well-formed, the caller dispatches it)
+    /// plus `p2` (the malformed shape this case diagnoses).
+    steps: Vec<qp::PlannedStep>,
+    /// The effect's OWN reason for refusing the malformed shape.
+    reason: &'static str,
+    /// The operator's correction (`--param KEY=VALUE`).
+    correction: Vec<&'static str>,
+}
+
+/// The parameterised cases: the reviewer's `collect_outcome` witness, the
+/// pre-existing `worktree_create` shape, and the multi-key `hosted_check`
+/// shape whose correction needs more than one `--param`.
+fn param_cases() -> Vec<ParamCase> {
+    let step = |id: &str, kind: &str, params: Val| qp::PlannedStep {
+        id: id.to_string(),
+        kind: kind.to_string(),
+        params: Some(params),
+    };
+    vec![
+        ParamCase {
+            kind: "worktree_create",
+            steps: vec![
+                step("p1", "checkout", object(vec![("ref", string("staging"))])),
+                // The required `branch` is missing (the committed shape).
+                step(
+                    "p2",
+                    "worktree_create",
+                    object(vec![("worktree", string("lane-p2"))]),
+                ),
+            ],
+            reason: "worktree_create requires a slug branch",
+            correction: vec!["branch=issue-92-f7-lane"],
+        },
+        ParamCase {
+            kind: "collect_outcome",
+            steps: vec![
+                // `p1` creates the lane `p2` collects from, so the CORRECTED
+                // dispatch has a real worktree to read.
+                step(
+                    "p1",
+                    "worktree_create",
+                    object(vec![
+                        ("branch", string("issue-92-f7-lane")),
+                        ("worktree", string("lane-p2")),
+                    ]),
+                ),
+                // The witness shape: the required `worktree` is missing.
+                step("p2", "collect_outcome", object(vec![])),
+            ],
+            reason: "step params missing \"worktree\"",
+            correction: vec!["worktree=lane-p2"],
+        },
+        ParamCase {
+            kind: "hosted_check",
+            steps: vec![
+                step("p1", "checkout", object(vec![("ref", string("staging"))])),
+                // A multi-key correction: no repo, no number.
+                step("p2", "hosted_check", object(vec![])),
+            ],
+            reason: "hosted_check requires an owner/name repo",
+            correction: vec!["repo=example-org/widgets", "number=33"],
+        },
+    ]
+}
+
+/// Drive ONE case end to end with supervision OFF — every dispatch is the
+/// operator's own:
+///
+///   1. the caller's first attempt at `p2` carries the committed malformed
+///      params, refuses typed (`refusal.request.malformed`, the effect's own
+///      reason) and records the diagnosis `run retry` addresses;
+///   2. `canter run retry` mints the single-use authorization;
+///   3. the SAME malformed dispatch through the supported surface refuses
+///      typed and consumes NOTHING (at 43abbc9d only worktree_create was
+///      screened, so this step burned the authorization for every other kind
+///      and the operator's correction was refused `retry_required`);
+///   4. the corrected dispatch succeeds and consumes the authorization
+///      exactly once.
+fn run_param_case(case: &ParamCase) {
+    // One `ik_`-safe label per kind (the key vocabulary is [a-z0-9-] only).
+    let label = format!("f7-{}", case.kind.replace('_', "-"));
+    let fixture = DaemonFixture::new(&label);
+    let (bound, digest) = {
+        let state = fixture.seed();
+        seed_grant(&state, "gr_0000000000000095", 5);
+        let mut request = request_lane_steps(vec![selected("#5", REV_A)]);
+        request.steps = case.steps.clone();
+        render_bound(&state, &request)
+    };
+    let integration = fixture.dir.join("integration");
+    init_repo(&integration);
+    let fakebin = write_fake_gh(&fixture.dir);
+    let host_path = std::env::var("PATH").unwrap_or_default();
+    let daemon = fixture.spawn_with_path(&format!("{}:{host_path}", fakebin.display()));
+    wait_ready(&fixture);
+
+    // Supervision is OFF: nothing but the operator dispatches this run.
+    let params = params_doc(
+        &idem_key(&label),
+        &bound,
+        &digest,
+        &role_revision(),
+        "gr_0000000000000095",
+        None,
+    );
+    let result = rpc_ok(&fixture.socket, &fresh_id(1), "queue.submit", Some(params));
+    let run = instance_of(&result, 5);
+    let applied = rpc_ok(
+        &fixture.socket,
+        &fresh_id(2),
+        "apply",
+        Some(caller_apply_params(
+            &fixture,
+            &integration,
+            &bound,
+            &run,
+            "gr_0000000000000095",
+            ("p1", 5),
+            &idem_key(&format!("{label}-p1")),
+        )),
+    );
+    assert!(
+        applied.get("refused").is_none(),
+        "p1 ({}) applied: {}",
+        case.steps[0].kind,
+        canter::canonical::canonical_text(&applied)
+    );
+    let p1 = fixture
+        .seed()
+        .run_step_attempts(&run)
+        .expect("attempts")
+        .into_iter()
+        .find(|(step, _)| step == "p1")
+        .unwrap_or_else(|| panic!("p1 recorded no attempt"));
+    assert_eq!(p1.1, "succeeded", "p1 landed: {p1:?}");
+
+    // (1) The operator's first attempt at p2 carries the malformed shape.
+    let refusal = rpc_refusal(
+        &fixture.socket,
+        &fresh_id(3),
+        "apply",
+        Some(caller_apply_params(
+            &fixture,
+            &integration,
+            &bound,
+            &run,
+            "gr_0000000000000095",
+            ("p2", 5),
+            &idem_key(&format!("{label}-p2-bad")),
+        )),
+    );
+    assert!(
+        refusal.contains("refusal.request.malformed"),
+        "the first attempt refuses typed: {refusal}"
+    );
+    assert!(
+        refusal.contains(case.reason),
+        "the reason is the effect's own contract: {refusal}"
+    );
+    let attempts = fixture.seed().run_step_attempts(&run).expect("attempts");
+    assert!(
+        attempts
+            .iter()
+            .any(|(step, status)| step == "p2" && status == "refused"),
+        "the first attempt is recorded as the diagnosis: {attempts:?}"
+    );
+    let diagnosed = attempts_for(&fixture, &run, "p2");
+
+    // (2) `run retry` mints the bounded authorization — and nothing else.
+    let (exit, stdout, stderr) = run_cli(&fixture, &["retry", "--run", &run, "--step", "p2"]);
+    assert_eq!(exit, 0, "retry exit; stdout: {stdout}; stderr: {stderr}");
+    assert_eq!(
+        picked(&cli_envelope(&stdout), &["data", "retry", "status"]),
+        "authorized",
+        "the minted authorization is unconsumed: {stdout}"
+    );
+
+    // (3) The malformed dispatch through the supported surface: typed
+    // refusal, no claim, no attempt, nothing burned.
+    let (exit, stdout, stderr) = run_cli(&fixture, &["dispatch", "--run", &run, "--step", "p2"]);
+    assert_eq!(
+        exit, 4,
+        "malformed {label} dispatch exit; stdout: {stdout}; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("refusal.request.malformed"),
+        "the refusal is typed: {stderr}"
+    );
+    assert!(
+        stderr.contains(case.reason),
+        "the reason is the effect's own contract: {stderr}"
+    );
+    let retries = fixture.seed().run_retries(&run).expect("retries");
+    assert!(
+        retries.iter().all(|retry| retry.consumed_at.is_empty()),
+        "the refused {label} dispatch burns nothing: {retries:?}"
+    );
+    assert_eq!(
+        attempts_for(&fixture, &run, "p2"),
+        diagnosed,
+        "the refused {label} dispatch attempts nothing"
+    );
+
+    // (4) The corrected dispatch succeeds and consumes exactly once.
+    let mut argv = vec!["dispatch", "--run", &run, "--step", "p2"];
+    for correction in &case.correction {
+        argv.push("--param");
+        argv.push(correction);
+    }
+    let (exit, stdout, stderr) = run_cli(&fixture, &argv);
+    assert_eq!(
+        exit, 0,
+        "corrected {label} dispatch exit; stdout: {stdout}; stderr: {stderr}"
+    );
+    let retries = fixture.seed().run_retries(&run).expect("retries");
+    assert_eq!(
+        retries
+            .iter()
+            .filter(|retry| !retry.consumed_at.is_empty())
+            .count(),
+        1,
+        "exactly one {label} authorization consumed: {retries:?}"
+    );
+    let attempts = fixture.seed().run_step_attempts(&run).expect("attempts");
+    assert!(
+        attempts
+            .iter()
+            .any(|(step, status)| step == "p2" && status == "succeeded"),
+        "the corrected {label} dispatch landed: {attempts:?}"
+    );
+
+    shutdown(daemon);
+}
+
+#[test]
+fn every_kind_refuses_a_malformed_dispatch_before_the_authorization_is_burned() {
+    for case in param_cases() {
+        run_param_case(&case);
+    }
 }
 
 // ---------------------------------------------------------------------------

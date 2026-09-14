@@ -603,7 +603,13 @@ fn cli_run_duplicate_key_refuses_a_reused_key_and_usage_errors_exit_two() {
     // The help surface documents the subcommands.
     let (exit, stdout, stderr) = fixture.cli(&["run", "--help"]);
     assert_eq!(exit, 0, "run --help exit; stderr: {stderr}");
-    for needle in ["run pause", "run resume", "run retry", "run status"] {
+    for needle in [
+        "run pause",
+        "run resume",
+        "run retry",
+        "run dispatch",
+        "run status",
+    ] {
         assert!(
             stdout.contains(needle),
             "help must document {needle}: {stdout}"

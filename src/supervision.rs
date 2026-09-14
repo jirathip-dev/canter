@@ -549,11 +549,17 @@ pub trait SupervisedDispatch: Send + Sync {
 /// - the run is live: not paused, no pause request, no human queue, no
 ///   terminal blocker, not blocked/invalidated/done;
 /// - no step dispatch is in flight (a run mid-effect is never advanced);
-/// - the run still has a next unachieved step;
-/// - that step has never been dispatched, or it is a recorded non-success
-///   WITH an unconsumed bounded retry authorization (the operator's
-///   `run.retry`): a diagnosed step is re-dispatched only under that
-///   authorization, which the dispatch consumes exactly once.
+/// - the run still has a next unachieved step, and that step has NEVER been
+///   dispatched.
+///
+/// A DIAGNOSED step (failed/refused/ambiguous) is never re-dispatched here,
+/// with or without a pending bounded retry authorization: re-dispatching it
+/// means carrying the operator's CORRECTED step params, which this driver
+/// does not hold — a dispatch built from the run's committed (stale) params
+/// would consume the operator's single-use authorization with the very
+/// request that was refused. `run.retry` therefore authorizes only, and the
+/// operator's own corrected dispatch consumes the authorization exactly once
+/// through the apply path.
 ///
 /// Non-armed/unknown supervision therefore keeps its classification-only,
 /// zero-effect guarantee verbatim: this function returns `None` for every
@@ -591,18 +597,9 @@ pub fn dispatch_intent(
     match latest_attempt_for(evidence, &step_id) {
         // Never dispatched: the plain continuation of an armed run.
         None => {}
-        // A diagnosed step (failed/refused/ambiguous) is re-dispatched ONLY
-        // under an unconsumed bounded retry authorization.
-        Some((_, status, _)) if status != "succeeded" => {
-            let authorized = evidence
-                .retries
-                .iter()
-                .any(|retry| retry.step_id == step_id && retry.consumed_at.is_empty());
-            if !authorized {
-                return None;
-            }
-        }
-        _ => return None,
+        // Diagnosed (or otherwise recorded): the operator's corrected
+        // dispatch owns it — never the driver.
+        Some(_) => return None,
     }
     Some(DispatchIntent {
         instance_id: run.instance_id.clone(),

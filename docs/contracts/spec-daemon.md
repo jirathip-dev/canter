@@ -31,7 +31,7 @@ remain usable without it; SQLite owns state; no network control API).
   `lane.checkpoint.create`, `lane.checkpoint.status`, `lane.retire`,
   `lane.start`, `lane.adopt`, `lane.successor.consume`,
   `state.epoch`, `queue.submit`, `queue.status`, `run.pause`,
-  `run.resume`, `run.retry`, `run.status`, `supervision.status`,
+  `run.resume`, `run.retry`, `run.dispatch`, `run.status`, `supervision.status`,
   `backup.create`, `restore.begin`, `journal.tail`,
   `events.subscribe` (issue #77 adds no method: the target-profile plan
   travels as an optional `params.profile` on `lane.replacement.request` and
@@ -311,20 +311,22 @@ outcome after the effect transaction commits.
 
 ## Run-scoped control methods (issue #86)
 
-Safe-boundary pause, resume and bounded retry over exactly ONE run — the
+Safe-boundary pause, resume, bounded retry and one supported step dispatch
+over exactly ONE run — the
 `run-` instance row the queue executor commits for every admitted issue
-(spec-state.md "Run control additions"). All four methods address one
+(spec-state.md "Run control additions"). All five methods address one
 exact run identity, journal through the same claim machinery as every
 daemon mutation (`params.idempotency_key` required on the mutating paths;
 a same-key retry replays the recorded response) and render a module-local
-document (`hf-run-control/v1` / `hf-run-retry/v1`, deliberately outside
-the closed `hf-*` family set like the #84 preview and the #85 submission).
+document (`hf-run-control/v1` / `hf-run-retry/v1` / `hf-run-dispatch/v1`,
+deliberately outside the closed `hf-*` family set like the #84 preview and
+the #85 submission).
 
 **Scope matrix (run vs fleet vs lane), normative:**
 
 | level | identity | methods | effect of a control |
 | --- | --- | --- | --- |
-| run | one `run-` + 16 hex instance id | `run.pause` / `run.resume` / `run.retry` / `run.status` | exactly this run: stop admitting new steps, lift THIS run's pause, authorize one bounded re-dispatch of one diagnosed step |
+| run | one `run-` + 16 hex instance id | `run.pause` / `run.resume` / `run.retry` / `run.dispatch` / `run.status` | exactly this run: stop admitting new steps, lift THIS run's pause, authorize one bounded re-dispatch of one diagnosed step (authorization only), dispatch ONE committed-spine step with the caller's own step inputs |
 | fleet | the whole run population | NONE — there is no `fleet.*` method in the closed set | a fleet-level hold is an operator policy expressed as the set of paused runs; every resume is fenced on the exact instance id, so no run control ever lifts another run's pause or anything fleet-wide |
 | lane | one handoff lane generation (`rp_` records) | `lane.*` only | run controls never touch lane records; a non-run identity refuses `refusal.run.target` |
 
@@ -379,11 +381,38 @@ clears a repository/fleet-level hold or bypasses a gate.
   grant (`refusal.grant.inactive`), an unconsumed authorization that
   already exists (`refusal.run.retry_pending`) and an exhausted attempt
   bound (`refusal.run.retry_bound`, three bounded retries per step). On
-  success it records ONE single-use authorization (`run_retries`); the next
-  dispatch of that exact step consumes it (a re-dispatch of a diagnosed
-  failed step without an unconsumed authorization refuses
-  `refusal.run.retry_required` before any effect). Nothing is spawned by
-  the retry itself.
+  success it records ONE single-use authorization (`run_retries`) and
+  NOTHING else: the retry dispatches no step, spawns nothing and consumes
+  no authorization — the authorized re-dispatch belongs to the operator,
+  who supplies the corrected step inputs (see `run.dispatch`). A
+  re-dispatch of a diagnosed failed step without an unconsumed
+  authorization refuses `refusal.run.retry_required` before any effect.
+- `run.dispatch` requires `params.instance_id`, `params.step` (a
+  committed-spine plan step id) and an optional `params.params` object: the
+  step's OWN inputs, which are merged over the step's committed params (the
+  caller supplies only what the operator actually knows — a correction — and
+  never a hand-built `hf-plan/v1`). Everything else is DERIVED from durable
+  state: the plan document (run row pins + the committed step spine with the
+  merged params), the run's grant/epoch/issue revision and the topology +
+  admission inputs of the run's own recorded dispatch context. A run without
+  a committed spine or without a recorded dispatch context refuses
+  `refusal.run.scope` (the first dispatch of a run belongs to the caller that
+  holds the topology), a step outside the spine refuses
+  `refusal.run.step_unknown`, and the merged params are checked against the
+  step kind's existing param contract BEFORE anything is journaled. That
+  pre-screen is TOTAL over the closed step-kind set: each kind's own param
+  contract, the request-level observed read-backs (`review_evidence`,
+  `post_merge_verify`) and the topology gates its effect reads (the archive
+  root) are resolved up front, and a kind with no registered contract refuses
+  as well — so a request that is not well-formed enough to be attempted
+  refuses typed (e.g. `refusal.request.malformed`, `refusal.push_policy`)
+  whatever its kind and leaves any pending bounded retry authorization
+  UNCONSUMED. The resulting dispatch runs through
+  the same `apply` engine, so every gate re-derives there and exactly one
+  unconsumed authorization is consumed by a re-dispatch of a diagnosed step.
+  It renders `hf-run-dispatch/v1` (the addressed run/step, the params the
+  dispatch presented, the recorded apply outcome and the authorization this
+  dispatch consumed).
 - `run.status` requires `params.instance_id` and renders the control state
   read-only: `active` / `pause_requested` / `paused`, the durable request
   fields, the live boundary and the scope block. No claim and no journal
@@ -452,9 +481,12 @@ clears a repository/fleet-level hold or bypasses a gate.
   done, no terminal blocker), has no step claim in flight, has a committed
   spine, has already dispatched at least one step (the durable topology and
   admission inputs a dispatch re-presents come from the run's own applies —
-  none is invented), and either never attempted that step or holds an
-  unconsumed bounded `run.retry` authorization for it (consumed exactly
-  once by the dispatch). A fan-out step still needs the caller-presented
+  none is invented), and the frontier step has NEVER been attempted. A
+  DIAGNOSED step (a recorded non-success) is never re-dispatched by the
+  driver, with or without a pending `run.retry` authorization: re-dispatching
+  it means carrying the operator's CORRECTED step params, which the driver
+  does not hold — the operator's own `run.dispatch` owns it. A fan-out step
+  still needs the caller-presented
   admission inputs: supervision re-presents the run's committed caps and
   occupancy but never fabricates a host-resource measurement, so the
   admission gate refuses `refusal.admission.proof_missing` when no fresh
