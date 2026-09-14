@@ -173,8 +173,10 @@ runs control-plane effects:
     ambient environment plus the standard system directories — never from the
     child's allowlisted PATH — and the whole termination is named in one
     diagnostic line on the captured stderr (what the helper attempt did, how
-    many members were reaped by pid, which members survived), so the step
-    outcome/evidence explains a failure instead of hiding it;
+    many members were reaped by positive pid, which members no kill could
+    reach): a failed attempt is named with its reason and is never counted as
+    a reap nor rendered as delivered, so the step outcome/evidence explains a
+    failure instead of hiding it;
   - the post-exit path of the captured pipes is bounded by a documented grace
     (`PIPE_READ_GRACE`, 750 ms, which contains the reap window): a descendant
     that survives the reaping and holds the inherited write ends can never

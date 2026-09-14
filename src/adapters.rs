@@ -1366,8 +1366,12 @@ pub fn run_grouped(spec: ProcSpec<'_>) -> ProcOut {
             Ok(Some(status)) => break status,
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
             Err(err) => {
+                // The signal is attempted ONCE: a failure recorded by the
+                // deadline branch above is reported here too, never replaced by
+                // "delivered" (issue #92 round 5 — `None` means delivered, so
+                // the already-attempted failure must be handed on, not dropped).
                 let failure = if group_signalled {
-                    None
+                    group_signal.clone()
                 } else {
                     signal_group(group)
                 };
@@ -1569,20 +1573,24 @@ fn helper_attempt(candidates: &[&str], args: &[&str], label: &str) -> Option<Str
 /// The negative-pid form is NOT portable — the BSD `kill` accepts it while
 /// GNU/procps parses it as an option cluster and exits non-zero — so this is
 /// never the guarantee; [`reap_group`] verifies and finishes the job by
-/// positive pid (issue #92 round 3).
+/// positive pid (issue #92 round 3). The attempt's result is handed on
+/// unchanged (`None` delivered, `Some(reason)` every candidate failed) so the
+/// caller can report a signal that was NOT delivered instead of rendering it
+/// as delivered (issue #92 round 5).
 fn signal_group(group: u32) -> Option<String> {
     helper_attempt(
         &GROUP_HELPER_CANDIDATES,
         &["-9", &format!("-{group}")],
         "group signal",
-    )?;
-    None
+    )
 }
 
 /// Terminate one process by POSITIVE pid (unambiguous on both platforms).
+/// Same contract as [`signal_group`]: `None` means the kill was delivered,
+/// `Some(reason)` means it was not ([`reap_group`] must never count that as a
+/// reap — issue #92 round 5).
 fn kill_pid(pid: u32) -> Option<String> {
-    helper_attempt(&GROUP_HELPER_CANDIDATES, &["-9", &pid.to_string()], "reap")?;
-    None
+    helper_attempt(&GROUP_HELPER_CANDIDATES, &["-9", &pid.to_string()], "reap")
 }
 
 /// The live members of one process group, through the portable
@@ -1636,8 +1644,8 @@ fn group_members(group: u32) -> Option<Vec<u32>> {
 
 /// What one deadline's group termination did (issue #92 round 3): the outcome
 /// of the best-effort group signal, how many members were reaped by positive
-/// pid, which members were still live when the bounded window expired, and
-/// any failure reason worth naming.
+/// pid, which members no kill could reach (so they were still live at the last
+/// enumeration), and any failure reason worth naming.
 struct GroupReap {
     signal: Option<String>,
     reaped: usize,
@@ -1652,6 +1660,12 @@ struct GroupReap {
 /// `deadline` expires. Never signals our own pid and never a pid outside the
 /// target group; a descendant that left the group (its own session or process
 /// group) is unreachable by construction and is reported instead of blocking.
+///
+/// Every number this loop reports is derived from the attempt results
+/// (issue #92 round 5): `kill_pid` → `None` (delivered) is the only way a
+/// member is counted as reaped, and only members no kill could reach are
+/// carried into [`GroupReap::remaining`] as live survivors — a reported
+/// failure is never evidence of delivery.
 fn reap_group(group: u32, deadline: Instant, signal: Option<String>) -> GroupReap {
     let mut report = GroupReap {
         signal,
@@ -1659,6 +1673,10 @@ fn reap_group(group: u32, deadline: Instant, signal: Option<String>) -> GroupRea
         remaining: Vec::new(),
         notes: Vec::new(),
     };
+    // Members whose positive-pid kill was delivered, once each: the
+    // diagnostic counts members, never repeat attempts against a member that
+    // is still dying.
+    let mut killed: Vec<u32> = Vec::new();
     loop {
         match group_members(group) {
             None => {
@@ -1672,17 +1690,24 @@ fn reap_group(group: u32, deadline: Instant, signal: Option<String>) -> GroupRea
                 break;
             }
             Some(members) => {
+                let mut survivors = Vec::new();
                 for pid in &members {
                     match kill_pid(*pid) {
-                        None => report.reaped += 1,
+                        None => {
+                            if !killed.contains(pid) {
+                                killed.push(*pid);
+                            }
+                        }
                         Some(reason) => {
+                            survivors.push(*pid);
                             if report.notes.len() < 3 && !report.notes.contains(&reason) {
                                 report.notes.push(reason);
                             }
                         }
                     }
                 }
-                report.remaining = members;
+                report.reaped = killed.len();
+                report.remaining = survivors;
             }
         }
         if Instant::now() >= deadline {
@@ -1694,9 +1719,10 @@ fn reap_group(group: u32, deadline: Instant, signal: Option<String>) -> GroupRea
 }
 
 /// The one-line diagnostic of one deadline's group termination, so a failure
-/// is self-diagnosing: what the best-effort signal did, how many members were
-/// reaped by pid, which members were still live at the window's end, and any
-/// failure reason (issue #92 round 3).
+/// is self-diagnosing: what the best-effort signal did (a signal that was not
+/// delivered is named with its reason — never rendered as delivered), how many
+/// members were reaped by pid, which members no kill could reach, and any
+/// failure reason (issue #92 round 5).
 fn group_reap_diagnostic(group: u32, report: &GroupReap) -> String {
     let mut line = format!("[canter] deadline kill of process group -{group}: ");
     match &report.signal {
@@ -1711,8 +1737,9 @@ fn group_reap_diagnostic(group: u32, report: &GroupReap) -> String {
     ));
     if !report.remaining.is_empty() {
         line.push_str(&format!(
-            "; {} member(s) were still live when the bounded reap window expired (pids {:?}; a \
-             descendant that left the process group is not reachable by design)",
+            "; {} member(s) could not be killed by positive pid and were still live at the last \
+             enumeration (pids {:?}; a descendant that left the process group is not reachable by \
+             design)",
             report.remaining.len(),
             report.remaining
         ));
@@ -3930,6 +3957,45 @@ mod tests {
             shape.trim(),
             "inherited",
             "a workspace protocol row must keep the pre-existing spawn path"
+        );
+    }
+
+    #[test]
+    fn a_failed_group_reap_attempt_is_reported_not_discarded() {
+        // Issue #92 round 5 (review V1): [`helper_attempt`] returns `None`
+        // when the attempt was delivered and `Some(reason)` when every
+        // candidate failed. Both wrappers must hand that value on unchanged —
+        // a discarded failure renders "the group-signal helper delivered" and
+        // counts a member the helper could not kill as reaped, on exactly the
+        // platform this slice exists for.
+        //
+        // The id can never exist: it is past every platform's pid_max (Linux
+        // caps at 4 194 304) and still exactly representable as the helper's
+        // 32-bit `pid_t`, so no platform can map it onto a live process.
+        const IMPOSSIBLE_ID: u32 = 2_000_000_000;
+
+        let signal = signal_group(IMPOSSIBLE_ID);
+        assert!(
+            signal.is_some(),
+            "a failed group-signal attempt must be reported, not discarded: got {signal:?}"
+        );
+        let kill = kill_pid(IMPOSSIBLE_ID);
+        assert!(
+            kill.is_some(),
+            "a failed positive-pid kill attempt must be reported, not discarded: got {kill:?}"
+        );
+        // A reported failure names what every candidate did, so the caller's
+        // diagnostic can say the signal *failed* instead of claiming delivery.
+        assert!(
+            signal
+                .as_deref()
+                .is_some_and(|reason| reason.contains("group signal")),
+            "the reason must name the group signal attempt: {signal:?}"
+        );
+        assert!(
+            kill.as_deref()
+                .is_some_and(|reason| reason.contains("reap")),
+            "the reason must name the reap attempt: {kill:?}"
         );
     }
 

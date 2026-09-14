@@ -688,6 +688,16 @@ release process activates (docs/RELEASING.md), then semver applies.
   (journaled before effect, consumed retry authorizations respected, holds
   never cleared); non-armed supervision keeps its classification-only
   zero-effect contract verbatim.
+- Round-5 diagnostic-truthfulness fix (found by the independent round-3
+  review, finding V1): the group-signal and positive-pid-kill wrappers hand
+  the helper attempt's result on unchanged — `None` means the attempt was
+  delivered, `Some(reason)` means every candidate failed — so the one
+  diagnostic line names a group signal that could NOT be delivered (with its
+  reason) instead of rendering it as delivered, and the reap count and the
+  survivor list are derived from delivered attempts only (a member no kill
+  could reach is never counted as reaped). Pinned by
+  `adapters::tests::a_failed_group_reap_attempt_is_reported_not_discarded`
+  (raw exit 101 at the pre-fix head, 0 with the fix).
 - Round-3 platform fix (found by hosted CI on Linux: the round-2 helper form
   does not deliver the group signal there, so both no-orphan tests failed with
   the helpers alive and the assertions did not print the runner's own
