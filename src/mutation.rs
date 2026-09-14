@@ -36,7 +36,7 @@
 //! effect handlers.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use crate::canonical::{canonical_bytes, sha256_hex};
@@ -1096,20 +1096,59 @@ fn canonical_or(path: &Path) -> PathBuf {
 }
 
 /// Resolve a step param path that must live under the containment root.
-/// `relative` is a path relative to the root; anything escaping (or an
-/// absolute path when only relative paths are allowed) is refused.
+/// `relative` is a path relative to the root; anything escaping (an absolute
+/// path, a `..` walk, or a symlink that leaves the root) is refused. The
+/// destination does not have to exist yet for the escape to be visible
+/// (issue #130): the check resolves the path the effect would actually touch.
 pub fn contained_path(root: &Path, relative: &str) -> Result<PathBuf, MutationError> {
     if relative.is_empty() {
         return Err(MutationError::new(code::UNCONTAINED, "empty path"));
     }
     let candidate = root.join(relative);
-    if !is_contained(root, &candidate) {
+    if resolve_contained(root, relative).is_none() {
         return Err(MutationError::new(
             code::UNCONTAINED,
             format!("path {relative:?} escapes the containment root"),
         ));
     }
     Ok(candidate)
+}
+
+/// Resolve `relative` against `root` the way the OS resolves it at the moment
+/// the effect touches it, WITHOUT requiring the destination to exist yet:
+/// every component that exists is canonicalized (so a symlink can never hide
+/// an escape), a `..` moves out of the already-resolved prefix, and a
+/// component that does not exist yet is appended literally. `None` when the
+/// walk leaves the root (or ends on the root itself).
+///
+/// Issue #130: the previous check compared the LITERAL `root.join(relative)`
+/// with [`is_contained`], whose canonicalizing fallback cannot reveal the
+/// escape while the target does not exist — `root/../escaped-lane` still
+/// `starts_with` `root` lexically, so the pre-check admitted it and
+/// `git worktree add` then created the lane outside the root.
+fn resolve_contained(root: &Path, relative: &str) -> Option<PathBuf> {
+    if Path::new(relative).is_absolute() {
+        return None;
+    }
+    let root = canonical_or(root);
+    let mut resolved = root.clone();
+    for component in Path::new(relative).components() {
+        match component {
+            // `.` is a no-op; a `..` walks out of the resolved prefix, so an
+            // escape is visible immediately instead of only once the target
+            // exists.
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved = resolved.parent()?.to_path_buf();
+            }
+            Component::Normal(name) => {
+                resolved = canonical_or(&resolved.join(name));
+            }
+            // An absolute presented path is never a lane-relative path.
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    (resolved.starts_with(&root) && resolved != root).then_some(resolved)
 }
 
 // ---------------------------------------------------------------------------
@@ -3334,6 +3373,61 @@ mod tests {
             check_step_params("harness_start", Some(&foreign), &ParamContract::default())
                 .expect_err("foreign official executable");
         assert_eq!(code, code::BAD_PARAMS, "{message}");
+    }
+
+    /// Issue #130: the containment screen resolves the path the effect would
+    /// actually touch, so an escape is refused even when the destination does
+    /// not exist yet — and a symlink under the root cannot hide one either.
+    /// The pre-fix check compared the LITERAL join, whose canonicalizing
+    /// fallback leaves `root/../escaped-lane` `starts_with` the root, and
+    /// `git worktree add` then created the lane outside it.
+    #[test]
+    fn containment_refuses_a_destination_that_does_not_exist_yet() {
+        // A canonical fixture root: a symlinked temp ancestor must not be
+        // able to mask (or manufacture) a containment failure.
+        let dir = std::fs::canonicalize(std::env::temp_dir())
+            .expect("temp dir")
+            .join(format!("hf-mutation-130-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join("worktrees");
+        std::fs::create_dir_all(&root).expect("worktrees root");
+
+        // Escaping shapes refuse although no lane exists yet.
+        for escaping in [
+            "../escaped-lane",
+            "issues/../../escaped-lane",
+            "/tmp/escaped-lane",
+        ] {
+            let err = contained_path(&root, escaping).expect_err(escaping);
+            assert_eq!(err.code, code::UNCONTAINED, "{escaping}");
+        }
+
+        // A symlink under the root that leaves it cannot hide the escape: the
+        // presented path resolves through the link.
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(&outside, root.join("link-out")).expect("escaping symlink");
+            let err = contained_path(&root, "link-out/lane").expect_err("symlinked escape");
+            assert_eq!(err.code, code::UNCONTAINED);
+            // A symlink that stays INSIDE the root is still a lane path.
+            std::fs::create_dir_all(root.join("real")).expect("real dir");
+            symlink(root.join("real"), root.join("link-in")).expect("inner symlink");
+            assert!(
+                contained_path(&root, "link-in/lane").is_ok(),
+                "an in-root symlink is not an escape"
+            );
+        }
+
+        // The legitimate in-root shape resolves, and the screen creates
+        // nothing on its own.
+        let inside = contained_path(&root, "issues/130").expect("in-root lane");
+        assert_eq!(inside, root.join("issues/130"));
+        assert!(!root.join("issues").exists(), "the screen creates nothing");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Issue #92 F2: the session identity of a run is derived ONCE, so the
