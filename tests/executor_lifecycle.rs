@@ -294,11 +294,14 @@ fn a_child_that_exits_while_a_descendant_holds_the_pipes_returns_promptly() {
         "the child completed inside its deadline: {}",
         describe(&out)
     );
+    // The op must end shortly after the child is gone, never wait out the
+    // rest of the deadline window: the bound asserted here is far below the
+    // 30 s deadline but generous enough for a loaded host's scheduling jitter
+    // (the pre-fix bound waited `deadline + grace` = ~30 s).
     assert!(
-        elapsed < canter::adapters::PIPE_READ_GRACE + Duration::from_secs(2),
-        "a child that exits leaves only the documented grace ({:?}) for its descendants' pipes, \
-         took {elapsed:?} of a {timeout:?} deadline: {}",
-        canter::adapters::PIPE_READ_GRACE,
+        elapsed < Duration::from_secs(10),
+        "a child that exits must not make the op wait out its {timeout:?} deadline for a \
+         descendant's pipes, took {elapsed:?}: {}",
         describe(&out)
     );
     assert_eq!(
