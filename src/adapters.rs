@@ -1569,20 +1569,16 @@ fn helper_attempt(candidates: &[&str], args: &[&str], label: &str) -> Option<Str
     Some(failures.join("; "))
 }
 
-/// Best-effort group signal (the cheap first attempt): `kill -9 -<pgid>`.
-/// The negative-pid form is NOT portable — the BSD `kill` accepts it while
-/// GNU/procps parses it as an option cluster and exits non-zero — so this is
-/// never the guarantee; [`reap_group`] verifies and finishes the job by
-/// positive pid (issue #92 round 3). The attempt's result is handed on
-/// unchanged (`None` delivered, `Some(reason)` every candidate failed) so the
-/// caller can report a signal that was NOT delivered instead of rendering it
-/// as delivered (issue #92 round 5).
+/// Best-effort group signal: `kill -9 -<pgid>`. The form is not portable:
+/// procps returned zero for a nonexistent group where BSD kill failed.
+/// Exit status alone is not proof of delivery on either platform;
+/// [`reap_group`] verifies and finishes the job by positive pid.
 fn signal_group(group: u32) -> Option<String> {
-    helper_attempt(
-        &GROUP_HELPER_CANDIDATES,
-        &["-9", &format!("-{group}")],
-        "group signal",
-    )
+    signal_group_with(&GROUP_HELPER_CANDIDATES, group)
+}
+
+fn signal_group_with(candidates: &[&str], group: u32) -> Option<String> {
+    helper_attempt(candidates, &["-9", &format!("-{group}")], "group signal")
 }
 
 /// Terminate one process by POSITIVE pid (unambiguous on both platforms).
@@ -1590,7 +1586,11 @@ fn signal_group(group: u32) -> Option<String> {
 /// `Some(reason)` means it was not ([`reap_group`] must never count that as a
 /// reap — issue #92 round 5).
 fn kill_pid(pid: u32) -> Option<String> {
-    helper_attempt(&GROUP_HELPER_CANDIDATES, &["-9", &pid.to_string()], "reap")
+    kill_pid_with(&GROUP_HELPER_CANDIDATES, pid)
+}
+
+fn kill_pid_with(candidates: &[&str], pid: u32) -> Option<String> {
+    helper_attempt(candidates, &["-9", &pid.to_string()], "reap")
 }
 
 /// The live members of one process group, through the portable
@@ -3962,40 +3962,32 @@ mod tests {
 
     #[test]
     fn a_failed_group_reap_attempt_is_reported_not_discarded() {
-        // Issue #92 round 5 (review V1): [`helper_attempt`] returns `None`
-        // when the attempt was delivered and `Some(reason)` when every
-        // candidate failed. Both wrappers must hand that value on unchanged —
-        // a discarded failure renders "the group-signal helper delivered" and
-        // counts a member the helper could not kill as reaped, on exactly the
-        // platform this slice exists for.
-        //
-        // The id can never exist: it is past every platform's pid_max (Linux
-        // caps at 4 194 304) and still exactly representable as the helper's
-        // 32-bit `pid_t`, so no platform can map it onto a live process.
-        const IMPOSSIBLE_ID: u32 = 2_000_000_000;
-
-        let signal = signal_group(IMPOSSIBLE_ID);
-        assert!(
-            signal.is_some(),
-            "a failed group-signal attempt must be reported, not discarded: got {signal:?}"
-        );
-        let kill = kill_pid(IMPOSSIBLE_ID);
-        assert!(
-            kill.is_some(),
-            "a failed positive-pid kill attempt must be reported, not discarded: got {kill:?}"
-        );
-        // A reported failure names what every candidate did, so the caller's
-        // diagnostic can say the signal *failed* instead of claiming delivery.
+        // A NUL in the executable name prevents launch on every platform;
+        // no kill runs, and no platform-specific exit status is the oracle.
+        let candidates = ["invalid\0kill-helper"];
+        let signal = helper_attempt(&candidates, &["-9", "-7"], "group signal");
         assert!(
             signal
                 .as_deref()
                 .is_some_and(|reason| reason.contains("group signal")),
-            "the reason must name the group signal attempt: {signal:?}"
+            "the unlaunchable helper must report its failure: {signal:?}"
         );
+        assert_eq!(
+            signal_group_with(&candidates, 7),
+            signal,
+            "the group-signal wrapper must preserve the failure unchanged"
+        );
+
+        let kill = helper_attempt(&candidates, &["-9", "7"], "reap");
         assert!(
             kill.as_deref()
                 .is_some_and(|reason| reason.contains("reap")),
-            "the reason must name the reap attempt: {kill:?}"
+            "the unlaunchable helper must report its failure: {kill:?}"
+        );
+        assert_eq!(
+            kill_pid_with(&candidates, 7),
+            kill,
+            "the positive-pid wrapper must preserve the failure unchanged"
         );
     }
 
