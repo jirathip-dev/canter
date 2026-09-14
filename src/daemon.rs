@@ -1662,6 +1662,80 @@ fn dispatch_key(target: String) -> String {
     format!("ik_{}", &tail[..tail.len().min(64)])
 }
 
+/// Executor-owned claim reaper. Created only after a NEW claim commits, before
+/// any later state guard: unwinding/early returns release those guards first.
+/// Client disconnects do not own execution: the daemon finishes the already
+/// bounded effect and records its outcome even when nobody reads the response.
+/// Never expire a live executor by age (that could admit a duplicate effect).
+struct ApplyClaim<'a> {
+    shared: &'a Arc<Shared>,
+    request: &'a Request,
+    key: &'a str,
+}
+
+impl Drop for ApplyClaim<'_> {
+    fn drop(&mut self) {
+        let result = (|| -> Result<bool, StateError> {
+            let state = self.shared.lock_state().map_err(|message| StateError {
+                code: "state.unavailable",
+                message,
+            })?;
+            let Some(claim) = state.claim(self.key)? else {
+                return Ok(false);
+            };
+            if claim.status != "claimed" || claim.request_id != self.request.id {
+                return Ok(false);
+            }
+            let message = "apply executor exited before recording an outcome; external review is required before retrying with a new key";
+            let params = self.request.params.as_ref();
+            let plan_id = params
+                .and_then(|p| p.get("plan"))
+                .and_then(|p| p.get("plan_id"))
+                .and_then(Val::as_str)
+                .unwrap_or(DAEMON_PLAN_ID);
+            let step_id = params
+                .and_then(|p| p.get("step"))
+                .and_then(Val::as_str)
+                .unwrap_or(DAEMON_STEP_ID);
+            let outcome = apply_outcome(
+                plan_id,
+                step_id,
+                self.key,
+                "ambiguous",
+                null(),
+                Some(("state.interrupted", message.to_string())),
+            );
+            let response = err_response(&self.request.id, "state.interrupted", message);
+            state.resolve_claim(
+                self.key,
+                "apply",
+                "ambiguous",
+                &canonical_text(&outcome),
+                Some(&response),
+            )?;
+            if let Some(instance) = self
+                .request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("instance_id"))
+                .and_then(Val::as_str)
+            {
+                state.complete_run_pause_boundary(instance, &time::rfc3339_now())?;
+            }
+            Ok(true)
+        })();
+        match result {
+            Ok(true) => publish_after_state_change(self.shared, None),
+            Ok(false) => {}
+            Err(err) => self.shared.log.write(
+                "error",
+                "apply.reap_failed",
+                &format!("{}: {}", err.code, err.message),
+            ),
+        }
+    }
+}
+
 fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
     let parsed = match apply_params(request) {
         Ok(parsed) => parsed,
@@ -1808,6 +1882,11 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
         }
     };
     let _ = journaled;
+    let _claim = ApplyClaim {
+        shared,
+        request,
+        key: &key,
+    };
     // No publish here: every post-journal terminal path below publishes
     // once after its state change (hub-lock ordering rule).
 
@@ -2050,6 +2129,7 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
                 .map(|steps| steps.iter().any(|step| step == &parsed.step))
                 .unwrap_or(false),
             Err(err) => {
+                drop(state);
                 return resolve_apply_refusal(shared, request, &key, err.code, err.message);
             }
         }
@@ -2106,7 +2186,7 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
     // and never from a profile the caller names.
     let presented_profile = match presented_profile(request.params.as_ref()) {
         Ok(profile) => profile,
-        Err((code, message)) => return err_response(&request.id, code, &message),
+        Err((code, message)) => return resolve_apply_refusal(shared, request, &key, code, message),
     };
     let run_binding = match resolve_run_binding(
         shared,
@@ -2115,7 +2195,9 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
         presented_profile.as_ref(),
     ) {
         Ok(binding) => binding,
-        Err((code, message)) => return err_response(&request.id, &code, &message),
+        Err((code, message)) => {
+            return resolve_apply_refusal(shared, request, &key, &code, message);
+        }
     };
     let ctx = crate::mutation::EffectContext {
         plan: &plan,
@@ -2204,6 +2286,7 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
                         result = Val::Obj(fields);
                     }
                     Err(err) => {
+                        drop(state);
                         return finish_apply_refused(
                             shared,
                             request,
@@ -2244,6 +2327,7 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
                     &format!("{}:{}", plan.repository, salvage_target),
                     &parsed.instance_id,
                 ) {
+                    drop(state);
                     return finish_apply_refused(
                         shared,
                         request,
@@ -2289,6 +2373,7 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
                         result = Val::Obj(fields);
                     }
                     Err(err) => {
+                        drop(state);
                         return finish_apply_refused(
                             shared,
                             request,
@@ -5085,6 +5170,7 @@ fn method_lane_start(shared: &Arc<Shared>, request: &Request) -> String {
                 match stored_profile(&state, &plan.record.replacement_id) {
                     Ok(binding) => binding,
                     Err((code, message)) => {
+                        drop(state);
                         return finish_mutation(
                             shared,
                             request,
@@ -5696,6 +5782,7 @@ fn method_lane_adopt(shared: &Arc<Shared>, request: &Request) -> String {
                 match stored_profile(&state, &plan.record.replacement_id) {
                     Ok(binding) => binding,
                     Err((code, message)) => {
+                        drop(state);
                         return finish_mutation(
                             shared,
                             request,
@@ -6712,6 +6799,7 @@ fn method_backup_create(shared: &Arc<Shared>, request: &Request) -> String {
             let epoch = match state.current_epoch() {
                 Ok(epoch) => epoch,
                 Err(err) => {
+                    drop(state);
                     return finish_mutation(
                         shared,
                         request,
@@ -8311,6 +8399,126 @@ mod tests {
             LEGACY_CRASH_POINT_ENV, "HERDR_FLEET_CRASH_POINT",
             "pre-rename env var name"
         );
+    }
+
+    #[test]
+    fn abandoned_apply_claim_is_reaped_on_executor_unwind() {
+        let root = std::env::temp_dir().join(format!(
+            "canter-reap-{}-{}",
+            std::process::id(),
+            time::unix_now()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let paths = DaemonPaths {
+            state_dir: root.clone(),
+            runtime_dir: root.clone(),
+            socket_path: root.join("sock"),
+            lock_path: root.join("lock"),
+            db_path: root.join("state.db"),
+            audit_mirror_path: root.join("audit.jsonl"),
+            events_mirror_path: root.join("events.jsonl"),
+            backups_dir: root.join("backups"),
+            checkpoints_dir: root.join("checkpoints"),
+            log_path: root.join("daemon.log"),
+        };
+        let state = Arc::new(Mutex::new(
+            State::open(&paths.db_path, crate::state::Retention::default()).unwrap(),
+        ));
+        let mut supervisor = crate::supervision::start(
+            Arc::clone(&state),
+            crate::supervision::SupervisorOptions::default(),
+        );
+        let wake = supervisor.wake_handle();
+        wake.signal_stop();
+        assert!(supervisor.join());
+        let shared = Arc::new(Shared {
+            state,
+            hub: Mutex::new(Hub::new(0)),
+            log: DaemonLog::open(&paths.log_path).unwrap(),
+            paths,
+            pid: std::process::id(),
+            started_at: time::rfc3339_now(),
+            running: AtomicBool::new(true),
+            supervisor: wake,
+        });
+        let key = format!("ik_{}", "abandoned");
+        let request = Request {
+            id: "01234567".to_string(),
+            method: "apply".to_string(),
+            params: Some(object(vec![
+                ("instance_id", string("run-1")),
+                ("step", string("r1")),
+            ])),
+            line: String::new(),
+        };
+        shared
+            .lock_state()
+            .unwrap()
+            .journal_intent(
+                "mutate.review_evidence",
+                "run-1:r1",
+                &key,
+                &request.id,
+                &request.method,
+                None,
+                None,
+                &request.line,
+            )
+            .unwrap();
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _claim = ApplyClaim {
+                shared: &shared,
+                request: &request,
+                key: &key,
+            };
+            assert_eq!(
+                shared
+                    .lock_state()
+                    .unwrap()
+                    .claim(&key)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "claimed",
+                "a live executor's claim must not be reclaimed"
+            );
+            panic!("synthetic executor disappearance outside the state guard");
+        }));
+        assert!(unwind.is_err());
+        let state = shared.lock_state().unwrap();
+        let claim = state.claim(&key).unwrap().unwrap();
+        assert_eq!(
+            claim.status, "ambiguous",
+            "abandoned executor must not leave an in-flight claim"
+        );
+        let outcome = Val::parse_json(claim.outcome.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            outcome
+                .get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(Val::as_str),
+            Some("state.interrupted")
+        );
+        assert!(state.claims_in_flight().unwrap().is_empty());
+        drop(state);
+        // A completed claim must remain byte-identical on a later scope exit.
+        drop(ApplyClaim {
+            shared: &shared,
+            request: &request,
+            key: &key,
+        });
+        assert_eq!(
+            shared
+                .lock_state()
+                .unwrap()
+                .claim(&key)
+                .unwrap()
+                .unwrap()
+                .outcome,
+            claim.outcome
+        );
+        drop(shared);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

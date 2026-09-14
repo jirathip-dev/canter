@@ -2941,6 +2941,12 @@ fn the_prompt_runs_the_runs_declared_role_binding_and_continues_its_session() {
         Some(harness_role_revision().as_str())
     );
 
+    // The early refusal now has a durable outcome (Refs #133), rather than
+    // an orphaned claim. The existing retry fence therefore needs the same
+    // explicit authorization as every other recorded refused attempt.
+    let (exit, stdout, stderr) = run_cli(&fixture, &["retry", "--run", &run, "--step", "p3"]);
+    assert_eq!(exit, 0, "retry exit; stdout: {stdout}; stderr: {stderr}");
+
     // The prompt continues that exact session, runs the declared role
     // binding, and records the child's REAL stdout as the step result.
     let prompted = rpc_ok(
