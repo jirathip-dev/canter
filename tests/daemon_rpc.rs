@@ -1047,6 +1047,12 @@ fn non_draining_subscriber_is_disconnected_under_backpressure() {
     // succeed.
     let socket_path = fixture.socket.clone();
     let mut stream = UnixStream::connect(&socket_path).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("bound subscriber reads");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .expect("bound subscriber writes");
     let mut reader = BufReader::new(stream.try_clone().expect("clone"));
     let request = format!(
         "{}\n",
@@ -1083,19 +1089,22 @@ fn non_draining_subscriber_is_disconnected_under_backpressure() {
     // Each mutation journals two events (intent + outcome).
     let storm_events = storm_requests * 2;
 
-    // Drain with a read timeout: the daemon must disconnect the stalled
-    // subscriber (bounded queue + socket buffer) instead of delivering the
-    // whole storm, while the mutations themselves all succeeded.
-    stream
-        .set_read_timeout(Some(Duration::from_millis(250)))
-        .expect("read timeout");
+    // Drain under the read bound configured before subscription: the daemon
+    // must disconnect the stalled subscriber (bounded queue + socket buffer)
+    // instead of delivering the whole storm, while the mutations themselves
+    // all succeeded.
     let mut saw_lines = 0usize;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let mut line = String::new();
         let read = match reader.read_line(&mut line) {
             Ok(read) => read,
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
                 assert!(Instant::now() < deadline, "subscriber never disconnected");
                 continue;
             }

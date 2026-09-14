@@ -13,9 +13,11 @@
 //!   prompts or continues work.
 //!
 //! No fixed real sleeps: every wait is a bounded poll with a deadline.
+#[path = "support/process_group.rs"]
+mod process_group;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use canter::client::Connection;
@@ -27,6 +29,7 @@ use canter::queue_preview as qp;
 use canter::state::{Retention, State};
 use canter::supervision;
 use canter::value::{Val, integer, null, object, string};
+use process_group::{GroupChild, assert_no_process_for_socket};
 
 // ---------------------------------------------------------------------------
 // Constants and builders (the #84/#85 fixture shape, one selected issue)
@@ -240,9 +243,10 @@ impl DaemonFixture {
 
     /// Spawn the daemon with an explicit `PATH` (the fake harness/forge
     /// executables the dispatched effects must resolve).
-    fn spawn_with_path(&self, path: &str) -> Child {
+    fn spawn_with_path(&self, path: &str) -> GroupChild {
         std::fs::create_dir_all(&self.state_dir).expect("state home");
-        Command::new(env!("CARGO_BIN_EXE_canter"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_canter"));
+        command
             .args(["daemon", "run", "--socket"])
             .arg(&self.socket)
             .env("XDG_STATE_HOME", &self.state_dir)
@@ -251,14 +255,14 @@ impl DaemonFixture {
             .stdout(Stdio::null())
             .stderr(Stdio::from(
                 std::fs::File::create(self.dir.join("daemon.stderr.log")).expect("stderr log"),
-            ))
-            .spawn()
-            .expect("spawn daemon")
+            ));
+        GroupChild::spawn(&mut command, &self.socket).expect("spawn daemon")
     }
 
-    fn spawn(&self) -> Child {
+    fn spawn(&self) -> GroupChild {
         std::fs::create_dir_all(&self.state_dir).expect("state home");
-        Command::new(env!("CARGO_BIN_EXE_canter"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_canter"));
+        command
             .args(["daemon", "run", "--socket"])
             .arg(&self.socket)
             .env("XDG_STATE_HOME", &self.state_dir)
@@ -266,9 +270,8 @@ impl DaemonFixture {
             .stdout(Stdio::null())
             .stderr(Stdio::from(
                 std::fs::File::create(self.dir.join("daemon.stderr.log")).expect("stderr log"),
-            ))
-            .spawn()
-            .expect("spawn daemon")
+            ));
+        GroupChild::spawn(&mut command, &self.socket).expect("spawn daemon")
     }
 }
 
@@ -384,13 +387,19 @@ fn rpc_refusal(socket: &Path, id: &str, method: &str, params: Option<Val>) -> St
     )
 }
 
-fn shutdown(mut daemon: Child) {
-    let _ = daemon.kill();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while daemon.try_wait().expect("try_wait").is_none() {
-        assert!(Instant::now() < deadline, "daemon did not exit");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+fn shutdown(mut daemon: GroupChild) {
+    daemon.terminate("supervision fixture daemon");
+}
+
+#[test]
+fn supervision_fixture_reaps_its_daemon_group() {
+    let fixture = DaemonFixture::new("leak-detector");
+    fixture.seed();
+    let socket = fixture.socket.clone();
+    let daemon = fixture.spawn();
+    wait_ready(&fixture);
+    shutdown(daemon);
+    assert_no_process_for_socket(&socket);
 }
 
 // ---------------------------------------------------------------------------
@@ -1878,7 +1887,7 @@ fn assert_retry_authorization_survives(fixture: &DaemonFixture, run: &str, step:
 /// driver dispatched once by itself. The committed request is complete, but
 /// its branch already exists, so the real effect records a diagnosed adapter
 /// failure that `run.retry` may address.
-fn retry_lane_scenario(name: &str) -> (DaemonFixture, Child, String) {
+fn retry_lane_scenario(name: &str) -> (DaemonFixture, GroupChild, String) {
     let fixture = DaemonFixture::new(name);
     let (bound, digest) = {
         let state = fixture.seed();

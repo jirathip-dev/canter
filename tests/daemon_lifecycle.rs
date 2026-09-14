@@ -8,15 +8,18 @@
 //! isolated XDG state and an explicit short socket under a per-test temp
 //! dir; nothing here touches the real host state, the service manager, or
 //! the network (see tests/no_network_surface.rs).
+#[path = "support/process_group.rs"]
+mod process_group;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use canter::client::{Connection, RpcError};
 use canter::dirs::DaemonPaths;
 use canter::state::{Retention, State};
 use canter::value::{Val, integer, object, string};
+use process_group::{GroupChild, assert_no_process_for_socket};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_canter")
@@ -60,7 +63,7 @@ impl Fixture {
     /// given (used to run the daemon in a PATH without herdr/git/gh for the
     /// cold-boot recovery probe); `empty_path` replaces PATH entirely
     /// (only the absolute binary path is used to spawn).
-    fn spawn(&self, path_mode: PathMode) -> Child {
+    fn spawn(&self, path_mode: PathMode) -> GroupChild {
         let mut command = Command::new(bin());
         let stderr_file =
             std::fs::File::create(self.dir.join("daemon.stderr.log")).expect("stderr log");
@@ -81,7 +84,7 @@ impl Fixture {
                 command.env("PATH", &empty);
             }
         }
-        command.spawn().expect("spawn daemon")
+        GroupChild::spawn(&mut command, &self.socket).expect("spawn daemon")
     }
 }
 
@@ -184,21 +187,8 @@ fn fresh_id(seed: u32) -> String {
     format!("{:08x}", seed + std::process::id())
 }
 
-fn wait_exit(mut child: Child, label: &str) {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if let Some(status) = child.try_wait().expect("try_wait") {
-            let _ = status;
-            return;
-        }
-        assert!(Instant::now() < deadline, "{label} did not exit in time");
-        std::thread::sleep(Duration::from_millis(25));
-    }
-}
-
-fn kill(mut child: Child, label: &str) {
-    let _ = child.kill();
-    wait_exit(child, label);
+fn kill(mut child: GroupChild, label: &str) {
+    child.terminate(label);
 }
 
 // ---------------------------------------------------------------------------
@@ -653,7 +643,7 @@ fn make_plan(steps: Vec<Val>) -> Val {
 struct AdmissionScenario {
     fixture: Fixture,
     plan: Val,
-    daemon: Option<Child>,
+    daemon: Option<GroupChild>,
 }
 
 impl AdmissionScenario {
@@ -736,8 +726,7 @@ impl AdmissionScenario {
 impl Drop for AdmissionScenario {
     fn drop(&mut self) {
         if let Some(mut daemon) = self.daemon.take() {
-            let _ = daemon.kill();
-            wait_exit(daemon, "admission scenario daemon");
+            daemon.terminate("admission scenario daemon");
         }
         let _ = std::fs::remove_dir_all(&self.fixture.dir);
     }
@@ -915,4 +904,16 @@ fn paused_schedule_and_instance_survive_restart_and_boot_recovery() {
         "pause is durable across restarts"
     );
     kill(daemon, "post-restart daemon");
+}
+
+#[test]
+fn daemon_lifecycle_fixture_reaps_its_daemon_group() {
+    let fixture = Fixture::new("leak-detector");
+    let socket = fixture.socket.clone();
+    {
+        let _daemon = fixture.spawn(PathMode::Host);
+        wait_ready(&fixture);
+    }
+    assert_no_process_for_socket(&socket);
+    std::fs::remove_dir_all(&fixture.dir).expect("remove leak-detector fixture");
 }

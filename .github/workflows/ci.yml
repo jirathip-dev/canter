@@ -273,43 +273,7 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Tests
-        run: |
-          python3 -u - <<'PY'
-          import os
-          from pathlib import Path
-          import signal
-          import subprocess
-          import sys
-          import time
-
-          # Leave time for the runner to publish a normal failure log.
-          started = time.monotonic()
-          deadline = started + 18 * 60
-          suites = [["--lib"], ["--bins"]]
-          suites += [["--test", path.stem] for path in sorted(Path("tests").glob("*.rs"))]
-          suites += [["--doc"]]
-          for suite in suites:
-              label = " ".join(suite)
-              budget = min(300, deadline - time.monotonic())
-              print(f"::group::Tests {label} at +{time.monotonic() - started:.1f}s")
-              if budget <= 0:
-                  sys.exit(f"::error::Tests aggregate deadline exceeded before {label}")
-              child = subprocess.Popen(
-                  ["cargo", "test", "--locked", *suite, "--", "--test-threads=1", "--nocapture"],
-                  start_new_session=True,
-              )
-              try:
-                  code = child.wait(timeout=budget)
-              except subprocess.TimeoutExpired:
-                  print(f"::error::Tests {label} exceeded {budget:.1f}s; last test name above is stalled")
-                  os.killpg(child.pid, signal.SIGKILL)
-                  child.wait(timeout=5)
-                  sys.exit(124)
-              print(f"Tests {label}: exit {code} at +{time.monotonic() - started:.1f}s")
-              print("::endgroup::")
-              if code != 0:
-                  sys.exit(code if code > 0 else 1)
-          PY
+        run: python3 -u scripts/ci-test-driver.py
 
       - name: Docs
         run: cargo doc --locked --no-deps

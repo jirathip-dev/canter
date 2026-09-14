@@ -72,9 +72,11 @@ impl Connection {
     /// `client.closed`, `client.read` — all unconfirmed classes), and a
     /// peer-closed socket reads EOF immediately, so nothing blocks.
     fn from_stream(stream: UnixStream) -> Result<Connection, RpcError> {
-        // Best effort by contract: the 15s bound is a liveness improvement,
-        // never a precondition for speaking to the daemon.
-        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(15)));
+        // Best effort by contract: the 15s I/O bounds are a liveness
+        // improvement, never a precondition for speaking to the daemon.
+        let timeout = Some(std::time::Duration::from_secs(15));
+        let _ = stream.set_read_timeout(timeout);
+        let _ = stream.set_write_timeout(timeout);
         let reader_stream = stream
             .try_clone()
             .map_err(|err| client_error("client.connect", err.to_string()))?;

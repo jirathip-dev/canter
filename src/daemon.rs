@@ -53,6 +53,8 @@ pub const REPLAY_MAX_LINES: i64 = 8192;
 /// Per-subscriber bounded event queue; a subscriber that does not drain it
 /// is disconnected (bounded backpressure, AC7).
 pub const SUBSCRIBER_QUEUE_CAP: usize = 64;
+/// A subscriber that stops draining cannot pin its socket-writer thread.
+const EVENT_STREAM_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 /// Upper bound on journal records served per `journal.tail` call.
 pub const JOURNAL_TAIL_LIMIT: i64 = 2000;
 /// Fallback id used for responses to unparseable request bytes (schema-valid
@@ -7750,6 +7752,7 @@ fn serve_event_stream(
     writer: &mut UnixStream,
     cursor: Option<i64>,
 ) -> Result<(), String> {
+    configure_event_writer(writer)?;
     let (receiver, snapshot_lines, replay_lines) = {
         let (sender, receiver) = sync_channel::<String>(SUBSCRIBER_QUEUE_CAP);
         let mut hub = shared.hub.lock().map_err(|_| "hub poisoned".to_string())?;
@@ -7758,20 +7761,26 @@ fn serve_event_stream(
         (receiver, snapshot, replay)
     };
     for line in snapshot_lines.iter().chain(replay_lines.iter()) {
-        writer
-            .write_all(line.as_bytes())
-            .and_then(|()| writer.write_all(b"\n"))
-            .and_then(|()| writer.flush())
-            .map_err(|err| format!("write event: {err}"))?;
+        write_event_line(writer, line)?;
     }
     for line in receiver {
-        writer
-            .write_all(line.as_bytes())
-            .and_then(|()| writer.write_all(b"\n"))
-            .and_then(|()| writer.flush())
-            .map_err(|err| format!("write event: {err}"))?;
+        write_event_line(writer, &line)?;
     }
     Ok(())
+}
+
+fn configure_event_writer(writer: &UnixStream) -> Result<(), String> {
+    writer
+        .set_write_timeout(Some(EVENT_STREAM_WRITE_TIMEOUT))
+        .map_err(|err| format!("configure event write timeout: {err}"))
+}
+
+fn write_event_line(writer: &mut UnixStream, line: &str) -> Result<(), String> {
+    writer
+        .write_all(line.as_bytes())
+        .and_then(|()| writer.write_all(b"\n"))
+        .and_then(|()| writer.flush())
+        .map_err(|err| format!("write event: {err}"))
 }
 
 /// Compute (snapshot lines, replay lines) for a subscriber cursor. Must be
@@ -9097,6 +9106,45 @@ mod tests {
             dispatch_request_from(&material, "p6-5", Some(&complete_params), "ik_f10-complete")
                 .expect("complete request");
         preflight_apply_request(&complete).expect("contracts-complete continuation");
+    }
+
+    #[test]
+    fn event_stream_write_timeout_closes_a_stalled_socket() {
+        use std::io::Read;
+
+        let (mut writer, mut reader) = UnixStream::pair().expect("socket pair");
+        let payload_bytes = 8 * 1024 * 1024;
+        let payload = "x".repeat(payload_bytes);
+        let (sender, receiver) = sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let result = configure_event_writer(&writer)
+                .and_then(|()| write_event_line(&mut writer, &payload));
+            sender.send(result).expect("report writer result");
+        });
+
+        let result = match receiver
+            .recv_timeout(EVENT_STREAM_WRITE_TIMEOUT + std::time::Duration::from_secs(2))
+        {
+            Ok(result) => result,
+            Err(error) => {
+                drop(reader);
+                worker.join().expect("join blocked writer after peer close");
+                panic!("event-stream writer remained blocked beyond its bound: {error}");
+            }
+        };
+        worker.join().expect("join bounded writer");
+        let error = result.expect_err("a non-draining peer must time out the write");
+        assert!(error.contains("write event:"), "{error}");
+
+        let mut prefix = Vec::new();
+        reader
+            .read_to_end(&mut prefix)
+            .expect("closed peer reaches EOF");
+        assert!(!prefix.is_empty(), "the socket accepted a bounded prefix");
+        assert!(
+            prefix.len() < payload_bytes + 1,
+            "the stalled socket unexpectedly accepted the whole event"
+        );
     }
 
     #[test]

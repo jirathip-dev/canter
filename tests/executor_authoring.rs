@@ -1,9 +1,13 @@
 //! Isolated supported-surface executor proofs. No live services or direct DB writes.
+#[path = "support/process_group.rs"]
+mod process_group;
+
 use canter::canonical::canonical_text;
 use canter::value::{Val, integer, object, string};
+use process_group::{GroupChild, assert_no_process_for_socket};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -13,7 +17,7 @@ const REV_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 struct Fixture {
     root: PathBuf,
-    daemon: Option<Child>,
+    daemon: Option<GroupChild>,
 }
 
 fn field<'a>(doc: &'a Val, path: &[&str]) -> &'a Val {
@@ -149,21 +153,19 @@ impl Fixture {
     }
     fn stop(&mut self) {
         if let Some(mut child) = self.daemon.take() {
-            child.kill().expect("stop own daemon");
-            child.wait().expect("reap own daemon");
+            child.terminate("executor-authoring daemon");
         }
     }
     fn restart(&mut self) {
         self.stop();
-        self.daemon = Some(
-            self.command()
-                .args(["daemon", "run", "--socket"])
-                .arg(self.path("d.sock"))
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap(),
-        );
+        let socket = self.path("d.sock");
+        let mut command = self.command();
+        command
+            .args(["daemon", "run", "--socket"])
+            .arg(&socket)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        self.daemon = Some(GroupChild::spawn(&mut command, &socket).expect("spawn daemon"));
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             if canter::client::call(&self.path("d.sock"), "state.epoch", Some(&object(vec![])))
@@ -346,6 +348,16 @@ impl Drop for Fixture {
 }
 fn succeeded(doc: &Val) {
     assert!(matches!(field(doc, &["dispatch"]), Val::Obj(_)), "{doc:?}");
+}
+
+#[test]
+fn executor_fixture_reaps_its_daemon_group() {
+    let socket;
+    {
+        let fixture = Fixture::new();
+        socket = fixture.path("d.sock");
+    }
+    assert_no_process_for_socket(&socket);
 }
 
 #[test]
