@@ -976,7 +976,7 @@ fn a_mint_without_a_live_daemon_is_refused_typed() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn replay_returns_the_recorded_outcome_and_a_second_mint_never_duplicates() {
+fn replay_returns_the_recorded_outcome_and_a_fresh_key_opens_a_new_window() {
     let fixture = Fixture::new("replay");
     let (request, _digest) = bound_document(&fixture, &[("#5", REV_A)]);
     let daemon = fixture.spawn(None);
@@ -999,19 +999,18 @@ fn replay_returns_the_recorded_outcome_and_a_second_mint_never_duplicates() {
     assert_eq!(exit, 1, "reused key refuses: {stderr}");
     assert!(stderr.contains("state.claim_reused"), "{stderr}");
 
-    // A fresh key with the same binding refuses instead of creating a second
-    // authorization for the same reviewed run — and it refuses WHATEVER
-    // window is asked for: the grant id is the identity of the reviewed
-    // binding, not of the window, so a re-mint with a longer `--expires-in`
-    // cannot slip a second grant past the first one.
-    let (exit, _stdout, stderr) =
+    // A fresh key opens a distinct authorization window for the same reviewed
+    // binding; it neither extends nor replaces the first grant.
+    let (exit, second_stdout, stderr) =
         fixture.grant_issue_with(&request, 5, 7200, Some(&key("replay-0002")));
-    assert_eq!(exit, 1, "second key refuses: {stderr}");
-    assert!(stderr.contains("state.grant_exists"), "{stderr}");
+    assert_eq!(exit, 0, "second window: {stderr}");
+    let second = envelope(&second_stdout).get("data").cloned().expect("data");
+    let second_id = text_of(&second, "grant_id");
+    assert_ne!(second_id, grant_id);
     assert_eq!(
         listed_grants(&fixture).len(),
-        1,
-        "exactly one grant for the reviewed binding after the longer-window re-mint"
+        2,
+        "both immutable authorization windows remain visible"
     );
 
     // Exactly-once + recorded replay at the wire level, on a DISTINCT
@@ -1064,8 +1063,8 @@ fn replay_returns_the_recorded_outcome_and_a_second_mint_never_duplicates() {
     );
     assert_eq!(
         listed.get("grants").and_then(Val::as_array).map(Vec::len),
-        Some(2),
-        "one grant per distinct binding, never two for one: {listed:?}"
+        Some(3),
+        "two windows for one binding plus the distinct wire document: {listed:?}"
     );
 
     shutdown(daemon);
@@ -1181,17 +1180,22 @@ fn a_crash_after_the_commit_keeps_exactly_one_grant() {
         .expect("grants");
     assert_eq!(grants.len(), 1, "exactly the committed grant: {listed:?}");
 
-    // The same binding with a fresh key still refuses — whatever window is
-    // asked for — so no duplicate grant appears: exactly one survives the
-    // interrupt.
-    let (exit, _stdout, stderr) =
+    let original_id = text_of(&grants[0], "grant_id");
+
+    // A fresh key after restart opens another immutable window; the committed
+    // pre-crash grant remains present and is never duplicated or replaced.
+    let (exit, stdout, stderr) =
         fixture.grant_issue_with(&request, 5, 7200, Some(&key("crash-commit-0002")));
-    assert_eq!(exit, 1, "no duplicate mint: {stderr}");
-    assert!(stderr.contains("state.grant_exists"), "{stderr}");
-    assert_eq!(
-        listed_grants(&fixture).len(),
-        1,
-        "exactly one grant after the crash and the longer-window re-mint"
+    assert_eq!(exit, 0, "fresh post-crash window: {stderr}");
+    let data = envelope(&stdout).get("data").cloned().expect("data");
+    assert_ne!(text_of(&data, "grant_id"), original_id);
+    let listed = listed_grants(&fixture);
+    assert_eq!(listed.len(), 2, "both windows remain after restart");
+    assert!(
+        listed
+            .iter()
+            .any(|grant| text_of(grant, "grant_id") == original_id),
+        "the pre-crash grant remains visible"
     );
 
     shutdown(daemon);

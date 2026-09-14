@@ -1089,7 +1089,81 @@ fn classify_items(
                 .and_then(|owned| owned.get("issue_revision"))
                 .and_then(Val::as_str)
                 .unwrap_or_default();
-            if owned_status == "paused" {
+            if owned_revision != revision {
+                let Some(presented_grant) = grants.get(&id) else {
+                    items.push(PlannedItem {
+                        id: id.display(),
+                        work_item,
+                        issue_number: id.number,
+                        revision,
+                        grant_id: None,
+                        resume_digest: None,
+                        verdict: SubmissionVerdict::Refused {
+                            code: codes::GRANT,
+                            message: format!(
+                                "revision rebind for {} requires a fresh presented grant window",
+                                id.display()
+                            ),
+                        },
+                    });
+                    continue;
+                };
+                let row = state
+                    .grant_by_id(presented_grant)
+                    .map_err(|err| SubmissionError::new(err.code, err.message))?;
+                match grant_binding_refusal(
+                    state,
+                    material,
+                    presented_grant,
+                    row,
+                    &id,
+                    &revision,
+                )? {
+                    Some((code, message)) => SubmissionVerdict::Refused { code, message },
+                    None => {
+                        let stored = state
+                            .instance_by_id(&instance_id)
+                            .map_err(|err| SubmissionError::new(err.code, err.message))?
+                            .ok_or_else(|| {
+                                SubmissionError::new(
+                                    "state.not_found",
+                                    format!("owned run {instance_id} disappeared"),
+                                )
+                            })?;
+                        if !state
+                            .grant_issued_after(presented_grant, &stored.grant_id)
+                            .map_err(|err| SubmissionError::new(err.code, err.message))?
+                        {
+                            SubmissionVerdict::Refused {
+                                code: preview_holds::REVISION_STALE,
+                                message: format!(
+                                    "grant {presented_grant} is not a later authorization than the current owner's grant {}; the older selection remains stale",
+                                    stored.grant_id
+                                ),
+                            }
+                        } else {
+                            grant_id = Some(presented_grant.clone());
+                            if let Some((code, message)) = environment {
+                                SubmissionVerdict::Waiting {
+                                    code: code_static(code)
+                                        .unwrap_or(preview_holds::OCCUPANCY_UNKNOWN),
+                                    message: message.clone(),
+                                }
+                            } else if overlap_subjects.contains(id_text.as_str()) {
+                                SubmissionVerdict::Waiting {
+                                    code: crate::lifecycle::code::MONOREPO_OVERLAP,
+                                    message: format!(
+                                        "the planned scope worktrees/issues/{} overlaps a concurrent lane scope; the revision rebind waits",
+                                        id.number
+                                    ),
+                                }
+                            } else {
+                                SubmissionVerdict::Approved
+                            }
+                        }
+                    }
+                }
+            } else if owned_status == "paused" {
                 let presented = material
                     .resume
                     .iter()
@@ -1116,14 +1190,6 @@ fn classify_items(
                              authorization"
                         ),
                     }
-                }
-            } else if owned_revision != revision {
-                SubmissionVerdict::Refused {
-                    code: preview_holds::REVISION_STALE,
-                    message: format!(
-                        "run {instance_id} recorded revision {owned_revision}; the selected \
-                         revision {revision} is not the bound spec revision"
-                    ),
                 }
             } else {
                 SubmissionVerdict::Refused {

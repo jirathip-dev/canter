@@ -4295,6 +4295,10 @@ fn execute_grant_issue(args: &GrantIssueArgs, invocation: &Invocation) -> CmdRes
     let created_at = crate::time::rfc3339_from_unix(now);
     let expires_at = crate::time::rfc3339_from_unix(now + args.expires_in);
     let scope = format!("worktrees/issues/{}", args.issue);
+    let key = args
+        .idempotency_key
+        .clone()
+        .unwrap_or_else(|| format!("ik_grant-{now}-{}", client::fresh_id()));
     let grant_id = grant_id_for(
         &request,
         args.issue,
@@ -4302,6 +4306,7 @@ fn execute_grant_issue(args: &GrantIssueArgs, invocation: &Invocation) -> CmdRes
         &role_revision,
         &scope,
         epoch,
+        &key,
     );
     let caps: Vec<Val> = request
         .boundary
@@ -4329,10 +4334,6 @@ fn execute_grant_issue(args: &GrantIssueArgs, invocation: &Invocation) -> CmdRes
         ("state_epoch", integer(epoch)),
         ("created_at", string(&created_at)),
     ]);
-    let key = args
-        .idempotency_key
-        .clone()
-        .unwrap_or_else(|| format!("ik_grant-{now}-{}", client::fresh_id()));
     let params = object(vec![
         ("grant", document.clone()),
         ("idempotency_key", string(&key)),
@@ -4383,13 +4384,9 @@ fn execute_grant_issue(args: &GrantIssueArgs, invocation: &Invocation) -> CmdRes
     ok_result(data, human)
 }
 
-/// The content-addressed grant id: `gr_` + first 16 hex of the sha256 over
-/// the canonical binding material (domain-separated), the same rule the plan
-/// id and the work-item id follow. The identity is the REVIEWED BINDING, not
-/// the window: `created_at` and `expires_at` are deliberately NOT part of it,
-/// so one reviewed run names exactly one grant whatever a caller asks for and
-/// a re-mint with ANY window refuses `state.grant_exists` (the first minted
-/// window stands) instead of silently creating a second authorization.
+/// A grant binds one explicit issuance as well as the reviewed material.
+/// A fresh invocation opens a fresh window without extending any old grant;
+/// reusing its key is still refused by the daemon's exactly-once claim fence.
 fn grant_id_for(
     request: &crate::queue_preview::QueueRequest,
     issue_number: i64,
@@ -4397,6 +4394,7 @@ fn grant_id_for(
     policy_hash: &str,
     scope: &str,
     state_epoch: i64,
+    issuance: &str,
 ) -> String {
     let caps: Vec<Val> = request
         .boundary
@@ -4406,6 +4404,7 @@ fn grant_id_for(
         .collect();
     let preimage = object(vec![
         ("schema", string("hf-grant-id/v1")),
+        ("issuance", string(issuance)),
         ("repository", string(&request.repository)),
         (
             "issue",

@@ -62,10 +62,10 @@ remain usable without it; SQLite owns state; no network control API).
   response document is the minted `hf-grant/v1` document itself (the
   contract shape, `caps` as an array). The `gr_` id is content-addressed
   over the REVIEWED BINDING (repository, issue number + acceptance revision,
-  workflow hash, policy hash, phase, scope, caps, live state epoch); the
-  requested window is deliberately not part of that identity, so a re-mint
-  of the same binding refuses `state.grant_exists` whatever `expires_at` it
-  asks for and the first minted window stands.
+  workflow hash, policy hash, phase, scope, caps, live state epoch) AND the
+  issuance idempotency key. A fresh key therefore opens a fresh authorization
+  window without extending or replacing an earlier live/expired row; replaying
+  one key remains exactly-once and returns its recorded response.
   Minting is not authorization: the
   grant only becomes authority at the board / `queue submit` point.
 - `apply` **requires** `params.idempotency_key` (`ik_` format): an apply
@@ -299,6 +299,14 @@ outcome after the effect transaction commits.
   paused run refuses `submission.paused` unless the presented engine
   digest authorizes exactly that run's resume (applied once, in the same
   transaction, against the same run).
+- Acceptance revision hashes are opaque and never sorted lexically. A selected
+  revision different from the active owner's revision is `preview.revision_stale`
+  unless a route grant for that exact selection was issued AFTER the owner's
+  grant. Presenting that later, still-valid grant atomically invalidates the old
+  run and rebinds the unique ownership row to the new run; presenting an older
+  grant remains stale, and the same-revision case remains
+  `submission.already_owned`. The grant insertion order is the normative
+  authorization-window order.
 - `queue.status` requires `params.submission_id` (`qs_` + 16 hex) and
   returns the same document the submit response carried (a pure
   projection of the committed rows; `state.not_found` for an unknown id).

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 const REV: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const REV_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 struct Fixture {
     root: PathBuf,
@@ -313,6 +314,76 @@ fn f7_contract_param_names_are_reachable_through_cli() {
         assert_eq!(exit, 4, "{name}: {doc:?}");
         assert_eq!(text(&doc, &["error", "code"]), "state.not_found");
     }
+}
+
+#[test]
+fn f5_fresh_issuance_opens_live_and_expired_binding_windows() {
+    let mut fixture = Fixture::new();
+    fixture.preview(REV);
+    let first = fixture.grant("1");
+    let second = fixture.grant("3600");
+    assert_ne!(text(&first, &["grant_id"]), text(&second, &["grant_id"]));
+    fixture.restart();
+    let expiry = text(&first, &["grant", "expires_at"]);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while canter::time::rfc3339_now().as_str() < expiry && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(canter::time::rfc3339_now().as_str() >= expiry);
+    let third = fixture.grant("3600");
+    assert_ne!(text(&first, &["grant_id"]), text(&third, &["grant_id"]));
+    let listed = canter::client::call(
+        &fixture.path("d.sock"),
+        "grants.list",
+        Some(&object(vec![])),
+    )
+    .unwrap();
+    let grants = field(&listed, &["grants"]).as_array().unwrap();
+    assert_eq!(grants.len(), 3);
+    assert_eq!(
+        grants
+            .iter()
+            .find(|g| text(g, &["grant_id"]) == text(&first, &["grant_id"]))
+            .unwrap()
+            .get("expires_at"),
+        Some(&string(expiry))
+    );
+}
+
+#[test]
+fn f4_later_authorization_rebinds_revision_but_older_window_is_stale() {
+    let fixture = Fixture::new();
+
+    let digest_a = fixture.preview(REV);
+    let grant_a = fixture.grant("3600");
+    let admitted_a = fixture.submit(&digest_a, text(&grant_a, &["grant_id"]));
+    let old_run = admitted_a
+        .get("items")
+        .and_then(Val::as_array)
+        .unwrap()[0]
+        .get("instance_id")
+        .and_then(Val::as_str)
+        .unwrap()
+        .to_string();
+
+    // B has a distinct binding and a later grant window than A's owner. It
+    // can therefore rebind ownership without depending on grant renewal.
+    let digest_b = fixture.preview(REV_B);
+    let grant_b = fixture.grant("3600");
+    let rebound = fixture.submit(&digest_b, text(&grant_b, &["grant_id"]));
+    let rebound_item = &rebound.get("items").and_then(Val::as_array).unwrap()[0];
+    assert_eq!(text(rebound_item, &["status"]), "admitted");
+    let new_run = text(rebound_item, &["instance_id"]);
+    assert_ne!(new_run, old_run);
+    let old_status = fixture.ok(&["run", "status", "--run", &old_run]);
+    assert_eq!(text(&old_status, &["run", "status"]), "invalidated");
+
+    // A's older authorization cannot move ownership back after B was bound.
+    let digest_a = fixture.preview(REV);
+    let stale = fixture.submit(&digest_a, text(&grant_a, &["grant_id"]));
+    let stale_item = &stale.get("items").and_then(Val::as_array).unwrap()[0];
+    assert_eq!(text(stale_item, &["status"]), "refused");
+    assert_eq!(text(stale_item, &["reason"]), "preview.revision_stale");
 }
 
 #[test]

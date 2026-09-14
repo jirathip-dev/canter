@@ -686,69 +686,94 @@ fn admit_queue_item_in_tx(
     slots: &mut FanoutSlots<'_>,
 ) -> Result<AdmissionDecision, StateError> {
     let scope = format!("worktrees/issues/{}", item.issue_number);
-    if let Some(run) = ctx.ownership.get(&item.issue_number) {
-        // An owner that appeared after the preview moved the verdict: only
-        // an explicit engine-authorized resume of a still-paused run admits
-        // an owned item; every other owned item is refused without any
-        // effect.
-        let authorized = match (item.resume_digest, run.paused) {
-            (Some(presented), true) => {
-                crate::engine::authorize_resume(&run.resume_digest, presented).is_ok()
-            }
-            _ => false,
-        };
-        if authorized {
-            let affected = tx
-                .execute(
-                    "UPDATE instances SET paused = 0, resume_digest = '',
-                            status = 'running', updated_at = ?2
-                      WHERE instance_id = ?1 AND paused = 1",
-                    params![run.instance_id, ctx.at],
+    let superseded_instance = if let Some(run) = ctx.ownership.get(&item.issue_number) {
+        if run.issue_revision != item.issue_revision {
+            let Some(candidate_grant) = item.grant_id else {
+                return Ok(AdmissionDecision::Refused {
+                    code: crate::queue_executor::codes::GRANT,
+                    message: format!(
+                        "revision rebind from {} to {} requires a fresh presented grant window",
+                        run.issue_revision, item.issue_revision
+                    ),
+                });
+            };
+            let ordering: Option<(i64, i64)> = tx
+                .query_row(
+                    "SELECT candidate.rowid, prior.rowid
+                       FROM grants candidate, grants prior
+                      WHERE candidate.grant_id = ?1 AND prior.grant_id = ?2",
+                    params![candidate_grant, run.grant_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
-                .map_err(|err| StateError::from_sqlite("admit_queue_item: resume", err))?;
-            if affected == 1 {
-                return Ok(AdmissionDecision::Admitted {
-                    instance_id: run.instance_id.clone(),
+                .optional()
+                .map_err(|err| {
+                    StateError::from_sqlite("admit_queue_item: revision authorization", err)
+                })?;
+            if !matches!(ordering, Some((candidate, prior)) if candidate > prior) {
+                return Ok(AdmissionDecision::Refused {
+                    code: crate::queue_preview::holds::REVISION_STALE,
+                    message: format!(
+                        "run {} owns revision {} under grant {}; candidate grant {candidate_grant} is not a later authorization window for selected revision {}",
+                        run.instance_id, run.issue_revision, run.grant_id, item.issue_revision
+                    ),
+                });
+            }
+            Some(run.instance_id.clone())
+        } else {
+            // An owner that appeared after the preview moved the verdict: only
+            // an explicit engine-authorized resume of a still-paused run admits
+            // an owned item; every other same-revision item is refused.
+            let authorized = match (item.resume_digest, run.paused) {
+                (Some(presented), true) => {
+                    crate::engine::authorize_resume(&run.resume_digest, presented).is_ok()
+                }
+                _ => false,
+            };
+            if authorized {
+                let affected = tx
+                    .execute(
+                        "UPDATE instances SET paused = 0, resume_digest = '',
+                                status = 'running', updated_at = ?2
+                          WHERE instance_id = ?1 AND paused = 1",
+                        params![run.instance_id, ctx.at],
+                    )
+                    .map_err(|err| StateError::from_sqlite("admit_queue_item: resume", err))?;
+                if affected == 1 {
+                    return Ok(AdmissionDecision::Admitted {
+                        instance_id: run.instance_id.clone(),
+                    });
+                }
+                return Ok(AdmissionDecision::Refused {
+                    code: crate::queue_executor::codes::PAUSED,
+                    message: "the run left its paused state while the submission committed; \
+                         no implicit state change is applied"
+                        .to_string(),
+                });
+            }
+            if run.paused {
+                return Ok(AdmissionDecision::Refused {
+                    code: crate::queue_executor::codes::PAUSED,
+                    message: format!(
+                        "run {} is paused and stays paused: a paused fleet is resumed only \
+                         with a separate explicit engine-minted resume authorization",
+                        run.instance_id
+                    ),
                 });
             }
             return Ok(AdmissionDecision::Refused {
-                code: crate::queue_executor::codes::PAUSED,
-                message: "the run left its paused state while the submission committed; \
-                     no implicit state change is applied"
-                    .to_string(),
-            });
-        }
-        if run.paused {
-            return Ok(AdmissionDecision::Refused {
-                code: crate::queue_executor::codes::PAUSED,
+                code: crate::queue_executor::codes::ALREADY_OWNED,
                 message: format!(
-                    "run {} is paused and stays paused: a paused fleet is resumed only \
-                     with a separate explicit engine-minted resume authorization",
+                    "run {} already owns this issue; a duplicate submission never \
+                     creates a second owner",
                     run.instance_id
                 ),
             });
         }
-        if run.issue_revision != item.issue_revision {
-            return Ok(AdmissionDecision::Refused {
-                code: crate::queue_preview::holds::REVISION_STALE,
-                message: format!(
-                    "run {} recorded revision {}; the selected revision {} is not the \
-                     bound spec revision",
-                    run.instance_id, run.issue_revision, item.issue_revision
-                ),
-            });
-        }
-        return Ok(AdmissionDecision::Refused {
-            code: crate::queue_executor::codes::ALREADY_OWNED,
-            message: format!(
-                "run {} already owns this issue; a duplicate submission never \
-                 creates a second owner",
-                run.instance_id
-            ),
-        });
-    }
-    // No live owner: re-verify the presented grant under the guard (status,
-    // epoch and expiry are the volatile facts).
+    } else {
+        None
+    };
+    // No live owner, or an explicitly later revision authorization: re-verify
+    // the presented grant under the guard (status, epoch and expiry).
     let grant_id = item.grant_id.unwrap_or_default();
     let grant: Option<GrantBinding> = tx
         .query_row(
@@ -855,8 +880,25 @@ fn admit_queue_item_in_tx(
             ),
         });
     }
+    if let Some(old) = &superseded_instance {
+        let affected = tx
+            .execute(
+                "UPDATE instances SET status = 'invalidated', updated_at = ?2
+                  WHERE instance_id = ?1
+                    AND status IN ('new', 'running', 'paused', 'human_queue', 'blocked')",
+                params![old, ctx.at],
+            )
+            .map_err(|err| StateError::from_sqlite("admit_queue_item: supersede", err))?;
+        if affected != 1 {
+            return Err(state_error(
+                "state.ownership_conflict",
+                format!("owner {old} changed before the revision rebind committed"),
+            ));
+        }
+    }
     // Admitted: one run row plus one unique ownership row, both inside this
-    // transaction.
+    // transaction. A revision rebind invalidates the old owner in this same
+    // transaction before replacing its ownership row.
     let derived = format!("hf-queue-run/v1|{}|{}", ctx.submission_id, item.work_item);
     let run_id = format!(
         "run-{}",
@@ -985,6 +1027,7 @@ enum AdmissionDecision {
 struct OwnedRunSnapshot {
     instance_id: String,
     issue_revision: String,
+    grant_id: String,
     paused: bool,
     resume_digest: String,
 }
@@ -2035,6 +2078,55 @@ impl State {
             .optional()
             .map_err(|err| StateError::from_sqlite("grant_by_id: query", err))?;
         Ok(row)
+    }
+
+    /// Whether a candidate grant was issued after the grant of the current
+    /// owner. SQLite insertion order is the authorization-window order; grant
+    /// ids and revision hashes are never ordered lexically.
+    pub fn grant_issued_after(
+        &self,
+        candidate_grant: &str,
+        prior_grant: &str,
+    ) -> Result<bool, StateError> {
+        let conn = self.lock("grant_issued_after")?;
+        let pair: Option<(i64, i64)> = conn
+            .query_row(
+                "SELECT candidate.rowid, prior.rowid
+                   FROM grants candidate, grants prior
+                  WHERE candidate.grant_id = ?1 AND prior.grant_id = ?2",
+                params![candidate_grant, prior_grant],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("grant_issued_after: query", err))?;
+        Ok(matches!(pair, Some((candidate, prior)) if candidate > prior))
+    }
+
+    /// Whether durable state contains a later authorization window for this
+    /// exact selected revision than the current owner's grant.
+    pub fn revision_has_newer_grant(
+        &self,
+        repository: &str,
+        issue_number: i64,
+        issue_revision: &str,
+        prior_grant: &str,
+    ) -> Result<bool, StateError> {
+        let conn = self.lock("revision_has_newer_grant")?;
+        let newer: i64 = conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM grants candidate
+                       JOIN grants prior ON prior.grant_id = ?4
+                      WHERE candidate.repository = ?1
+                        AND candidate.issue_number = ?2
+                        AND candidate.issue_revision = ?3
+                        AND candidate.rowid > prior.rowid
+                 )",
+                params![repository, issue_number, issue_revision, prior_grant],
+                |row| row.get(0),
+            )
+            .map_err(|err| StateError::from_sqlite("revision_has_newer_grant: query", err))?;
+        Ok(newer != 0)
     }
 
     /// Invalidate an active grant (material issue/acceptance edit — AC2).
@@ -3207,7 +3299,7 @@ impl State {
         let owned: BTreeMap<i64, OwnedRunSnapshot> = {
             let mut statement = tx
                 .prepare(
-                    "SELECT issue_number, instance_id, issue_revision, paused, resume_digest
+                    "SELECT issue_number, instance_id, issue_revision, grant_id, paused, resume_digest
                        FROM instances
                       WHERE repository = ?1
                         AND status IN ('new', 'running', 'paused', 'human_queue', 'blocked')",
@@ -3220,8 +3312,9 @@ impl State {
                         OwnedRunSnapshot {
                             instance_id: row.get(1)?,
                             issue_revision: row.get(2)?,
-                            paused: row.get::<_, i64>(3)? != 0,
-                            resume_digest: row.get(4)?,
+                            grant_id: row.get(3)?,
+                            paused: row.get::<_, i64>(4)? != 0,
+                            resume_digest: row.get(5)?,
                         },
                     ))
                 })
@@ -11536,7 +11629,7 @@ fn advance_queue_in_tx(
                 let mut owned: BTreeMap<i64, OwnedRunSnapshot> = BTreeMap::new();
                 let mut statement = tx
                     .prepare(
-                        "SELECT issue_number, instance_id, issue_revision, paused, resume_digest
+                        "SELECT issue_number, instance_id, issue_revision, grant_id, paused, resume_digest
                            FROM instances
                           WHERE repository = ?1
                             AND status IN ('new', 'running', 'paused', 'human_queue', 'blocked')",
@@ -11549,8 +11642,9 @@ fn advance_queue_in_tx(
                             OwnedRunSnapshot {
                                 instance_id: row.get(1)?,
                                 issue_revision: row.get(2)?,
-                                paused: row.get::<_, i64>(3)? != 0,
-                                resume_digest: row.get(4)?,
+                                grant_id: row.get(3)?,
+                                paused: row.get::<_, i64>(4)? != 0,
+                                resume_digest: row.get(5)?,
                             },
                         ))
                     })
