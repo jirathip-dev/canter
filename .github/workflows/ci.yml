@@ -336,6 +336,7 @@ jobs:
           "--test handoff_crash_acceptance",
           "--test harness_adapters",
           "--test herdr_compatibility",
+          "--test herdr_pane_execution",
           "--test lane_cli",
           "--test lane_replacement",
           "--test mutation_engine",
