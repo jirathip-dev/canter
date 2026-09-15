@@ -9,6 +9,65 @@ import uuid
 MARKER = "CANTER_FIXTURE_TAG"
 
 
+class LiveOutput:
+    """Best-effort runner output; never wait for a pipe reader."""
+
+    LIMIT = 2 * 1024 * 1024
+    PENDING = 64 * 1024
+    NOTICE = b"\n::notice::Live output limited; full logs remain in the group artifact files.\n"
+
+    def __init__(self, fd=1):
+        self.fd = fd
+        self.pending = bytearray()
+        self.consumed = 0
+        self.limited = False
+        self.noticed = False
+        self.closed = False
+
+    def __enter__(self):
+        self.blocking = os.get_blocking(self.fd)
+        os.set_blocking(self.fd, False)
+        return self
+
+    def __exit__(self, *_exc):
+        try:
+            self.flush()
+        finally:
+            os.set_blocking(self.fd, self.blocking)
+
+    def write(self, data):
+        self.flush()
+        allowed = min(len(data), self.LIMIT - self.consumed)
+        self.consumed += allowed
+        queued = min(allowed, self.PENDING - len(self.pending))
+        self.pending.extend(data[:queued])
+        self.limited |= queued < len(data)
+        self.flush()
+
+    def flush(self):
+        # At most a data write and a notice write; partial writes/EAGAIN wait
+        # for a later tick, never for the consumer. No buffered Python stdout.
+        for _ in range(2):
+            if self.closed:
+                return
+            if not self.pending:
+                if not self.limited or self.noticed:
+                    return
+                self.pending.extend(self.NOTICE)
+                self.noticed = True
+            try:
+                written = os.write(self.fd, self.pending)
+            except BlockingIOError:
+                return
+            except BrokenPipeError:
+                self.closed = True
+                self.pending.clear()
+                return
+            del self.pending[:written]
+            if self.pending:
+                return
+
+
 def fixture_environment():
     env = dict(os.environ)
     env.setdefault(MARKER, uuid.uuid4().hex)
@@ -113,12 +172,12 @@ def ps_check(pids, path, deadline):
         ).returncode
 
 
-def cleanup_scope(child, tag, log_dir, deadline):
+def cleanup_scope(child, tag, log_dir, deadline, report=print):
     child.poll()
     found = scope_snapshot(tag, deadline)
     seen = set(found) | {child.pid}
     ps_check(seen, log_dir / "ps-before.txt", deadline)
-    print(f"Scope cleanup: found={sorted(found)}", flush=True)
+    report(f"Scope cleanup: found={sorted(found)}", flush=True)
     for signum in (signal.SIGTERM, signal.SIGKILL):
         # The leader's exit is NOT evidence its group died. Signal the whole
         # session-created group even when Popen already observed leader exit.
@@ -140,7 +199,7 @@ def cleanup_scope(child, tag, log_dir, deadline):
     reap_adopted(child.pid)
     remaining = scope_snapshot(tag, deadline)
     ps_code = ps_check(seen | set(remaining), log_dir / "ps-after.txt", deadline)
-    print(f"Scope final: remaining={sorted(remaining)} ps_exit={ps_code}", flush=True)
+    report(f"Scope final: remaining={sorted(remaining)} ps_exit={ps_code}", flush=True)
     if remaining or ps_code != 1:
         raise RuntimeError(f"scope not empty: pids={sorted(remaining)} ps_exit={ps_code}")
     return len(found)

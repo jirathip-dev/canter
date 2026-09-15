@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Linux regression/witness: setsid + exec + anonymous argv cannot escape CI."""
 import importlib.util
+import ctypes
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -166,6 +168,135 @@ class LinuxScopeTests(unittest.TestCase):
                 result = subprocess.run([sys.executable, str(WRAPPER), "--seconds", "3", "--log-dir", root, "--", sys.executable, "-c", f"raise SystemExit({code})"], capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, code, result.stdout + result.stderr)
                 self.assertIn("remaining=[] ps_exit=1", result.stdout)
+
+    def flood_witness(self, hostile):
+        # The caller deliberately NEVER drains stdout until the wrapper exits.
+        # A small kernel pipe makes backpressure deterministic, not load-based.
+        libc = ctypes.CDLL(None, use_errno=True)
+        old = ctypes.c_int()
+        self.assertEqual(libc.prctl(37, ctypes.byref(old), 0, 0, 0), 0)
+        self.assertEqual(libc.prctl(36, 1, 0, 0, 0), 0)
+        read_fd, write_fd = os.pipe()
+        fcntl.fcntl(write_fd, fcntl.F_SETPIPE_SZ, 4096)
+        child = None
+        records = {}
+        try:
+            with tempfile.TemporaryDirectory(prefix="canter-emit-witness-") as temp:
+                root = Path(temp)
+                fixture = root / "flood.py"
+                fixture.write_text('''import json, os, signal, subprocess, sys, time
+from pathlib import Path
+if sys.argv[2] == "hostile": signal.signal(signal.SIGTERM, signal.SIG_IGN)
+worker = subprocess.Popen(["/bin/sleep", "120"], start_new_session=True)
+rows = {str(pid): Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19] for pid in (os.getpid(), worker.pid)}
+Path(sys.argv[1]).write_text(json.dumps(rows))
+sys.stdout.buffer.write(b"F" * (4 * 1024 * 1024) + b"FLOOD_COMPLETE\\n")
+sys.stdout.buffer.flush()
+time.sleep(120)
+''')
+                argv = [sys.executable, "-u", str(WRAPPER), "--seconds", "1", "--log-dir", str(root / "logs"), "--", sys.executable, "-u", str(fixture), str(root / "pids.json"), "hostile" if hostile else "normal"]
+                started = time.monotonic()
+                child = subprocess.Popen(argv, stdout=write_fd, stderr=subprocess.STDOUT)
+                deadline = started + 3
+                while not (root / "pids.json").exists():
+                    if time.monotonic() >= deadline:
+                        self.fail("flood fixture never started")
+                    time.sleep(0.01)
+                records = {int(pid): ticks for pid, ticks in json.loads((root / "pids.json").read_text()).items()}
+                before = subprocess.run(["ps", "-ww", "-p", ",".join(map(str, records)), "-o", "pid,ppid,pgid,sid,stat,args"], capture_output=True, text=True, timeout=3)
+                self.assertEqual(before.returncode, 0, before.stderr)
+                try:
+                    code = child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    print(f"BLOCKED_WRAPPER_PID={child.pid} WCHAN={Path(f'/proc/{child.pid}/wchan').read_text()}")
+                    self.fail("scope blocked on a full caller pipe past its deadline")
+                elapsed = time.monotonic() - started
+                self.assertTrue(os.get_blocking(write_fd), "stdout blocking mode must be restored")
+                os.close(write_fd)
+                write_fd = None
+                # A retained pipe writer would block EOF; select bounds that too.
+                import select
+                while True:
+                    self.assertTrue(select.select([read_fd], [], [], 1)[0], "caller pipe has no EOF")
+                    if not os.read(read_fd, 8192):
+                        break
+                after = subprocess.run(["ps", "-ww", "-p", ",".join(map(str, records)), "-o", "pid,ppid,pgid,sid,stat,args"], capture_output=True, text=True, timeout=3)
+                print(f"FLOOD hostile={hostile} raw_exit={code} duration_s={elapsed:.3f} cleanup_s={elapsed - 1:.3f}")
+                print(f"PS_BEFORE_EXIT={before.returncode}\n{before.stdout}PS_AFTER_EXIT={after.returncode}\n{after.stdout}")
+                print((root / "logs/scope-status.txt").read_text())
+                self.assertEqual(code, 124)
+                self.assertLess(elapsed, 4.5 if hostile else 3)
+                self.assertEqual(after.returncode, 1, after.stdout + after.stderr)
+                for pid in records:
+                    self.assertFalse(Path(f"/proc/{pid}").exists(), "survivor or zombie remains")
+                self.assertEqual((root / "logs/driver.log").read_bytes(), b"F" * (4 * 1024 * 1024) + b"FLOOD_COMPLETE\n")
+                self.assertIn("status=finished\nexit=124", (root / "logs/scope-status.txt").read_text())
+                self.assertIn("remaining=[] ps_exit=1", (root / "logs/scope.log").read_text())
+                print("AUTHORITATIVE_FLOOD_INTACT=1 ZERO_SURVIVORS=1 PROMPT_SHELL_EOF=1")
+        finally:
+            # Own subreaper/PID identities keep even the pre-fix RED bounded.
+            if child is not None and child.poll() is None:
+                child.kill()
+                child.wait(timeout=3)
+            signal_members(records, signal.SIGKILL, time.monotonic() + 3)
+            for pid in records:
+                try:
+                    deadline = time.monotonic() + 3
+                    while os.waitpid(pid, os.WNOHANG)[0] == 0:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(f"owned witness PID {pid} did not reap")
+                        time.sleep(0.01)
+                except ChildProcessError:
+                    pass
+            if write_fd is not None:
+                os.close(write_fd)
+            os.close(read_fd)
+            libc.prctl(36, old.value, 0, 0, 0)
+
+    def test_full_caller_pipe_cannot_block_scope_deadline(self):
+        self.flood_witness(False)
+
+    def test_full_caller_pipe_cannot_block_hostile_child_cleanup(self):
+        self.flood_witness(True)
+
+    def test_live_emit_budget_does_not_reduce_authoritative_files(self):
+        from ci_test_processes import LiveOutput
+        with tempfile.TemporaryDirectory(prefix="canter-emit-budget-") as temp:
+            root = Path(temp)
+            code = "from pathlib import Path; import time; root=Path(%r); [(root/f'flood-{i}.log').write_bytes(b'X'*(1024*1024)) for i in range(20)]; time.sleep(3)" % temp
+            result = subprocess.run([sys.executable, "-u", str(WRAPPER), "--seconds", "6", "--log-dir", temp, "--", sys.executable, "-u", "-c", code], capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertGreater(len(result.stdout), LiveOutput.LIMIT // 2)
+            self.assertLessEqual(len(result.stdout), LiveOutput.LIMIT + len(LiveOutput.NOTICE))
+            self.assertEqual(result.stdout.count(LiveOutput.NOTICE), 1)
+            for i in range(20):
+                self.assertEqual((root / f"flood-{i}.log").read_bytes(), b"X" * (1024 * 1024))
+            self.assertIn(LiveOutput.NOTICE, (root / "scope.log").read_bytes())
+            print(f"LIVE_BYTES={len(result.stdout)} LIMIT={LiveOutput.LIMIT} NOTICE_COUNT={result.stdout.count(LiveOutput.NOTICE)} AUTHORITATIVE_FILES_INTACT=20")
+
+    def test_live_pending_stays_small_and_closed_reader_is_harmless(self):
+        from ci_test_processes import LiveOutput
+        read_fd, write_fd = os.pipe()
+        try:
+            fcntl.fcntl(write_fd, fcntl.F_SETPIPE_SZ, 4096)
+            with LiveOutput(write_fd) as live:
+                self.assertFalse(os.get_blocking(write_fd))
+                for _ in range(300):
+                    live.write(b"X" * 8192)
+                    self.assertLessEqual(len(live.pending), LiveOutput.PENDING)
+                self.assertEqual(live.consumed, LiveOutput.LIMIT)
+                self.assertTrue(live.limited)
+                self.assertTrue(live.pending, "exercise partial writes and EAGAIN")
+                os.close(read_fd)
+                read_fd = None
+                live.flush()
+                self.assertTrue(live.closed)
+                self.assertFalse(live.pending)
+            self.assertTrue(os.get_blocking(write_fd))
+        finally:
+            if read_fd is not None:
+                os.close(read_fd)
+            os.close(write_fd)
 
 
 if __name__ == "__main__":

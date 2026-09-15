@@ -10,7 +10,7 @@ import sys
 import time
 import uuid
 
-from ci_test_processes import MARKER, cleanup_scope, reap_adopted
+from ci_test_processes import MARKER, LiveOutput, cleanup_scope, reap_adopted
 
 
 def main():
@@ -22,9 +22,21 @@ def main():
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if sys.platform != "linux" or not command or args.seconds <= 0:
         parser.error("requires Linux, a positive deadline, and a command after --")
+    with LiveOutput() as live:
+        return run_scope(args, command, live)
+
+
+def run_scope(args, command, live):
     args.log_dir.mkdir(parents=True, exist_ok=True)
     status = args.log_dir / "scope-status.txt"
+    scope_log = args.log_dir / "scope.log"
     status.write_text("status=starting\n")
+
+    def report(text, flush=False):
+        # Cleanup/control messages also must never block on the runner pipe.
+        with scope_log.open("a") as stream:
+            stream.write(text + "\n")
+        live.write((text + "\n").encode())
     # PR_SET_CHILD_SUBREAPER: orphaned double-forks (even env_clear + setsid)
     # become ours, not init's. This changes only this supervisor process.
     libc = ctypes.CDLL(None, use_errno=True)
@@ -43,17 +55,22 @@ def main():
     offsets = {}
 
     def emit_logs():
-        # No child inherits the runner pipe. Read at most one chunk per file
-        # per tick; a blocked/escaped writer can neither hold EOF nor block us.
+        live.flush()
+        if live.consumed >= live.LIMIT:
+            return
+        # Files remain complete; neither a blocked pipe nor a huge log can
+        # prevent the next deadline check. Live output is strictly best-effort.
         for path in sorted(args.log_dir.rglob("*.log")):
+            if live.consumed >= live.LIMIT:
+                break
+            if path == scope_log:
+                continue
             with path.open("rb") as stream:
                 stream.seek(offsets.get(path, 0))
                 data = stream.read(8192)
                 offsets[path] = stream.tell()
             if data:
-                print(f"\n--- {path.relative_to(args.log_dir)} ---", flush=True)
-                sys.stdout.buffer.write(data)
-                sys.stdout.buffer.flush()
+                live.write(f"\n--- {path.relative_to(args.log_dir)} ---\n".encode() + data)
 
     code = 1
     child = None
@@ -76,22 +93,25 @@ def main():
         if child is not None:
             cleanup_deadline = time.monotonic() + 15
             try:
-                found = cleanup_scope(child, tag, args.log_dir, cleanup_deadline)
+                found = cleanup_scope(child, tag, args.log_dir, cleanup_deadline, report=report)
                 if found:
                     code = code or 1  # Reaping a leak never turns a suite green.
             except (OSError, RuntimeError, subprocess.SubprocessError) as error:
-                print(f"::error::scope cleanup incomplete: {error}", flush=True)
+                report(f"::error::scope cleanup incomplete: {error}")
                 code = code or 1
                 # A denied marker read must not prevent containment cleanup.
                 # Retry ancestry-only within the SAME bound; still fail RED.
                 try:
-                    cleanup_scope(child, None, args.log_dir, cleanup_deadline)
+                    cleanup_scope(child, None, args.log_dir, cleanup_deadline, report=report)
                 except (OSError, RuntimeError, subprocess.SubprocessError) as fallback:
-                    print(f"::error::scope fallback incomplete: {fallback}", flush=True)
+                    report(f"::error::scope fallback incomplete: {fallback}")
         emit_logs()
         code = code if code >= 0 else 128 - code
         status.write_text(f"status=finished\nexit={code}\nduration_s={time.monotonic() - started:.2f}\n{MARKER}={tag}\n")
-        print(f"Scope exit={code} duration_s={time.monotonic() - started:.2f}", flush=True)
+        report(f"Scope exit={code} duration_s={time.monotonic() - started:.2f}")
+        if live.limited:
+            with scope_log.open("ab") as stream:
+                stream.write(live.NOTICE)
     return code
 
 
