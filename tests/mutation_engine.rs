@@ -461,6 +461,13 @@ fn flow_steps() -> Vec<Val> {
                 ("harness_key", string("lane")),
                 ("executable", string("hf-lane")),
                 ("kind", string("argv")),
+                // Issue #139: this fixture's lane harness is the declarative
+                // `argv` kind (an arbitrary fixture executable), which has no
+                // documented Herdr pane row, so the plan selects the
+                // documented bare-subprocess substrate explicitly. The pane
+                // substrate (and its default) is witnessed end to end in
+                // `tests/herdr_pane_execution.rs` and `tests/supervision.rs`.
+                ("execution", string("headless")),
             ])),
         ),
         step(
@@ -475,6 +482,7 @@ fn flow_steps() -> Vec<Val> {
                 ("executable", string("hf-lane")),
                 ("kind", string("argv")),
                 ("worktree", string("issues-123")),
+                ("execution", string("headless")),
                 (
                     "payload",
                     string("implement acceptance criteria (synthetic)"),
@@ -563,6 +571,7 @@ fn policy_steps() -> Vec<Val> {
                 ("executable", string("hf-lane")),
                 ("kind", string("argv")),
                 ("worktree", string("issues-123")),
+                ("execution", string("headless")),
                 (
                     "payload",
                     string("implement acceptance criteria (synthetic)"),

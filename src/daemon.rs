@@ -9059,17 +9059,22 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         };
-        let steps: Vec<Val> =
-            crate::plan::queue_run_steps("acme/widgets", "staging", "worker", &[5])
-                .into_iter()
-                .map(|step| {
-                    object(vec![
-                        ("id", string(&step.id)),
-                        ("kind", string(&step.kind)),
-                        ("params", step.params.unwrap_or_else(null)),
-                    ])
-                })
-                .collect();
+        let steps: Vec<Val> = crate::plan::queue_run_steps(
+            "acme/widgets",
+            "staging",
+            "worker",
+            &[5],
+            crate::adapters::ExecutionMode::HerdrPane,
+        )
+        .into_iter()
+        .map(|step| {
+            object(vec![
+                ("id", string(&step.id)),
+                ("kind", string(&step.kind)),
+                ("params", step.params.unwrap_or_else(null)),
+            ])
+        })
+        .collect();
         DispatchMaterial {
             instance,
             spine: steps

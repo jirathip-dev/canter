@@ -720,6 +720,44 @@ release process activates (docs/RELEASING.md), then semver applies.
   failure: a timed-out `hermes` step with a surviving helper blocked the read
   for the descendant's lifetime and blew a 300 s bound).
 
+### Added (issue #139 — `harness_start` runs the role inside a Herdr pane)
+
+- The harness role now runs on a closed **execution substrate** selected by
+  the reviewed step (`params.execution`):
+  - `herdr` (the **default**, ADR-0003: Herdr owns workspaces, panes,
+    terminals and agent-process hosting): the bind step creates (or, read
+    back and REUSES) a Herdr pane in the run's lane worktree
+    (`herdr workspace create --cwd <lane worktree> --label <session>
+    --no-focus`), starts the role in it
+    (`herdr agent start <session> --kind <kind> --pane <pane> [--
+    <role args>]`, the profile-authoritative role/provider/model binding on
+    the kind's documented flags), and records the lane↔pane/agent binding in
+    the substrate (`herdr pane report-metadata … --token canter_lane=<session>
+    --token canter_generation=<n>`). The prompt is delivered THROUGH the
+    Herdr path (`herdr agent prompt <session> <payload> --wait`), the state
+    and the delivery evidence are read back through `herdr agent get` /
+    `herdr agent read`, and the interruption is the documented
+    `herdr agent send-keys <session> ctrl+c` row. The recorded step outcome
+    names the substrate, the pane, the agent and the settled Herdr state
+    (`result.pane` / `result.agent` / `result.harness_state`), so the
+    terminal outcome is collected through Herdr instead of being inferred
+    from a process exit, and an interruption records `outcome: "interrupted"`
+    distinctly from a settled terminal state;
+  - `headless`: the pre-#139 bare-subprocess row, kept ONLY as a documented
+    fallback an operator selects explicitly on the reviewed step. It is never
+    chosen silently.
+- **Availability and identity are fail-closed**: a missing/unspawnable Herdr
+  executable refuses typed `refusal.unavailable.herdr` with NO fallback to a
+  bare subprocess, a superseded lane generation (or another lane's, or another
+  worktree's) pane/agent refuses typed `refusal.stale.generation` before any
+  prompt is delivered, a kind with no documented Herdr kind refuses
+  `refusal.execution.unsupported`, and a plan that cannot name exactly one
+  lane worktree refuses typed on the pane substrate instead of creating a pane
+  at a bare cwd or in the wrong lane.
+- The admission/grant/ownership/journal/idempotency gates and the single
+  `method_apply` effect path are unchanged; the substrate is a plan-bound step
+  param, so it can never move at effect time.
+
 ### Changed
 
 - Documentation polish (issue #12, PR #13): security recipe doc line fix

@@ -201,6 +201,30 @@ runs control-plane effects:
     extend an effect past `deadline + grace`, and whatever arrived inside the
     bound is kept (the capture may be empty or partial in that case).
 
+- **Execution substrate per step (issue #139)**: a harness step
+  (`harness_start`, `prompt`) may declare `params.execution`, a closed token
+  (`herdr` | `headless`):
+  - absent ⇒ `herdr`, the product substrate: the role runs inside a Herdr
+    pane created in the run's lane worktree (`workspace create --cwd …`), the
+    prompt is delivered through `herdr agent prompt`, and observation/
+    interruption/terminal outcome are collected through the `herdr agent`
+    rows (see [spec-capabilities.md](spec-capabilities.md), "Execution
+    substrates"). The bind step resolves the lane worktree from the reviewed
+    plan: a plan that binds no `worktree` (or more than one, e.g. a
+    multi-issue submission) refuses typed on this substrate and names the
+    explicit fallback instead of creating a pane at a bare cwd or in the
+    wrong lane;
+  - `headless` ⇒ the pre-#139 bare-subprocess row, selected explicitly by the
+    reviewed plan. It is never chosen silently, and a Herdr failure never
+    falls back to it: the substrate is a step param, so it is bound by the
+    plan digest and can never move at effect time;
+  - a token outside the closed set refuses `refusal.request.malformed`; it is
+    never defaulted.
+  The recorded step outcome names the substrate (`result.execution`), the
+  pane and agent of a pane-substrate bind (`result.pane` / `result.agent`),
+  and the settled Herdr state of a pane-substrate prompt
+  (`result.harness_state`).
+
 ## 5. Typed outcomes: `hf-outcome/v1`
 
 Every plan step ends in one typed outcome:

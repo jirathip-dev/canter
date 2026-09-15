@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use canter::adapters::{
-    Op, OpRequest, Profile, bind_identity, execute_op, new_session, run_grouped,
+    ExecutionMode, Op, OpRequest, Profile, bind_identity, execute_op, new_session, run_grouped,
 };
 use canter::process::{ProcOut, ProcSpec, ProcStatus};
 
@@ -450,7 +450,10 @@ fn the_effect_prompt_row_leads_its_own_process_group() {
     let profile = Profile::official(canter::adapters::HarnessKind::Hermes, "lane-7")
         .expect("profile")
         .with_binding("provider-a", "model-a")
-        .expect("binding");
+        .expect("binding")
+        // Issue #139: this fixture pins the bare-subprocess row (now the
+        // explicitly selected headless substrate).
+        .with_execution(ExecutionMode::Headless);
     let identity = bind_identity("lane-7", "tty-7", 1).expect("identity");
     let session = new_session("sess-92", identity).expect("session");
 
@@ -475,7 +478,9 @@ fn every_other_adapter_op_spawns_exactly_as_before_the_group_runner() {
     let shape = dir.path("group-shape.txt");
     let env = runner_env(&bin, &[("LANE_GROUP_SHAPE", &shape.to_string_lossy())]);
     group_shape_fake(&dir, "herdr", "printf '{}'");
-    let profile = Profile::official(canter::adapters::HarnessKind::Pi, "pi").expect("profile");
+    let profile = Profile::official(canter::adapters::HarnessKind::Pi, "pi")
+        .expect("profile")
+        .with_execution(ExecutionMode::Headless);
     let identity = bind_identity("pi", "tty-9", 1).expect("identity");
     let session = new_session("sess-0002", identity).expect("session");
     let request = OpRequest {
@@ -544,7 +549,10 @@ fn prompt_runs_the_declared_role_binding_and_returns_real_output() {
     let profile = Profile::official(canter::adapters::HarnessKind::Hermes, "lane-7")
         .expect("profile")
         .with_binding("provider-a", "model-a")
-        .expect("binding");
+        .expect("binding")
+        // Issue #139: this fixture pins the bare-subprocess row (now the
+        // explicitly selected headless substrate).
+        .with_execution(ExecutionMode::Headless);
     let identity = bind_identity("lane-7", "tty-7", 1).expect("identity");
     let session = new_session("sess-92", identity).expect("session");
 

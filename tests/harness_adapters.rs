@@ -20,8 +20,8 @@ use std::time::Duration;
 use canter::adapters::{
     ADAPTER_TIMEOUT, AgentIdentity, CODE_BINDING, CODE_CREDENTIALS, CODE_EXIT, CODE_MALFORMED,
     CODE_PROCESS_DEATH, CODE_STALE_IDENTITY, CODE_TIMEOUT, CODE_UNAVAILABLE,
-    CODE_UNKNOWN_CAPABILITY, CODE_UNKNOWN_HARNESS, HarnessKind, Op, OpRequest, Profile,
-    bind_identity, execute_named, execute_op, new_session, probe_profile,
+    CODE_UNKNOWN_CAPABILITY, CODE_UNKNOWN_HARNESS, ExecutionMode, HarnessKind, Op, OpRequest,
+    Profile, bind_identity, execute_named, execute_op, new_session, probe_profile,
 };
 use canter::canonical::canonical_bytes;
 use canter::config::Harness as ConfigHarness;
@@ -186,8 +186,16 @@ const TEST_MODEL: &str = "example-model";
 /// An official profile carrying the explicit provider/model binding the
 /// Pi/Jcode prompt rows require (issue #80). Kinds whose prompt row does
 /// not carry the pair are returned unchanged.
+///
+/// Issue #139: these fake-executable fixtures pin the BARE-SUBPROCESS rows
+/// (the pre-#139 adapter contract), which are now the explicitly selected
+/// headless substrate — so the fixture selects it explicitly. The default
+/// substrate is the Herdr pane (pinned in `tests/herdr_pane_execution.rs`);
+/// nothing here falls back to it or from it.
 fn official_profile(kind: HarnessKind) -> Profile {
-    let profile = Profile::official(kind, kind.name()).expect("profile");
+    let profile = Profile::official(kind, kind.name())
+        .expect("profile")
+        .with_execution(ExecutionMode::Headless);
     if matches!(kind, HarnessKind::Pi | HarnessKind::Jcode) {
         profile
             .with_binding(TEST_PROVIDER, TEST_MODEL)
@@ -953,7 +961,8 @@ fn same_plan_fixture_passes_against_fake_implementations_of_every_adapter_contra
         ],
         BTreeMap::new(),
     )
-    .expect("argv profile");
+    .expect("argv profile")
+    .with_execution(ExecutionMode::Headless);
     let statuses = run_scenario(&profile, &sequence, &bins.env(), "argv");
     status_sets.push(statuses);
 
@@ -1021,7 +1030,9 @@ echo "unexpected argv: $*" >&2
 exit 9
 "#,
     );
-    let profile = Profile::official(HarnessKind::ClaudeCode, "claude-code").expect("profile");
+    let profile = Profile::official(HarnessKind::ClaudeCode, "claude-code")
+        .expect("profile")
+        .with_execution(ExecutionMode::Headless);
     let hostile = "a; rm -rf /tmp/x; $(touch /tmp/pwned); `echo injected`; \"quoted\"; && || | > < & newline\nhere; s/ed/";
     let result = run_op_retry(
         &profile,
@@ -1106,7 +1117,9 @@ fn unknown_harness_kind_fails_typed_and_independent_probes_keep_working() {
         limits: vec![],
         binding_introspection: false,
     };
-    let profile = Profile::from_config(&known).expect("known kind parses");
+    let profile = Profile::from_config(&known)
+        .expect("known kind parses")
+        .with_execution(ExecutionMode::Headless);
     let probe = probe_retry(&profile, &bins.env());
     assert!(probe.present);
     let observe = run_op_retry(&profile, &workspace_request(Op::Observe), &bins.env());
@@ -1141,7 +1154,8 @@ fn spawned_identity_is_the_resolved_absolute_path_witness() {
         ],
         BTreeMap::new(),
     )
-    .expect("argv profile");
+    .expect("argv profile")
+    .with_execution(ExecutionMode::Headless);
     let identity = bind_identity("ws-session-8", "tty-8-c1", 1).expect("identity");
     let session = new_session("sess-c1-witness", identity).expect("session");
     let result = run_op_retry(
@@ -1198,7 +1212,8 @@ fn harness_prompt_runs_confined_to_the_assigned_worktree() {
         ],
         BTreeMap::new(),
     )
-    .expect("argv profile");
+    .expect("argv profile")
+    .with_execution(ExecutionMode::Headless);
     let identity = bind_identity("ws-session-8", "tty-8-c1", 1).expect("identity");
     let session = new_session("sess-c1-confinement", identity).expect("session");
     // A fake "worktree" directory (the test stands in for the lane root).
@@ -1963,7 +1978,8 @@ fn prompt_rows_source_the_pair_from_the_declared_binding_not_a_literal() {
         let profile = Profile::official(kind, kind.name())
             .expect("profile")
             .with_binding("alt-provider", "alt-model")
-            .expect("binding");
+            .expect("binding")
+            .with_execution(ExecutionMode::Headless);
         let result = run_op_retry(
             &profile,
             &prompt_request("payload", ADAPTER_TIMEOUT),
@@ -1998,7 +2014,9 @@ fn unbound_prompt_is_a_typed_refusal_without_spawning_the_harness() {
     // `refusal.unavailable.harness` instead. No default, no substitution.
     for kind in [HarnessKind::Pi, HarnessKind::Jcode] {
         let bins = FakeBins::new();
-        let profile = Profile::official(kind, kind.name()).expect("profile");
+        let profile = Profile::official(kind, kind.name())
+            .expect("profile")
+            .with_execution(ExecutionMode::Headless);
         let result = run_op_retry(
             &profile,
             &prompt_request("do the thing", ADAPTER_TIMEOUT),
@@ -2028,7 +2046,9 @@ fn unbound_prompt_under_herdr_reports_blocked_with_a_static_message() {
     let bins = FakeBins::new();
     let log = bins.path.join("herdr-argv.log");
     bins.bin("herdr", herdr_logger_body());
-    let profile = Profile::official(HarnessKind::Pi, "pi").expect("profile");
+    let profile = Profile::official(HarnessKind::Pi, "pi")
+        .expect("profile")
+        .with_execution(ExecutionMode::Headless);
     let mut env = bins.env_herdr();
     env.insert(
         "HF_FAKE_LOG".to_string(),

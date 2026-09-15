@@ -117,6 +117,10 @@ can run with **no harness credentials** (AC7).
   inferred and no fallback model is substituted, issue #80),
   `refusal.malformed.output` (unparsable structured output),
   `refusal.stale.identity`, `refusal.identity.incomplete`,
+  `refusal.unavailable.herdr` / `refusal.stale.generation` /
+  `refusal.execution.unsupported` (the pane substrate: unavailable, a
+  superseded lane generation or another lane's pane, and a kind with no
+  documented pane row — issue #139),
   `refusal.request.malformed`, `refusal.session.unbound` (a harness step
   addressed the run's bound session but the run bound none; issue #92 F2),
   `adapter.timeout` (deadline exceeded, and the child's process group is
@@ -129,6 +133,46 @@ can run with **no harness credentials** (AC7).
   surviving descendant can never extend the op — outcome class `ambiguous`),
   `adapter.process_death`
   (`ambiguous`), and `adapter.exit` (ordinary non-zero exit).
+- **Execution substrates (issue #139)**: a harness role operation runs on one
+  of two closed substrates, selected by the reviewed step
+  (`params.execution`, spec-plans.md):
+  - `herdr` (**the default**): the role runs INSIDE a Herdr pane — ADR-0003
+    makes Herdr the execution/workspace substrate — and every row goes
+    through the Herdr CLI ([awaiting-evidence] for the interactive rows until
+    the human-gated clean-host smoke, like the workspace rows above; fakes pin
+    the exact argv shape in `tests/herdr_pane_execution.rs`):
+    `workspace create --cwd <lane worktree> --label <session> --no-focus`
+    (reuse is READ BACK through `workspace list` + `pane list`, never
+    assumed), `agent start <session> --kind <kind> --pane <pane> [-- <role
+    args>]` (the profile-authoritative binding rides on the start row, as on
+    the headless rows), `pane report-metadata … --token canter_lane=<session>
+    --token canter_generation=<n>` (the lane↔pane/agent binding),
+    `agent prompt <session> <payload> --wait`, `agent get`/`agent read`
+    (state + delivery evidence), and `agent send-keys <session> ctrl+c`
+    (interruption). The recorded step outcome names the substrate, the pane
+    and the agent, and the settled Herdr state (`harness_state`) — the
+    terminal outcome is collected through Herdr, never inferred from a
+    process exit, and an interruption records `outcome: "interrupted"`
+    distinctly from a settled terminal state. A kind with no documented Herdr
+    kind (Jcode, `argv`) refuses `refusal.execution.unsupported`;
+  - `headless`: the pre-#139 bare-subprocess row, kept ONLY as a documented
+    fallback an operator selects explicitly on the reviewed step. It is never
+    selected silently.
+  - **Availability is a typed refusal**: when the Herdr executable is missing
+    or unspawnable the operation refuses `refusal.unavailable.herdr`
+    (spawn-failure class, `refused` — not `failed`) and there is **no**
+    fallback to a bare subprocess: the headless row is only ever reached when
+    the profile's substrate IS `headless`.
+  - **Generation-safe lane↔pane/agent identity**: the pane records the bound
+    lane session id and the lane generation, and EVERY pane-substrate
+    operation re-reads them (`agent get`/`agent list` `tokens`, `pane_id`,
+    `cwd`) before addressing the pane/agent. A superseded generation, another
+    lane's identity or another worktree refuses
+    `refusal.stale.generation` — a stale lane never addresses a reused
+    pane/agent identity and never delivers a prompt into it. The pane's cwd
+    must be the run's lane worktree: the bind step resolves that path from the
+    reviewed plan and refuses rather than creating a pane at a bare cwd or in
+    the wrong lane.
 - **Boundaries**: adapters pass only the explicit environment allowlist
   (`env_allow`, spec-config.md), never read the host environment
   themselves, never store tokens, and never persist raw prompts or

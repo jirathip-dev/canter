@@ -1627,12 +1627,15 @@ pub fn declared_session(
 pub struct HarnessStartInputs {
     /// The declared harness role inputs.
     pub harness: HarnessInputs,
+    /// The declared execution substrate (issue #139).
+    pub execution: crate::adapters::ExecutionMode,
     /// The identity the step declares, when it declares one.
     pub declared: Option<crate::adapters::SessionHandle>,
 }
 
 /// Resolve the params-caused inputs of `harness_start` (params required; the
-/// declared role key, executable and kind; the declared session identity).
+/// declared role key, executable and kind; the execution substrate; the
+/// declared session identity).
 pub fn harness_start_inputs(params: Option<&Val>) -> Result<HarnessStartInputs, EffectOutcome> {
     let Some(params) = params else {
         return Err(refusal(code::BAD_PARAMS, "harness_start requires params"));
@@ -1640,8 +1643,118 @@ pub fn harness_start_inputs(params: Option<&Val>) -> Result<HarnessStartInputs, 
     let declared = declared_session(Some(params), "harness_start")?;
     Ok(HarnessStartInputs {
         harness: harness_inputs(params)?,
+        execution: declared_execution(Some(params))?,
         declared,
     })
+}
+
+/// Resolve the declared execution substrate of one harness step (issue
+/// #139). `params.execution` is a closed token (`herdr` | `headless`) and
+/// defaults to the Herdr pane substrate — the product path (ADR-0003). The
+/// bare-subprocess row is only ever run when the reviewed step declares
+/// `"headless"`; an unknown token refuses typed and is never coerced to a
+/// default, and nothing downgrades a substrate after a substrate failure.
+pub fn declared_execution(
+    params: Option<&Val>,
+) -> Result<crate::adapters::ExecutionMode, EffectOutcome> {
+    match params.and_then(|params| params.get("execution")) {
+        None => Ok(crate::adapters::ExecutionMode::default()),
+        Some(Val::Str(text)) => crate::adapters::ExecutionMode::parse(text).ok_or_else(|| {
+            refusal(
+                code::BAD_PARAMS,
+                format!(
+                    "step params.execution {text:?} is outside the closed substrate set ({}); a \
+                         substrate is never defaulted",
+                    crate::adapters::ExecutionMode::ALL
+                        .iter()
+                        .map(|mode| mode.name())
+                        .collect::<Vec<_>>()
+                        .join("|")
+                ),
+            )
+        }),
+        Some(other) => Err(refusal(
+            code::BAD_PARAMS,
+            format!(
+                "step params.execution must be a string token ({}), got {}",
+                crate::adapters::ExecutionMode::ALL
+                    .iter()
+                    .map(|mode| mode.name())
+                    .collect::<Vec<_>>()
+                    .join("|"),
+                other.type_name()
+            ),
+        )),
+    }
+}
+
+/// The lane worktrees the reviewed plan binds (issue #139), in first-bound
+/// order and deduplicated. The plan document is where the lane path is
+/// reviewed, so it is the only source the pane substrate reads for it.
+fn plan_lane_worktrees(ctx: &EffectContext<'_>) -> Vec<String> {
+    let steps = match ctx.plan.doc.get("steps") {
+        Some(Val::Arr(steps)) => steps.clone(),
+        _ => Vec::new(),
+    };
+    let mut worktrees: Vec<String> = Vec::new();
+    for step in &steps {
+        let Some(params) = step.get("params") else {
+            continue;
+        };
+        let Some(worktree) = params.get("worktree").and_then(Val::as_str) else {
+            continue;
+        };
+        if !worktrees.iter().any(|bound| bound == worktree) {
+            worktrees.push(worktree.to_string());
+        }
+    }
+    worktrees
+}
+
+/// The run's lane worktree for the pane substrate (issue #139): the pane is
+/// created IN the run's lane worktree and never at a bare cwd, so the bind
+/// step resolves that path from the reviewed plan and refuses typed when the
+/// plan cannot name exactly one. A plan that binds several lane worktrees
+/// (a multi-issue submission) is refused rather than given a pane in the
+/// wrong lane — the operator keeps the explicit `params.execution =
+/// "headless"` fallback for that shape.
+fn run_lane_worktree(ctx: &EffectContext<'_>, what: &str) -> Result<PathBuf, EffectOutcome> {
+    let worktrees = plan_lane_worktrees(ctx);
+    match worktrees.len() {
+        1 => {
+            let worktree = contained_path(ctx.worktrees_root, &worktrees[0])
+                .map_err(|err| refusal(err.code, err.message))?;
+            if !worktree.is_dir() {
+                return Err(refusal(
+                    code::OUTPUT_LOCATION,
+                    format!(
+                        "{what} binds the lane worktree {:?}, which is not a directory; the Herdr \
+                         pane substrate creates the worker's pane there and never at a bare cwd",
+                        worktrees[0]
+                    ),
+                ));
+            }
+            Ok(worktree)
+        }
+        0 => Err(refusal(
+            code::BAD_PARAMS,
+            format!(
+                "{what} runs on the Herdr pane substrate, which creates the worker's pane in the \
+                 run's lane worktree, and no plan step binds a `worktree`; declare \
+                 params.execution = \"headless\" to run the bare-subprocess fallback explicitly"
+            ),
+        )),
+        _ => Err(refusal(
+            code::OUTPUT_LOCATION,
+            format!(
+                "{what}: this plan binds {} lane worktrees ({worktrees:?}); the Herdr pane \
+                 substrate binds ONE lane worktree per run and refuses rather than panning the \
+                 wrong lane — declare params.execution = \"headless\" to run the bare-subprocess \
+                 fallback explicitly",
+                worktrees.len()
+            ),
+        )),
+    }
 }
 
 /// The params-caused inputs of `prompt`.
@@ -1649,6 +1762,8 @@ pub fn harness_start_inputs(params: Option<&Val>) -> Result<HarnessStartInputs, 
 pub struct PromptInputs {
     /// The declared harness role inputs.
     pub harness: HarnessInputs,
+    /// The declared execution substrate (issue #139).
+    pub execution: crate::adapters::ExecutionMode,
     /// The identity the step declares, when it declares one.
     pub declared: Option<crate::adapters::SessionHandle>,
     /// The bounded prompt payload.
@@ -1692,6 +1807,7 @@ pub fn prompt_inputs(
     let declared = declared_session(Some(params), "prompt")?;
     Ok(PromptInputs {
         harness: harness_inputs(params)?,
+        execution: declared_execution(Some(params))?,
         declared,
         payload,
         worktree,
@@ -2388,8 +2504,22 @@ fn effect_harness_start(ctx: &EffectContext<'_>) -> EffectOutcome {
         payload: None,
         timeout: Duration::from_secs(deadline),
     };
-    let result =
-        crate::adapters::execute_op_in_worktree(&profile, &request, ctx.env, ctx.integration_repo);
+    // Issue #139: the substrate decides WHERE the role starts. The Herdr
+    // pane substrate creates (or reuses) the worker's pane IN the run's lane
+    // worktree — never at a bare cwd — so the bind effect resolves that path
+    // from the reviewed plan and refuses typed when the plan cannot name
+    // exactly one. The headless substrate keeps its pre-#139 working
+    // directory byte for byte.
+    let cwd = match profile.execution {
+        crate::adapters::ExecutionMode::Headless => ctx.integration_repo.to_path_buf(),
+        crate::adapters::ExecutionMode::HerdrPane => {
+            match run_lane_worktree(ctx, "harness_start") {
+                Ok(worktree) => worktree,
+                Err(outcome) => return outcome,
+            }
+        }
+    };
+    let result = crate::adapters::execute_op_in_worktree(&profile, &request, ctx.env, &cwd);
     if result.status != "succeeded" {
         return EffectOutcome {
             status: result.status,
@@ -2398,7 +2528,25 @@ fn effect_harness_start(ctx: &EffectContext<'_>) -> EffectOutcome {
             result: null(),
         };
     }
-    ok(session_binding_result(ctx, &profile, &session))
+    // The recorded binding names the substrate and, on the pane substrate,
+    // the exact pane/agent identity the worker runs in (issue #139) — the
+    // read-back the effect reports is the adapter's verified one.
+    let mut fields = match session_binding_result(ctx, &profile, &session) {
+        Val::Obj(fields) => fields,
+        _ => unreachable!("the session binding result is an object"),
+    };
+    fields.insert("execution".to_string(), string(profile.execution.name()));
+    for key in ["pane", "agent", "reused"] {
+        fields.insert(
+            key.to_string(),
+            result
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get(key).cloned())
+                .unwrap_or_else(null),
+        );
+    }
+    ok(Val::Obj(fields))
 }
 
 /// The recorded binding of one session effect (issue #92 F2): the session
@@ -2563,6 +2711,19 @@ fn effect_prompt(ctx: &EffectContext<'_>) -> EffectOutcome {
     fields.insert("worktree".to_string(), string(&inputs.worktree));
     fields.insert("branch".to_string(), string(&branch));
     fields.insert("requires_delta".to_string(), bool_(inputs.requires_delta));
+    // Issue #139: the recorded outcome names the substrate and, on the pane
+    // substrate, the settled Herdr agent state the delivery was observed in
+    // — the terminal outcome is collected through Herdr, not inferred from a
+    // process exit.
+    fields.insert("execution".to_string(), string(profile.execution.name()));
+    fields.insert(
+        "harness_state".to_string(),
+        result
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("state").cloned())
+            .unwrap_or_else(null),
+    );
     ok(Val::Obj(fields))
 }
 
@@ -3345,15 +3506,23 @@ fn harness_profile(
             ),
         }
         .map_err(|err| refusal(err.code, err.message))?;
+        // Issue #139: the substrate is the one the reviewed step declares
+        // (default: the Herdr pane substrate). It is resolved BEFORE the
+        // binding is applied — a malformed substrate token refuses, it is
+        // never coerced to a default, and no failure ever downgrades it.
+        let execution = declared_execution(Some(params))?;
         // The declared provider/model pair rides from the reviewed role
         // configuration (never from a step param, never a default id).
         return profile
             .with_binding(&role.provider, &role.model)
+            .map(|profile| profile.with_execution(execution))
             .map_err(|err| refusal(err.code, err.message));
     }
     // No committed role configuration (a presented plan outside the queue
     // executor): the plan declares the binding itself and nothing is
-    // defaulted but the declarative kind.
+    // defaulted but the declarative kind and the substrate (issue #139,
+    // `params.execution`, default: the Herdr pane substrate).
+    let execution = declared_execution(Some(params))?;
     if parsed_kind == crate::adapters::HarnessKind::Argv {
         crate::adapters::Profile::argv(
             &key,
@@ -3361,11 +3530,13 @@ fn harness_profile(
             &crate::adapters::HARNESS_CAPS,
             BTreeMap::new(),
         )
+        .map(|profile| profile.with_execution(execution))
         .map_err(|err| refusal(err.code, err.message))
     } else {
         // Official kinds carry their own metadata (executable must match
         // the official name; fake executables in tests use those names).
         crate::adapters::Profile::official(parsed_kind, &key)
+            .map(|profile| profile.with_execution(execution))
             .map_err(|err| refusal(err.code, err.message))
     }
 }

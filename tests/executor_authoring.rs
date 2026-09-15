@@ -177,6 +177,13 @@ impl Fixture {
         }
         panic!("fixture daemon did not become ready");
     }
+    /// The authored spine of this fixture, rendered with the EXPLICIT
+    /// bare-subprocess substrate (issue #139): this fixture certifies the
+    /// authored-spine semantics (durable step inputs, grant windows, the
+    /// collection/retry frontier) against a direct-subprocess worker, so it
+    /// selects the documented fallback explicitly instead of standing up a
+    /// pane substrate. The default (Herdr pane) path is witnessed end to end
+    /// in `tests/herdr_pane_execution.rs` and `tests/supervision.rs`.
     fn preview(&self, revision: &str) -> String {
         self.ok(&[
             "queue",
@@ -185,6 +192,8 @@ impl Fixture {
             "widgets",
             "--harness",
             "worker",
+            "--execution",
+            "headless",
             "--host",
             "host-1",
             "--issue",
