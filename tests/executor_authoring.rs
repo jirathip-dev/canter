@@ -60,7 +60,7 @@ impl Fixture {
             fixture.path("d.sock").to_str().unwrap()));
         fixture.write(
             "bin/hermes",
-            "#!/bin/sh\nprintf 'x\\n' >> \"$HOME/prompt-count\"\ncase \"$*\" in\n  *persist-me*) test -f \"$HOME/allow-prompt\" || exit 9 ;;\nesac\nprintf '%s\\n' \"$@\" > prompt-argv\nprintf 'fixture output\\n'\n",
+            "#!/bin/sh\nprintf 'x\\n' >> \"$HOME/prompt-count\"\ncase \"$*\" in\n  *persist-me*) test -f \"$HOME/allow-prompt\" || exit 9 ;;\n  *\"Implement acme/widgets#5\"*) printf 'autonomous worker change\\n' > autonomous.txt; git add autonomous.txt; git -c user.name=Worker -c user.email=worker@example.invalid commit -m 'worker delivery' ;;\nesac\nprintf '%s\\n' \"$@\" > prompt-argv\nprintf 'fixture output\\n'\n",
         );
         std::fs::set_permissions(
             fixture.path("bin/hermes"),
@@ -232,6 +232,28 @@ impl Fixture {
             "0",
         ])
     }
+    fn submit_supervised(&self, digest: &str, grant: &str) -> Val {
+        self.ok(&[
+            "queue",
+            "submit",
+            "--request",
+            self.path("request.json").to_str().unwrap(),
+            "--confirm-digest",
+            digest,
+            "--grant",
+            &format!("5={grant}"),
+            "--caps",
+            "4/2/2",
+            "--host-available",
+            "yes",
+            "--harness-lanes",
+            "0",
+            "--supervise",
+            "arm",
+            "--topology",
+            self.path("topology.json").to_str().unwrap(),
+        ])
+    }
     fn run(&self) -> String {
         let digest = self.preview(REV);
         let grant = self.grant("3600");
@@ -361,6 +383,100 @@ fn executor_fixture_reaps_its_daemon_group() {
 }
 
 #[test]
+fn cycle2_supervision_dispatches_the_authored_spine_through_collection() {
+    let mut fixture = Fixture::new();
+    let digest = fixture.preview(REV);
+    let grant = fixture.grant("3600");
+    let submitted = fixture.submit_supervised(&digest, text(&grant, &["grant_id"]));
+    let run = text(
+        &field(&submitted, &["items"]).as_array().unwrap()[0],
+        &["instance_id"],
+    )
+    .to_string();
+
+    // No `run dispatch` call occurs in this test. The daemon-owned supervisor
+    // must use the topology/admission committed by `queue submit` and advance
+    // each successful outcome on its own wake.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        let status = fixture.ok(&["supervision", "status", "--run", &run]);
+        if text(&status, &["cursor", "next_step"]) == "p6-5"
+            && text(&status, &["evaluation", "reason"]) == "supervision.waiting_approval"
+        {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "supervisor stalled: {status:?}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let attempts = field(&status, &["cursor", "attempts"])
+        .as_array()
+        .expect("attempts")
+        .clone();
+    assert_eq!(
+        attempts.len(),
+        5,
+        "p1 through p5 each ran once: {attempts:?}"
+    );
+    assert!(
+        attempts
+            .iter()
+            .all(|attempt| { attempt.get("status").and_then(Val::as_str) == Some("succeeded") })
+    );
+    assert_eq!(
+        text(&status, &["evaluation", "reason"]),
+        "supervision.waiting_approval"
+    );
+    assert_eq!(
+        field(&status, &["evaluation", "eligible"]).as_bool(),
+        Some(false),
+        "p6 names its concrete independent-review blocker"
+    );
+    assert_eq!(
+        fixture.worktree_git(&["branch", "--show-current"]),
+        "issue-5"
+    );
+    assert_eq!(fixture.prompt_invocations(), 1);
+    assert_eq!(
+        std::fs::read_to_string(fixture.path("trees/issues-5/autonomous.txt")).unwrap(),
+        "autonomous worker change\n"
+    );
+
+    fixture.restart();
+    let audit = std::fs::read_to_string(fixture.path("state/canter/journal/audit.jsonl")).unwrap();
+    let rows: Vec<Val> = audit
+        .lines()
+        .map(|line| Val::parse_json(line).expect("audit row"))
+        .collect();
+    let expected = [
+        "mutate.checkout",
+        "mutate.worktree_create",
+        "mutate.harness_start",
+        "mutate.prompt",
+        "mutate.collect_outcome",
+    ];
+    let mut pairs = Vec::new();
+    for action in expected {
+        let position = rows
+            .iter()
+            .position(|row| row.get("action").and_then(Val::as_str) == Some(action))
+            .unwrap_or_else(|| panic!("missing {action}: {rows:?}"));
+        let outcome_action = format!("outcome.{action}");
+        assert_eq!(
+            rows.get(position + 1)
+                .and_then(|row| row.get("action"))
+                .and_then(Val::as_str),
+            Some(outcome_action.as_str()),
+            "{action} must be immediately followed by its outcome"
+        );
+        pairs.push((
+            field(&rows[position], &["seq"]).as_int().unwrap(),
+            field(&rows[position + 1], &["seq"]).as_int().unwrap(),
+        ));
+    }
+    eprintln!("AUTONOMOUS_RUN={run} MUTATE_OUTCOME_SEQS={pairs:?} ATTEMPTS={attempts:?}");
+}
+
+#[test]
 fn f6_first_dispatch_uses_supported_topology_input() {
     let fixture = Fixture::new();
     let run = fixture.run();
@@ -429,6 +545,107 @@ fn f5_fresh_issuance_opens_live_and_expired_binding_windows() {
             .get("expires_at"),
         Some(&string(expiry))
     );
+}
+
+#[test]
+fn cycle2_expired_grant_rotation_continues_the_same_run_explicitly() {
+    let mut fixture = Fixture::new();
+    let digest = fixture.preview(REV);
+    let old = fixture.grant("4");
+    let submitted = fixture.submit(&digest, text(&old, &["grant_id"]));
+    let run = text(
+        &field(&submitted, &["items"]).as_array().unwrap()[0],
+        &["instance_id"],
+    )
+    .to_string();
+    succeeded(&fixture.first(&run));
+    let expiry = text(&old, &["grant", "expires_at"]);
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while !canter::mutation::is_expired(expiry, &canter::time::rfc3339_now())
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(canter::mutation::is_expired(
+        expiry,
+        &canter::time::rfc3339_now()
+    ));
+    let (exit, refused) = fixture.cli(&["run", "dispatch", "--run", &run, "--step", "p2-5"]);
+    assert_eq!(exit, 4, "{refused:?}");
+    assert!(canonical_text(&refused).contains("refusal.grant.expired"));
+    let new = fixture.grant("3600");
+    assert_ne!(text(&old, &["grant_id"]), text(&new, &["grant_id"]));
+    let rotated = fixture.submit(&digest, text(&new, &["grant_id"]));
+    let item = &field(&rotated, &["items"]).as_array().unwrap()[0];
+    assert_eq!(
+        text(item, &["status"]),
+        "admitted",
+        "fresh issuance must unblock the same binding: {item:?}"
+    );
+    assert_eq!(text(item, &["instance_id"]), run);
+    // A rotation is durable and explicit, not a replacement of either grant row.
+    fixture.restart();
+    let journal =
+        std::fs::read_to_string(fixture.path("state/canter/journal/audit.jsonl")).unwrap();
+    let rotation = journal
+        .lines()
+        .find(|line| line.contains("grant.rotation"))
+        .expect("recorded rotation");
+    eprintln!("ROTATION_RECORD={rotation}");
+    assert!(rotation.contains(text(&old, &["grant_id"])));
+    assert!(rotation.contains(text(&new, &["grant_id"])));
+    assert!(rotation.contains(text(&new, &["grant", "expires_at"])));
+    let status = fixture.ok(&["run", "status", "--run", &run]);
+    assert!(canonical_text(&status).contains(text(&new, &["grant_id"])));
+    // The expired dispatch is a diagnosed attempt; after rotating the grant,
+    // the supported bounded retry explicitly authorizes its continuation.
+    fixture.ok(&["run", "retry", "--run", &run, "--step", "p2-5"]);
+    succeeded(&fixture.ok(&["run", "dispatch", "--run", &run, "--step", "p2-5"]));
+    let replay = fixture.submit(&digest, text(&new, &["grant_id"]));
+    assert_eq!(
+        text(
+            &field(&replay, &["items"]).as_array().unwrap()[0],
+            &["status"]
+        ),
+        "refused"
+    );
+    let journal =
+        std::fs::read_to_string(fixture.path("state/canter/journal/audit.jsonl")).unwrap();
+    assert_eq!(
+        journal
+            .lines()
+            .filter(|line| line.contains("\"action\":\"grant.rotation\""))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn cycle2_live_grant_is_not_rotated_by_another_issuance() {
+    let fixture = Fixture::new();
+    let digest = fixture.preview(REV);
+    let old = fixture.grant("3600");
+    let submitted = fixture.submit(&digest, text(&old, &["grant_id"]));
+    let run = text(
+        &field(&submitted, &["items"]).as_array().unwrap()[0],
+        &["instance_id"],
+    );
+    let new = fixture.grant("3600");
+    let refused = fixture.submit(&digest, text(&new, &["grant_id"]));
+    assert_eq!(
+        text(
+            &field(&refused, &["items"]).as_array().unwrap()[0],
+            &["reason"]
+        ),
+        "submission.already_owned"
+    );
+    succeeded(&fixture.first(run));
+    let status = fixture.ok(&["run", "status", "--run", run]);
+    assert!(canonical_text(&status).contains(text(&old, &["grant_id"])));
+    assert!(!canonical_text(&status).contains(text(&new, &["grant_id"])));
+    let journal =
+        std::fs::read_to_string(fixture.path("state/canter/journal/events.jsonl")).unwrap();
+    assert!(!journal.contains("grant.rotation"));
 }
 
 #[test]
@@ -534,9 +751,6 @@ fn f8_supported_surface_binds_reviewed_role_and_derived_session() {
     let expected = canter::mutation::run_session_handle(&run).unwrap();
     assert!(canonical_text(&started).contains(&expected.session_id));
     fixture.restart();
-    let (exit, refusal) = fixture.cli(&["run", "dispatch", "--run", &run, "--step", "p4-5"]);
-    assert_eq!(exit, 4);
-    assert!(text(&refusal, &["error", "message"]).contains("payload"));
     fixture.admission();
     let prompted = fixture.ok(&[
         "run",
@@ -547,17 +761,19 @@ fn f8_supported_surface_binds_reviewed_role_and_derived_session() {
         "p4-5",
         "--admission",
         fixture.path("admission.json").to_str().unwrap(),
-        "--param",
-        "payload=bounded fixture work",
     ]);
     succeeded(&prompted);
+    assert!(
+        text(&prompted, &["step", "params", "payload"]).contains("acme/widgets#5"),
+        "the producer-authored prompt survives restart"
+    );
     let argv = std::fs::read_to_string(fixture.path("trees/issues-5/prompt-argv")).unwrap();
     for required in [
         "worker",
         "provider-a",
         "model-a",
         &expected.session_id,
-        "bounded fixture work",
+        "Implement acme/widgets#5",
     ] {
         assert!(argv.contains(required), "missing {required}: {argv}");
     }

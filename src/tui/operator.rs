@@ -56,9 +56,9 @@ use super::{Action, BoardView, ColorMode, ReadModel, UiState, clip, handle_key a
 
 /// The statement the authorization screen shows: what the action does and
 /// what it does not do.
-pub const AUTHORIZE_STATEMENT: &str = "authorization starts a daemon-owned run: the submission is committed \
-by the daemon and survives this terminal; no workflow step has been executed and no implementation, review \
-or merge is claimed";
+pub const AUTHORIZE_STATEMENT: &str = "authorization commits a daemon-owned run that survives this terminal; \
+the submission mutation itself claims no implementation, review or merge, while explicitly armed supervision \
+may separately dispatch the run through the gated apply path";
 
 /// Surface-local notice: no reviewed run plan was presented to this surface.
 pub const CODE_PLAN: &str = "operator.plan";

@@ -55,7 +55,7 @@ pub const CAP_MAX: usize = 65_536;
 /// The statement every submission document renders: what a committed
 /// submission did and did NOT do. A submission admits runs; it never claims
 /// a step executed.
-pub const STATEMENT: &str = "submission admission only: admitted items own a durable run record and no workflow step has been executed; a waiting item can be admitted later only by the ONE verified delivery that advances this queue cursor (issue #96, under the same admission and ownership checks), refused items are not running, and this is not a completed implementation";
+pub const STATEMENT: &str = "the submission mutation only admits durable run records; when supervision is explicitly armed its separate driver may dispatch the run through the gated apply path, while a waiting item can be admitted later only by the ONE verified delivery that advances this queue cursor under the same admission and ownership checks; refused items are not running, and admission alone is not a completed implementation";
 
 /// The queue-cursor advance vocabulary (issue #96): the durable continuation
 /// from one verified delivery to the next eligible approved issue of the
@@ -221,7 +221,7 @@ pub fn parse_params(params: &Val) -> Result<SubmissionMaterial, SubmissionError>
             "the submission params must be an object",
         ));
     };
-    const KEYS: [&str; 11] = [
+    const KEYS: [&str; 12] = [
         "idempotency_key",
         "digest",
         "epoch",
@@ -233,6 +233,7 @@ pub fn parse_params(params: &Val) -> Result<SubmissionMaterial, SubmissionError>
         "grants",
         "resume",
         "supervision",
+        "dispatch",
     ];
     for key in map.keys() {
         if !KEYS.contains(&key.as_str()) {
@@ -312,6 +313,17 @@ pub fn parse_params(params: &Val) -> Result<SubmissionMaterial, SubmissionError>
         None | Some(Val::Null) => None,
         Some(value) => Some(parse_supervision(value)?),
     };
+    if let Some(dispatch) = params.get("dispatch") {
+        let valid = matches!(dispatch, Val::Obj(_))
+            && matches!(dispatch.get("topology"), Some(Val::Obj(_)))
+            && matches!(dispatch.get("admission"), Some(Val::Obj(_)));
+        if !valid {
+            return Err(SubmissionError::new(
+                "usage.queue_submission.dispatch",
+                "dispatch must carry topology and admission objects",
+            ));
+        }
+    }
     Ok(SubmissionMaterial {
         idempotency_key: key,
         preview,
@@ -1183,6 +1195,62 @@ fn classify_items(
                              resumed only with a separate explicit engine-minted resume \
                              authorization"
                         ),
+                    }
+                }
+            } else if let Some(presented_grant) = grants.get(&id) {
+                let stored = state
+                    .instance_by_id(&instance_id)
+                    .map_err(|err| SubmissionError::new(err.code, err.message))?
+                    .ok_or_else(|| {
+                        SubmissionError::new(
+                            "state.not_found",
+                            format!("owned run {instance_id} disappeared"),
+                        )
+                    })?;
+                let prior = state
+                    .grant_by_id(&stored.grant_id)
+                    .map_err(|err| SubmissionError::new(err.code, err.message))?;
+                let prior_expired = prior.as_ref().is_some_and(|grant| {
+                    grant.status == "active"
+                        && is_expired(&grant.expires_at, &crate::time::rfc3339_now())
+                });
+                if !prior_expired {
+                    SubmissionVerdict::Refused {
+                        code: codes::ALREADY_OWNED,
+                        message: format!(
+                            "run {instance_id} already owns this issue under a live grant; a fresh window never rotates a live binding"
+                        ),
+                    }
+                } else {
+                    let candidate = state
+                        .grant_by_id(presented_grant)
+                        .map_err(|err| SubmissionError::new(err.code, err.message))?;
+                    match grant_binding_refusal(
+                        state,
+                        material,
+                        presented_grant,
+                        candidate,
+                        &id,
+                        &revision,
+                    )? {
+                        Some((code, message)) => SubmissionVerdict::Refused { code, message },
+                        None => {
+                            if !state
+                                .grant_issued_after(presented_grant, &stored.grant_id)
+                                .map_err(|err| SubmissionError::new(err.code, err.message))?
+                            {
+                                SubmissionVerdict::Refused {
+                                    code: preview_holds::REVISION_STALE,
+                                    message: format!(
+                                        "grant {presented_grant} is not a later authorization than expired grant {}; rotation is explicit and issuance-ordered",
+                                        stored.grant_id
+                                    ),
+                                }
+                            } else {
+                                grant_id = Some(presented_grant.clone());
+                                SubmissionVerdict::Approved
+                            }
+                        }
                     }
                 }
             } else {

@@ -511,7 +511,10 @@ fn flow_steps() -> Vec<Val> {
         step(
             "m1",
             "merge",
-            Some(object(vec![("branch", string("issue-123"))])),
+            Some(object(vec![
+                ("branch", string("issue-123")),
+                ("merge_policy", string("ff")),
+            ])),
         ),
         step("v1", "post_merge_verify", Some(object(vec![]))),
         step(
@@ -1085,7 +1088,7 @@ fn plan_rpc_digest_binding_and_idempotent_replay() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn lane_flow_merges_verified_head_closes_issue_and_cleans_with_salvage() {
+fn lane_flow_rehearses_then_verifies_landed_head_and_cleans_with_salvage() {
     let scenario = Scenario::new("lane-flow", "2999-01-01T00:00:00Z", flow_steps());
     let integration_base = scenario.integration_base();
 
@@ -1128,13 +1131,15 @@ fn lane_flow_merges_verified_head_closes_issue_and_cleans_with_salvage() {
             .starts_with("ev_")
     );
 
-    // Merge gate passes with current bindings; the integration branch
-    // fast-forwards exactly to the reviewed head.
-    let merged = scenario.apply_ok(15, "m1", Some(&feature_head), Some(&integration_base));
+    // The merge step is a read-only ff-policy rehearsal. The fixture then
+    // models the orchestrator-owned landing before post-merge verification.
+    let rehearsed = scenario.apply_ok(15, "m1", Some(&feature_head), Some(&integration_base));
     assert_eq!(
-        merged.get("merged_head").and_then(Val::as_str),
-        Some(feature_head.as_str())
+        rehearsed.get("mode").and_then(Val::as_str),
+        Some("rehearsal")
     );
+    assert_eq!(scenario.integration_base(), integration_base);
+    Git::new(&scenario.repos.checkout).run(&["merge", "--ff-only", "issue-123"]);
     let verified = scenario.apply_ok(16, "v1", Some(&feature_head), Some(&integration_base));
     assert_eq!(
         verified.get("contains_feature").and_then(Val::as_bool),
@@ -1183,6 +1188,111 @@ fn lane_flow_merges_verified_head_closes_issue_and_cleans_with_salvage() {
 // ---------------------------------------------------------------------------
 // AC4 RED: moved base invalidates recorded evidence before the merge
 // ---------------------------------------------------------------------------
+
+fn cycle2_reviewed_merge(policy: &str, squash_first: bool) -> (Scenario, String, String) {
+    let mut steps = flow_steps();
+    steps[5] = step(
+        "m1",
+        "merge",
+        Some(object(vec![
+            ("branch", string("issue-123")),
+            ("merge_policy", string(policy)),
+        ])),
+    );
+    let scenario = Scenario::new(
+        &format!("c2-{}{}", &policy[..1], u8::from(squash_first)),
+        "2999-01-01T00:00:00Z",
+        steps,
+    );
+    let base = scenario.integration_base();
+    scenario.apply_ok(10, "w1", None, None);
+    scenario.apply_ok(11, "h1", None, None);
+    scenario.apply_ok(12, "p1", None, None);
+    let collected = scenario.apply_ok(13, "o1", None, Some(&base));
+    let feature = collected
+        .get("head")
+        .and_then(Val::as_str)
+        .unwrap()
+        .to_string();
+    let git = Git::new(&scenario.repos.checkout);
+    if squash_first {
+        git.run(&["merge", "--squash", "issue-123"]);
+        git.run(&["commit", "-m", "fixture policy squash"]);
+        git.run(&["push", "origin", "staging"]);
+    }
+    let base = scenario.integration_base();
+    scenario.apply_ok(14, "r1", Some(&feature), Some(&base));
+    (scenario, feature, base)
+}
+
+#[test]
+fn cycle2_merge_rehearsal_never_lands_in_the_integration_checkout() {
+    for policy in ["ff", "squash"] {
+        let (scenario, feature, base) = cycle2_reviewed_merge(policy, false);
+        let git = Git::new(&scenario.repos.checkout);
+        // Dirty operator files and the index are not a rehearsal workspace.
+        std::fs::write(scenario.repos.checkout.join("base.txt"), "operator edit\n").unwrap();
+        git.run(&["add", "base.txt"]);
+        let index = git.run(&["write-tree"]);
+        let refs = git.run(&["show-ref"]);
+        let remote = git.run(&["ls-remote", "origin", "refs/heads/staging"]);
+        let result = scenario.apply_ok(15, "m1", Some(&feature), Some(&base));
+        assert_eq!(
+            git.head("staging"),
+            base,
+            "rehearsal must not move integration"
+        );
+        assert_eq!(git.run(&["show-ref"]), refs);
+        assert_eq!(git.run(&["write-tree"]), index);
+        assert_eq!(
+            git.run(&["ls-remote", "origin", "refs/heads/staging"]),
+            remote
+        );
+        assert_eq!(
+            std::fs::read_to_string(scenario.repos.checkout.join("base.txt")).unwrap(),
+            "operator edit\n"
+        );
+        assert_eq!(result.get("mode").and_then(Val::as_str), Some("rehearsal"));
+        assert_eq!(
+            result.get("merge_policy").and_then(Val::as_str),
+            Some(policy)
+        );
+        assert_eq!(result.get("landed").and_then(Val::as_bool), Some(false));
+        assert_eq!(
+            result.get("result_tree").and_then(Val::as_str),
+            Some(git.head("issue-123^{tree}").as_str())
+        );
+        assert!(
+            result.get("merged_head").is_none(),
+            "no landing claim: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn cycle2_squash_rehearsal_succeeds_after_the_policy_squash() {
+    let (scenario, feature, base) = cycle2_reviewed_merge("squash", true);
+    let result = scenario.apply_ok(15, "m1", Some(&feature), Some(&base));
+    assert_eq!(scenario.integration_base(), base);
+    assert_eq!(
+        result.get("result_tree").and_then(Val::as_str),
+        Some(
+            Git::new(&scenario.repos.checkout)
+                .head("staging^{tree}")
+                .as_str()
+        )
+    );
+}
+
+#[test]
+fn cycle2_ff_refusal_names_policy_divergence_not_an_inferred_base_move() {
+    let (scenario, feature, base) = cycle2_reviewed_merge("ff", true);
+    let (code, message) = scenario.apply_err(15, "m1", Some(&feature), Some(&base));
+    assert_eq!(code, "effect.merge.not_fast_forward");
+    assert!(message.contains("ff policy"), "{message}");
+    assert!(!message.contains("base moved after"), "{message}");
+    assert_eq!(scenario.integration_base(), base);
+}
 
 #[test]
 fn moved_integration_base_invalidates_stale_evidence_and_refuses_merge() {
@@ -1424,6 +1534,7 @@ fn premature_issue_close_refuses_closure_premature_over_the_wire() {
         .to_string();
     scenario.apply_ok(85, "r1", Some(&feature), Some(&base));
     scenario.apply_ok(86, "m1", Some(&feature), Some(&base));
+    Git::new(&scenario.repos.checkout).run(&["merge", "--ff-only", "issue-123"]);
     scenario.apply_ok(87, "v1", Some(&feature), Some(&base));
     let closed = scenario.apply_ok(88, "i1", Some(&feature), Some(&base));
     assert_eq!(

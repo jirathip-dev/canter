@@ -1256,6 +1256,7 @@ fn only_a_reviewed_pass_with_green_checks_at_the_run_pins_is_a_delivery() {
     fn snapshot(run: InstanceRow, newest: Option<EvidenceRow>) -> SupervisionEvidence {
         SupervisionEvidence {
             run,
+            has_dispatch_context: false,
             ownership_instance: Some(RUN_ID.to_string()),
             submission_id: Some("qs_0123456789abcdef".to_string()),
             submission_digest: Some("d".repeat(64)),

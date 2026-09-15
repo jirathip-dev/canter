@@ -1413,8 +1413,12 @@ fn stale_evidence_reads_held_and_never_healthy_over_the_real_daemon() {
     );
     assert_eq!(
         text_at(&daemon_doc, &["evaluation", "class"]).as_deref(),
-        Some("unknown"),
-        "the recorded class itself is unknown for an unobserved run"
+        Some("needs-attention"),
+        "the recorded class names the missing autonomous dispatch context"
+    );
+    assert_eq!(
+        text_at(&daemon_doc, &["evaluation", "reason"]).as_deref(),
+        Some(supervision::codes::DISPATCH_CONTEXT_MISSING)
     );
 
     let mut console = console_with_selection(&fixture, &state);

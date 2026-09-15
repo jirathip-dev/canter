@@ -431,7 +431,7 @@ pub fn is_expired(expires_at: &str, now: &str) -> bool {
     if !crate::formats::is_rfc3339_seconds_z(expires_at) {
         return true;
     }
-    expires_at < now
+    expires_at <= now
 }
 
 // ---------------------------------------------------------------------------
@@ -1146,7 +1146,18 @@ fn resolve_contained(root: &Path, relative: &str) -> Option<PathBuf> {
                 resolved = resolved.parent()?.to_path_buf();
             }
             Component::Normal(name) => {
-                resolved = canonical_or(&resolved.join(name));
+                let candidate = resolved.join(name);
+                resolved = match std::fs::symlink_metadata(&candidate) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        // A dangling symlink can make `git worktree add`
+                        // create its branch before failing the filesystem
+                        // operation. Refuse it before git sees the request.
+                        std::fs::canonicalize(candidate).ok()?
+                    }
+                    Ok(_) => canonical_or(&candidate),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => candidate,
+                    Err(_) => return None,
+                };
             }
             // An absolute presented path is never a lane-relative path.
             Component::RootDir | Component::Prefix(_) => return None,
@@ -1694,8 +1705,8 @@ pub fn prompt_inputs(
 pub struct CollectOutcomeInputs {
     /// The relative lane worktree to collect from.
     pub worktree: String,
-    /// The declared integration base (`params.base_head`), when present.
-    pub base_head: Option<String>,
+    /// The declared or freshly observed integration base.
+    pub base_head: String,
     /// The feature branch the run bound, when declared.
     pub branch: Option<String>,
     /// Whether an empty committed delta is a typed refusal.
@@ -1710,10 +1721,16 @@ pub fn collect_outcome_inputs(
 ) -> Result<CollectOutcomeInputs, EffectOutcome> {
     let worktree = param_str(params, "worktree")?.to_string();
     screened_containment(contract, &worktree)?;
-    let base_head = match param_str_opt(params, "base_head") {
-        Some(head) if is_hex40(head) => Some(head.to_string()),
+    let base_head = match param_str_opt(params, "base_head").or(contract.observed_integration_base)
+    {
+        Some(head) if is_hex40(head) => head.to_string(),
         Some(_) => return Err(refusal(code::BAD_PARAMS, "base_head must be 40-hex")),
-        None => None,
+        None => {
+            return Err(refusal(
+                code::BAD_PARAMS,
+                "collect_outcome requires base_head from this run's recorded checkout or the apply's exact observed integration base; the current integration branch is never substituted",
+            ));
+        }
     };
     let branch = match param_str_opt(params, "branch") {
         Some(branch) if is_slug(branch) => Some(branch.to_string()),
@@ -1820,11 +1837,20 @@ pub fn review_evidence_inputs(
     })
 }
 
-/// Resolve the params-caused inputs of `merge` (a slug FEATURE branch).
+/// The explicit integration policy of a read-only merge rehearsal.
+#[derive(Clone, Debug)]
+pub struct MergeInputs {
+    /// The slug feature branch.
+    pub branch: String,
+    /// The closed policy (`squash` | `ff`).
+    pub policy: String,
+}
+
+/// Resolve the params-caused inputs of `merge` (feature branch + policy).
 pub fn merge_inputs(
     params: Option<&Val>,
     contract: &ParamContract<'_>,
-) -> Result<String, EffectOutcome> {
+) -> Result<MergeInputs, EffectOutcome> {
     let branch = match param_str(params, "branch") {
         Ok(value) if is_slug(value) => value.to_string(),
         _ => {
@@ -1845,7 +1871,16 @@ pub fn merge_inputs(
             format!("only feature branches merge to the integration branch, got {branch:?}"),
         ));
     }
-    Ok(branch)
+    let policy = match param_str(params, "merge_policy") {
+        Ok(value @ ("squash" | "ff")) => value.to_string(),
+        _ => {
+            return Err(refusal(
+                code::BAD_PARAMS,
+                "merge requires merge_policy squash|ff",
+            ));
+        }
+    };
+    Ok(MergeInputs { branch, policy })
 }
 
 /// The params-caused inputs of `branch_push`.
@@ -2578,18 +2613,7 @@ fn effect_collect_outcome(ctx: &EffectContext<'_>) -> EffectOutcome {
         Ok(path) => path,
         Err(err) => return refusal(err.code, err.message),
     };
-    let base_head = match inputs
-        .base_head
-        .or_else(|| ctx.observed_integration_base.map(str::to_string))
-    {
-        Some(head) => head,
-        None => {
-            return refusal(
-                code::BAD_PARAMS,
-                "collect_outcome requires base_head from this run's recorded checkout or the apply's exact observed integration base; the current integration branch is never substituted",
-            );
-        }
-    };
+    let base_head = inputs.base_head;
     let head_out = match run_git(ctx, &worktree, &["rev-parse", "--verify", "HEAD"]) {
         Ok(out) => out,
         Err(outcome) => return outcome,
@@ -2686,15 +2710,14 @@ fn effect_review_evidence(ctx: &EffectContext<'_>) -> EffectOutcome {
     ]))
 }
 
-/// `merge`: integrate the reviewed feature branch into the integration
-/// checkout (fast-forward only — a moved base refuses deterministically).
-/// The evidence gate runs daemon-side before this effect.
+/// `merge`: rehearse the explicit integration policy without changing the
+/// integration checkout, any ref, or the remote. The evidence gate runs
+/// daemon-side before this effect; the orchestrator owns the real forge merge.
 fn effect_merge(ctx: &EffectContext<'_>) -> EffectOutcome {
-    let branch = match merge_inputs(ctx.params, &ctx.param_contract()) {
-        Ok(branch) => branch,
+    let inputs = match merge_inputs(ctx.params, &ctx.param_contract()) {
+        Ok(inputs) => inputs,
         Err(outcome) => return outcome,
     };
-    // The integration checkout must sit on the integration branch.
     let current = match run_git(ctx, ctx.integration_repo, &["branch", "--show-current"]) {
         Ok(out) => out.stdout.trim().to_string(),
         Err(outcome) => return outcome,
@@ -2708,30 +2731,85 @@ fn effect_merge(ctx: &EffectContext<'_>) -> EffectOutcome {
             ),
         );
     }
-    match run_git(ctx, ctx.integration_repo, &["merge", "--ff-only", &branch]) {
-        Ok(out) => {
-            let head = match run_git(
-                ctx,
-                ctx.integration_repo,
-                &["rev-parse", ctx.integration_branch],
-            ) {
-                Ok(out) => out.stdout.trim().to_string(),
-                Err(outcome) => return outcome,
-            };
-            let _ = out;
-            ok(object(vec![
-                ("integration_branch", string(ctx.integration_branch)),
-                ("merged_head", string(&head)),
-                ("feature_branch", string(&branch)),
-            ]))
-        }
-        Err(_) => failed(
+    let integration_head = match run_git(
+        ctx,
+        ctx.integration_repo,
+        &["rev-parse", "--verify", ctx.integration_branch],
+    ) {
+        Ok(out) => out.stdout.trim().to_string(),
+        Err(outcome) => return outcome,
+    };
+    let reviewed_base = ctx.observed_integration_base.unwrap_or_default();
+    let feature_tree = match run_git(
+        ctx,
+        ctx.integration_repo,
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("{}^{{tree}}", inputs.branch),
+        ],
+    ) {
+        Ok(out) => out.stdout.trim().to_string(),
+        Err(outcome) => return outcome,
+    };
+    let integration_tree = match run_git(
+        ctx,
+        ctx.integration_repo,
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("{}^{{tree}}", ctx.integration_branch),
+        ],
+    ) {
+        Ok(out) => out.stdout.trim().to_string(),
+        Err(outcome) => return outcome,
+    };
+    let feature_descends = run_git(
+        ctx,
+        ctx.integration_repo,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            &integration_head,
+            &inputs.branch,
+        ],
+    )
+    .is_ok();
+    if integration_head != reviewed_base && feature_tree != integration_tree {
+        return failed(
             code::MERGE_NOT_FF,
             format!(
-                "merge of {branch:?} is not fast-forwardable: the integration base moved after the review evidence was recorded"
+                "{} policy rehearsal refused: integration ref {:?} is at {integration_head}, not reviewed base {reviewed_base}",
+                inputs.policy, ctx.integration_branch
             ),
-        ),
+        );
     }
+    if inputs.policy == "ff" && !feature_descends {
+        return failed(
+            code::MERGE_NOT_FF,
+            format!(
+                "ff policy divergence: feature branch {:?} is not a descendant of integration ref {:?}; a squash result is not an ff merge",
+                inputs.branch, ctx.integration_branch
+            ),
+        );
+    }
+    if inputs.policy == "squash" && !feature_descends && feature_tree != integration_tree {
+        return failed(
+            code::MERGE_FAILED,
+            format!(
+                "squash policy rehearsal cannot prove feature tree {feature_tree} against integration tree {integration_tree}"
+            ),
+        );
+    }
+    ok(object(vec![
+        ("mode", string("rehearsal")),
+        ("landed", bool_(false)),
+        ("merge_policy", string(&inputs.policy)),
+        ("integration_branch", string(ctx.integration_branch)),
+        ("integration_head", string(&integration_head)),
+        ("feature_branch", string(&inputs.branch)),
+        ("result_tree", string(&feature_tree)),
+    ]))
 }
 
 /// `post_merge_verify`: prove the merged integration head contains the
@@ -3382,6 +3460,17 @@ mod tests {
             ("branch", string("lane-7")),
             ("worktree", string("lane-7")),
         ]);
+        let collect = object(vec![
+            ("worktree", string("lane-7")),
+            (
+                "base_head",
+                string("2222222222222222222222222222222222222222"),
+            ),
+        ]);
+        let merge = object(vec![
+            ("branch", string("lane-7")),
+            ("merge_policy", string("squash")),
+        ]);
         let harness = object(vec![("harness_key", string("lane"))]);
         let prompt = object(vec![
             ("harness_key", string("lane")),
@@ -3431,9 +3520,9 @@ mod tests {
             ("worktree_create", Some(&feature), &empty),
             ("harness_start", Some(&harness), &empty),
             ("prompt", Some(&prompt), &empty),
-            ("collect_outcome", Some(&feature), &empty),
+            ("collect_outcome", Some(&collect), &empty),
             ("review_evidence", Some(&review), &observed),
-            ("merge", Some(&feature), &empty),
+            ("merge", Some(&merge), &empty),
             ("cleanup", Some(&feature), &empty),
             ("publish", Some(&publish), &empty),
             ("branch_push", Some(&push), &empty),
@@ -3543,6 +3632,9 @@ mod tests {
             symlink(&outside, root.join("link-out")).expect("escaping symlink");
             let err = contained_path(&root, "link-out/lane").expect_err("symlinked escape");
             assert_eq!(err.code, code::UNCONTAINED);
+            symlink(dir.join("missing"), root.join("dangle")).expect("dangling symlink");
+            let err = contained_path(&root, "dangle/lane").expect_err("dangling symlink");
+            assert_eq!(err.code, code::UNCONTAINED);
             // A symlink that stays INSIDE the root is still a lane path.
             std::fs::create_dir_all(root.join("real")).expect("real dir");
             symlink(root.join("real"), root.join("link-in")).expect("inner symlink");
@@ -3557,6 +3649,8 @@ mod tests {
         let inside = contained_path(&root, "issues/130").expect("in-root lane");
         assert_eq!(inside, root.join("issues/130"));
         assert!(!root.join("issues").exists(), "the screen creates nothing");
+        let err = contained_path(&root, ".").expect_err("root itself is not a lane");
+        assert_eq!(err.code, code::UNCONTAINED);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

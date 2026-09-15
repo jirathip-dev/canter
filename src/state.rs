@@ -653,6 +653,7 @@ impl FanoutSlots<'_> {
 /// the shared decision re-derives (ownership snapshots, counted
 /// same-repository lanes) plus the inputs the approved submission bound.
 struct QueueAdmission<'a> {
+    state: &'a State,
     repository: &'a str,
     submission_id: &'a str,
     epoch: i64,
@@ -686,6 +687,7 @@ fn admit_queue_item_in_tx(
     slots: &mut FanoutSlots<'_>,
 ) -> Result<AdmissionDecision, StateError> {
     let scope = format!("worktrees/issues/{}", item.issue_number);
+    let mut rotation: Option<(String, String)> = None;
     let superseded_instance = if let Some(run) = ctx.ownership.get(&item.issue_number) {
         if run.issue_revision != item.issue_revision {
             let Some(candidate_grant) = item.grant_id else {
@@ -720,54 +722,93 @@ fn admit_queue_item_in_tx(
             }
             Some(run.instance_id.clone())
         } else {
-            // An owner that appeared after the preview moved the verdict: only
-            // an explicit engine-authorized resume of a still-paused run admits
-            // an owned item; every other same-revision item is refused.
-            let authorized = match (item.resume_digest, run.paused) {
-                (Some(presented), true) => {
-                    crate::engine::authorize_resume(&run.resume_digest, presented).is_ok()
+            let expired_rotation = match item.grant_id {
+                Some(candidate) if candidate != run.grant_id => {
+                    let windows: Option<(i64, i64, String, String, i64)> = tx
+                        .query_row(
+                            "SELECT candidate.rowid, prior.rowid, prior.status,
+                                    prior.expires_at, prior.state_epoch
+                               FROM grants candidate, grants prior
+                              WHERE candidate.grant_id = ?1 AND prior.grant_id = ?2",
+                            params![candidate, run.grant_id],
+                            |row| {
+                                Ok((
+                                    row.get(0)?,
+                                    row.get(1)?,
+                                    row.get(2)?,
+                                    row.get(3)?,
+                                    row.get(4)?,
+                                ))
+                            },
+                        )
+                        .optional()
+                        .map_err(|err| {
+                            StateError::from_sqlite("admit_queue_item: grant rotation", err)
+                        })?;
+                    matches!(
+                        windows,
+                        Some((candidate_row, prior_row, ref status, ref expires_at, epoch))
+                            if candidate_row > prior_row
+                                && status == "active"
+                                && epoch == ctx.epoch
+                                && crate::mutation::is_expired(expires_at, ctx.at)
+                    )
                 }
                 _ => false,
             };
-            if authorized {
-                let affected = tx
-                    .execute(
-                        "UPDATE instances SET paused = 0, resume_digest = '',
-                                status = 'running', updated_at = ?2
-                          WHERE instance_id = ?1 AND paused = 1",
-                        params![run.instance_id, ctx.at],
-                    )
-                    .map_err(|err| StateError::from_sqlite("admit_queue_item: resume", err))?;
-                if affected == 1 {
-                    return Ok(AdmissionDecision::Admitted {
-                        instance_id: run.instance_id.clone(),
+            if expired_rotation {
+                rotation = Some((run.instance_id.clone(), run.grant_id.clone()));
+                None
+            } else {
+                // An owner that appeared after the preview moved the verdict: only
+                // an explicit engine-authorized resume of a still-paused run admits
+                // an owned item; every other same-revision item is refused.
+                let authorized = match (item.resume_digest, run.paused) {
+                    (Some(presented), true) => {
+                        crate::engine::authorize_resume(&run.resume_digest, presented).is_ok()
+                    }
+                    _ => false,
+                };
+                if authorized {
+                    let affected = tx
+                        .execute(
+                            "UPDATE instances SET paused = 0, resume_digest = '',
+                                    status = 'running', updated_at = ?2
+                              WHERE instance_id = ?1 AND paused = 1",
+                            params![run.instance_id, ctx.at],
+                        )
+                        .map_err(|err| StateError::from_sqlite("admit_queue_item: resume", err))?;
+                    if affected == 1 {
+                        return Ok(AdmissionDecision::Admitted {
+                            instance_id: run.instance_id.clone(),
+                        });
+                    }
+                    return Ok(AdmissionDecision::Refused {
+                        code: crate::queue_executor::codes::PAUSED,
+                        message: "the run left its paused state while the submission committed; \
+                             no implicit state change is applied"
+                            .to_string(),
+                    });
+                }
+                if run.paused {
+                    return Ok(AdmissionDecision::Refused {
+                        code: crate::queue_executor::codes::PAUSED,
+                        message: format!(
+                            "run {} is paused and stays paused: a paused fleet is resumed only \
+                             with a separate explicit engine-minted resume authorization",
+                            run.instance_id
+                        ),
                     });
                 }
                 return Ok(AdmissionDecision::Refused {
-                    code: crate::queue_executor::codes::PAUSED,
-                    message: "the run left its paused state while the submission committed; \
-                         no implicit state change is applied"
-                        .to_string(),
-                });
-            }
-            if run.paused {
-                return Ok(AdmissionDecision::Refused {
-                    code: crate::queue_executor::codes::PAUSED,
+                    code: crate::queue_executor::codes::ALREADY_OWNED,
                     message: format!(
-                        "run {} is paused and stays paused: a paused fleet is resumed only \
-                         with a separate explicit engine-minted resume authorization",
+                        "run {} already owns this issue; a duplicate submission never \
+                         creates a second owner",
                         run.instance_id
                     ),
                 });
             }
-            return Ok(AdmissionDecision::Refused {
-                code: crate::queue_executor::codes::ALREADY_OWNED,
-                message: format!(
-                    "run {} already owns this issue; a duplicate submission never \
-                     creates a second owner",
-                    run.instance_id
-                ),
-            });
         }
     } else {
         None
@@ -864,6 +905,36 @@ fn admit_queue_item_in_tx(
                 grant.scope
             ),
         });
+    }
+    if let Some((instance_id, superseded_grant)) = rotation {
+        let affected = tx
+            .execute(
+                "UPDATE instances SET grant_id = ?2, updated_at = ?3
+                  WHERE instance_id = ?1 AND grant_id = ?4
+                    AND status IN ('new', 'running', 'human_queue', 'blocked')",
+                params![instance_id, grant_id, ctx.at, superseded_grant],
+            )
+            .map_err(|err| StateError::from_sqlite("admit_queue_item: rotate grant", err))?;
+        if affected != 1 {
+            return Err(state_error(
+                "state.ownership_conflict",
+                format!("run {instance_id} changed before its expired grant rotation committed"),
+            ));
+        }
+        let mut key = format!("ik_rotate-{instance_id}-{grant_id}");
+        key.truncate(64);
+        ctx.state.append_audit_locked(
+            tx,
+            "grant.rotation",
+            &format!(
+                "run:{instance_id}:superseded:{superseded_grant}:replacement:{grant_id}:expires:{}",
+                grant.expires_at
+            ),
+            &key,
+            None,
+            Some(grant_id),
+        )?;
+        return Ok(AdmissionDecision::Admitted { instance_id });
     }
     if let Some((code, message)) = slots.hold() {
         return Ok(AdmissionDecision::Waiting { code, message });
@@ -2820,16 +2891,43 @@ impl State {
         instance_id: &str,
     ) -> Result<Option<RecordedDispatch>, StateError> {
         let conn = self.lock("run_dispatch_context")?;
+        let submissions: Vec<String> = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT submission_id FROM queue_submission_items
+                      WHERE instance_id = ?1 AND status = 'admitted' ORDER BY rowid",
+                )
+                .map_err(|err| {
+                    StateError::from_sqlite("run_dispatch_context: submissions prepare", err)
+                })?;
+            let rows = statement
+                .query_map(params![instance_id], |row| row.get::<_, String>(0))
+                .map_err(|err| {
+                    StateError::from_sqlite("run_dispatch_context: submissions query", err)
+                })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(|err| {
+                    StateError::from_sqlite("run_dispatch_context: submission row", err)
+                })?);
+            }
+            out
+        };
         let mut statement = conn
             .prepare(
-                "SELECT request_line, response FROM idempotency
-                  WHERE method = 'apply' AND outcome IS NOT NULL
+                "SELECT method, key, request_line, COALESCE(response, '') FROM idempotency
+                  WHERE method IN ('queue.submit', 'apply') AND outcome IS NOT NULL
                   ORDER BY rowid",
             )
             .map_err(|err| StateError::from_sqlite("run_dispatch_context: prepare", err))?;
         let rows = statement
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
             })
             .map_err(|err| StateError::from_sqlite("run_dispatch_context: query", err))?;
         let mut topology: Option<Val> = None;
@@ -2837,12 +2935,42 @@ impl State {
         let mut integration_base: Option<String> = None;
         let mut feature_head: Option<String> = None;
         for row in rows {
-            let (line, response_line) =
+            let (method, key, line, response_line) =
                 row.map_err(|err| StateError::from_sqlite("run_dispatch_context: row", err))?;
             let Ok(request) = Val::parse_json(&line) else {
                 continue;
             };
             let params = request.get("params").cloned().unwrap_or_else(null);
+            if method == "queue.submit" {
+                let digest = params
+                    .get("digest")
+                    .and_then(Val::as_str)
+                    .unwrap_or_default();
+                let submission = crate::queue_executor::submission_id(digest, &key);
+                if !submissions.iter().any(|known| known == &submission) {
+                    continue;
+                }
+                if let Some(dispatch @ Val::Obj(_)) = params.get("dispatch") {
+                    if let Some(presented @ Val::Obj(_)) = dispatch.get("topology") {
+                        match &topology {
+                            Some(bound) if bound != presented => {
+                                return Err(state_error(
+                                    "state.corrupt",
+                                    format!(
+                                        "run {instance_id} recorded conflicting dispatch topologies"
+                                    ),
+                                ));
+                            }
+                            None => topology = Some(presented.clone()),
+                            _ => {}
+                        }
+                    }
+                    if let Some(presented @ Val::Obj(_)) = dispatch.get("admission") {
+                        admission = Some(presented.clone());
+                    }
+                }
+                continue;
+            }
             if params.get("instance_id").and_then(Val::as_str) != Some(instance_id) {
                 continue;
             }
@@ -2878,6 +3006,7 @@ impl State {
                 }
                 if let Some(head) = result
                     .get("feature_head")
+                    .or_else(|| result.get("head"))
                     .and_then(Val::as_str)
                     .filter(|head| crate::formats::is_hex40(head))
                 {
@@ -3478,6 +3607,7 @@ impl State {
                 },
                 SubmissionVerdict::Approved => {
                     let admission = QueueAdmission {
+                        state: self,
                         repository: &plan.repository,
                         submission_id: &plan.submission_id,
                         epoch,
@@ -10950,6 +11080,9 @@ pub struct QueueItemRef {
 pub struct SupervisionEvidence {
     /// The durable run row.
     pub run: InstanceRow,
+    /// Whether a committed submission/apply claim contains the topology and
+    /// admission material required to dispatch the next supported step.
+    pub has_dispatch_context: bool,
     /// The live owner run recorded for the run's work item, when one is.
     pub ownership_instance: Option<String>,
     /// The committed submission that admitted the run, when one is.
@@ -11538,6 +11671,7 @@ fn queue_advance_attempt_locked(
 /// attestation, and is armed with the delivering run's supervision
 /// authorization so the queue keeps continuing.
 fn advance_queue_in_tx(
+    state: &State,
     tx: &rusqlite::Transaction<'_>,
     delivery: &crate::supervision::VerifiedDelivery,
     delivering_instance: &str,
@@ -11767,6 +11901,7 @@ fn advance_queue_in_tx(
                     admitted_harness: 0,
                 };
                 let admission = QueueAdmission {
+                    state,
                     repository: &submission.repository,
                     submission_id: &submission.submission_id,
                     epoch,
@@ -12193,6 +12328,59 @@ impl State {
         Ok(next.map(|unix| (unix - now_unix).max(0)))
     }
 
+    /// Whether this run has committed host-local material for autonomous
+    /// dispatch. Queue submission context belongs only to its exact durable
+    /// submission; apply context belongs only to its exact run.
+    fn has_dispatch_context_locked(
+        &self,
+        conn: &Connection,
+        instance_id: &str,
+        submission: Option<&str>,
+    ) -> Result<bool, StateError> {
+        let mut statement = conn
+            .prepare(
+                "SELECT method, key, request_line FROM idempotency
+                  WHERE method IN ('apply', 'queue.submit') AND outcome IS NOT NULL
+                  ORDER BY rowid DESC",
+            )
+            .map_err(|err| StateError::from_sqlite("supervision dispatch context: prepare", err))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|err| StateError::from_sqlite("supervision dispatch context: query", err))?;
+        for row in rows {
+            let (method, key, line) = row
+                .map_err(|err| StateError::from_sqlite("supervision dispatch context: row", err))?;
+            let Ok(request) = Val::parse_json(&line) else {
+                continue;
+            };
+            let Some(params) = request.get("params") else {
+                continue;
+            };
+            if method == "apply"
+                && params.get("instance_id").and_then(Val::as_str) == Some(instance_id)
+                && matches!(params.get("topology"), Some(Val::Obj(_)))
+            {
+                return Ok(true);
+            }
+            if method != "queue.submit" || !matches!(params.get("dispatch"), Some(Val::Obj(_))) {
+                continue;
+            }
+            let Some(digest) = params.get("digest").and_then(Val::as_str) else {
+                continue;
+            };
+            if submission == Some(crate::queue_executor::submission_id(digest, &key).as_str()) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// The recorded-evidence snapshot of one supervised run, read under ONE
     /// guard. `None` when no supervision row exists (a run that was never
     /// authorized is never evaluated).
@@ -12222,7 +12410,8 @@ impl State {
                         i.issue_number, i.status
                    FROM queue_submission_items i
                    JOIN queue_submissions s ON s.submission_id = i.submission_id
-                  WHERE i.instance_id = ?1 AND i.status = 'admitted'",
+                  WHERE i.instance_id = ?1 AND i.status = 'admitted'
+                  ORDER BY i.rowid DESC LIMIT 1",
             )
             .map_err(|err| StateError::from_sqlite("supervision_evidence: submission", err))?;
         let submission: Option<(String, String, String, i64, String, i64, String)> = statement
@@ -12263,6 +12452,8 @@ impl State {
             ),
             None => (None, None, Vec::new(), None),
         };
+        let has_dispatch_context =
+            self.has_dispatch_context_locked(&conn, instance_id, submission_id.as_deref())?;
         let ownership_instance: Option<String> = conn
             .query_row(
                 "SELECT instance_id FROM queue_ownership WHERE instance_id = ?1",
@@ -12326,6 +12517,7 @@ impl State {
             .map_err(|err| StateError::from_sqlite("supervision_evidence: newest", err))?;
         Ok(Some(SupervisionEvidence {
             run,
+            has_dispatch_context,
             ownership_instance,
             submission_id,
             submission_digest,
@@ -12554,7 +12746,7 @@ impl State {
         // guard (see `advance_queue_in_tx`); a refusal inside it rolls the
         // check back rather than committing a half an advance.
         if let Some(delivery) = &plan.advance {
-            advance_queue_in_tx(&tx, delivery, &plan.instance_id, &plan.at)?;
+            advance_queue_in_tx(self, &tx, delivery, &plan.instance_id, &plan.at)?;
         }
         tx.commit()
             .map_err(|err| StateError::from_sqlite("commit_supervision_check: commit", err))?;

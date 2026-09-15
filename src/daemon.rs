@@ -3613,7 +3613,17 @@ fn method_run_retry(shared: &Arc<Shared>, request: &Request) -> String {
             .grant_by_id(&run.grant_id)
             .map_err(|err| (err.code, err.message))?;
         match grant {
-            Some(grant) if grant.status == "active" => {}
+            Some(grant) if grant.status == "active" => {
+                if crate::mutation::is_expired(&grant.expires_at, &time::rfc3339_now()) {
+                    return Err((
+                        crate::mutation::code::GRANT_EXPIRED,
+                        format!(
+                            "grant {} of run {} expired at {}; rotate it explicitly before retrying",
+                            grant.grant_id, parsed.instance_id, grant.expires_at
+                        ),
+                    ));
+                }
+            }
             Some(grant) => {
                 return Err((
                     crate::mutation::code::GRANT_INACTIVE,

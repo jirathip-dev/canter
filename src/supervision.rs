@@ -1,6 +1,6 @@
 //! Supervised reconciliation driver (issue #95): durable, event-driven
-//! evaluation of explicitly authorized runs, with a bounded timer fallback
-//! and NO continuation effect.
+//! evaluation and bounded dispatch of explicitly authorized runs, with a
+//! timer fallback.
 //!
 //! Scope of this slice, stated positively and negatively:
 //!
@@ -10,17 +10,20 @@
 //!   authorization binds the approved preview digest, so a run whose
 //!   recorded binding no longer matches (unapproved/drifted plan) is
 //!   classified `unknown`/held and is never eligible.
-//! - The driver **evaluates and reports**, and performs exactly ONE bounded
-//!   continuation effect (issue #96): when the recorded evidence of an
+//! - The driver **evaluates and reports** and dispatches an armed run's first
+//!   and next unattempted autonomous step through the daemon's existing apply
+//!   engine. That preserves the committed grant, capability, admission,
+//!   ownership, topology, journal and idempotency gates; diagnosed steps still
+//!   require the operator's explicit corrected retry dispatch.
+//! - It also performs exactly ONE queue-continuation effect (issue #96): when
+//!   the recorded evidence of an
 //!   authorized run is a fresh VERIFIED delivery (reviewed `pass` with every
 //!   named check `passed` at the recorded delivered head, bound to the run's
 //!   own workflow/policy pins), the driver advances that run's
 //!   already-authorized queue cursor — once per delivered issue — and admits
 //!   the next eligible approved issue of the SAME committed submission under
-//!   the existing admission and ownership checks. It never spawns, prompts,
-//!   resumes, retries, mutates Git or clears a hold: the admitted run is a
-//!   durable run record and no workflow step is executed. `continuation-eligible`
-//!   stays a REPORT for a later slice.
+//!   the existing admission and ownership checks. It never resumes a pause,
+//!   authorizes a retry, retries a diagnosed step or clears a hold.
 //! - A duplicate delivery event, a replayed check or a crash/restart never
 //!   duplicates a dispatch: the advance is keyed to the delivered issue
 //!   (one consumption per submission item, ever) and the cursor is derived
@@ -82,7 +85,8 @@ pub const SUPERVISION_SCHEMA: &str = "hf-supervision/v1";
 /// params (module-local).
 pub const AUTHORIZATION_SCHEMA: &str = "hf-supervision-authorization/v1";
 
-/// Closed desired-supervision vocabulary. `armed` evaluates; `disabled` is
+/// Closed desired-supervision vocabulary. `armed` evaluates and dispatches
+/// supported unattempted steps; `disabled` is
 /// an explicit recorded decision NOT to supervise (the default when no
 /// authorization block is presented at all is no row).
 pub const DESIRED: [&str; 2] = ["armed", "disabled"];
@@ -115,7 +119,7 @@ pub const TRIGGERS: [&str; 7] = [
 
 /// The statement every supervision document carries: what this surface does
 /// and provably does NOT do.
-pub const STATEMENT: &str = "supervision only: one explicitly authorized run is classified from recorded evidence (never inferred from activity); a fresh verified reviewed-and-CI-green delivery of that run advances its already-authorized queue cursor exactly once and admits the next eligible approved issue of the same committed submission as a durable run record under the existing admission and ownership checks (no workflow step is executed), and supervision never otherwise continues work, spawns, prompts, resumes a pause, authorizes a retry, mutates Git or clears a hold, so no harness/LLM/process effect occurs";
+pub const STATEMENT: &str = "an explicitly armed run is classified from recorded evidence and each unattempted autonomous next step is dispatched through the existing apply engine with the committed grant, capability, admission, ownership, topology, journal and idempotency gates; a fresh verified reviewed-and-CI-green delivery advances its authorized queue cursor exactly once under the same admission and ownership checks; supervision never resumes a pause, authorizes or consumes a retry, retries a diagnosed step, invents missing inputs or clears a hold";
 
 /// Default bounded timer fallback cadence (seconds).
 pub const DEFAULT_CHECK_INTERVAL_SECS: i64 = 60;
@@ -150,7 +154,15 @@ pub const DEFAULT_MAX_WAIT_SECS: i64 = 60;
 /// `crate::mutation`), grouped by the evidence source they wait on.
 const WORKER_STEP_KINDS: [&str; 3] = ["harness_start", "prompt", "collect_outcome"];
 const CI_STEP_KINDS: [&str; 2] = ["hosted_check", "post_merge_verify"];
-const APPROVAL_STEP_KINDS: [&str; 1] = ["approve"];
+const APPROVAL_STEP_KINDS: [&str; 2] = ["approve", "review_evidence"];
+const AUTONOMOUS_STEP_KINDS: [&str; 6] = [
+    "checkout",
+    "worktree_create",
+    "harness_start",
+    "prompt",
+    "collect_outcome",
+    "hosted_check",
+];
 
 /// Stable supervision codes: `usage.supervision.*` for presented shape
 /// errors, `supervision.*` for recorded-evidence classifications.
@@ -206,6 +218,9 @@ pub mod codes {
     /// The committed check dispatched the run's next unachieved step through
     /// the apply engine (issue #92 F4).
     pub const DISPATCH: &str = "supervision.dispatch.next_step";
+    /// The run was armed without the host-local topology/admission context
+    /// required by the gated apply path.
+    pub const DISPATCH_CONTEXT_MISSING: &str = "supervision.dispatch_context_missing";
 }
 
 /// A typed supervision error/refusal (fail closed; stable codes).
@@ -543,14 +558,13 @@ pub trait SupervisedDispatch: Send + Sync {
 /// operator's own corrected dispatch consumes the authorization exactly once
 /// through the apply path.
 ///
-/// Non-armed/unknown supervision therefore keeps its classification-only,
-/// zero-effect guarantee verbatim: this function returns `None` for every
-/// row that is not explicitly armed.
+/// Non-armed/unknown supervision keeps its zero-effect guarantee: this
+/// function returns `None` for every row that is not explicitly armed.
 pub fn dispatch_intent(
     row: &SupervisionRow,
     evidence: &SupervisionEvidence,
 ) -> Option<DispatchIntent> {
-    if row.desired != "armed" {
+    if !evidence.has_dispatch_context || row.desired != "armed" {
         return None;
     }
     if !authorization_bound(evidence, &row.authorization_digest) {
@@ -568,14 +582,10 @@ pub fn dispatch_intent(
     if evidence.in_flight.is_some() {
         return None;
     }
-    // A run that never dispatched a step carries no durable dispatch context
-    // (the topology and admission inputs its own applies presented), so its
-    // FIRST dispatch belongs to the caller who holds them: supervision never
-    // invents a topology or a measurement for it.
-    if evidence.attempts.is_empty() {
+    let (step_id, kind) = next_unachieved_step(evidence)?;
+    if !AUTONOMOUS_STEP_KINDS.contains(&kind.as_str()) {
         return None;
     }
-    let (step_id, kind) = next_unachieved_step(evidence)?;
     match latest_attempt_for(evidence, &step_id) {
         // Never dispatched: the plain continuation of an armed run.
         None => {}
@@ -750,6 +760,25 @@ pub fn classify(
     // 5. Live work: an in-flight step claim is legitimate long-running work.
     if evidence.in_flight.is_some() {
         return Verdict::new("healthy", codes::IN_FLIGHT, false, &next_step);
+    }
+    if AUTONOMOUS_STEP_KINDS.contains(&next_kind.as_str())
+        && latest_attempt_for(evidence, &next_step).is_none()
+        && !evidence.has_dispatch_context
+    {
+        return Verdict::new(
+            "needs-attention",
+            codes::DISPATCH_CONTEXT_MISSING,
+            false,
+            &next_step,
+        );
+    }
+    // A never-attempted, fully authored executor step is eligible NOW. The
+    // driver dispatches it through the apply engine on this same check.
+    if evidence.has_dispatch_context
+        && AUTONOMOUS_STEP_KINDS.contains(&next_kind.as_str())
+        && latest_attempt_for(evidence, &next_step).is_none()
+    {
+        return Verdict::new("healthy", codes::DISPATCH, true, &next_step);
     }
     // 6. Known waits for external evidence: never a progress-timeout case.
     if APPROVAL_STEP_KINDS.contains(&next_kind.as_str()) {
@@ -1177,8 +1206,7 @@ pub struct SupervisorOptions {
     pub max_wait_secs: i64,
     /// The dispatch hook of an armed run's continuation (issue #92 F4). The
     /// daemon implements it with the merged apply engine; `None` keeps the
-    /// driver classification-only (no effect ever leaves this crate's
-    /// pre-#92 supervision contract).
+    /// driver classification-only.
     pub dispatch: Option<Arc<dyn SupervisedDispatch>>,
 }
 
@@ -1199,6 +1227,8 @@ pub struct SupervisorWake {
     gate: Mutex<bool>,
     condvar: Condvar,
     ticks: AtomicU64,
+    #[cfg(test)]
+    deadline_evaluations: AtomicU64,
     checks: AtomicU64,
     /// Dispatches handed to the daemon's apply engine (issue #92 F4).
     dispatches: AtomicU64,
@@ -1216,6 +1246,8 @@ impl SupervisorWake {
             gate: Mutex::new(false),
             condvar: Condvar::new(),
             ticks: AtomicU64::new(0),
+            #[cfg(test)]
+            deadline_evaluations: AtomicU64::new(0),
             checks: AtomicU64::new(0),
             dispatches: AtomicU64::new(0),
             waiting: AtomicBool::new(false),
@@ -1281,9 +1313,13 @@ impl SupervisorWake {
             Some(deadline) => {
                 let now = Instant::now();
                 if deadline <= now {
-                    return;
+                    // A due row can remain due when its reconciliation cannot
+                    // commit. Back off instead of re-querying SQLite in a
+                    // full-core loop; a new-work wake still interrupts this.
+                    Duration::from_secs(1)
+                } else {
+                    deadline - now
                 }
-                deadline - now
             }
             None => Duration::from_secs(DEFAULT_MAX_WAIT_SECS as u64),
         };
@@ -1431,6 +1467,10 @@ impl SupervisorCore {
 
     /// The nearest wake instant: the smallest scheduled check (bounded).
     fn next_deadline(&self) -> Option<Instant> {
+        #[cfg(test)]
+        self.wake
+            .deadline_evaluations
+            .fetch_add(1, Ordering::SeqCst);
         let wait = {
             let state = match self.state.lock() {
                 Ok(state) => state,
@@ -1733,6 +1773,7 @@ mod tests {
     ) -> SupervisionEvidence {
         SupervisionEvidence {
             run,
+            has_dispatch_context: true,
             ownership_instance: Some("run-0123456789abcdef".to_string()),
             submission_digest: submission_digest.map(str::to_string),
             submission_id: Some("qs_0123456789abcdef".to_string()),
@@ -1802,7 +1843,7 @@ mod tests {
         };
         let digest = "d".repeat(64);
         let bound = Some(digest.as_str());
-        let steps = [("checkout", "checkout"), ("check", "hosted_check")];
+        let steps = [("merge", "merge"), ("check", "hosted_check")];
         let fresh = "2026-09-13T00:00:30Z";
         let fresh_unix = time::unix_from_rfc3339(fresh).expect("instant");
         let classify_at = |mut evidence: SupervisionEvidence, now_unix: i64| {
@@ -1866,11 +1907,17 @@ mod tests {
         let verdict = classify(&in_flight, &digest, &policy, fresh_unix);
         assert_eq!(verdict.class, "healthy");
         assert_eq!(verdict.reason, codes::IN_FLIGHT);
-        // Known waits never trigger a continuation, however old the marker.
-        for (kind, class, reason) in [
-            ("hosted_check", "waiting-CI", codes::WAITING_CI),
-            ("prompt", "waiting-workers", codes::WAITING_WORKERS),
-            ("approve", "waiting-approval", codes::WAITING_APPROVAL),
+        // Fully authored autonomous frontiers dispatch; explicit approval
+        // remains a known external wait.
+        for (kind, class, reason, eligible) in [
+            ("hosted_check", "healthy", codes::DISPATCH, true),
+            ("prompt", "healthy", codes::DISPATCH, true),
+            (
+                "approve",
+                "waiting-approval",
+                codes::WAITING_APPROVAL,
+                false,
+            ),
         ] {
             let evidence = evidence_for(
                 run_row("run-0123456789abcdef"),
@@ -1882,7 +1929,7 @@ mod tests {
             let verdict = classify(&evidence, &digest, &policy, fresh_unix);
             assert_eq!(verdict.class, class, "kind {kind}");
             assert_eq!(verdict.reason, reason);
-            assert!(!verdict.eligible);
+            assert_eq!(verdict.eligible, eligible);
         }
         // A capacity refusal on the next step blocks capacity.
         let evidence = evidence_for(
@@ -2521,7 +2568,7 @@ mod tests {
                 "2026-09-13T00:00:00Z",
             )
             .expect("arm");
-        let steps = [("checkout", "checkout")];
+        let steps = [("merge", "merge")];
         let now = 1_800_000_000;
         // 1. No observation recorded yet: held, and the commit must not open
         //    a window (this is the reviewer's exact scenario).
@@ -2590,7 +2637,7 @@ mod tests {
                 "2026-09-13T00:00:00Z",
             )
             .expect("arm");
-        let steps = [("checkout", "checkout")];
+        let steps = [("merge", "merge")];
         let now = 1_800_000_000;
         // A committed HELD check is reported as held ...
         let unobserved = evidence_for(run_row(run), Some(&digest), &steps, &[], "");
@@ -2667,6 +2714,38 @@ mod tests {
             Some("healthy"),
             "the observation is reported separately, never as the record"
         );
+    }
+
+    #[test]
+    fn cycle2_idle_driver_bounds_deadline_evaluations_and_wakes() {
+        // An immediately due deadline models an overdue check that cannot commit.
+        // The read-only next_deadline calculation must not become a busy loop.
+        let state = Arc::new(Mutex::new(temp_state("idle-deadline")));
+        let mut driver = start(
+            state,
+            SupervisorOptions {
+                max_wait_secs: 0,
+                dispatch: None,
+            },
+        );
+        let wake = driver.wake_handle();
+        std::thread::sleep(Duration::from_millis(350));
+        let evaluations = wake.deadline_evaluations.load(Ordering::SeqCst);
+        let ticks = wake.ticks();
+        wake.wake();
+        let until = Instant::now() + Duration::from_secs(2);
+        while wake.ticks() == ticks && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let woke = wake.ticks() > ticks;
+        wake.signal_stop();
+        assert!(driver.join());
+        eprintln!("IDLE_WINDOW_MS=350 NEXT_DEADLINE_EVALUATIONS={evaluations} WAKE={woke}");
+        assert!(
+            evaluations <= 2,
+            "idle driver spun: {evaluations} evaluations"
+        );
+        assert!(woke, "a new-work wake must interrupt the deadline wait");
     }
 
     #[test]
