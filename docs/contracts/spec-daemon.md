@@ -322,17 +322,17 @@ outcome after the effect transaction commits.
   resolved `ambiguous` like every other interrupted mutation, so a retry
   needs a fresh key and no effect is ever repeated.
 
-## Run-scoped control methods (issue #86)
+## Run-scoped control methods (issue #86 + issue #146)
 
-Safe-boundary pause, resume, bounded retry, evidence resolution and one supported step dispatch
-over exactly ONE run — the
+Safe-boundary pause, resume, bounded retry, evidence resolution, one supported step dispatch
+and the explicit release of a run that can never progress over exactly ONE run — the
 `run-` instance row the queue executor commits for every admitted issue
-(spec-state.md "Run control additions"). All six methods address one
+(spec-state.md "Run control additions"). All seven methods address one
 exact run identity, journal through the same claim machinery as every
 daemon mutation (`params.idempotency_key` required on the mutating paths;
 a same-key retry replays the recorded response) and render a module-local
 document (`hf-run-control/v1` / `hf-run-retry/v1` /
-`hf-run-resolution/v1` / `hf-run-dispatch/v1`,
+`hf-run-resolution/v1` / `hf-run-dispatch/v1` / `hf-run-release/v1`,
 deliberately outside the closed `hf-*` family set like the #84 preview and
 the #85 submission).
 
@@ -340,7 +340,7 @@ the #85 submission).
 
 | level | identity | methods | effect of a control |
 | --- | --- | --- | --- |
-| run | one `run-` + 16 hex instance id | `run.pause` / `run.resume` / `run.retry` / `run.resolve` / `run.dispatch` / `run.status` | exactly this run: stop admitting new steps, lift THIS run's pause, authorize one bounded re-dispatch of one diagnosed step (authorization only), resolve one diagnosed prompt from recorder-attributed evidence without an effect, or dispatch ONE committed-spine step with the caller's own step inputs |
+| run | one `run-` + 16 hex instance id | `run.pause` / `run.resume` / `run.retry` / `run.release` / `run.resolve` / `run.dispatch` / `run.status` | exactly this run: stop admitting new steps, lift THIS run's pause, authorize one bounded re-dispatch of one diagnosed step (authorization only), release a run that can never progress — its issue ownership and the occupancy it held are freed and it goes terminal (bookkeeping only), resolve one diagnosed prompt from recorder-attributed evidence without an effect, or dispatch ONE committed-spine step with the caller's own step inputs |
 | fleet | the whole run population | NONE — there is no `fleet.*` method in the closed set | a fleet-level hold is an operator policy expressed as the set of paused runs; every resume is fenced on the exact instance id, so no run control ever lifts another run's pause or anything fleet-wide |
 | lane | one handoff lane generation (`rp_` records) | `lane.*` only | run controls never touch lane records; a non-run identity refuses `refusal.run.target` |
 
@@ -400,6 +400,32 @@ clears a repository/fleet-level hold or bypasses a gate.
   who supplies the corrected step inputs (see `run.dispatch`). A
   re-dispatch of a diagnosed failed step without an unconsumed
   authorization refuses `refusal.run.retry_required` before any effect.
+- `run.release` (issue #146) requires `params.instance_id`,
+  `params.reason` (1-300 printable characters) and
+  `params.idempotency_key`. It releases exactly ONE run that can never
+  progress, in ONE transaction: the run's unique ownership row is removed,
+  the run goes terminal (`invalidated`, pause state cleared and the resume
+  digest consumed) so it stops counting against the global,
+  per-repository and per-harness occupancy, and a `run.release` audit
+  record carries the operator reason, the exact run identity
+  (repository/issue/revision), what was freed and the authorization window
+  the run held. It refuses BEFORE any effect while anything of that run is
+  genuinely live: a step-dispatch claim still in flight
+  (`refusal.run.in_flight` — nothing is killed, cancelled or cleaned up),
+  an unconsumed bounded retry authorization (`refusal.run.retry_pending` —
+  the authorization is never burned), a terminal run
+  (`refusal.run.terminal`, so a second release needs the SAME idempotency
+  key to replay the recorded response) and an unknown run
+  (`state.not_found`). A missing, revoked or EXPIRED grant is deliberately
+  NOT a fence: such a run is exactly what a release exists for, and the
+  release records that window (`release.authorization.status` /
+  `expires_at` / `usable:false`) without presenting or reusing it — a
+  continuation of that work needs a freshly minted grant window (a
+  same-binding rotation), never a silent reuse of the expired one. A
+  released run is never resumed, retried, dispatched or continued: the
+  engine refuses a terminal instance (`refusal.instance.state`) and
+  supervision's dispatch intent is a no-op for it, while the freed issue
+  is admitted by a fresh submission on its own merits.
 - `run.resolve` requires one diagnosed `prompt` step plus a recorder identity
   and closed artifact evidence (`feature_head`, the prompt's bound `branch`,
   `pull_request {repository, number}`, and non-empty named `checks`). It

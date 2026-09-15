@@ -121,6 +121,7 @@ fn every_documented_command_has_working_help() {
         "run pause",
         "run resume",
         "run retry",
+        "run release",
         "run resolve",
         "run dispatch",
         "run status",

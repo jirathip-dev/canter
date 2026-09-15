@@ -23,8 +23,8 @@ use canter::lifecycle::ConcurrencyCaps;
 use canter::plan::DOCTRINE_WORKFLOW_ID;
 use canter::queue_preview as qp;
 use canter::state::{
-    QueueSubmissionItemPlan, QueueSubmissionPlan, Retention, RunRetryClaim, State,
-    SubmissionVerdict,
+    QueueSubmissionItemPlan, QueueSubmissionItemRow, QueueSubmissionPlan, Retention, RunRetryClaim,
+    State, SubmissionVerdict,
 };
 use canter::value::{Val, integer, object, string};
 
@@ -36,6 +36,13 @@ const WORKFLOW_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef012
 const POLICY_HASH: &str = "feedface01234567feedface01234567feedface01234567feedface01234567";
 const GRANT_5: &str = "gr_0000000000000091";
 const GRANT_6: &str = "gr_0000000000000092";
+/// A FRESHLY issued window for issue #5's binding (issue #146: a released
+/// run's expired window is never silently reused — the fresh submission
+/// presents a new issuance for the same binding).
+const GRANT_5B: &str = "gr_0000000000000093";
+/// Windows for the issues a release frees capacity for (issue #146).
+const GRANT_7: &str = "gr_0000000000000094";
+const GRANT_8: &str = "gr_0000000000000095";
 const AT: &str = "2026-09-12T00:00:00Z";
 
 fn bin() -> &'static str {
@@ -168,10 +175,32 @@ fn work_item(number: i64) -> String {
 /// admitted run ids in membership order. The bound-input line is the REAL
 /// preview document, so the run's step spine is exactly the reviewed spine.
 fn seed_submission(state: &State, issues: &[(i64, &str)]) -> Vec<String> {
+    submit_with_id(
+        state,
+        &format!("qs_{:016x}", 0x86u64 + std::process::id() as u64),
+        issues,
+    )
+    .iter()
+    .filter_map(|item| item.instance_id.clone())
+    .collect()
+}
+
+/// Commit ONE submission under an EXPLICIT submission id and return its
+/// recorded item rows (issue #146: the release witnesses submit the same
+/// issue more than once inside one fixture, so the derived submission id
+/// cannot be reused). Presenting a grant id that is already issued reuses
+/// that exact row (a rotation/re-presentation never mints a second grant).
+fn submit_with_id(
+    state: &State,
+    submission_id: &str,
+    issues: &[(i64, &str)],
+) -> Vec<QueueSubmissionItemRow> {
     for (number, grant_id) in issues {
-        state
-            .issue_grant(&grant_doc(grant_id, *number))
-            .expect("issue grant");
+        if state.grant_by_id(grant_id).expect("grant read").is_none() {
+            state
+                .issue_grant(&grant_doc(grant_id, *number))
+                .expect("issue grant");
+        }
     }
     let request = request_with(
         issues
@@ -182,7 +211,7 @@ fn seed_submission(state: &State, issues: &[(i64, &str)]) -> Vec<String> {
     let (bound, digest) = render_bound(state, &request);
     let epoch = state.current_epoch().expect("epoch");
     let plan = QueueSubmissionPlan {
-        submission_id: format!("qs_{:016x}", 0x86u64 + std::process::id() as u64),
+        submission_id: submission_id.to_string(),
         repository: REPO.to_string(),
         state_epoch: epoch,
         digest: digest.clone(),
@@ -220,9 +249,6 @@ fn seed_submission(state: &State, issues: &[(i64, &str)]) -> Vec<String> {
     };
     let (_, items) = state.submit_queue_run(&plan).expect("submission commits");
     items
-        .iter()
-        .filter_map(|item| item.instance_id.clone())
-        .collect()
 }
 
 /// The canonical request line of one recorded `apply` attempt.
@@ -1748,6 +1774,489 @@ fn wire_retry_addresses_the_ledger_frontier_not_a_stale_node() {
         !retries[0].consumed_at.is_empty(),
         "the authorization was consumed by the single re-dispatch"
     );
+
+    shutdown(daemon);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #146: the explicit release of a run that can never progress —
+// ownership/occupancy freed, the reason and the run identity audited, and
+// every genuinely live run still fenced.
+// ---------------------------------------------------------------------------
+
+/// The recorded `run.release` audit records of one state store, oldest
+/// first (the release transaction appends its record with the effect).
+fn release_records(state: &State) -> Vec<Val> {
+    let (_, lines) = state.journal_tail(0, 10_000).expect("journal tail");
+    lines
+        .iter()
+        .filter_map(|line| Val::parse_json(line).ok())
+        .filter(|doc| doc.get("action").and_then(Val::as_str) == Some("run.release"))
+        .collect()
+}
+
+fn release_params(key: &str, instance_id: &str, reason: &str) -> Val {
+    canter::run_control::release_params(key, instance_id, reason)
+}
+
+/// The `(status, reason)` of the only item of one recorded submission.
+fn item_outcome(item: &QueueSubmissionItemRow) -> (&str, &str) {
+    (
+        item.status.as_str(),
+        item.reason.as_deref().unwrap_or_default(),
+    )
+}
+
+#[test]
+fn state_release_frees_the_issue_for_a_fresh_submission() {
+    let fixture = StateFixture::new("release-state");
+    let state = fixture.open();
+    let runs = seed_submission(&state, &[(5, GRANT_5), (6, GRANT_6)]);
+    let victim = runs[0].clone();
+    let other = runs[1].clone();
+    assert_eq!(state.queue_ownership_rows().expect("ownership").len(), 2);
+
+    // Control (the reported symptom): while the predecessor owns #5, a fresh
+    // submission for that issue is refused outright.
+    let owned = submit_with_id(&state, "qs_0000000000000101", &[(5, GRANT_5)]);
+    assert_eq!(
+        item_outcome(&owned[0]),
+        ("refused", "submission.already_owned")
+    );
+
+    // The release: ONE transaction that frees the ownership row and the run
+    // itself, and records why.
+    let outcome = state
+        .release_run(
+            &victim,
+            "dead predecessor kept permanent ownership",
+            "ik_release-146-0001",
+            AT,
+        )
+        .expect("release commits");
+    assert!(outcome.ownership_freed);
+    assert_eq!(outcome.run.status, "invalidated");
+    assert!(outcome.grant_usable, "the window it held is recorded");
+
+    // Ownership is free: only the unrelated lane remains, and the released
+    // run keeps its committed spine (a release is not a rewrite).
+    let owners = state.queue_ownership_rows().expect("ownership");
+    assert_eq!(owners.len(), 1);
+    assert_eq!(owners[0].instance_id, other);
+    assert!(state.run_step_spine(&victim).expect("spine").is_some());
+
+    // A second release is typed, never a second effect.
+    let err = state
+        .release_run(&victim, "again", "ik_release-146-0002", AT)
+        .expect_err("a terminal run has nothing to release");
+    assert_eq!(err.code, "refusal.run.terminal");
+
+    // The audit carries the reason, the exact run identity and the window.
+    let records = release_records(&state);
+    assert_eq!(records.len(), 1, "exactly ONE release record: {records:?}");
+    let target = records[0]
+        .get("target")
+        .and_then(Val::as_str)
+        .expect("recorded target");
+    assert!(target.starts_with(&format!("run:{victim}:")), "{target}");
+    assert!(
+        target.contains(&format!("repository:{REPO}#5@{REV_A}")),
+        "{target}"
+    );
+    assert!(target.contains("ownership:freed"), "{target}");
+    assert!(target.contains(&format!("grant:{GRANT_5}")), "{target}");
+    assert!(target.contains("grant_usable:true"), "{target}");
+    assert!(
+        target.ends_with("reason:dead predecessor kept permanent ownership"),
+        "{target}"
+    );
+    assert_eq!(
+        records[0].get("idempotency_key").and_then(Val::as_str),
+        Some("ik_release-146-0001")
+    );
+
+    // The freed issue is admitted again on its own merits, as a NEW run that
+    // uniquely owns it.
+    let readmitted = submit_with_id(&state, "qs_0000000000000103", &[(5, GRANT_5)]);
+    assert_eq!(item_outcome(&readmitted[0]), ("admitted", ""));
+    let new_run = readmitted[0].instance_id.clone().expect("new run");
+    assert_ne!(new_run, victim);
+    let owners = state.queue_ownership_rows().expect("ownership");
+    assert_eq!(owners.len(), 2);
+    assert!(
+        owners
+            .iter()
+            .any(|owner| owner.issue_number == 5 && owner.instance_id == new_run),
+        "the unique ownership row names the fresh run: {owners:?}"
+    );
+}
+
+#[test]
+fn state_release_frees_the_occupancy_the_run_held() {
+    let fixture = StateFixture::new("release-capacity");
+    let state = fixture.open();
+    // The per-repository cap (2) is spent on two live runs and the freed run
+    // is the one that can never progress.
+    let runs = seed_submission(&state, &[(5, GRANT_5), (6, GRANT_6)]);
+    let victim = runs[0].clone();
+    let held = submit_with_id(&state, "qs_0000000000000201", &[(7, GRANT_7)]);
+    assert_eq!(
+        item_outcome(&held[0]),
+        ("waiting", "refusal.admission.cap_repository")
+    );
+
+    // Releasing the dead run frees the slot it held...
+    let outcome = state
+        .release_run(
+            &victim,
+            "dead run held a capacity slot it could never use",
+            "ik_release-146-0006",
+            AT,
+        )
+        .expect("release commits");
+    assert!(outcome.ownership_freed);
+
+    // ... so the issue that was waiting for capacity is admitted...
+    let admitted = submit_with_id(&state, "qs_0000000000000202", &[(7, GRANT_7)]);
+    assert_eq!(item_outcome(&admitted[0]), ("admitted", ""));
+    // ... and exactly ONE slot was freed: a further issue still waits for it.
+    let still_held = submit_with_id(&state, "qs_0000000000000203", &[(8, GRANT_8)]);
+    assert_eq!(
+        item_outcome(&still_held[0]),
+        ("waiting", "refusal.admission.cap_repository")
+    );
+}
+
+#[test]
+fn state_release_of_a_paused_predecessor_clears_the_pause_and_admits_a_fresh_submission() {
+    let fixture = StateFixture::new("release-paused");
+    let state = fixture.open();
+    let run = seed_submission(&state, &[(5, GRANT_5)])[0].clone();
+    let digest = sha256_hex(b"release-paused-witness");
+    let paused = state
+        .request_run_pause(&run, "operator hold", &digest, AT)
+        .expect("pause commits at the boundary");
+    assert!(paused.paused);
+
+    // The reported case 1: a paused predecessor refuses every fresh
+    // submission for its issue, forever.
+    let refused = submit_with_id(&state, "qs_0000000000000201", &[(5, GRANT_5)]);
+    assert_eq!(item_outcome(&refused[0]), ("refused", "submission.paused"));
+
+    // A release is the supported path out, and it clears the pause state so
+    // no stale resume digest survives a terminal run.
+    let outcome = state
+        .release_run(
+            &run,
+            "paused predecessor blocked a zero-operator redrive",
+            "ik_release-146-0003",
+            AT,
+        )
+        .expect("a paused run is releasable");
+    assert!(outcome.ownership_freed);
+    assert_eq!(outcome.run.status, "invalidated");
+    assert!(!outcome.run.paused && !outcome.run.pause_requested);
+    assert!(outcome.run.resume_digest.is_empty());
+    let err = state
+        .resume_run(&run, &digest, AT)
+        .expect_err("a released run is never resumed");
+    assert_eq!(err.code, "refusal.run.terminal");
+
+    let readmitted = submit_with_id(&state, "qs_0000000000000202", &[(5, GRANT_5)]);
+    assert_eq!(readmitted[0].status, "admitted");
+    assert_ne!(readmitted[0].instance_id.clone().expect("run"), run);
+}
+
+#[test]
+fn state_release_refuses_while_an_unconsumed_authorization_exists() {
+    let fixture = StateFixture::new("release-authorized");
+    let state = fixture.open();
+    let run = seed_submission(&state, &[(5, GRANT_5)])[0].clone();
+    // A diagnosed failed attempt plus ONE bounded retry authorization: the
+    // run still HOLDS an authorization, so it is not releasable.
+    seed_attempt(
+        &state,
+        &run,
+        "p1",
+        &idem_key("release-attempt-0001"),
+        Some("failed"),
+    );
+    let retry = state
+        .record_run_retry(&run, "p1", AT)
+        .expect("authorization recorded");
+    assert!(retry.consumed_at.is_empty());
+
+    let err = state
+        .release_run(&run, "dead predecessor", "ik_release-146-0004", AT)
+        .expect_err("a live authorization fences the release");
+    assert_eq!(err.code, "refusal.run.retry_pending");
+    assert!(err.message.contains(&retry.retry_id), "{}", err.message);
+
+    // Nothing was burned and nothing was freed: the run is untouched, its
+    // ownership row is intact and the authorization is still unconsumed.
+    assert_eq!(
+        state
+            .instance_by_id(&run)
+            .expect("run")
+            .expect("row")
+            .status,
+        "new"
+    );
+    assert_eq!(state.queue_ownership_rows().expect("ownership").len(), 1);
+    let rows = state.run_retries(&run).expect("retries");
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0].consumed_at.is_empty(),
+        "the authorization is never burned by a refused release"
+    );
+    assert!(release_records(&state).is_empty());
+}
+
+#[test]
+fn state_release_of_a_run_whose_grant_expired_is_the_same_supported_path() {
+    let fixture = StateFixture::new("release-expired");
+    let state = fixture.open();
+    let run = seed_submission(&state, &[(5, GRANT_5)])[0].clone();
+    // The predecessor's window expires (the reported case 3: the run is dead
+    // with no path forward).
+    {
+        let conn =
+            rusqlite::Connection::open(fixture.dir.join("state.db")).expect("raw connection");
+        let affected = conn
+            .execute(
+                "UPDATE grants SET expires_at = ?2 WHERE grant_id = ?1",
+                rusqlite::params![GRANT_5, "2000-01-01T00:00:00Z"],
+            )
+            .expect("expire the window");
+        assert_eq!(affected, 1);
+    }
+    // It still owns its issue: a fresh submission for that issue is refused.
+    let owned = submit_with_id(&state, "qs_0000000000000301", &[(5, GRANT_5)]);
+    assert_eq!(
+        item_outcome(&owned[0]),
+        ("refused", "submission.already_owned")
+    );
+
+    // The SAME release path reaches it, and the record states the window it
+    // held without ever presenting or reusing it.
+    let outcome = state
+        .release_run(
+            &run,
+            "predecessor grant expired; no path forward",
+            "ik_release-146-0005",
+            AT,
+        )
+        .expect("an expired-grant run is releasable");
+    assert!(outcome.ownership_freed);
+    assert!(!outcome.grant_usable, "the window was honestly expired");
+    let window = outcome.grant.expect("the recorded window");
+    assert_eq!(window.grant_id, GRANT_5);
+    assert_eq!(window.expires_at, "2000-01-01T00:00:00Z");
+    let records = release_records(&state);
+    assert_eq!(records.len(), 1);
+    let target = records[0]
+        .get("target")
+        .and_then(Val::as_str)
+        .expect("recorded target");
+    assert!(target.contains("grant_usable:false"), "{target}");
+    assert!(target.contains(&format!("grant:{GRANT_5}")), "{target}");
+    assert!(
+        target.ends_with("reason:predecessor grant expired; no path forward"),
+        "{target}"
+    );
+
+    // The expired window is never silently reused ...
+    let stale = submit_with_id(&state, "qs_0000000000000302", &[(5, GRANT_5)]);
+    assert_eq!(
+        item_outcome(&stale[0]),
+        ("refused", "refusal.grant.expired")
+    );
+    // ... a freshly issued window for the same binding is admitted.
+    let fresh = submit_with_id(&state, "qs_0000000000000303", &[(5, GRANT_5B)]);
+    assert_eq!(fresh[0].status, "admitted");
+    assert_ne!(fresh[0].instance_id.as_deref(), Some(run.as_str()));
+}
+
+#[test]
+fn wire_release_refuses_a_run_with_a_step_in_flight_then_frees_it_once_settled() {
+    let fixture = DaemonFixture::new("release-wire");
+    let run = {
+        let state = fixture.seed();
+        seed_submission(&state, &[(5, GRANT_5)])[0].clone()
+    };
+    // The fixture `git` shim keeps one checkout effect in flight for ~a
+    // second, so the release lands while a step is genuinely executing.
+    let fakebin = write_slow_failing_git(&fixture);
+    let daemon = fixture.spawn_with_path(None, Some(&fakebin));
+    wait_ready(&fixture);
+
+    let socket = fixture.socket.clone();
+    let run_thread = run.clone();
+    let dispatch = std::thread::spawn(move || {
+        rpc(
+            &socket,
+            &fresh_id(1),
+            "apply",
+            Some(apply_params(
+                &run_thread,
+                "p1",
+                &idem_key("release-inflight-0001"),
+                5,
+            )),
+        )
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let status = rpc_ok(
+            &fixture.socket,
+            &fresh_id(2),
+            "run.status",
+            Some(canter::run_control::status_params(&run)),
+        );
+        if status
+            .get("boundary")
+            .and_then(|b| b.get("in_flight_step"))
+            .and_then(Val::as_str)
+            == Some("p1")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the step dispatch never became in flight: {}",
+            canonical_text(&status)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // A run with work in flight is genuinely live: the release refuses typed
+    // and changes NOTHING (no ownership freed, no audit record, no kill).
+    let (code, message) = rpc_err(
+        &fixture.socket,
+        &fresh_id(3),
+        "run.release",
+        Some(release_params(
+            &idem_key("release-live-0001"),
+            &run,
+            "predecessor is dead",
+        )),
+    );
+    assert_eq!(code, "refusal.run.in_flight", "{message}");
+    {
+        let state = fixture.seed();
+        assert_eq!(state.queue_ownership_rows().expect("ownership").len(), 1);
+        assert_eq!(
+            state
+                .instance_by_id(&run)
+                .expect("run")
+                .expect("row")
+                .status,
+            "new"
+        );
+        assert!(
+            release_records(&state).is_empty(),
+            "a refused release records no release"
+        );
+    }
+
+    // The in-flight step reaches its recorded outcome (the shimmed checkout
+    // fails); nothing was cancelled by the refusal.
+    let dispatch_doc = dispatch.join().expect("join the in-flight dispatch");
+    assert_eq!(
+        dispatch_doc.get("ok").and_then(Val::as_bool),
+        Some(false),
+        "the shimmed checkout fails: {}",
+        canonical_text(&dispatch_doc)
+    );
+
+    // Now the same release commits: the ownership and the occupancy are
+    // freed and the run goes terminal.
+    let released = rpc_ok(
+        &fixture.socket,
+        &fresh_id(4),
+        "run.release",
+        Some(release_params(
+            &idem_key("release-ok-0001"),
+            &run,
+            "predecessor can never progress",
+        )),
+    );
+    assert_eq!(
+        text(&released, &["schema"]),
+        canter::run_control::RUN_RELEASE_SCHEMA
+    );
+    assert_eq!(text(&released, &["release", "ownership"]), "freed");
+    assert_eq!(text(&released, &["run", "status"]), "invalidated");
+    assert_eq!(text(&released, &["release", "status"]), "invalidated");
+    assert_eq!(
+        text(&released, &["release", "reason"]),
+        "predecessor can never progress"
+    );
+    assert_eq!(
+        text(&released, &["release", "authorization", "grant_id"]),
+        GRANT_5
+    );
+    assert_eq!(
+        released
+            .get("release")
+            .and_then(|release| release.get("authorization"))
+            .and_then(|authorization| authorization.get("usable"))
+            .and_then(Val::as_bool),
+        Some(true)
+    );
+    assert_eq!(text(&released, &["scope", "level"]), "run");
+    assert_eq!(text(&released, &["scope", "run"]), run);
+    let release_id = text(&released, &["release_id"]).to_string();
+    assert!(
+        release_id.starts_with("rl_") && release_id.len() == 19,
+        "{release_id}"
+    );
+
+    // Idempotency: the SAME request id + key replays the recorded response
+    // byte for byte (a retry never releases twice).
+    let replay = rpc_ok(
+        &fixture.socket,
+        &fresh_id(4),
+        "run.release",
+        Some(release_params(
+            &idem_key("release-ok-0001"),
+            &run,
+            "predecessor can never progress",
+        )),
+    );
+    assert_eq!(
+        canonical_text(&replay),
+        canonical_text(&released),
+        "the recorded release response is replayed"
+    );
+    // A FRESH key is a terminal refusal, never a second release.
+    let (code, _) = rpc_err(
+        &fixture.socket,
+        &fresh_id(5),
+        "run.release",
+        Some(release_params(
+            &idem_key("release-again-0001"),
+            &run,
+            "again",
+        )),
+    );
+    assert_eq!(code, "refusal.run.terminal");
+
+    // The released run is inert: the daemon refuses every effect for it ...
+    let (code, _) = rpc_err(
+        &fixture.socket,
+        &fresh_id(6),
+        "apply",
+        Some(apply_params(&run, "p1", &idem_key("release-after-0001"), 5)),
+    );
+    assert_eq!(code, "refusal.instance.state");
+    // ... exactly ONE release record exists, and the issue is free again.
+    let state = fixture.seed();
+    assert_eq!(release_records(&state).len(), 1);
+    assert!(state.queue_ownership_rows().expect("ownership").is_empty());
+    let readmitted = submit_with_id(&state, "qs_0000000000000401", &[(5, GRANT_5)]);
+    assert_eq!(readmitted[0].status, "admitted");
+    assert_ne!(readmitted[0].instance_id.as_deref(), Some(run.as_str()));
 
     shutdown(daemon);
 }
