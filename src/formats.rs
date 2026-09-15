@@ -24,6 +24,15 @@ fn path_component_chars(text: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
+/// Step param names share the contract namespace, including underscores.
+pub fn is_step_param_name(text: &str) -> bool {
+    text.len() <= 64
+        && text.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+        && text
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-')
+}
+
 /// Slug: `^[a-z0-9][a-z0-9-]{0,63}$` (repository keys, workflow ids, step ids).
 pub fn is_slug(text: &str) -> bool {
     let mut chars = text.chars();

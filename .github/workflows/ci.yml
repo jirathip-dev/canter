@@ -10,12 +10,17 @@ on:
   push:
     branches: [staging, main]
   workflow_dispatch:
+    inputs:
+      matrix_witness:
+        description: 'Deliberately hang --lib and fail --bins; other suites run normally'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ inputs.matrix_witness || false }}
   cancel-in-progress: true
 
 jobs:
@@ -252,10 +257,10 @@ jobs:
           fi
           echo "staging guard: refs/heads/staging exists on origin ($REF)"
 
-  rust-ubuntu:
-    name: rust-ubuntu
+  rust-ubuntu-build:
+    name: rust-ubuntu-build
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -272,50 +277,144 @@ jobs:
       - name: Clippy (warnings denied)
         run: cargo clippy --locked --all-targets -- -D warnings
 
-      - name: Tests
-        run: |
-          python3 -u - <<'PY'
-          import os
-          from pathlib import Path
-          import signal
-          import subprocess
-          import sys
-          import time
+      - name: Build test executables
+        id: test-build
+        timeout-minutes: 5
+        run: cargo test --locked --no-run
 
-          # Leave time for the runner to publish a normal failure log.
-          started = time.monotonic()
-          deadline = started + 18 * 60
-          suites = [["--lib"], ["--bins"]]
-          suites += [["--test", path.stem] for path in sorted(Path("tests").glob("*.rs"))]
-          suites += [["--doc"]]
-          for suite in suites:
-              label = " ".join(suite)
-              budget = min(300, deadline - time.monotonic())
-              print(f"::group::Tests {label} at +{time.monotonic() - started:.1f}s")
-              if budget <= 0:
-                  sys.exit(f"::error::Tests aggregate deadline exceeded before {label}")
-              child = subprocess.Popen(
-                  ["cargo", "test", "--locked", *suite, "--", "--test-threads=1", "--nocapture"],
-                  start_new_session=True,
-              )
-              try:
-                  code = child.wait(timeout=budget)
-              except subprocess.TimeoutExpired:
-                  print(f"::error::Tests {label} exceeded {budget:.1f}s; last test name above is stalled")
-                  os.killpg(child.pid, signal.SIGKILL)
-                  child.wait(timeout=5)
-                  sys.exit(124)
-              print(f"Tests {label}: exit {code} at +{time.monotonic() - started:.1f}s")
-              print("::endgroup::")
-              if code != 0:
-                  sys.exit(code if code > 0 else 1)
-          PY
+      - name: Test driver regression checks
+        id: driver-checks
+        timeout-minutes: 3
+        run: |
+          python3 scripts/test-ci-test-driver.py
+          python3 scripts/test-ci-test-scope.py
+
+      # Preserve source and build mtimes together so downstream cargo reuses
+      # the hoisted build. Only tracked sources and target are archived, not .git.
+      - name: Package test build
+        run: |
+          git ls-files -z > "$RUNNER_TEMP/test-sources"
+          tar --format=posix --exclude=target/debug/incremental -cf "$RUNNER_TEMP/test-build.tar" --null -T "$RUNNER_TEMP/test-sources" target
+
+      - name: Upload test build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rust-ubuntu-test-build
+          path: ${{ runner.temp }}/test-build.tar
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Docs
         run: cargo doc --locked --no-deps
 
       - name: Release build
         run: cargo build --release --locked
+
+  # Refs #136: a wedged runner cannot hide the suite's job identity.
+  rust-ubuntu-suite:
+    name: rust-ubuntu (${{ matrix.suite }})
+    needs: rust-ubuntu-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        suite: [
+          "--lib",
+          "--bins",
+          "--test board_read_model",
+          "--test checkpoint",
+          "--test cli_readonly",
+          "--test cli_smoke",
+          "--test commands",
+          "--test daemon_lifecycle",
+          "--test daemon_rpc",
+          "--test executor_authoring",
+          "--test executor_lifecycle",
+          "--test grant_issue",
+          "--test handoff_crash_acceptance",
+          "--test harness_adapters",
+          "--test herdr_compatibility",
+          "--test lane_cli",
+          "--test lane_replacement",
+          "--test mutation_engine",
+          "--test no_network_surface",
+          "--test profile_binding",
+          "--test queue_advance",
+          "--test queue_cli",
+          "--test queue_preview",
+          "--test queue_submit",
+          "--test redact_scale",
+          "--test rename_compat",
+          "--test rename_sweep",
+          "--test restart_pause_continuity",
+          "--test retirement",
+          "--test run_control",
+          "--test run_control_cli",
+          "--test service_plans",
+          "--test start_adopt",
+          "--test supervision",
+          "--test tui_board",
+          "--test tui_live_wiring",
+          "--test tui_operator",
+          "--test tui_supervision",
+          "--doc"
+        ]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned toolchain from rust-toolchain.toml
+        run: rustup toolchain install 1.97.1 --profile minimal
+
+      - name: Download test build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: rust-ubuntu-test-build
+          path: ${{ runner.temp }}
+
+      - name: Restore test build
+        run: |
+          tar -xf "$RUNNER_TEMP/test-build.tar"
+          git diff --exit-code
+
+      - name: Install deliberate matrix witness
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.matrix_witness }}
+        run: python3 scripts/ci-matrix-witness.py
+
+      - name: Tests group
+        timeout-minutes: 4
+        env:
+          SUITE: ${{ matrix.suite }}
+          LOG_DIR: ${{ runner.temp }}/canter-test-group
+        run: python3 -u scripts/ci-test-scope.py --seconds 200 --log-dir "$LOG_DIR" -- python3 -u scripts/ci-test-driver.py --suite="$SUITE" --aggregate-seconds 180 --per-suite-seconds 150
+
+      - name: Upload group diagnostics
+        if: ${{ always() }}
+        timeout-minutes: 2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rust-ubuntu-tests-${{ matrix.suite }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/canter-test-group
+          if-no-files-found: error
+          retention-days: 7
+
+  # Preserve the stable required-check name; skipped/cancelled is not success.
+  rust-ubuntu:
+    name: rust-ubuntu
+    needs: [rust-ubuntu-build, rust-ubuntu-suite]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Require every suite and build to pass
+        env:
+          BUILD_RESULT: ${{ needs.rust-ubuntu-build.result }}
+          SUITE_RESULT: ${{ needs.rust-ubuntu-suite.result }}
+        run: |
+          printf 'build=%s suites=%s\n' "$BUILD_RESULT" "$SUITE_RESULT"
+          test "$BUILD_RESULT" = success
+          test "$SUITE_RESULT" = success
 
   rust-macos:
     name: rust-macos

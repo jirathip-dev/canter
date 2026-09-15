@@ -13,9 +13,11 @@
 //! Evidence rules: raw process exits are asserted directly, JSON assertions
 //! parse the documented `hf-output/v1` envelope, and the daemon readback is
 //! compared canonically.
+#[path = "support/process_group.rs"]
+mod process_group;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use canter::client::{Connection, RpcError};
@@ -25,6 +27,7 @@ use canter::plan::DOCTRINE_WORKFLOW_ID;
 use canter::queue_preview as qp;
 use canter::state::{Retention, State};
 use canter::value::{Val, bool_, object, string};
+use process_group::{GroupChild, assert_no_process_for_socket};
 
 const REPO: &str = "example-org/widgets";
 const HARNESS: &str = "lane-1";
@@ -106,7 +109,7 @@ impl Fixture {
         self.state_dir.join("canter").join("daemon.log")
     }
 
-    fn spawn(&self, crash_point: Option<&str>) -> Child {
+    fn spawn(&self, crash_point: Option<&str>) -> GroupChild {
         std::fs::create_dir_all(&self.state_dir).expect("state home");
         let mut command = Command::new(bin());
         command
@@ -121,7 +124,7 @@ impl Fixture {
         if let Some(point) = crash_point {
             command.env("CANTER_CRASH_POINT", point);
         }
-        command.spawn().expect("spawn daemon")
+        GroupChild::spawn(&mut command, &self.socket).expect("spawn daemon")
     }
 
     /// Run the CLI with the fixture environment: (exit, stdout, stderr).
@@ -246,24 +249,8 @@ fn wait_ready(fixture: &Fixture) {
     );
 }
 
-fn wait_exit(mut child: Child, label: &str) -> i32 {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if let Some(status) = child.try_wait().expect("try_wait") {
-            return status.code().unwrap_or(-1);
-        }
-        assert!(Instant::now() < deadline, "{label} did not exit in time");
-        std::thread::sleep(Duration::from_millis(25));
-    }
-}
-
-fn shutdown(mut daemon: Child) {
-    let _ = daemon.kill();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while daemon.try_wait().expect("try_wait").is_none() {
-        assert!(Instant::now() < deadline, "daemon did not exit");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+fn shutdown(mut daemon: GroupChild) {
+    daemon.terminate("grant fixture daemon");
 }
 
 /// One RPC exchange (ok or refused).
@@ -976,7 +963,7 @@ fn a_mint_without_a_live_daemon_is_refused_typed() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn replay_returns_the_recorded_outcome_and_a_second_mint_never_duplicates() {
+fn replay_returns_the_recorded_outcome_and_a_fresh_key_opens_a_new_window() {
     let fixture = Fixture::new("replay");
     let (request, _digest) = bound_document(&fixture, &[("#5", REV_A)]);
     let daemon = fixture.spawn(None);
@@ -999,19 +986,18 @@ fn replay_returns_the_recorded_outcome_and_a_second_mint_never_duplicates() {
     assert_eq!(exit, 1, "reused key refuses: {stderr}");
     assert!(stderr.contains("state.claim_reused"), "{stderr}");
 
-    // A fresh key with the same binding refuses instead of creating a second
-    // authorization for the same reviewed run — and it refuses WHATEVER
-    // window is asked for: the grant id is the identity of the reviewed
-    // binding, not of the window, so a re-mint with a longer `--expires-in`
-    // cannot slip a second grant past the first one.
-    let (exit, _stdout, stderr) =
+    // A fresh key opens a distinct authorization window for the same reviewed
+    // binding; it neither extends nor replaces the first grant.
+    let (exit, second_stdout, stderr) =
         fixture.grant_issue_with(&request, 5, 7200, Some(&key("replay-0002")));
-    assert_eq!(exit, 1, "second key refuses: {stderr}");
-    assert!(stderr.contains("state.grant_exists"), "{stderr}");
+    assert_eq!(exit, 0, "second window: {stderr}");
+    let second = envelope(&second_stdout).get("data").cloned().expect("data");
+    let second_id = text_of(&second, "grant_id");
+    assert_ne!(second_id, grant_id);
     assert_eq!(
         listed_grants(&fixture).len(),
-        1,
-        "exactly one grant for the reviewed binding after the longer-window re-mint"
+        2,
+        "both immutable authorization windows remain visible"
     );
 
     // Exactly-once + recorded replay at the wire level, on a DISTINCT
@@ -1064,8 +1050,8 @@ fn replay_returns_the_recorded_outcome_and_a_second_mint_never_duplicates() {
     );
     assert_eq!(
         listed.get("grants").and_then(Val::as_array).map(Vec::len),
-        Some(2),
-        "one grant per distinct binding, never two for one: {listed:?}"
+        Some(3),
+        "two windows for one binding plus the distinct wire document: {listed:?}"
     );
 
     shutdown(daemon);
@@ -1075,7 +1061,7 @@ fn replay_returns_the_recorded_outcome_and_a_second_mint_never_duplicates() {
 fn a_crash_after_the_intent_leaves_no_partial_grant() {
     let fixture = Fixture::new("crash-intent");
     let (request, _digest) = bound_document(&fixture, &[("#5", REV_A)]);
-    let mut daemon = fixture.spawn(Some("grants.issue.after-intent"));
+    let daemon = fixture.spawn(Some("grants.issue.after-intent"));
     wait_ready(&fixture);
 
     // The mint dies with the daemon (the crash point aborts the process).
@@ -1098,8 +1084,7 @@ fn a_crash_after_the_intent_leaves_no_partial_grant() {
         "--json",
     ]);
     assert_ne!(exit, 0, "the interrupted mint cannot report success");
-    let _ = daemon.kill();
-    wait_exit(daemon, "crashed daemon");
+    shutdown(daemon);
 
     // Restart: reconciliation reads the marker and reports the truth.
     let daemon = fixture.spawn(None);
@@ -1135,7 +1120,7 @@ fn a_crash_after_the_intent_leaves_no_partial_grant() {
 fn a_crash_after_the_commit_keeps_exactly_one_grant() {
     let fixture = Fixture::new("crash-commit");
     let (request, _digest) = bound_document(&fixture, &[("#5", REV_A)]);
-    let mut daemon = fixture.spawn(Some("grants.issue.after-commit"));
+    let daemon = fixture.spawn(Some("grants.issue.after-commit"));
     wait_ready(&fixture);
 
     let request_arg = request.display().to_string();
@@ -1159,8 +1144,7 @@ fn a_crash_after_the_commit_keeps_exactly_one_grant() {
         &config_arg,
         "--json",
     ]);
-    let _ = daemon.kill();
-    wait_exit(daemon, "crashed daemon");
+    shutdown(daemon);
 
     let daemon = fixture.spawn(None);
     wait_ready(&fixture);
@@ -1181,20 +1165,36 @@ fn a_crash_after_the_commit_keeps_exactly_one_grant() {
         .expect("grants");
     assert_eq!(grants.len(), 1, "exactly the committed grant: {listed:?}");
 
-    // The same binding with a fresh key still refuses — whatever window is
-    // asked for — so no duplicate grant appears: exactly one survives the
-    // interrupt.
-    let (exit, _stdout, stderr) =
+    let original_id = text_of(&grants[0], "grant_id");
+
+    // A fresh key after restart opens another immutable window; the committed
+    // pre-crash grant remains present and is never duplicated or replaced.
+    let (exit, stdout, stderr) =
         fixture.grant_issue_with(&request, 5, 7200, Some(&key("crash-commit-0002")));
-    assert_eq!(exit, 1, "no duplicate mint: {stderr}");
-    assert!(stderr.contains("state.grant_exists"), "{stderr}");
-    assert_eq!(
-        listed_grants(&fixture).len(),
-        1,
-        "exactly one grant after the crash and the longer-window re-mint"
+    assert_eq!(exit, 0, "fresh post-crash window: {stderr}");
+    let data = envelope(&stdout).get("data").cloned().expect("data");
+    assert_ne!(text_of(&data, "grant_id"), original_id);
+    let listed = listed_grants(&fixture);
+    assert_eq!(listed.len(), 2, "both windows remain after restart");
+    assert!(
+        listed
+            .iter()
+            .any(|grant| text_of(grant, "grant_id") == original_id),
+        "the pre-crash grant remains visible"
     );
 
     shutdown(daemon);
+}
+
+#[test]
+fn grant_fixture_reaps_its_daemon_group() {
+    let fixture = Fixture::new("leak-detector");
+    fixture.seed();
+    let socket = fixture.socket.clone();
+    let daemon = fixture.spawn(None);
+    wait_ready(&fixture);
+    shutdown(daemon);
+    assert_no_process_for_socket(&socket);
 }
 
 #[test]
@@ -1206,22 +1206,33 @@ fn a_second_daemon_is_still_refused_while_issuance_is_available() {
 
     // A second daemon on the same state/socket is refused (the single-writer
     // lock is untouched by this slice).
-    let mut second = Command::new(bin());
-    second
+    let stdout_path = fixture.dir.join("second-daemon.stdout.log");
+    let stdout_file = std::fs::File::create(&stdout_path).expect("second daemon stdout");
+    let mut command = Command::new(bin());
+    command
         .args(["daemon", "run", "--socket"])
         .arg(&fixture.socket)
         .args(["--json"])
         .env("XDG_STATE_HOME", &fixture.state_dir)
         .env("HOME", &fixture.dir)
-        .stdout(Stdio::piped())
+        .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::null());
-    let output = second.output().expect("second daemon");
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "the second daemon must exit 1"
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let mut second = GroupChild::spawn(&mut command, &fixture.socket).expect("second daemon");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = second.try_wait().expect("wait for second daemon") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            second.terminate("second grant daemon");
+            panic!("the second daemon did not refuse within 5 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let reaped = second.terminate("second grant daemon");
+    assert_eq!(status.code(), reaped.code(), "stable reaped status");
+    assert_eq!(status.code(), Some(1), "the second daemon must exit 1");
+    let stdout = std::fs::read_to_string(stdout_path).expect("read second daemon stdout");
     assert!(
         stdout.contains("daemon.busy"),
         "the second daemon must be refused: {stdout}"

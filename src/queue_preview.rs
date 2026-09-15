@@ -460,6 +460,17 @@ fn validate_request(request: &QueueRequest) -> Result<Validated, PreviewError> {
                 format!("the declared step id {:?} appears twice", step.id),
             ));
         }
+        if let Some(Val::Obj(params)) = &step.params
+            && !params.keys().all(|key| formats::is_step_param_name(key))
+        {
+            return Err(PreviewError::new(
+                "usage.queue_steps",
+                format!(
+                    "step {:?} carries a param name outside [a-z][a-z0-9_-]*",
+                    step.id
+                ),
+            ));
+        }
     }
     if request.selected.is_empty() {
         return Err(PreviewError::new(
@@ -1083,7 +1094,29 @@ pub fn preview_queue(state: &State, request: &QueueRequest) -> Result<QueuePrevi
         ]));
     }
 
-    // Items: durable ownership first, then dependency readiness.
+    // Items: durable ownership first, then dependency readiness. A moved
+    // revision is rebindable only when a later grant window explicitly binds
+    // that exact selection; opaque revision hashes are never ordered.
+    let mut rebindable: BTreeSet<(IssueId, String)> = BTreeSet::new();
+    for issue in &request.selected {
+        if let Some(owner) = owned_rows.iter().copied().find(|row| {
+            row.repository == issue.id.repository
+                && row.issue_number == issue.id.number
+                && row.issue_revision != issue.revision
+        }) {
+            let authorized = state
+                .revision_has_newer_grant(
+                    &issue.id.repository,
+                    issue.id.number,
+                    &issue.revision,
+                    &owner.grant_id,
+                )
+                .map_err(|err| PreviewError::new(err.code, err.message))?;
+            if authorized {
+                rebindable.insert((issue.id.clone(), issue.revision.clone()));
+            }
+        }
+    }
     let owned_of = |id: &IssueId, revision: &str| -> Option<(OwnedRun, bool)> {
         let rows: Vec<&InstanceRow> = owned_rows
             .iter()
@@ -1091,7 +1124,8 @@ pub fn preview_queue(state: &State, request: &QueueRequest) -> Result<QueuePrevi
             .filter(|row| row.repository == id.repository && row.issue_number == id.number)
             .collect();
         let witness = rows.first()?;
-        let settled = rows.iter().any(|row| row.issue_revision == revision);
+        let settled = rows.iter().any(|row| row.issue_revision == revision)
+            || rebindable.contains(&(id.clone(), revision.to_string()));
         Some((
             OwnedRun {
                 instance_id: witness.instance_id.clone(),
@@ -1115,7 +1149,7 @@ pub fn preview_queue(state: &State, request: &QueueRequest) -> Result<QueuePrevi
                 code: holds::REVISION_STALE,
                 subject: item.id.display(),
                 message: format!(
-                    "the selected spec revision {} does not match the revision the active run {} recorded ({}); the run was bound to a stale revision",
+                    "the selected spec revision {} differs from active run {} at {}; no later grant window authorizes this exact revision, so only the older authorization remains",
                     item.revision, run.instance_id, run.revision
                 ),
             });

@@ -53,6 +53,8 @@ pub const REPLAY_MAX_LINES: i64 = 8192;
 /// Per-subscriber bounded event queue; a subscriber that does not drain it
 /// is disconnected (bounded backpressure, AC7).
 pub const SUBSCRIBER_QUEUE_CAP: usize = 64;
+/// A subscriber that stops draining cannot pin its socket-writer thread.
+const EVENT_STREAM_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 /// Upper bound on journal records served per `journal.tail` call.
 pub const JOURNAL_TAIL_LIMIT: i64 = 2000;
 /// Fallback id used for responses to unparseable request bytes (schema-valid
@@ -608,6 +610,7 @@ fn dispatch(shared: &Arc<Shared>, request: &Request) -> String {
         "run.pause" => method_run_pause(shared, request),
         "run.resume" => method_run_resume(shared, request),
         "run.retry" => method_run_retry(shared, request),
+        "run.resolve" => method_run_resolve(shared, request),
         "run.dispatch" => method_run_dispatch(shared, request),
         "run.status" => method_run_status(shared, request),
         "supervision.status" => method_supervision_status(shared, request),
@@ -1366,6 +1369,17 @@ impl crate::supervision::SupervisedDispatch for DaemonDispatch {
             None,
             &dispatch_key(format!("{}-{}", intent.instance_id, intent.step_id)),
         )?;
+        if let Err((code, message)) = preflight_apply_request(&request) {
+            shared.log.write(
+                "info",
+                "supervision.input_required",
+                &format!(
+                    "run {} step {} held before dispatch: {code}: {message}",
+                    intent.instance_id, intent.step_id
+                ),
+            );
+            return Err(format!("{code}: {message}"));
+        }
         let response = method_apply(shared, &request);
         let doc = Val::parse_json(response.trim())
             .map_err(|message| format!("the dispatch response is unreadable ({message})"))?;
@@ -1411,8 +1425,10 @@ struct DispatchMaterial {
     spine: Vec<String>,
     steps: Vec<Val>,
     topology: Val,
-    caps: Option<Val>,
-    harness_lanes: Option<i64>,
+    profile: Option<Val>,
+    admission: Option<Val>,
+    feature_head: Option<String>,
+    integration_base: Option<String>,
 }
 
 /// Read the dispatch material of one run (issue #92 F4 and the operator
@@ -1423,6 +1439,7 @@ struct DispatchMaterial {
 fn read_dispatch_material(
     state: &crate::state::State,
     instance_id: &str,
+    topology: Option<&Val>,
 ) -> Result<DispatchMaterial, (String, String)> {
     let instance = state
         .instance_by_id(instance_id)
@@ -1446,29 +1463,83 @@ fn read_dispatch_material(
         .run_step_spine(instance_id)
         .map_err(|err| (err.code.to_string(), err.message))?
         .ok_or_else(no_spine)?;
-    let steps = state
+    let mut steps = state
         .run_step_documents(instance_id)
         .map_err(|err| (err.code.to_string(), err.message))?
         .ok_or_else(no_spine)?;
     let recorded = state
         .run_dispatch_context(instance_id)
-        .map_err(|err| (err.code.to_string(), err.message))?
-        .ok_or_else(|| {
-            (
+        .map_err(|err| (err.code.to_string(), err.message))?;
+    let topology = match (recorded.as_ref(), topology) {
+        (Some(recorded), Some(presented)) if recorded.topology != *presented => {
+            return Err((
                 crate::run_control::codes::SCOPE.to_string(),
                 format!(
-                    "run {instance_id} has no recorded dispatch topology; the first dispatch of a \
-                     run belongs to the caller that holds it"
+                    "run {instance_id} already bound a different topology; dispatch never changes its lane paths"
                 ),
-            )
-        })?;
+            ));
+        }
+        (Some(recorded), _) => recorded.topology.clone(),
+        (None, Some(presented)) => presented.clone(),
+        (None, None) => {
+            return Err((
+                crate::run_control::codes::SCOPE.to_string(),
+                format!(
+                    "run {instance_id} needs --topology FILE for its first dispatch: integration_branch, production_branches, integration_repo and worktrees_root"
+                ),
+            ));
+        }
+    };
+    let profile = state
+        .run_role_binding(instance_id)
+        .map_err(|err| (err.code.to_string(), err.message))?;
+    if let Some(profile) = &profile {
+        for step in &mut steps {
+            if matches!(
+                step.get("kind").and_then(Val::as_str),
+                Some("harness_start" | "prompt")
+            ) {
+                let derived = object(vec![
+                    (
+                        "harness_key",
+                        profile.get("key").cloned().unwrap_or_else(null),
+                    ),
+                    ("kind", profile.get("kind").cloned().unwrap_or_else(null)),
+                ]);
+                if let Some(params) = merged_step_params(Some(&derived), step.get("params")) {
+                    *step = step_with_params(step, &params);
+                }
+            }
+        }
+    }
+    if let Some(base) = recorded
+        .as_ref()
+        .and_then(|context| context.integration_base.as_deref())
+    {
+        for step in &mut steps {
+            if step.get("kind").and_then(Val::as_str) == Some("collect_outcome") {
+                let derived = object(vec![("base_head", string(base))]);
+                if let Some(params) = merged_step_params(Some(&derived), step.get("params")) {
+                    *step = step_with_params(step, &params);
+                }
+            }
+        }
+    }
     Ok(DispatchMaterial {
         instance,
         spine,
         steps,
-        topology: recorded.topology,
-        caps: recorded.caps,
-        harness_lanes: recorded.harness_lanes,
+        topology,
+        profile,
+        admission: recorded
+            .as_ref()
+            .and_then(|context| context.admission.clone()),
+        feature_head: recorded
+            .as_ref()
+            .and_then(|context| context.feature_head.clone()),
+        integration_base: recorded
+            .as_ref()
+            .and_then(|context| context.integration_base.clone()),
     })
 }
 
@@ -1502,12 +1573,8 @@ fn dispatch_request_from(
         ("digest_confirmed", bool_(false)),
         ("scheduled", bool_(false)),
     ];
-    if let Some(caps) = material.caps.clone() {
-        let mut admission = vec![("caps", caps)];
-        if let Some(lanes) = material.harness_lanes {
-            admission.push(("harness_lanes", integer(lanes)));
-        }
-        flags.push(("admission", object(admission)));
+    if let Some(admission) = &material.admission {
+        flags.push(("admission", admission.clone()));
     }
     let params = object(vec![
         ("idempotency_key", string(key)),
@@ -1520,11 +1587,26 @@ fn dispatch_request_from(
             object(vec![
                 ("issue_revision", string(&instance.issue_revision)),
                 ("policy_hash", string(&instance.policy_hash)),
-                ("feature_head", null()),
-                ("integration_base", null()),
+                (
+                    "feature_head",
+                    material
+                        .feature_head
+                        .as_deref()
+                        .map(string)
+                        .unwrap_or_else(null),
+                ),
+                (
+                    "integration_base",
+                    material
+                        .integration_base
+                        .as_deref()
+                        .map(string)
+                        .unwrap_or_else(null),
+                ),
             ]),
         ),
         ("topology", material.topology.clone()),
+        ("profile", material.profile.clone().unwrap_or_else(null)),
         ("flags", object(flags)),
     ]);
     let id = format!("disp_{step_id}");
@@ -1555,7 +1637,7 @@ fn build_dispatch_request(
     key: &str,
 ) -> Result<Request, String> {
     let state = shared.lock_state()?;
-    let material = read_dispatch_material(&state, instance_id)
+    let material = read_dispatch_material(&state, instance_id, None)
         .map_err(|(code, message)| format!("{code}: {message}"))?;
     dispatch_request_from(&material, step_id, step_params, key)
         .map_err(|(code, message)| format!("{code}: {message}"))
@@ -1662,6 +1744,52 @@ fn dispatch_key(target: String) -> String {
     format!("ik_{}", &tail[..tail.len().min(64)])
 }
 
+/// Purely validate the addressed step's own input contract. This runs before
+/// journaling, so a request that was never executable cannot become a failed
+/// effect attempt or consume a bounded retry.
+fn check_apply_step_contract(
+    kind: &str,
+    params: Option<&Val>,
+    parsed: &ApplyParams,
+) -> Result<(), (String, String)> {
+    crate::mutation::check_step_params(
+        kind,
+        params,
+        &crate::mutation::ParamContract {
+            integration_branch: &parsed.integration_branch,
+            production_branches: &parsed.production_branches,
+            observed_feature_head: parsed.feature_head.as_deref(),
+            observed_integration_base: parsed.integration_base.as_deref(),
+            has_archive_root: parsed.archive_root.is_some(),
+            worktrees_root: Some(parsed.worktrees_root.as_path()),
+        },
+    )
+}
+
+/// Pure preflight used by autonomous supervision before it hands a request to
+/// `method_apply`. The apply path repeats the same shared contract check as a
+/// boundary defense; neither path invents missing step parameters.
+fn preflight_apply_request(request: &Request) -> Result<(), (String, String)> {
+    let parsed = apply_params(request)?;
+    let plan = crate::mutation::bind_plan(&parsed.plan)
+        .map_err(|err| (err.code.to_string(), err.message))?;
+    let step = crate::mutation::plan_step(&plan, &parsed.step)
+        .map_err(|err| (err.code.to_string(), err.message))?;
+    let kind =
+        crate::mutation::step_kind(step).map_err(|err| (err.code.to_string(), err.message))?;
+    let params = match step.get("params") {
+        Some(value @ Val::Obj(_)) => Some(value),
+        None | Some(Val::Null) => None,
+        _ => {
+            return Err((
+                "refusal.request.malformed".to_string(),
+                "plan step params must be an object or null".to_string(),
+            ));
+        }
+    };
+    check_apply_step_contract(&kind, params, &parsed)
+}
+
 /// Executor-owned claim reaper. Created only after a NEW claim commits, before
 /// any later state guard: unwinding/early returns release those guards first.
 /// Client disconnects do not own execution: the daemon finishes the already
@@ -1766,6 +1894,9 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
             );
         }
     };
+    if let Err((code, message)) = check_apply_step_contract(&kind, params, &parsed) {
+        return err_response(&request.id, &code, message);
+    }
     // Daemon-level risk gates that need no state: destructive/production
     // effects are never schedulable; production-branch effects require a
     // fresh interactive TTY-confirmed digest; real-external effects require
@@ -2091,28 +2222,6 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
     }
     let _ = latest_evidence;
 
-    // The step's OWN param contract (issue #92) is checked BEFORE the
-    // bounded-retry fence: a request that is not well-formed enough to be
-    // attempted refuses typed here and leaves the operator's single-use
-    // retry authorization UNCONSUMED, so a corrected re-dispatch stays
-    // possible. The contract is TOTAL over the closed step-kind set and the
-    // check is the same code the effect itself resolves its inputs with, so
-    // the refusal reason never diverges and no kind inherits the burn.
-    if let Err((code, message)) = crate::mutation::check_step_params(
-        &kind,
-        params,
-        &crate::mutation::ParamContract {
-            integration_branch: &parsed.integration_branch,
-            production_branches: &parsed.production_branches,
-            observed_feature_head: parsed.feature_head.as_deref(),
-            observed_integration_base: parsed.integration_base.as_deref(),
-            has_archive_root: parsed.archive_root.is_some(),
-            worktrees_root: Some(parsed.worktrees_root.as_path()),
-        },
-    ) {
-        return resolve_apply_refusal(shared, request, &key, &code, message);
-    }
-
     // Bounded retry fence (issue #86), queue runs only: a re-dispatch of a
     // step whose recorded outcome was a terminal non-success requires (and
     // consumes) exactly one recorded retry authorization; a first dispatch
@@ -2186,7 +2295,9 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
     // and never from a profile the caller names.
     let presented_profile = match presented_profile(request.params.as_ref()) {
         Ok(profile) => profile,
-        Err((code, message)) => return resolve_apply_refusal(shared, request, &key, code, message),
+        Err((code, message)) => {
+            return resolve_apply_refusal(shared, request, &key, code, message);
+        }
     };
     let run_binding = match resolve_run_binding(
         shared,
@@ -3547,6 +3658,303 @@ fn method_run_retry(shared: &Arc<Shared>, request: &Request) -> String {
     }
 }
 
+/// `run.resolve`: record recorder-attributed artifact evidence for ONE
+/// diagnosed prompt without invoking the prompt effect again. The resolved
+/// journal row is the attempt-ledger transition; supervision's existing
+/// diagnosed-step no-redispatch fence is unchanged.
+fn method_run_resolve(shared: &Arc<Shared>, request: &Request) -> String {
+    let Some(params) = request.params.as_ref() else {
+        return err_response(
+            &request.id,
+            "refusal.malformed",
+            "run.resolve requires params: idempotency_key, instance_id, step, recorder, evidence",
+        );
+    };
+    let parsed = match crate::run_control::parse_resolution_params(params) {
+        Ok(parsed) => parsed,
+        Err(err) => return err_response(&request.id, err.code, err.message),
+    };
+    let target = format!("run:{}:{}", parsed.instance_id, parsed.step);
+    let key = match journal_mutation(shared, request, "mutate.run.resolve", &target) {
+        Intent::Claimed { key } => key,
+        Intent::Replay { response } => return replay(shared, &response),
+        Intent::Refused { code, message } => return err_response(&request.id, code, message),
+    };
+    crash_point("run.resolve.after-intent");
+    let state = match shared.lock_state() {
+        Ok(state) => state,
+        Err(message) => {
+            return finish_mutation(
+                shared,
+                request,
+                &key,
+                "run.resolve",
+                false,
+                null(),
+                Some(("state.unavailable", message)),
+            );
+        }
+    };
+    let validated =
+        (|| -> Result<(crate::state::InstanceRow, String, String), (&'static str, String)> {
+            let run = state
+                .instance_by_id(&parsed.instance_id)
+                .map_err(|err| (err.code, err.message))?
+                .ok_or_else(|| {
+                    (
+                        "state.not_found",
+                        format!("no instance {}", parsed.instance_id),
+                    )
+                })?;
+            if matches!(run.status.as_str(), "done" | "invalidated") {
+                return Err((
+                    crate::run_control::codes::TERMINAL,
+                    format!(
+                        "run {} is {}; a terminal run is never resolved",
+                        run.instance_id, run.status
+                    ),
+                ));
+            }
+            if run.paused || run.pause_requested {
+                return Err((
+                    crate::run_control::codes::PAUSED,
+                    format!(
+                        "run {} is {}; resume it before resolution",
+                        run.instance_id,
+                        crate::run_control::control_state(&run)
+                    ),
+                ));
+            }
+            if let Some(step) = state
+                .in_flight_run_step(&run.instance_id)
+                .map_err(|err| (err.code, err.message))?
+            {
+                return Err((
+                    crate::run_control::codes::IN_FLIGHT,
+                    format!(
+                        "run {} still has in-flight step {step:?}; evidence cannot resolve an effect that may still be running",
+                        run.instance_id
+                    ),
+                ));
+            }
+            let spine = state
+                .run_step_spine(&run.instance_id)
+                .map_err(|err| (err.code, err.message))?
+                .ok_or_else(|| {
+                    (
+                        crate::run_control::codes::SCOPE,
+                        format!("run {} has no committed step spine", run.instance_id),
+                    )
+                })?;
+            if !spine.iter().any(|step| step == &parsed.step) {
+                return Err((
+                    crate::run_control::codes::STEP_UNKNOWN,
+                    format!("step {:?} is not in run {}", parsed.step, run.instance_id),
+                ));
+            }
+            let steps = state
+                .run_step_documents(&run.instance_id)
+                .map_err(|err| (err.code, err.message))?
+                .unwrap_or_default();
+            let step = steps
+                .iter()
+                .find(|step| step.get("id").and_then(Val::as_str) == Some(parsed.step.as_str()))
+                .ok_or_else(|| {
+                    (
+                        crate::run_control::codes::STEP_UNKNOWN,
+                        format!("step {:?} has no committed document", parsed.step),
+                    )
+                })?;
+            let kind = step.get("kind").and_then(Val::as_str).unwrap_or_default();
+            if kind != "prompt" {
+                return Err((
+                    crate::run_control::codes::RESOLUTION_KIND,
+                    format!(
+                        "step {:?} is {kind:?}; evidence resolution supports diagnosed prompt effects only",
+                        parsed.step
+                    ),
+                ));
+            }
+            let expected_branch = step
+                .get("params")
+                .and_then(|params| params.get("branch"))
+                .and_then(Val::as_str)
+                .ok_or_else(|| {
+                    (
+                        crate::run_control::codes::RESOLUTION_EVIDENCE,
+                        format!(
+                            "prompt step {:?} records no bound output branch",
+                            parsed.step
+                        ),
+                    )
+                })?;
+            let evidence_branch = parsed
+                .evidence
+                .get("branch")
+                .and_then(Val::as_str)
+                .unwrap_or_default();
+            if evidence_branch != expected_branch {
+                return Err((
+                    crate::run_control::codes::RESOLUTION_EVIDENCE,
+                    format!(
+                        "artifact branch {evidence_branch:?} is not the prompt's bound output branch {expected_branch:?}"
+                    ),
+                ));
+            }
+            let evidence_repository = parsed
+                .evidence
+                .get("pull_request")
+                .and_then(|pull| pull.get("repository"))
+                .and_then(Val::as_str)
+                .unwrap_or_default();
+            if evidence_repository != run.repository {
+                return Err((
+                    crate::run_control::codes::RESOLUTION_EVIDENCE,
+                    format!(
+                        "artifact PR repository {evidence_repository:?} is not run repository {:?}",
+                        run.repository
+                    ),
+                ));
+            }
+            let attempts = state
+                .run_step_attempts(&run.instance_id)
+                .map_err(|err| (err.code, err.message))?;
+            let frontier = crate::run_control::frontier_of(&spine, &attempts, &run.current_node);
+            if frontier.as_deref() != Some(parsed.step.as_str()) {
+                return Err((
+                    crate::run_control::codes::STEP_ORDER,
+                    format!(
+                        "step {:?} is not run {}'s diagnosed frontier (next {:?})",
+                        parsed.step, run.instance_id, frontier
+                    ),
+                ));
+            }
+            let prior = attempts
+                .iter()
+                .rfind(|(step, _)| step == &parsed.step)
+                .map(|(_, status)| status.as_str());
+            let prior = match prior {
+                Some(status @ ("failed" | "ambiguous")) => status.to_string(),
+                Some("succeeded") => {
+                    return Err((
+                        crate::run_control::codes::STEP_DONE,
+                        format!("step {:?} already succeeded", parsed.step),
+                    ));
+                }
+                _ => {
+                    return Err((
+                        crate::run_control::codes::STEP_UNDIAGNOSED,
+                        format!(
+                            "step {:?} has no failed/ambiguous effect to resolve",
+                            parsed.step
+                        ),
+                    ));
+                }
+            };
+            let epoch = state
+                .current_epoch()
+                .map_err(|err| (err.code, err.message))?;
+            if run.state_epoch != epoch {
+                return Err((
+                    crate::mutation::code::EPOCH_STALE,
+                    format!(
+                        "run {} belongs to epoch {}, live epoch is {epoch}",
+                        run.instance_id, run.state_epoch
+                    ),
+                ));
+            }
+            let grant = state
+                .grant_by_id(&run.grant_id)
+                .map_err(|err| (err.code, err.message))?
+                .ok_or_else(|| {
+                    (
+                        crate::mutation::code::GRANT_INACTIVE,
+                        format!("no grant {} exists", run.grant_id),
+                    )
+                })?;
+            if grant.status != "active" {
+                return Err((
+                    crate::mutation::code::GRANT_INACTIVE,
+                    format!("grant {} is {}", grant.grant_id, grant.status),
+                ));
+            }
+            if crate::mutation::is_expired(&grant.expires_at, &time::rfc3339_now()) {
+                return Err((
+                    crate::mutation::code::GRANT_EXPIRED,
+                    format!("grant {} expired at {}", grant.grant_id, grant.expires_at),
+                ));
+            }
+            let owns = state
+                .queue_ownership_rows()
+                .map_err(|err| (err.code, err.message))?
+                .iter()
+                .any(|owner| owner.instance_id == run.instance_id);
+            if !owns {
+                return Err((
+                    crate::run_control::codes::SUPERSEDED,
+                    format!("run {} no longer owns its work item", run.instance_id),
+                ));
+            }
+            Ok((run, kind.to_string(), prior))
+        })();
+    let response = match validated {
+        Err((code, message)) => resolve_mutation_on(
+            &state,
+            &shared.log,
+            request,
+            &key,
+            "run.resolve",
+            false,
+            null(),
+            Some((code, message)),
+        ),
+        Ok((run, kind, prior)) => {
+            let at = time::rfc3339_now();
+            let resolution = crate::run_control::resolution_doc(
+                &run,
+                &parsed.step,
+                &kind,
+                &prior,
+                &parsed.recorder,
+                &parsed.evidence,
+                &at,
+                &key,
+            );
+            let response = ok_response(&request.id, resolution.clone());
+            let outcome = apply_outcome(
+                DAEMON_PLAN_ID,
+                &parsed.step,
+                &key,
+                "succeeded",
+                resolution,
+                None,
+            );
+            match state.resolve_run_step_claim(
+                &key,
+                "run.resolve",
+                &canonical_text(&outcome),
+                &response,
+                &parsed.instance_id,
+                &parsed.step,
+                &at,
+            ) {
+                Ok(_) => response,
+                Err(err) => err_response(
+                    &request.id,
+                    err.code,
+                    format!(
+                        "the resolution could not be committed (fail closed): {}",
+                        err.message
+                    ),
+                ),
+            }
+        }
+    };
+    drop(state);
+    publish_after_state_change(shared, None);
+    response
+}
+
 /// `run.dispatch` (issue #92): the SUPPORTED step-dispatch surface. The
 /// caller presents the run, the committed-spine step and only that step's own
 /// inputs; the plan document, the issue/grant/workflow pins, the topology and
@@ -3577,10 +3985,14 @@ fn method_run_dispatch(shared: &Arc<Shared>, request: &Request) -> String {
             Ok(state) => state,
             Err(message) => return err_response(&request.id, "state.unavailable", message),
         };
-        let material = match read_dispatch_material(&state, &parsed.instance_id) {
-            Ok(material) => material,
-            Err((code, message)) => return err_response(&request.id, &code, message),
-        };
+        let mut material =
+            match read_dispatch_material(&state, &parsed.instance_id, parsed.topology.as_ref()) {
+                Ok(material) => material,
+                Err((code, message)) => return err_response(&request.id, &code, message),
+            };
+        if parsed.admission.is_some() {
+            material.admission = parsed.admission.clone();
+        }
         if !material.spine.iter().any(|step| step == &parsed.step) {
             return err_response(
                 &request.id,
@@ -3590,6 +4002,40 @@ fn method_run_dispatch(shared: &Arc<Shared>, request: &Request) -> String {
                     parsed.step, parsed.instance_id, material.spine
                 ),
             );
+        }
+        let attempts = match state.run_step_attempts(&parsed.instance_id) {
+            Ok(attempts) => attempts,
+            Err(err) => return err_response(&request.id, err.code, err.message),
+        };
+        let frontier = crate::run_control::frontier_of(
+            &material.spine,
+            &attempts,
+            &material.instance.current_node,
+        );
+        if frontier.as_deref() != Some(parsed.step.as_str()) {
+            let terminal = frontier.is_none()
+                || attempts
+                    .iter()
+                    .rev()
+                    .find(|(step, _)| step == &parsed.step)
+                    .is_some_and(|(_, status)| status == "succeeded");
+            let code = if terminal {
+                crate::run_control::codes::STEP_DONE
+            } else {
+                crate::run_control::codes::STEP_ORDER
+            };
+            let message = if terminal {
+                format!(
+                    "step {:?} of run {} has already succeeded; the effect is never repeated",
+                    parsed.step, parsed.instance_id
+                )
+            } else {
+                format!(
+                    "step {:?} is not the current frontier step of run {} (next step {:?})",
+                    parsed.step, parsed.instance_id, frontier
+                )
+            };
+            return err_response(&request.id, code, message);
         }
         let step = match material
             .steps
@@ -3648,10 +4094,9 @@ fn method_run_dispatch(shared: &Arc<Shared>, request: &Request) -> String {
     // Fail closed BEFORE anything is journaled or claimed: a request that is
     // not well-formed enough to be attempted refuses typed here, so the
     // operator's single-use retry authorization survives for the correction.
-    // The contract is built from the SAME topology/observed read-backs the
-    // derived dispatch presents (`observed.feature_head`/`integration_base`
-    // are null on this path, exactly as the run's own dispatch presents
-    // them), so the pre-screen and the derived apply agree by construction.
+    // The contract is built from the SAME topology and durable worker-head
+    // read-backs the derived dispatch presents, so the pre-screen and the
+    // derived apply agree by construction.
     let has_archive_root = material
         .topology
         .get("archive_root")
@@ -3667,8 +4112,8 @@ fn method_run_dispatch(shared: &Arc<Shared>, request: &Request) -> String {
         &crate::mutation::ParamContract {
             integration_branch: &integration_branch,
             production_branches: &production_branches,
-            observed_feature_head: None,
-            observed_integration_base: None,
+            observed_feature_head: material.feature_head.as_deref(),
+            observed_integration_base: material.integration_base.as_deref(),
             has_archive_root,
             worktrees_root: worktrees_root.as_deref(),
         },
@@ -7307,6 +7752,7 @@ fn serve_event_stream(
     writer: &mut UnixStream,
     cursor: Option<i64>,
 ) -> Result<(), String> {
+    configure_event_writer(writer)?;
     let (receiver, snapshot_lines, replay_lines) = {
         let (sender, receiver) = sync_channel::<String>(SUBSCRIBER_QUEUE_CAP);
         let mut hub = shared.hub.lock().map_err(|_| "hub poisoned".to_string())?;
@@ -7315,20 +7761,26 @@ fn serve_event_stream(
         (receiver, snapshot, replay)
     };
     for line in snapshot_lines.iter().chain(replay_lines.iter()) {
-        writer
-            .write_all(line.as_bytes())
-            .and_then(|()| writer.write_all(b"\n"))
-            .and_then(|()| writer.flush())
-            .map_err(|err| format!("write event: {err}"))?;
+        write_event_line(writer, line)?;
     }
     for line in receiver {
-        writer
-            .write_all(line.as_bytes())
-            .and_then(|()| writer.write_all(b"\n"))
-            .and_then(|()| writer.flush())
-            .map_err(|err| format!("write event: {err}"))?;
+        write_event_line(writer, &line)?;
     }
     Ok(())
+}
+
+fn configure_event_writer(writer: &UnixStream) -> Result<(), String> {
+    writer
+        .set_write_timeout(Some(EVENT_STREAM_WRITE_TIMEOUT))
+        .map_err(|err| format!("configure event write timeout: {err}"))
+}
+
+fn write_event_line(writer: &mut UnixStream, line: &str) -> Result<(), String> {
+    writer
+        .write_all(line.as_bytes())
+        .and_then(|()| writer.write_all(b"\n"))
+        .and_then(|()| writer.flush())
+        .map_err(|err| format!("write event: {err}"))
 }
 
 /// Compute (snapshot lines, replay lines) for a subscriber cursor. Must be
@@ -8567,6 +9019,132 @@ mod tests {
     #[test]
     fn fallback_request_id_is_schema_valid() {
         assert!(crate::formats::is_request_id(FALLBACK_REQUEST_ID));
+    }
+
+    fn f10_dispatch_material() -> DispatchMaterial {
+        let instance = crate::state::InstanceRow {
+            instance_id: "run-0123456789abcdef".to_string(),
+            repository: "acme/widgets".to_string(),
+            workflow_id: crate::plan::DOCTRINE_WORKFLOW_ID.to_string(),
+            workflow_hash: "a".repeat(64),
+            policy_hash: "b".repeat(64),
+            grant_id: "gr_0123456789abcdef".to_string(),
+            issue_number: 5,
+            issue_revision: "c".repeat(40),
+            phase: "implement".to_string(),
+            scope: "worktrees/issues/5".to_string(),
+            caps: "[]".to_string(),
+            current_node: "p5-5".to_string(),
+            normal_rounds: 0,
+            recovery_rounds: 0,
+            human_queue: false,
+            terminal_blockers: 0,
+            paused: false,
+            resume_digest: String::new(),
+            pause_requested: false,
+            pause_reason: String::new(),
+            pause_requested_at: String::new(),
+            state_epoch: 1,
+            status: "running".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let steps: Vec<Val> =
+            crate::plan::queue_run_steps("acme/widgets", "staging", "worker", &[5])
+                .into_iter()
+                .map(|step| {
+                    object(vec![
+                        ("id", string(&step.id)),
+                        ("kind", string(&step.kind)),
+                        ("params", step.params.unwrap_or_else(null)),
+                    ])
+                })
+                .collect();
+        DispatchMaterial {
+            instance,
+            spine: steps
+                .iter()
+                .filter_map(|step| step.get("id").and_then(Val::as_str))
+                .map(str::to_string)
+                .collect(),
+            steps,
+            topology: object(vec![
+                ("integration_branch", string("staging")),
+                ("production_branches", Val::Arr(vec![string("main")])),
+                ("integration_repo", string("/tmp/integration")),
+                ("worktrees_root", string("/tmp/worktrees")),
+            ]),
+            profile: None,
+            admission: None,
+            feature_head: Some("d".repeat(40)),
+            integration_base: Some("e".repeat(40)),
+        }
+    }
+
+    #[test]
+    fn f10_supervision_preflight_skips_incomplete_params_and_accepts_complete_params() {
+        let material = f10_dispatch_material();
+        let incomplete = dispatch_request_from(&material, "p6-5", None, "ik_f10-incomplete")
+            .expect("incomplete request remains constructible");
+        let (code, message) = preflight_apply_request(&incomplete).expect_err("must refuse");
+        assert_eq!(code, "refusal.request.malformed");
+        assert!(message.contains("reviewer"), "{message}");
+
+        let complete_params = object(vec![
+            ("reviewer", string("reviewer")),
+            ("implementer", string("worker")),
+            ("verdict", string("pass")),
+            (
+                "checks",
+                Val::Arr(vec![object(vec![
+                    ("name", string("focused")),
+                    ("status", string("passed")),
+                ])]),
+            ),
+        ]);
+        let complete =
+            dispatch_request_from(&material, "p6-5", Some(&complete_params), "ik_f10-complete")
+                .expect("complete request");
+        preflight_apply_request(&complete).expect("contracts-complete continuation");
+    }
+
+    #[test]
+    fn event_stream_write_timeout_closes_a_stalled_socket() {
+        use std::io::Read;
+
+        let (mut writer, mut reader) = UnixStream::pair().expect("socket pair");
+        let payload_bytes = 8 * 1024 * 1024;
+        let payload = "x".repeat(payload_bytes);
+        let (sender, receiver) = sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let result = configure_event_writer(&writer)
+                .and_then(|()| write_event_line(&mut writer, &payload));
+            sender.send(result).expect("report writer result");
+        });
+
+        let result = match receiver
+            .recv_timeout(EVENT_STREAM_WRITE_TIMEOUT + std::time::Duration::from_secs(2))
+        {
+            Ok(result) => result,
+            Err(error) => {
+                drop(reader);
+                worker.join().expect("join blocked writer after peer close");
+                panic!("event-stream writer remained blocked beyond its bound: {error}");
+            }
+        };
+        worker.join().expect("join bounded writer");
+        let error = result.expect_err("a non-draining peer must time out the write");
+        assert!(error.contains("write event:"), "{error}");
+
+        let mut prefix = Vec::new();
+        reader
+            .read_to_end(&mut prefix)
+            .expect("closed peer reaches EOF");
+        assert!(!prefix.is_empty(), "the socket accepted a bounded prefix");
+        assert!(
+            prefix.len() < payload_bytes + 1,
+            "the stalled socket unexpectedly accepted the whole event"
+        );
     }
 
     #[test]

@@ -121,6 +121,8 @@ fn every_documented_command_has_working_help() {
         "run pause",
         "run resume",
         "run retry",
+        "run resolve",
+        "run dispatch",
         "run status",
         "supervision status",
         "board",
@@ -136,7 +138,11 @@ fn every_documented_command_has_working_help() {
         &["capabilities", "--help"][..],
         &["queue", "--help"][..],
         &["run", "--help"][..],
+        &["run", "resolve", "--help"][..],
+        &["run", "dispatch", "--help"][..],
+        &["run", "status", "--help"][..],
         &["supervision", "--help"][..],
+        &["supervision", "status", "--help"][..],
         &["board", "--help"][..],
         &["grant", "--help"][..],
         &["grant", "issue", "--help"][..],
@@ -146,6 +152,36 @@ fn every_documented_command_has_working_help() {
         assert!(
             stdout_of(&out).contains("USAGE"),
             "{args:?} --help should print usage"
+        );
+    }
+}
+
+#[test]
+fn f11_misplaced_global_flags_get_a_targeted_error_without_the_usage_dump() {
+    for args in [
+        &["--config", "config.toml", "status"][..],
+        &[
+            "--socket",
+            "daemon.sock",
+            "run",
+            "status",
+            "--run",
+            "run-0123456789abcdef",
+        ][..],
+        &["--json", "status"][..],
+        &["--config=config.toml", "status"][..],
+    ] {
+        let out = run(args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}: stdout stays empty");
+        let stderr = stderr_of(&out);
+        assert!(
+            stderr.contains("--config/--socket/--json belong after the subcommand"),
+            "{args:?}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("USAGE:"),
+            "{args:?}: targeted error must not dump global usage: {stderr}"
         );
     }
 }

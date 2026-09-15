@@ -70,7 +70,8 @@ USAGE:
     canter run pause --run RUN_ID --reason TEXT [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run resume --run RUN_ID --digest HEX64 [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run retry --run RUN_ID --step STEP [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
-    canter run dispatch --run RUN_ID --step STEP [--param KEY=VALUE]... [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
+    canter run resolve --run RUN_ID --step STEP --recorder IDENTITY --evidence FILE [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
+    canter run dispatch --run RUN_ID --step STEP [--param KEY=VALUE]... [--topology FILE] [--admission FILE] [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run status --run RUN_ID [--socket PATH] [--config PATH] [--json]
     canter supervision status --run RUN_ID [--socket PATH] [--config PATH] [--json]
     canter grant issue --request FILE --issue N --expires-in SECS [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
@@ -98,8 +99,8 @@ COMMANDS:
     queue            Preview one reviewed run (the plan producer), submit one
                      approved selected-issue run, or read one committed
                      submission back (preview/status are read-only).
-    run              Pause, resume, retry, dispatch, or inspect exactly ONE
-                     run (pause/resume/retry/dispatch are typed controls;
+    run              Pause, resume, retry, resolve, dispatch, or inspect ONE
+                     run (pause/resume/retry/resolve/dispatch are typed controls;
                      status is read-only; the surface is run-scoped only).
     supervision      Read the versioned supervision status of exactly ONE
                      supervised run back (read-only; supervision is armed
@@ -168,6 +169,9 @@ pub enum RunAction {
     /// Authorize ONE bounded re-dispatch of ONE diagnosed step:
     /// `run retry`.
     Retry(RunRetryArgs),
+    /// Resolve ONE diagnosed prompt from recorder-attributed artifact evidence
+    /// without issuing its effect again: `run resolve`.
+    Resolve(RunResolveArgs),
     /// Dispatch ONE committed-spine step with the operator's own step inputs:
     /// `run dispatch`.
     Dispatch(RunDispatchArgs),
@@ -214,6 +218,23 @@ pub struct RunRetryArgs {
     pub socket: Option<String>,
 }
 
+/// `run resolve`: one diagnosed prompt plus a closed artifact-evidence file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunResolveArgs {
+    /// Explicit run id (`run-` + 16 hex).
+    pub run: String,
+    /// The exact diagnosed prompt step.
+    pub step: String,
+    /// Identity of the operator/agent recording the evidence.
+    pub recorder: String,
+    /// Readable JSON evidence object (feature head, branch, PR and checks).
+    pub evidence: PathBuf,
+    /// `--idempotency-key`: replay-safe automation key.
+    pub idempotency_key: Option<String>,
+    /// Explicit daemon socket override.
+    pub socket: Option<String>,
+}
+
 /// `run dispatch`: the exact target, the committed-spine step and the
 /// operator's own step inputs (everything else is derived daemon-side).
 #[derive(Clone, Debug, PartialEq)]
@@ -225,6 +246,10 @@ pub struct RunDispatchArgs {
     /// The operator's step-specific inputs (`--param KEY=VALUE`, repeatable);
     /// merged over the step's committed params.
     pub params: Vec<(String, Val)>,
+    /// Optional first-dispatch topology document.
+    pub topology: Option<PathBuf>,
+    /// Optional fresh admission attestation document.
+    pub admission: Option<PathBuf>,
     /// `--idempotency-key`: replay-safe automation key.
     pub idempotency_key: Option<String>,
     /// Explicit daemon socket override.
@@ -1485,6 +1510,7 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
         "pause" => "run pause",
         "resume" => "run resume",
         "retry" => "run retry",
+        "resolve" => "run resolve",
         "dispatch" => "run dispatch",
         "status" => "run status",
         "-h" | "--help" => return Err(ParseError::Help(help_request("run"))),
@@ -1503,6 +1529,10 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
     let mut step: Option<String> = None;
     let mut idempotency_key: Option<String> = None;
     let mut step_params: Vec<(String, Val)> = Vec::new();
+    let mut topology = None;
+    let mut admission = None;
+    let mut recorder: Option<String> = None;
+    let mut evidence: Option<PathBuf> = None;
     let rest = &args[1..];
     let mut index = 0;
     while index < rest.len() {
@@ -1556,6 +1586,32 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
                 }
                 step = Some(value);
             }
+            "--topology" | "--admission" if action.as_str() == "dispatch" => {
+                let flag = rest[index].as_str();
+                let value = PathBuf::from(flag_value(rest, &mut index, command, flag)?);
+                if flag == "--topology" {
+                    topology = Some(value);
+                } else {
+                    admission = Some(value);
+                }
+            }
+            "--recorder" if action.as_str() == "resolve" => {
+                let value = flag_value(rest, &mut index, command, "--recorder")?;
+                if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+                    return Err(ParseError::Usage(
+                        "run resolve: --recorder must be 1-128 printable characters".to_string(),
+                    ));
+                }
+                recorder = Some(value);
+            }
+            "--evidence" if action.as_str() == "resolve" => {
+                evidence = Some(PathBuf::from(flag_value(
+                    rest,
+                    &mut index,
+                    command,
+                    "--evidence",
+                )?));
+            }
             "--param" => {
                 let value = flag_value(rest, &mut index, command, "--param")?;
                 let Some((name, raw)) = value.split_once('=') else {
@@ -1563,9 +1619,9 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
                         "{command}: --param must be KEY=VALUE, got {value:?}"
                     )));
                 };
-                if !crate::formats::is_slug(name) {
+                if !crate::formats::is_step_param_name(name) {
                     return Err(ParseError::Usage(format!(
-                        "{command}: --param key must be a step param name (slug), got {name:?}"
+                        "{command}: --param key must be a step param name ([a-z][a-z0-9_-]*), got {name:?}"
                     )));
                 }
                 // One deterministic typing rule: a value that IS JSON
@@ -1654,6 +1710,36 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
                 socket,
             })
         }
+        "resolve" => {
+            if reason.is_some() || digest.is_some() || !step_params.is_empty() {
+                return Err(ParseError::Usage(
+                    "run resolve takes --run, --step, --recorder and --evidence only".to_string(),
+                ));
+            }
+            let Some(step) = step else {
+                return Err(ParseError::Usage(
+                    "run resolve: --step STEP is required (the diagnosed prompt)".to_string(),
+                ));
+            };
+            let Some(recorder) = recorder else {
+                return Err(ParseError::Usage(
+                    "run resolve: --recorder IDENTITY is required".to_string(),
+                ));
+            };
+            let Some(evidence) = evidence else {
+                return Err(ParseError::Usage(
+                    "run resolve: --evidence FILE is required".to_string(),
+                ));
+            };
+            RunAction::Resolve(RunResolveArgs {
+                run,
+                step,
+                recorder,
+                evidence,
+                idempotency_key,
+                socket,
+            })
+        }
         "dispatch" => {
             if reason.is_some() || digest.is_some() {
                 return Err(ParseError::Usage(
@@ -1669,6 +1755,8 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
                 run,
                 step,
                 params: step_params,
+                topology,
+                admission,
                 idempotency_key,
                 socket,
             })
@@ -1743,6 +1831,7 @@ fn parse_supervision(args: &[&String]) -> Result<Invocation, ParseError> {
                 }
                 run = Some(value);
             }
+            "-h" | "--help" => return Err(ParseError::Help(help_request("supervision"))),
             flag => {
                 return Err(ParseError::Usage(format!(
                     "{command}: unknown flag {flag:?}; run `canter supervision --help`"
@@ -4278,6 +4367,10 @@ fn execute_grant_issue(args: &GrantIssueArgs, invocation: &Invocation) -> CmdRes
     let created_at = crate::time::rfc3339_from_unix(now);
     let expires_at = crate::time::rfc3339_from_unix(now + args.expires_in);
     let scope = format!("worktrees/issues/{}", args.issue);
+    let key = args
+        .idempotency_key
+        .clone()
+        .unwrap_or_else(|| format!("ik_grant-{now}-{}", client::fresh_id()));
     let grant_id = grant_id_for(
         &request,
         args.issue,
@@ -4285,6 +4378,7 @@ fn execute_grant_issue(args: &GrantIssueArgs, invocation: &Invocation) -> CmdRes
         &role_revision,
         &scope,
         epoch,
+        &key,
     );
     let caps: Vec<Val> = request
         .boundary
@@ -4312,10 +4406,6 @@ fn execute_grant_issue(args: &GrantIssueArgs, invocation: &Invocation) -> CmdRes
         ("state_epoch", integer(epoch)),
         ("created_at", string(&created_at)),
     ]);
-    let key = args
-        .idempotency_key
-        .clone()
-        .unwrap_or_else(|| format!("ik_grant-{now}-{}", client::fresh_id()));
     let params = object(vec![
         ("grant", document.clone()),
         ("idempotency_key", string(&key)),
@@ -4366,13 +4456,9 @@ fn execute_grant_issue(args: &GrantIssueArgs, invocation: &Invocation) -> CmdRes
     ok_result(data, human)
 }
 
-/// The content-addressed grant id: `gr_` + first 16 hex of the sha256 over
-/// the canonical binding material (domain-separated), the same rule the plan
-/// id and the work-item id follow. The identity is the REVIEWED BINDING, not
-/// the window: `created_at` and `expires_at` are deliberately NOT part of it,
-/// so one reviewed run names exactly one grant whatever a caller asks for and
-/// a re-mint with ANY window refuses `state.grant_exists` (the first minted
-/// window stands) instead of silently creating a second authorization.
+/// A grant binds one explicit issuance as well as the reviewed material.
+/// A fresh invocation opens a fresh window without extending any old grant;
+/// reusing its key is still refused by the daemon's exactly-once claim fence.
 fn grant_id_for(
     request: &crate::queue_preview::QueueRequest,
     issue_number: i64,
@@ -4380,6 +4466,7 @@ fn grant_id_for(
     policy_hash: &str,
     scope: &str,
     state_epoch: i64,
+    issuance: &str,
 ) -> String {
     let caps: Vec<Val> = request
         .boundary
@@ -4389,6 +4476,7 @@ fn grant_id_for(
         .collect();
     let preimage = object(vec![
         ("schema", string("hf-grant-id/v1")),
+        ("issuance", string(issuance)),
         ("repository", string(&request.repository)),
         (
             "issue",
@@ -4958,6 +5046,7 @@ fn execute_run(action: RunAction, invocation: &Invocation) -> CmdResult {
         RunAction::Pause(args) => execute_run_pause(&args, invocation),
         RunAction::Resume(args) => execute_run_resume(&args, invocation),
         RunAction::Retry(args) => execute_run_retry(&args, invocation),
+        RunAction::Resolve(args) => execute_run_resolve(&args, invocation),
         RunAction::Dispatch(args) => execute_run_dispatch(&args, invocation),
         RunAction::Status(args) => execute_run_status(&args, invocation),
     }
@@ -5047,6 +5136,46 @@ fn execute_run_retry(args: &RunRetryArgs, invocation: &Invocation) -> CmdResult 
     }
 }
 
+/// `run resolve`: commit recorder-attributed evidence for one diagnosed
+/// prompt. Reading the evidence file is the only local action; the daemon
+/// validates and records the no-effect resolution.
+fn execute_run_resolve(args: &RunResolveArgs, invocation: &Invocation) -> CmdResult {
+    let paths = match run_control_paths(args.socket.as_deref(), invocation) {
+        Ok(paths) => paths,
+        Err(result) => return result,
+    };
+    let evidence = match std::fs::read_to_string(&args.evidence)
+        .map_err(|err| err.to_string())
+        .and_then(|text| Val::parse_json(&text))
+    {
+        Ok(value @ Val::Obj(_)) => value,
+        _ => {
+            return lane_error(
+                "usage.run_resolve",
+                "run resolve: --evidence requires a readable JSON object".to_string(),
+                false,
+            );
+        }
+    };
+    let key = args.idempotency_key.clone().unwrap_or_else(fresh_run_key);
+    let params = crate::run_control::resolution_params(
+        &key,
+        &args.run,
+        &args.step,
+        &args.recorder,
+        evidence,
+    );
+    match client::call(&paths.socket_path, "run.resolve", Some(&params)) {
+        Ok(result) => {
+            let human = crate::run_control::render_human(&result);
+            ok_result(result, human)
+        }
+        Err(RpcError { code, message }) => {
+            lane_error(&code, format!("run resolve: {message}"), false)
+        }
+    }
+}
+
 /// `run dispatch`: dispatch ONE committed-spine step with the operator's own
 /// step inputs (daemon `run.dispatch`). The plan document, the issue/grant
 /// pins, the topology and the admission inputs are derived daemon-side from
@@ -5069,7 +5198,28 @@ fn execute_run_dispatch(args: &RunDispatchArgs, invocation: &Invocation) -> CmdR
                 .collect(),
         ))
     };
-    let params = crate::run_control::dispatch_params(&key, &args.run, &args.step, supplied);
+    let mut params = crate::run_control::dispatch_params(&key, &args.run, &args.step, supplied);
+    for (name, path) in [("topology", &args.topology), ("admission", &args.admission)] {
+        if let Some(path) = path {
+            let value = std::fs::read_to_string(path)
+                .map_err(|err| err.to_string())
+                .and_then(|text| Val::parse_json(&text));
+            match value {
+                Ok(value @ Val::Obj(_)) => {
+                    if let Val::Obj(map) = &mut params {
+                        map.insert(name.to_string(), value);
+                    }
+                }
+                _ => {
+                    return lane_error(
+                        "usage.run_dispatch",
+                        format!("run dispatch: --{name} requires a readable JSON object"),
+                        false,
+                    );
+                }
+            }
+        }
+    }
     match client::call(&paths.socket_path, "run.dispatch", Some(&params)) {
         Ok(result) => {
             let human = crate::run_control::render_human(&result);
@@ -5562,7 +5712,7 @@ state.not_found) · 5 config error.
 ";
 
 const RUN_USAGE: &str = "\
-canter run <pause|resume|retry|dispatch|status> — run-scoped controls for ONE run
+canter run <pause|resume|retry|resolve|dispatch|status> — run-scoped controls for ONE run
 
 USAGE:
     canter run pause --run RUN_ID --reason TEXT [--idempotency-key IK] \
@@ -5571,8 +5721,11 @@ USAGE:
 [--socket PATH] [--config PATH] [--json]
     canter run retry --run RUN_ID --step STEP [--idempotency-key IK] \
 [--socket PATH] [--config PATH] [--json]
+    canter run resolve --run RUN_ID --step STEP --recorder IDENTITY \
+--evidence FILE [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run dispatch --run RUN_ID --step STEP [--param KEY=VALUE]... \
-[--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
+[--topology FILE] [--admission FILE] [--idempotency-key IK] [--socket PATH] \
+[--config PATH] [--json]
     canter run status --run RUN_ID [--socket PATH] [--config PATH] [--json]
 
 The scope is the RUN only: --run names exactly one durable run record
@@ -5607,13 +5760,22 @@ WHOLE effect: nothing is dispatched, spawned or consumed by this command —
 the operator's own corrected dispatch of that exact step consumes it
 exactly once (single use).
 
+resolve records an explicit, recorder-attributed artifact for ONE diagnosed
+prompt (daemon `run.resolve`): a closed JSON object binds the delivered feature
+head, output branch, PR identity and named checks. It advances the attempt
+ledger without invoking the prompt effect again. It cannot resolve any other
+step kind, an in-flight effect, an unattempted/refused/succeeded step, or an
+artifact whose branch/repository differs from the run.
+
 dispatch performs that corrected dispatch (daemon `run.dispatch`): it takes
 the run, the committed-spine step and ONLY the step-specific inputs the
 operator actually knows (`--param KEY=VALUE`, repeatable; a value that is
 JSON keeps its type, everything else is the literal string). The plan
-document, the issue/grant/workflow pins, the topology and the admission
-inputs are derived daemon-side from the run's committed submission and the
-run's own recorded dispatch context, so no `hf-plan/v1` is ever hand-built.
+document and issue/grant/workflow pins are derived daemon-side from the run's
+committed submission. `--topology FILE` supplies the documented topology for
+the run's first dispatch; later dispatches reuse that immutable recorded
+topology. `--admission FILE` may provide a fresh caller-attested admission
+measurement. No `hf-plan/v1` is ever hand-built.
 The operator's inputs are merged over the step's committed params and
 validated against the step kind's existing param contract BEFORE anything
 is journaled. That pre-screen is TOTAL over the step kinds: each kind's own
@@ -6099,6 +6261,15 @@ pub fn cli_main() -> std::process::ExitCode {
     if args.is_empty() {
         eprintln!("{USAGE}");
         eprintln!("error: no arguments given; try `canter --help`");
+        return ExitCode::from(2);
+    }
+    if matches!(
+        args[0].split('=').next(),
+        Some("--config" | "--socket" | "--json")
+    ) {
+        eprintln!(
+            "error: --config/--socket/--json belong after the subcommand; for example: canter run status --run RUN_ID --config FILE --socket PATH"
+        );
         return ExitCode::from(2);
     }
     if args[0].starts_with('-') {

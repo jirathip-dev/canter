@@ -8,9 +8,11 @@
 //! driven through the `plan`/`apply` RPC methods with real git subprocesses
 //! (disposable local repos — never a real remote) and scripted `gh` fakes.
 //! Nothing here touches the network, a real repository, or a real account.
+#[path = "support/process_group.rs"]
+mod process_group;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use canter::canonical::{canonical_bytes, sha256_hex};
@@ -18,6 +20,7 @@ use canter::client::{Connection, RpcError};
 use canter::dirs::DaemonPaths;
 use canter::state::{Retention, State};
 use canter::value::{Val, integer, null, object, string};
+use process_group::{GroupChild, assert_no_process_for_socket};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_canter")
@@ -228,18 +231,18 @@ impl Fixture {
         }
     }
 
-    fn spawn(&self, path: &str) -> Child {
+    fn spawn(&self, path: &str) -> GroupChild {
         let stderr_file = std::fs::File::create(&self.stderr_log).expect("stderr log");
-        Command::new(bin())
+        let mut command = Command::new(bin());
+        command
             .args(["daemon", "run", "--socket"])
             .arg(&self.socket)
             .env("XDG_STATE_HOME", &self.state_dir)
             .env("HOME", &self.dir)
             .env("PATH", path)
             .stdout(Stdio::null())
-            .stderr(Stdio::from(stderr_file))
-            .spawn()
-            .expect("spawn daemon")
+            .stderr(Stdio::from(stderr_file));
+        GroupChild::spawn(&mut command, &self.socket).expect("spawn daemon")
     }
 }
 
@@ -340,18 +343,6 @@ fn rpc_err(socket: &Path, id: &str, method: &str, params: Option<Val>) -> (Strin
 
 fn fresh_id(seed: u32) -> String {
     format!("{:08x}", seed + std::process::id())
-}
-
-fn wait_exit(mut child: Child, label: &str) {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if let Some(status) = child.try_wait().expect("try_wait") {
-            let _ = status;
-            return;
-        }
-        assert!(Instant::now() < deadline, "{label} did not exit in time");
-        std::thread::sleep(Duration::from_millis(25));
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -607,7 +598,7 @@ struct Scenario {
     repos: Repos,
     fixture: Fixture,
     plan: Val,
-    daemon: Option<Child>,
+    daemon: Option<GroupChild>,
 }
 
 impl Scenario {
@@ -777,13 +768,22 @@ impl Scenario {
 impl Drop for Scenario {
     fn drop(&mut self) {
         if let Some(mut daemon) = self.daemon.take() {
-            let _ = daemon.kill();
-            wait_exit(daemon, "scenario daemon");
+            daemon.terminate("mutation scenario daemon");
         }
         if std::env::var("HF_KEEP_SANDBOX").is_err() {
             let _ = std::fs::remove_dir_all(&self.sandbox.root);
         }
     }
+}
+
+#[test]
+fn mutation_fixture_reaps_its_daemon_group() {
+    let socket;
+    {
+        let scenario = Scenario::new("leak-detector", "2999-01-01T00:00:00Z", flow_steps());
+        socket = scenario.fixture.socket.clone();
+    }
+    assert_no_process_for_socket(&socket);
 }
 
 // Issue #133: bounded wire probes must still inspect status and the durable
@@ -1104,7 +1104,7 @@ fn lane_flow_merges_verified_head_closes_issue_and_cleans_with_salvage() {
             .unwrap_or("")
             .contains("lane transcript ok")
     );
-    let collected = scenario.apply_ok(13, "o1", None, None);
+    let collected = scenario.apply_ok(13, "o1", None, Some(&integration_base));
     let feature_head = collected
         .get("head")
         .and_then(Val::as_str)
@@ -1191,7 +1191,7 @@ fn moved_integration_base_invalidates_stale_evidence_and_refuses_merge() {
     scenario.apply_ok(30, "w1", None, None);
     scenario.apply_ok(31, "h1", None, None);
     scenario.apply_ok(32, "p1", None, None);
-    let collected = scenario.apply_ok(33, "o1", None, None);
+    let collected = scenario.apply_ok(33, "o1", None, Some(&integration_base));
     let feature_head = collected
         .get("head")
         .and_then(Val::as_str)
@@ -1416,7 +1416,7 @@ fn premature_issue_close_refuses_closure_premature_over_the_wire() {
     scenario.apply_ok(81, "w1", None, None);
     scenario.apply_ok(82, "h1", None, None);
     scenario.apply_ok(83, "p1", None, None);
-    let collected = scenario.apply_ok(84, "o1", None, None);
+    let collected = scenario.apply_ok(84, "o1", None, Some(&base));
     let feature = collected
         .get("head")
         .and_then(Val::as_str)

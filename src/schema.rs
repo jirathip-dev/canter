@@ -1056,7 +1056,11 @@ fn validate_plan(obj: &Val) -> Verdict {
                     }
                 }
                 match step.get("params") {
-                    None | Some(Val::Null) | Some(Val::Obj(_)) => {}
+                    None | Some(Val::Null) => {}
+                    Some(Val::Obj(params))
+                        if params
+                            .keys()
+                            .all(|key| crate::formats::is_step_param_name(key)) => {}
                     Some(other) => {
                         return Verdict::refuse(
                             Refusal::Malformed,
@@ -1192,7 +1196,7 @@ pub const SUPPORTED_FAMILIES: [Family; 18] = [
 /// mint path for route grants: `params.grant` carries the exact
 /// `hf-grant/v1` document, issuance stays daemon-issued — the closed set
 /// grows by exactly the one method issuance needs).
-pub const RPC_METHODS: [&str; 38] = [
+pub const RPC_METHODS: [&str; 39] = [
     "capabilities",
     "doctor",
     "status",
@@ -1224,6 +1228,7 @@ pub const RPC_METHODS: [&str; 38] = [
     "run.pause",
     "run.resume",
     "run.retry",
+    "run.resolve",
     "run.dispatch",
     "run.status",
     "supervision.status",

@@ -463,36 +463,18 @@ fn step_kind<'a>(evidence: &'a SupervisionEvidence, step: &str) -> &'a str {
         .unwrap_or("")
 }
 
-/// The run's next unachieved step: the first spine step after the recorded
-/// achieved frontier. The frontier is the position of `current_node` when it
-/// is a spine step, otherwise the last spine step with a recorded
-/// `succeeded` attempt; `None` when the spine is exhausted or the frontier
-/// is unknown (a recorded node outside the spine is never guessed).
+/// The next unachieved step from the recorded attempt ledger. Once any
+/// attempt exists, the ledger is authoritative; `current_node` is only a
+/// pre-ledger compatibility fallback. A diagnosed step therefore remains the
+/// frontier until an explicit evidence resolution records it succeeded.
 pub fn next_unachieved_step(evidence: &SupervisionEvidence) -> Option<(String, String)> {
     let spine: Vec<String> = evidence.steps.iter().map(|(id, _)| id.clone()).collect();
-    if spine.is_empty() {
-        return None;
-    }
-    let mut index: Option<usize> = None;
-    for (position, step) in spine.iter().enumerate() {
-        let succeeded = evidence
-            .attempts
-            .iter()
-            .any(|(id, status, _)| id == step && status == "succeeded");
-        if succeeded {
-            index = Some(position);
-        }
-    }
-    if let Some(position) = crate::run_control::step_index_of(&spine, &evidence.run.current_node) {
-        index = Some(match index {
-            Some(achieved) => achieved.max(position),
-            None => position,
-        });
-    }
-    let next = match index {
-        Some(position) => spine.get(position + 1)?.to_string(),
-        None => spine.first()?.to_string(),
-    };
+    let attempts: Vec<(String, String)> = evidence
+        .attempts
+        .iter()
+        .map(|(step, status, _)| (step.clone(), status.clone()))
+        .collect();
+    let next = crate::run_control::frontier_of(&spine, &attempts, &evidence.run.current_node)?;
     let kind = step_kind(evidence, &next).to_string();
     Some((next, kind))
 }

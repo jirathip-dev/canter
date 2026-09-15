@@ -20,7 +20,7 @@
 
 use crate::canonical::{canonical_bytes, sha256_hex};
 use crate::config::{Repository, WorkflowPin};
-use crate::value::{Val, integer, null, object, string};
+use crate::value::{Val, bool_, integer, null, object, string};
 
 /// The built-in doctrine workflow id known to this read-only slice.
 pub const DOCTRINE_WORKFLOW_ID: &str = "fleet-doctrine-1";
@@ -192,7 +192,7 @@ fn steps_value(steps: &[PlanStep]) -> Val {
 /// deduplicated. The caller also enforces the executable step bound
 /// (`queue_preview::STEPS_MAX`) — the spine grows by six steps per issue.
 pub fn queue_run_steps(
-    repository: &str,
+    _repository: &str,
     integration_branch: &str,
     harness_key: &str,
     issues: &[u64],
@@ -203,54 +203,63 @@ pub fn queue_run_steps(
         params: Some(object(vec![("ref", string(integration_branch))])),
     }];
     for number in issues {
+        let branch = format!("issue-{number}");
+        let worktree = format!("issues-{number}");
         steps.push(PlanStep {
             id: format!("p2-{number}"),
             kind: "worktree_create".to_string(),
-            params: Some(object(vec![(
-                "scope",
-                string(&format!("worktrees/issues/{number}")),
-            )])),
+            params: Some(object(vec![
+                ("branch", string(&branch)),
+                ("worktree", string(&worktree)),
+            ])),
         });
     }
     steps.push(PlanStep {
         id: "p3".to_string(),
         kind: "harness_start".to_string(),
-        params: Some(object(vec![("harness", string(harness_key))])),
+        params: Some(object(vec![("harness_key", string(harness_key))])),
     });
     for number in issues {
-        let work_item = string(&format!("{repository}#{number}"));
+        let branch = format!("issue-{number}");
+        let worktree = format!("issues-{number}");
         steps.push(PlanStep {
             id: format!("p4-{number}"),
             kind: "prompt".to_string(),
             params: Some(object(vec![
-                ("harness", string(harness_key)),
-                ("work_item", work_item.clone()),
+                ("harness_key", string(harness_key)),
+                ("worktree", string(&worktree)),
+                ("branch", string(&branch)),
+                ("requires_delta", bool_(true)),
             ])),
         });
         steps.push(PlanStep {
             id: format!("p5-{number}"),
             kind: "collect_outcome".to_string(),
-            params: Some(object(vec![("work_item", work_item.clone())])),
+            params: Some(object(vec![
+                ("worktree", string(&worktree)),
+                ("branch", string(&branch)),
+                ("requires_delta", bool_(true)),
+            ])),
         });
+        // Review facts are supplied only after an independent review, but an
+        // empty object keeps the reviewed spine resolved without fabricating
+        // a reviewer, verdict, checks, or observed heads.
         steps.push(PlanStep {
             id: format!("p6-{number}"),
             kind: "review_evidence".to_string(),
-            params: Some(object(vec![("work_item", work_item.clone())])),
+            params: Some(object(vec![])),
         });
         steps.push(PlanStep {
             id: format!("p7-{number}"),
             kind: "merge".to_string(),
-            params: Some(object(vec![
-                ("work_item", work_item.clone()),
-                ("ref", string(integration_branch)),
-            ])),
+            params: Some(object(vec![("branch", string(&branch))])),
         });
         steps.push(PlanStep {
             id: format!("p8-{number}"),
             kind: "cleanup".to_string(),
             params: Some(object(vec![
-                ("work_item", work_item),
-                ("scope", string(&format!("worktrees/issues/{number}"))),
+                ("worktree", string(&worktree)),
+                ("branch", string(&branch)),
             ])),
         });
     }
@@ -524,21 +533,38 @@ mod tests {
             worktree
                 .params
                 .as_ref()
-                .and_then(|params| params.get("scope"))
+                .and_then(|params| params.get("worktree"))
                 .and_then(Val::as_str),
-            Some("worktrees/issues/5")
+            Some("issues-5")
+        );
+        assert_eq!(
+            worktree
+                .params
+                .as_ref()
+                .and_then(|params| params.get("branch"))
+                .and_then(Val::as_str),
+            Some("issue-5")
         );
         let prompt = one
             .iter()
             .find(|step| step.id == "p4-5")
             .expect("prompt step");
+        let prompt_params = prompt.params.as_ref().expect("prompt params");
         assert_eq!(
-            prompt
-                .params
-                .as_ref()
-                .and_then(|params| params.get("work_item"))
-                .and_then(Val::as_str),
-            Some("example-org/widgets#5")
+            prompt_params.get("worktree").and_then(Val::as_str),
+            Some("issues-5")
+        );
+        assert_eq!(
+            prompt_params.get("branch").and_then(Val::as_str),
+            Some("issue-5")
+        );
+        assert_eq!(
+            prompt_params.get("harness_key").and_then(Val::as_str),
+            Some("lane-1")
+        );
+        assert_eq!(
+            prompt_params.get("requires_delta").and_then(Val::as_bool),
+            Some(true)
         );
 
         // Deterministic: identical inputs, byte-identical steps.

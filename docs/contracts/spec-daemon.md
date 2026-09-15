@@ -31,7 +31,8 @@ remain usable without it; SQLite owns state; no network control API).
   `lane.checkpoint.create`, `lane.checkpoint.status`, `lane.retire`,
   `lane.start`, `lane.adopt`, `lane.successor.consume`,
   `state.epoch`, `queue.submit`, `queue.status`, `run.pause`,
-  `run.resume`, `run.retry`, `run.dispatch`, `run.status`, `supervision.status`,
+  `run.resume`, `run.retry`, `run.resolve`, `run.dispatch`, `run.status`,
+  `supervision.status`,
   `backup.create`, `restore.begin`, `journal.tail`,
   `events.subscribe` (issue #77 adds no method: the target-profile plan
   travels as an optional `params.profile` on `lane.replacement.request` and
@@ -62,10 +63,10 @@ remain usable without it; SQLite owns state; no network control API).
   response document is the minted `hf-grant/v1` document itself (the
   contract shape, `caps` as an array). The `gr_` id is content-addressed
   over the REVIEWED BINDING (repository, issue number + acceptance revision,
-  workflow hash, policy hash, phase, scope, caps, live state epoch); the
-  requested window is deliberately not part of that identity, so a re-mint
-  of the same binding refuses `state.grant_exists` whatever `expires_at` it
-  asks for and the first minted window stands.
+  workflow hash, policy hash, phase, scope, caps, live state epoch) AND the
+  issuance idempotency key. A fresh key therefore opens a fresh authorization
+  window without extending or replacing an earlier live/expired row; replaying
+  one key remains exactly-once and returns its recorded response.
   Minting is not authorization: the
   grant only becomes authority at the board / `queue submit` point.
 - `apply` **requires** `params.idempotency_key` (`ik_` format): an apply
@@ -299,6 +300,14 @@ outcome after the effect transaction commits.
   paused run refuses `submission.paused` unless the presented engine
   digest authorizes exactly that run's resume (applied once, in the same
   transaction, against the same run).
+- Acceptance revision hashes are opaque and never sorted lexically. A selected
+  revision different from the active owner's revision is `preview.revision_stale`
+  unless a route grant for that exact selection was issued AFTER the owner's
+  grant. Presenting that later, still-valid grant atomically invalidates the old
+  run and rebinds the unique ownership row to the new run; presenting an older
+  grant remains stale, and the same-revision case remains
+  `submission.already_owned`. The grant insertion order is the normative
+  authorization-window order.
 - `queue.status` requires `params.submission_id` (`qs_` + 16 hex) and
   returns the same document the submit response carried (a pure
   projection of the committed rows; `state.not_found` for an unknown id).
@@ -311,14 +320,15 @@ outcome after the effect transaction commits.
 
 ## Run-scoped control methods (issue #86)
 
-Safe-boundary pause, resume, bounded retry and one supported step dispatch
+Safe-boundary pause, resume, bounded retry, evidence resolution and one supported step dispatch
 over exactly ONE run — the
 `run-` instance row the queue executor commits for every admitted issue
-(spec-state.md "Run control additions"). All five methods address one
+(spec-state.md "Run control additions"). All six methods address one
 exact run identity, journal through the same claim machinery as every
 daemon mutation (`params.idempotency_key` required on the mutating paths;
 a same-key retry replays the recorded response) and render a module-local
-document (`hf-run-control/v1` / `hf-run-retry/v1` / `hf-run-dispatch/v1`,
+document (`hf-run-control/v1` / `hf-run-retry/v1` /
+`hf-run-resolution/v1` / `hf-run-dispatch/v1`,
 deliberately outside the closed `hf-*` family set like the #84 preview and
 the #85 submission).
 
@@ -326,7 +336,7 @@ the #85 submission).
 
 | level | identity | methods | effect of a control |
 | --- | --- | --- | --- |
-| run | one `run-` + 16 hex instance id | `run.pause` / `run.resume` / `run.retry` / `run.dispatch` / `run.status` | exactly this run: stop admitting new steps, lift THIS run's pause, authorize one bounded re-dispatch of one diagnosed step (authorization only), dispatch ONE committed-spine step with the caller's own step inputs |
+| run | one `run-` + 16 hex instance id | `run.pause` / `run.resume` / `run.retry` / `run.resolve` / `run.dispatch` / `run.status` | exactly this run: stop admitting new steps, lift THIS run's pause, authorize one bounded re-dispatch of one diagnosed step (authorization only), resolve one diagnosed prompt from recorder-attributed evidence without an effect, or dispatch ONE committed-spine step with the caller's own step inputs |
 | fleet | the whole run population | NONE — there is no `fleet.*` method in the closed set | a fleet-level hold is an operator policy expressed as the set of paused runs; every resume is fenced on the exact instance id, so no run control ever lifts another run's pause or anything fleet-wide |
 | lane | one handoff lane generation (`rp_` records) | `lane.*` only | run controls never touch lane records; a non-run identity refuses `refusal.run.target` |
 
@@ -361,13 +371,12 @@ clears a repository/fleet-level hold or bypasses a gate.
   fenced on the exact instance id (`WHERE instance_id = ? AND paused = 1`)
   and consumes the digest on success: an unrelated run's pause — or any
   fleet-level hold expressed as paused runs — is NEVER cleared.
-- The run's retry frontier derives from the RECORDED attempt ledger (issue
-  #92 F3): it is the first bound-spine step whose latest recorded attempt is
-  not `succeeded`, so a diagnosed `ambiguous` (timed-out) or failed attempt
-  is addressable even when the run's recorded node fell behind; the
-  node-derived frontier stays the other input and the FURTHER of the two
-  wins (a stale ledger never rewinds the frontier, a stale node never hides
-  a diagnosed step).
+- After the first recorded attempt, the RECORDED attempt ledger is the run's
+  authoritative frontier (issue #92 F10): it is the first bound-spine step
+  whose latest recorded attempt is not `succeeded`. Before any attempt, the
+  node-derived frontier preserves the pre-ledger run behavior. A diagnosed
+  `ambiguous` or failed attempt therefore cannot be hidden by a stale or
+  optimistically advanced node.
 - `run.retry` requires `params.instance_id` and `params.step` (a plan step
   id). It refuses: a terminal run (`refusal.run.terminal`), a paused or
   pause-requested run (`refusal.run.paused` — resume first), a run without
@@ -387,6 +396,15 @@ clears a repository/fleet-level hold or bypasses a gate.
   who supplies the corrected step inputs (see `run.dispatch`). A
   re-dispatch of a diagnosed failed step without an unconsumed
   authorization refuses `refusal.run.retry_required` before any effect.
+- `run.resolve` requires one diagnosed `prompt` step plus a recorder identity
+  and closed artifact evidence (`feature_head`, the prompt's bound `branch`,
+  `pull_request {repository, number}`, and non-empty named `checks`). It
+  validates the run, ownership, live epoch/grant, exact diagnosed frontier,
+  output branch and repository, then atomically records a successful attempt
+  attributed to the recorder. It carries no prompt, argv, topology, grant or
+  effect params and never executes the prompt again. The next frontier is the
+  next genuinely unachieved step; a prompt without a resolution remains
+  diagnosed and fenced from supervision re-dispatch.
 - `run.dispatch` requires `params.instance_id`, `params.step` (a
   committed-spine plan step id) and an optional `params.params` object: the
   step's OWN inputs, which are merged over the step's committed params (the
@@ -398,16 +416,17 @@ clears a repository/fleet-level hold or bypasses a gate.
   a committed spine or without a recorded dispatch context refuses
   `refusal.run.scope` (the first dispatch of a run belongs to the caller that
   holds the topology), a step outside the spine refuses
-  `refusal.run.step_unknown`, and the merged params are checked against the
+  `refusal.run.step_unknown`, a step other than the ledger-authoritative
+  frontier refuses `refusal.run.step_order`, and the merged params are checked against the
   step kind's existing param contract BEFORE anything is journaled. That
   pre-screen is TOTAL over the closed step-kind set: each kind's own param
-  contract, the request-level observed read-backs (`review_evidence`,
+  contract, the durable worker-head read-backs (`review_evidence`,
   `post_merge_verify`) and the topology gates its effect reads (the archive
   root) are resolved up front, and a kind with no registered contract refuses
   as well — so a request that is not well-formed enough to be attempted
   refuses typed (e.g. `refusal.request.malformed`, `refusal.push_policy`)
-  whatever its kind and leaves any pending bounded retry authorization
-  UNCONSUMED. The resulting dispatch runs through
+  whatever its kind, records no attempt, and leaves any pending bounded retry
+  authorization UNCONSUMED. The resulting dispatch runs through
   the same `apply` engine, so every gate re-derives there and exactly one
   unconsumed authorization is consumed by a re-dispatch of a diagnosed step.
   It renders `hf-run-dispatch/v1` (the addressed run/step, the params the

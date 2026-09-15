@@ -39,6 +39,9 @@ pub const RUN_RETRY_SCHEMA: &str = "hf-run-retry/v1";
 /// The supported step-dispatch document schema id (module-local).
 pub const RUN_DISPATCH_SCHEMA: &str = "hf-run-dispatch/v1";
 
+/// Evidence-based diagnosed-step resolution (module-local).
+pub const RUN_RESOLUTION_SCHEMA: &str = "hf-run-resolution/v1";
+
 /// Bound on the operator pause reason (same bound as the lane hold).
 pub const REASON_MAX: usize = 300;
 
@@ -54,6 +57,10 @@ pub const RETRY_STATEMENT: &str = "bounded retry only: exactly ONE diagnosed ste
 /// The statement every dispatch document carries: what the supported
 /// dispatch surface did and did NOT do.
 pub const DISPATCH_STATEMENT: &str = "step dispatch only: exactly ONE step of this run is dispatched, derived from the run's committed submission spine and the run's own recorded dispatch context — the caller presents only that step's own inputs (merged over the committed params, never a stale reconstruction); a request that is not well-formed enough to be attempted refuses typed BEFORE any bounded retry authorization is consumed, and that pre-screen is TOTAL over the closed step-kind set (each kind's own param contract, including the request-level observed read-backs and the topology gates its effect reads — a kind with no registered contract refuses too), so no kind inherits the burn; an unconsumed authorization of a diagnosed step is consumed by exactly this dispatch (single use), and nothing else is dispatched, spawned, resumed, cleaned up or widened";
+
+/// The statement on evidence-based resolution: the diagnosed effect is never
+/// executed again and the record conveys no review or merge authority.
+pub const RESOLUTION_STATEMENT: &str = "diagnosed-step resolution only: recorder-attributed artifact evidence marks exactly ONE prompt step delivered without re-executing its ambiguous/failed effect; no process is started or prompted, no Git/forge write occurs, no review verdict or merge authority is created, and supervision's diagnosed-step no-redispatch fence remains in force";
 
 /// The closed control-state vocabulary rendered by the documents.
 pub const CONTROL_STATES: [&str; 3] = ["active", "pause_requested", "paused"];
@@ -86,6 +93,12 @@ pub mod codes {
     pub const RETRY_PENDING: &str = "refusal.run.retry_pending";
     /// All bounded retries for this step are used.
     pub const RETRY_BOUND: &str = "refusal.run.retry_bound";
+    /// Evidence resolution is supported only for a diagnosed prompt effect.
+    pub const RESOLUTION_KIND: &str = "refusal.run.resolution_kind";
+    /// Artifact evidence or recorder identity is malformed/incomplete.
+    pub const RESOLUTION_EVIDENCE: &str = "refusal.run.resolution_evidence";
+    /// A claimed effect still exists; resolution cannot race it.
+    pub const IN_FLIGHT: &str = "refusal.run.in_flight";
     /// The run was superseded: live ownership of its issue belongs to
     /// another run.
     pub const SUPERSEDED: &str = "refusal.run.superseded";
@@ -143,6 +156,22 @@ pub struct RetryParams {
     pub step: String,
 }
 
+/// `run.resolve` params: one diagnosed prompt, attributed artifact evidence,
+/// and no instruction capable of re-running the effect.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolveParams {
+    /// The presented idempotency key.
+    pub idempotency_key: String,
+    /// The exact run identity (`run-` + 16 hex).
+    pub instance_id: String,
+    /// The exact diagnosed prompt step.
+    pub step: String,
+    /// The bounded identity that attests/records the evidence.
+    pub recorder: String,
+    /// Closed artifact evidence: feature head, branch, PR and named checks.
+    pub evidence: Val,
+}
+
 /// `run.dispatch` params, fully shape-validated (issue #92): the run, the
 /// committed-spine step and ONLY the step-specific inputs the operator
 /// actually knows — every other input (plan, issue pins, grant, topology,
@@ -159,6 +188,10 @@ pub struct DispatchParams {
     /// The operator's step inputs, merged over the step's committed params.
     /// `None` = the committed params as reviewed (no correction).
     pub step_params: Option<Val>,
+    /// Initial lane paths; later dispatches reuse the recorded topology.
+    pub topology: Option<Val>,
+    /// Explicit current admission attestation; never a synthesized measurement.
+    pub admission: Option<Val>,
 }
 
 /// Validate one required key and return its closed key set check.
@@ -309,11 +342,149 @@ pub fn parse_retry_params(params: &Val) -> Result<RetryParams, ControlError> {
     })
 }
 
+/// Parse a recorder-attributed artifact resolution. Its closed evidence is
+/// deliberately data-only: no argv, prompt, topology, grant, or effect params
+/// can ride this path and accidentally re-execute work.
+pub fn parse_resolution_params(params: &Val) -> Result<ResolveParams, ControlError> {
+    only_keys(
+        params,
+        &[
+            "idempotency_key",
+            "instance_id",
+            "step",
+            "recorder",
+            "evidence",
+        ],
+        "run.resolve",
+    )?;
+    let idempotency_key = required(params, "idempotency_key", "run.resolve")?;
+    if !formats::is_idempotency_key(&idempotency_key) {
+        return Err(ControlError::new(
+            "refusal.malformed",
+            "run.resolve params.idempotency_key must be `ik_` + 8-64 of [a-z0-9-]",
+        ));
+    }
+    let instance_id = required(params, "instance_id", "run.resolve")?;
+    if !formats::is_run_id(&instance_id) {
+        return Err(ControlError::new(
+            codes::TARGET,
+            "run.resolve addresses exactly ONE run (`run-` + 16 hex)",
+        ));
+    }
+    let step = required(params, "step", "run.resolve")?;
+    if !formats::is_slug(&step) {
+        return Err(ControlError::new(
+            "refusal.malformed",
+            "run.resolve params.step must be a committed plan step id (slug)",
+        ));
+    }
+    let recorder = required(params, "recorder", "run.resolve")?;
+    if recorder.is_empty() || recorder.len() > 128 || recorder.chars().any(char::is_control) {
+        return Err(ControlError::new(
+            codes::RESOLUTION_EVIDENCE,
+            "run.resolve recorder must be 1-128 printable characters",
+        ));
+    }
+    let evidence = params.get("evidence").cloned().ok_or_else(|| {
+        ControlError::new(
+            codes::RESOLUTION_EVIDENCE,
+            "run.resolve requires params.evidence",
+        )
+    })?;
+    only_keys(
+        &evidence,
+        &["feature_head", "branch", "pull_request", "checks"],
+        "run.resolve evidence",
+    )
+    .map_err(|err| ControlError::new(codes::RESOLUTION_EVIDENCE, err.message))?;
+    let feature_head = required(&evidence, "feature_head", "run.resolve evidence")
+        .map_err(|err| ControlError::new(codes::RESOLUTION_EVIDENCE, err.message))?;
+    if !formats::is_hex40(&feature_head) {
+        return Err(ControlError::new(
+            codes::RESOLUTION_EVIDENCE,
+            "run.resolve evidence.feature_head must be exact 40-hex",
+        ));
+    }
+    let branch = required(&evidence, "branch", "run.resolve evidence")
+        .map_err(|err| ControlError::new(codes::RESOLUTION_EVIDENCE, err.message))?;
+    if !formats::is_slug(&branch) {
+        return Err(ControlError::new(
+            codes::RESOLUTION_EVIDENCE,
+            "run.resolve evidence.branch must be a feature-branch slug",
+        ));
+    }
+    let pull_request = evidence.get("pull_request").ok_or_else(|| {
+        ControlError::new(
+            codes::RESOLUTION_EVIDENCE,
+            "run.resolve evidence requires pull_request {repository, number}",
+        )
+    })?;
+    only_keys(pull_request, &["repository", "number"], "pull_request")
+        .map_err(|err| ControlError::new(codes::RESOLUTION_EVIDENCE, err.message))?;
+    let repository = required(pull_request, "repository", "pull_request")
+        .map_err(|err| ControlError::new(codes::RESOLUTION_EVIDENCE, err.message))?;
+    let number = pull_request.get("number").and_then(Val::as_int);
+    if !formats::is_repository_identity(&repository) || !matches!(number, Some(value) if value > 0)
+    {
+        return Err(ControlError::new(
+            codes::RESOLUTION_EVIDENCE,
+            "run.resolve evidence.pull_request requires owner/name repository and positive number",
+        ));
+    }
+    let checks = evidence
+        .get("checks")
+        .and_then(Val::as_array)
+        .ok_or_else(|| {
+            ControlError::new(
+                codes::RESOLUTION_EVIDENCE,
+                "run.resolve evidence.checks must be a non-empty named-check list",
+            )
+        })?;
+    if checks.is_empty() {
+        return Err(ControlError::new(
+            codes::RESOLUTION_EVIDENCE,
+            "run.resolve evidence.checks must be non-empty",
+        ));
+    }
+    for check in checks {
+        only_keys(check, &["name", "status"], "resolution check")
+            .map_err(|err| ControlError::new(codes::RESOLUTION_EVIDENCE, err.message))?;
+        let name = required(check, "name", "resolution check")
+            .map_err(|err| ControlError::new(codes::RESOLUTION_EVIDENCE, err.message))?;
+        let status = required(check, "status", "resolution check")
+            .map_err(|err| ControlError::new(codes::RESOLUTION_EVIDENCE, err.message))?;
+        if name.is_empty()
+            || name.len() > 128
+            || name.chars().any(char::is_control)
+            || !matches!(status.as_str(), "passed" | "failed" | "pending")
+        {
+            return Err(ControlError::new(
+                codes::RESOLUTION_EVIDENCE,
+                "resolution checks require a bounded printable name and passed|failed|pending status",
+            ));
+        }
+    }
+    Ok(ResolveParams {
+        idempotency_key,
+        instance_id,
+        step,
+        recorder,
+        evidence,
+    })
+}
+
 /// Parse and shape-validate `run.dispatch` params (issue #92).
 pub fn parse_dispatch_params(params: &Val) -> Result<DispatchParams, ControlError> {
     only_keys(
         params,
-        &["idempotency_key", "instance_id", "step", "params"],
+        &[
+            "idempotency_key",
+            "instance_id",
+            "step",
+            "params",
+            "topology",
+            "admission",
+        ],
         "run.dispatch",
     )?;
     let idempotency_key = required(params, "idempotency_key", "run.dispatch")?;
@@ -342,7 +513,9 @@ pub fn parse_dispatch_params(params: &Val) -> Result<DispatchParams, ControlErro
     }
     let step_params = match params.get("params") {
         None | Some(Val::Null) => None,
-        Some(inputs @ Val::Obj(_)) => Some(inputs.clone()),
+        Some(inputs @ Val::Obj(map)) if map.keys().all(|key| formats::is_step_param_name(key)) => {
+            Some(inputs.clone())
+        }
         Some(other) => {
             return Err(ControlError::new(
                 "refusal.malformed",
@@ -353,11 +526,21 @@ pub fn parse_dispatch_params(params: &Val) -> Result<DispatchParams, ControlErro
             ));
         }
     };
+    let context = |name: &str| match params.get(name) {
+        None | Some(Val::Null) => Ok(None),
+        Some(value @ Val::Obj(_)) => Ok(Some(value.clone())),
+        _ => Err(ControlError::new(
+            "refusal.malformed",
+            format!("run.dispatch {name} must be an object"),
+        )),
+    };
     Ok(DispatchParams {
         idempotency_key,
         instance_id,
         step,
         step_params,
+        topology: context("topology")?,
+        admission: context("admission")?,
     })
 }
 
@@ -385,6 +568,24 @@ pub fn retry_params(key: &str, instance_id: &str, step: &str) -> Val {
         ("idempotency_key", string(key)),
         ("instance_id", string(instance_id)),
         ("step", string(step)),
+    ])
+}
+
+/// The canonical `run.resolve` params document. Evidence is data, never an
+/// effect request or a set of replacement step params.
+pub fn resolution_params(
+    key: &str,
+    instance_id: &str,
+    step: &str,
+    recorder: &str,
+    evidence: Val,
+) -> Val {
+    object(vec![
+        ("idempotency_key", string(key)),
+        ("instance_id", string(instance_id)),
+        ("step", string(step)),
+        ("recorder", string(recorder)),
+        ("evidence", evidence),
     ])
 }
 
@@ -445,39 +646,29 @@ pub fn next_step_of(spine: &[String], current_node: &str) -> Option<String> {
     spine.get(index + 1).cloned()
 }
 
-/// The retry frontier of one run, derived from the RECORDED attempt ledger
-/// (issue #92 F3): the first bound-spine step whose latest recorded attempt
-/// is not `succeeded` — an `ambiguous` (timed-out) or `failed` attempt IS
-/// the frontier, which is exactly the step `run.retry` must be able to
-/// address. The node-derived frontier ([`next_step_of`]) is kept as the
-/// other input and the FURTHER of the two wins, so:
-/// - a stale ledger can never rewind the frontier below the recorded node;
-/// - a stale node can never hide a diagnosed step the ledger knows about.
-///
-/// `None` only when neither input establishes one (empty spine).
-///
-/// Fail-closed by construction: this only decides WHICH step is the
-/// frontier; every eligibility check (diagnosis, bound, epoch, grant,
-/// consumption) stays where it was.
+/// The retry/continuation frontier of one run. Once an attempt ledger exists,
+/// it is authoritative: the first bound-spine step whose LATEST recorded
+/// attempt is not `succeeded` (including an unattempted gap) is the frontier.
+/// A stale `current_node` can therefore neither hide a diagnosed step nor
+/// skip an unattempted one. `current_node` is only the legacy fallback before
+/// the run has any attempt record.
 pub fn frontier_of(
     spine: &[String],
     attempts: &[(String, String)],
     current_node: &str,
 ) -> Option<String> {
-    let ledger = spine.iter().position(|step| {
-        let latest = attempts
-            .iter()
-            .rfind(|(id, _)| id == step)
-            .map(|(_, status)| status.as_str());
-        latest != Some("succeeded")
-    });
-    let node = next_step_of(spine, current_node).and_then(|step| step_index_of(spine, &step));
-    match (ledger, node) {
-        (Some(ledger), Some(node)) => spine.get(ledger.max(node)).cloned(),
-        (Some(ledger), None) => spine.get(ledger).cloned(),
-        (None, Some(node)) => spine.get(node).cloned(),
-        (None, None) => None,
+    if attempts.is_empty() {
+        return next_step_of(spine, current_node);
     }
+    spine
+        .iter()
+        .find(|step| {
+            attempts
+                .iter()
+                .rfind(|(id, _)| id == *step)
+                .is_none_or(|(_, status)| status != "succeeded")
+        })
+        .cloned()
 }
 
 /// The position of one step in the bound spine (`None` when it is not a
@@ -629,6 +820,43 @@ impl RunRetryRow {
             "consumed".to_string()
         }
     }
+}
+
+/// Render a successful evidence-based resolution of one diagnosed prompt.
+/// The record advances the ledger without issuing the prompt effect again.
+#[allow(clippy::too_many_arguments)]
+pub fn resolution_doc(
+    run: &InstanceRow,
+    step: &str,
+    kind: &str,
+    prior_status: &str,
+    recorder: &str,
+    evidence: &Val,
+    recorded_at: &str,
+    key: &str,
+) -> Val {
+    let digest =
+        sha256_hex(format!("{RUN_RESOLUTION_SCHEMA}|{}|{step}|{key}", run.instance_id).as_bytes());
+    object(vec![
+        ("schema", string(RUN_RESOLUTION_SCHEMA)),
+        ("resolution_id", string(&format!("rs_{}", &digest[..16]))),
+        ("run", run_block(run)),
+        (
+            "resolution",
+            object(vec![
+                ("step_id", string(step)),
+                ("kind", string(kind)),
+                ("prior_status", string(prior_status)),
+                ("status", string("succeeded")),
+                ("recorder", string(recorder)),
+                ("recorded_at", string(recorded_at)),
+                ("evidence", evidence.clone()),
+                ("effect_reexecuted", bool_(false)),
+            ]),
+        ),
+        ("scope", scope_block(&run.instance_id)),
+        ("statement", string(RESOLUTION_STATEMENT)),
+    ])
 }
 
 /// Render the `hf-run-dispatch/v1` projection of one supported step dispatch
