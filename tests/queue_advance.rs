@@ -771,6 +771,296 @@ fn a_paused_or_invalidated_run_never_advances_its_queue() {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #152: a delivering run completes only AFTER its LAST committed step
+// ---------------------------------------------------------------------------
+
+/// The queue spine prefix shared by every fixture: a resolved read step plus
+/// the reviewed-evidence step whose committed record IS the delivery.
+fn delivery_spine() -> Vec<qp::PlannedStep> {
+    vec![
+        qp::PlannedStep {
+            id: "p1".to_string(),
+            kind: "checkout".to_string(),
+            params: Some(resolved()),
+        },
+        qp::PlannedStep {
+            id: "r1".to_string(),
+            kind: "review_evidence".to_string(),
+            params: Some(review_params()),
+        },
+    ]
+}
+
+/// The `review_evidence` step params of the passing reviewed delivery.
+fn review_params() -> Val {
+    object(vec![
+        ("reviewer", string("reviewer-1")),
+        ("implementer", string("implementer-1")),
+        ("verdict", string("pass")),
+        (
+            "checks",
+            Val::Arr(vec![object(vec![
+                ("name", string("hosted-ci")),
+                ("status", string("passed")),
+            ])]),
+        ),
+    ])
+}
+
+/// The spine shape of issue #152 (the #146 plan): committed steps AFTER the
+/// reviewed delivery — the merge, then the cleanup.
+fn committed_tail_steps() -> Vec<qp::PlannedStep> {
+    let mut steps = delivery_spine();
+    steps.push(qp::PlannedStep {
+        id: "m1".to_string(),
+        kind: "merge".to_string(),
+        params: Some(object(vec![
+            ("branch", string("issue-5")),
+            ("merge_policy", string("squash")),
+        ])),
+    });
+    steps.push(qp::PlannedStep {
+        id: "c1".to_string(),
+        kind: "cleanup".to_string(),
+        params: Some(object(vec![
+            ("branch", string("issue-5")),
+            ("worktree", string("issues-5")),
+        ])),
+    });
+    steps
+}
+
+/// The boundary caps that cover the committed tail (merge + cleanup).
+fn tail_boundary_caps() -> Vec<String> {
+    ["read", "worktree", "spawn", "review", "merge", "cleanup"]
+        .iter()
+        .map(|cap| cap.to_string())
+        .collect()
+}
+
+/// Record ONE achieved step of a run through the SAME durable ledger the
+/// apply engine writes (pre-effect claim -> recorded outcome), so the
+/// frontier and the completion timing read one fact. No external effect runs
+/// here: the daemon-level witnesses drive the real effects.
+fn record_achieved_step(state: &State, run: &str, step: &str, action: &str, seed: u64) {
+    let key = idem_key(&format!("achieved-{step}-{seed}"));
+    let request_line = canter::canonical::canonical_text(&object(vec![
+        ("method", string("apply")),
+        (
+            "params",
+            object(vec![("instance_id", string(run)), ("step", string(step))]),
+        ),
+    ]));
+    let (claim, _) = state
+        .journal_intent(
+            action,
+            &format!("{REPO}:{run}:{step}"),
+            &key,
+            &format!("request-{seed:016x}"),
+            "apply",
+            None,
+            None,
+            &request_line,
+        )
+        .expect("step intent");
+    assert!(
+        matches!(claim, canter::state::ClaimAttempt::Claimed),
+        "the step claim must be fresh: {claim:?}"
+    );
+    let outcome = canter::canonical::canonical_text(&object(vec![("status", string("succeeded"))]));
+    state
+        .resolve_run_step_claim(
+            &key,
+            "apply",
+            &outcome,
+            "{}",
+            run,
+            step,
+            &canter::time::rfc3339_now(),
+        )
+        .expect("step outcome");
+}
+
+fn run_status(state: &State, run: &str) -> String {
+    state
+        .instance_by_id(run)
+        .expect("instance read")
+        .expect("instance row")
+        .status
+}
+
+fn submission_items(state: &State, submission: &str) -> Vec<canter::state::QueueSubmissionItemRow> {
+    state
+        .queue_submission_by_id(submission)
+        .expect("read")
+        .expect("submission")
+        .1
+}
+
+#[test]
+fn a_delivering_run_with_committed_steps_after_the_delivery_stays_live_until_its_last_step() {
+    let fixture = Fixture::new("committed-tail");
+    let state = fixture.open();
+    seed_grant(&state, "gr_0000000000000005", 5);
+    seed_grant(&state, "gr_0000000000000006", 6);
+    let mut request = request_with(vec![selected("#5", &[]), selected("#6", &[])]);
+    request.steps = committed_tail_steps();
+    request.boundary.caps = tail_boundary_caps();
+    let (bound, digest) = render_bound(&state, &request);
+    // ONE per-repository slot: the second approved issue waits.
+    let caps = ConcurrencyCaps {
+        global: 4,
+        per_repository: 1,
+        per_harness: 2,
+    };
+    let plan = submission_plan(
+        &state,
+        "ik_152-committed-tail",
+        &bound,
+        &digest,
+        &[("#5", "gr_0000000000000005"), ("#6", "gr_0000000000000006")],
+        caps,
+    );
+    let (submission, items) = state.submit_queue_run(&plan).expect("submit");
+    let run5 = item_of(&items, 5)
+        .instance_id
+        .clone()
+        .expect("issue 5 admitted");
+    assert_eq!(item_of(&items, 6).status, "waiting");
+
+    // Issue 5 is delivered: reviewed PASS + green checks at the exact head.
+    // The steps the run already executed (the read + its own reviewed
+    // evidence) are on the ledger, as a real run leaves them.
+    record_achieved_step(&state, &run5, "p1", "mutate.checkout", 11);
+    record_achieved_step(&state, &run5, "r1", "mutate.review_evidence", 12);
+    record_delivery(&state, &run5, HEAD_A);
+    let delivery = reconcile(&state, &run5, true).expect("a fresh verified delivery");
+
+    // The run's record NAMES the committed steps it still owes, so the
+    // delivery can never read as a bare `done`.
+    let evidence = state
+        .supervision_evidence(&run5)
+        .expect("evidence read")
+        .expect("supervised run");
+    assert_eq!(
+        supervision::next_unachieved_step(&evidence),
+        Some(("m1".to_string(), "merge".to_string())),
+        "the delivering run's frontier is its own committed merge step"
+    );
+    let spine: Vec<String> = evidence.steps.iter().map(|(id, _)| id.clone()).collect();
+    assert_eq!(spine, vec!["p1", "r1", "m1", "c1"]);
+    // The delivering run is NOT completed at delivery verification ...
+    assert_ne!(
+        run_status(&state, &run5),
+        "done",
+        "a run whose committed spine still owes the merge and the cleanup stays live"
+    );
+    // ... and the slot it still holds is reported as a HOLD, never a dispatch.
+    let advances = state
+        .queue_advance_rows(&submission.submission_id)
+        .expect("advances");
+    assert_eq!(advances.len(), 1);
+    assert_eq!(advances[0].next_instance_id, None);
+    assert!(
+        advances[0].reason.is_some(),
+        "the waiting issue is held while the delivering run has not finished: {:?}",
+        advances[0].reason
+    );
+    assert_eq!(
+        item_of(&submission_items(&state, &submission.submission_id), 6).status,
+        "waiting"
+    );
+
+    // The run's own committed merge step executes (its attempt is recorded
+    // on the same ledger the frontier reads).
+    record_achieved_step(&state, &run5, "m1", "mutate.merge", 1);
+    assert_eq!(reconcile(&state, &run5, false), Some(delivery.clone()));
+    assert_ne!(
+        run_status(&state, &run5),
+        "done",
+        "the cleanup is still owed: the run stays live after the merge"
+    );
+
+    // The LAST committed step executes: the run completes only NOW, and the
+    // freed slot admits the waiting issue in the same transaction.
+    record_achieved_step(&state, &run5, "c1", "mutate.cleanup", 2);
+    reconcile(&state, &run5, false);
+    assert_eq!(
+        run_status(&state, &run5),
+        "done",
+        "the delivering run completes after its LAST committed step"
+    );
+    let after = submission_items(&state, &submission.submission_id);
+    assert_eq!(item_of(&after, 6).status, "admitted");
+    let run6 = item_of(&after, 6)
+        .instance_id
+        .clone()
+        .expect("issue 6 admitted");
+    assert_ne!(run6, run5);
+    let advances = state
+        .queue_advance_rows(&submission.submission_id)
+        .expect("advances");
+    assert_eq!(advances.len(), 1, "one delivery, one cursor move");
+    assert_eq!(advances[0].next_instance_id.as_deref(), Some(run6.as_str()));
+    assert_eq!(advances[0].reason, None, "the hold settled");
+    assert_eq!(state.list_instances().expect("instances").len(), 2);
+}
+
+#[test]
+fn a_plan_that_ends_at_the_delivery_still_completes_at_the_delivery() {
+    let fixture = Fixture::new("delivery-last");
+    let state = fixture.open();
+    seed_grant(&state, "gr_0000000000000005", 5);
+    seed_grant(&state, "gr_0000000000000006", 6);
+    let (bound, digest) = render_bound(
+        &state,
+        &request_with(vec![selected("#5", &[]), selected("#6", &[])]),
+    );
+    let caps = ConcurrencyCaps {
+        global: 4,
+        per_repository: 1,
+        per_harness: 2,
+    };
+    let plan = submission_plan(
+        &state,
+        "ik_152-delivery-last",
+        &bound,
+        &digest,
+        &[("#5", "gr_0000000000000005"), ("#6", "gr_0000000000000006")],
+        caps,
+    );
+    let (submission, items) = state.submit_queue_run(&plan).expect("submit");
+    let run5 = item_of(&items, 5)
+        .instance_id
+        .clone()
+        .expect("issue 5 admitted");
+    record_delivery(&state, &run5, HEAD_A);
+
+    // ONE reconciliation: the delivery IS the run's last committed spine
+    // step, so completion (and the freed slot) stays exactly where it was
+    // before the #152 rule.
+    let delivery = reconcile(&state, &run5, true).expect("a fresh verified delivery");
+    assert_eq!(
+        run_status(&state, &run5),
+        "done",
+        "a plan that ends at the delivery completes at the delivery"
+    );
+    let after = submission_items(&state, &submission.submission_id);
+    assert_eq!(item_of(&after, 6).status, "admitted");
+    let run6 = item_of(&after, 6)
+        .instance_id
+        .clone()
+        .expect("issue 6 admitted");
+    let advances = state
+        .queue_advance_rows(&submission.submission_id)
+        .expect("advances");
+    assert_eq!(advances.len(), 1);
+    assert_eq!(advances[0].delivered_ordinal, delivery.item_ordinal);
+    assert_eq!(advances[0].next_instance_id.as_deref(), Some(run6.as_str()));
+    assert_eq!(advances[0].reason, None);
+}
+
+// ---------------------------------------------------------------------------
 // Live end-to-end: the real daemon advances the queue through its own
 // mutation path with no conductor in the loop
 // ---------------------------------------------------------------------------
@@ -930,16 +1220,22 @@ fn live_item(result: &Val, number: i64) -> Val {
         })
 }
 
-/// The `apply` params that record the delivery of one run through the real
-/// mutation surface: a plan whose `review_evidence` step names the reviewer
-/// verdict and the checks, the grant the run was admitted against, the exact
-/// observed head/base and the topology the daemon requires.
-fn delivery_apply_params(
+/// The `apply` params that run ONE step of one run through the real mutation
+/// surface: a plan whose single step names the effect, the grant the run was
+/// admitted against, the exact observed head/base and the topology the daemon
+/// requires.
+#[allow(clippy::too_many_arguments)]
+fn step_apply_params(
     seed: u64,
     fixture: &DaemonFixture,
     run: &str,
     number: i64,
     grant_id: &str,
+    step: &str,
+    kind: &str,
+    step_params: Val,
+    feature_head: &str,
+    integration_base: &str,
 ) -> Val {
     let seed_doc = object(vec![
         ("schema", string("hf-plan/v1")),
@@ -958,23 +1254,9 @@ fn delivery_apply_params(
         (
             "steps",
             Val::Arr(vec![object(vec![
-                ("id", string("r1")),
-                ("kind", string("review_evidence")),
-                (
-                    "params",
-                    object(vec![
-                        ("reviewer", string("reviewer-1")),
-                        ("implementer", string("implementer-1")),
-                        ("verdict", string("pass")),
-                        (
-                            "checks",
-                            Val::Arr(vec![object(vec![
-                                ("name", string("hosted-ci")),
-                                ("status", string("passed")),
-                            ])]),
-                        ),
-                    ]),
-                ),
+                ("id", string(step)),
+                ("kind", string(kind)),
+                ("params", step_params),
             ])]),
         ),
     ]);
@@ -988,7 +1270,7 @@ fn delivery_apply_params(
     let plan = Val::Obj(map);
     object(vec![
         ("plan", plan),
-        ("step", string("r1")),
+        ("step", string(step)),
         ("grant_id", string(grant_id)),
         ("instance_id", string(run)),
         (
@@ -996,8 +1278,8 @@ fn delivery_apply_params(
             object(vec![
                 ("issue_revision", string(REV_A)),
                 ("policy_hash", string(POLICY_HASH)),
-                ("feature_head", string(HEAD_A)),
-                ("integration_base", string(BASE_A)),
+                ("feature_head", string(feature_head)),
+                ("integration_base", string(integration_base)),
             ]),
         ),
         (
@@ -1019,6 +1301,29 @@ fn delivery_apply_params(
             string(&idem_key(&format!("apply-{seed}"))),
         ),
     ])
+}
+
+/// The `apply` params that record the delivery of one run through the real
+/// mutation surface: the reviewed `pass` verdict with its checks.
+fn delivery_apply_params(
+    seed: u64,
+    fixture: &DaemonFixture,
+    run: &str,
+    number: i64,
+    grant_id: &str,
+) -> Val {
+    step_apply_params(
+        seed,
+        fixture,
+        run,
+        number,
+        grant_id,
+        "r1",
+        "review_evidence",
+        review_params(),
+        HEAD_A,
+        BASE_A,
+    )
 }
 
 #[test]
@@ -1196,6 +1501,381 @@ fn the_real_daemon_advances_the_queue_to_the_next_issue_without_another_request(
     assert!(
         !log.contains("supervision.continue") && !log.contains("spawn"),
         "no continuation effect may be logged: {log}"
+    );
+    shutdown(daemon);
+}
+
+// ---------------------------------------------------------------------------
+// Live end-to-end (issue #152): the delivering run stays live for its own
+// committed merge and cleanup, and the queue continues only after them
+// ---------------------------------------------------------------------------
+
+/// One issue grant with an explicit capability set (the #152 fixture needs
+/// the `cleanup` capability the queue spine's last step requires).
+fn seed_grant_with_caps(state: &State, grant_id: &str, number: i64, caps: &[&str]) {
+    let epoch = state.current_epoch().expect("epoch");
+    let mut doc = grant_doc_at(grant_id, number, REV_A, epoch);
+    match &mut doc {
+        Val::Obj(map) => {
+            map.insert(
+                "caps".to_string(),
+                Val::Arr(caps.iter().map(|cap| string(cap)).collect()),
+            );
+        }
+        _ => unreachable!("grant document"),
+    }
+    state.issue_grant(&doc).expect("issue grant");
+}
+
+/// Run one git command in `dir`, asserting success. Disposable LOCAL
+/// repositories only — never a network remote.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "canter test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+        .env("GIT_COMMITTER_NAME", "canter test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+        .output()
+        .expect("spawn git");
+    assert!(
+        out.status.success(),
+        "git {args:?} in {} failed: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A disposable integration repo plus the run's own lane worktree. The lane
+/// branch sits AT the integration head, so the reviewed base is current and
+/// the branch is provably merged: the merge step is a read-only REHEARSAL
+/// (it never lands) and the cleanup may only delete a verified branch.
+fn repos_with_lane_branch(fixture: &DaemonFixture) -> String {
+    let repo = fixture.dir.join("repo");
+    std::fs::create_dir_all(&repo).expect("repo dir");
+    git(&repo, &["init", "-q", "-b", "staging"]);
+    git(&repo, &["config", "user.name", "canter test"]);
+    git(&repo, &["config", "user.email", "test@example.invalid"]);
+    std::fs::write(repo.join("base.txt"), "base\n").expect("base file");
+    git(&repo, &["add", "base.txt"]);
+    git(&repo, &["commit", "-q", "-m", "fixture base"]);
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["branch", "issue-5"]);
+    std::fs::create_dir_all(fixture.dir.join("worktrees")).expect("worktrees root");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            &format!("{}/worktrees/issues-5", fixture.dir.display()),
+            "issue-5",
+        ],
+    );
+    head
+}
+
+fn merge_params() -> Val {
+    object(vec![
+        ("branch", string("issue-5")),
+        ("merge_policy", string("squash")),
+    ])
+}
+
+fn cleanup_params() -> Val {
+    object(vec![
+        ("branch", string("issue-5")),
+        ("worktree", string("issues-5")),
+    ])
+}
+
+fn attempt_status(doc: &Val, step: &str) -> Option<String> {
+    doc.get("cursor")
+        .and_then(|cursor| cursor.get("attempts"))
+        .and_then(Val::as_array)
+        .and_then(|attempts| {
+            attempts
+                .iter()
+                .find(|attempt| attempt.get("step").and_then(Val::as_str) == Some(step))
+        })
+        .and_then(|attempt| attempt.get("status"))
+        .and_then(Val::as_str)
+        .map(str::to_string)
+}
+
+#[test]
+fn a_delivering_run_stays_live_for_its_committed_merge_and_cleanup_then_the_queue_continues() {
+    let fixture = DaemonFixture::new("tail");
+    let head = repos_with_lane_branch(&fixture);
+    let caps_for_tail = tail_boundary_caps();
+    let tail_caps: Vec<&str> = caps_for_tail.iter().map(|cap| cap.as_str()).collect();
+    let (bound, digest) = {
+        let state = fixture.seed();
+        seed_grant_with_caps(&state, "gr_0000000000000005", 5, &tail_caps);
+        seed_grant_with_caps(&state, "gr_0000000000000006", 6, &tail_caps);
+        let mut request = request_with(vec![selected("#5", &[]), selected("#6", &[])]);
+        request.steps = committed_tail_steps();
+        request.boundary.caps = tail_boundary_caps();
+        render_bound(&state, &request)
+    };
+    let daemon = fixture.spawn();
+    wait_ready(&fixture);
+
+    // ONE per-repository slot: issue 6 waits while issue 5 owns the run.
+    let caps = ConcurrencyCaps {
+        global: 4,
+        per_repository: 1,
+        per_harness: 2,
+    };
+    let submitted = rpc_ok(
+        &fixture.socket,
+        &fresh_id(1),
+        "queue.submit",
+        Some(submit_params_doc(
+            &idem_key("tail-submit"),
+            &bound,
+            &digest,
+            &[("#5", "gr_0000000000000005"), ("#6", "gr_0000000000000006")],
+            caps,
+            5,
+            60,
+        )),
+    );
+    let submission_id = submitted
+        .get("submission_id")
+        .and_then(Val::as_str)
+        .expect("submission id")
+        .to_string();
+    let run5 = live_item(&submitted, 5)
+        .get("instance_id")
+        .and_then(Val::as_str)
+        .expect("issue 5 admitted")
+        .to_string();
+    assert_eq!(
+        live_item(&submitted, 6).get("status").and_then(Val::as_str),
+        Some("waiting")
+    );
+
+    // The delivery is recorded through the daemon's OWN mutation path, at the
+    // reviewed head (the lane branch) and integration base.
+    let applied = rpc_ok(
+        &fixture.socket,
+        &fresh_id(2),
+        "apply",
+        Some(step_apply_params(
+            2,
+            &fixture,
+            &run5,
+            5,
+            "gr_0000000000000005",
+            "r1",
+            "review_evidence",
+            review_params(),
+            &head,
+            &head,
+        )),
+    );
+    assert!(
+        applied.get("evidence_id").and_then(Val::as_str).is_some(),
+        "the review evidence committed: {}",
+        canter::canonical::canonical_text(&applied)
+    );
+
+    // The driver's OWN reconciliation consumes the delivery (bounded poll, no
+    // fixed sleep): from here on the delivering run's status is committed.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut consumed_id = 10u64;
+    loop {
+        consumed_id += 1;
+        let doc = rpc_ok(
+            &fixture.socket,
+            &fresh_id(consumed_id),
+            "queue.status",
+            Some(object(vec![("submission_id", string(&submission_id))])),
+        );
+        if doc
+            .get("advance")
+            .and_then(|advance| advance.get("consumed"))
+            .and_then(Val::as_int)
+            == Some(1)
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "the verified delivery was never consumed; last: {}",
+                canter::canonical::canonical_text(&doc)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // The run's OWN committed merge step (p7 of the #146 plan) is dispatched
+    // and EXECUTES. Before #152 the instance was already terminal here and
+    // this is where `refusal.instance.state` refused it.
+    let merge = rpc(
+        &fixture.socket,
+        &fresh_id(3),
+        "apply",
+        Some(step_apply_params(
+            3,
+            &fixture,
+            &run5,
+            5,
+            "gr_0000000000000005",
+            "m1",
+            "merge",
+            merge_params(),
+            &head,
+            &head,
+        )),
+    );
+    assert_eq!(
+        merge.get("ok").and_then(Val::as_bool),
+        Some(true),
+        "the delivering run's committed merge step must be dispatchable: {}",
+        canter::canonical::canonical_text(&merge)
+    );
+    let merged = merge.get("result").cloned().expect("merge result");
+    assert_eq!(
+        merged.get("mode").and_then(Val::as_str),
+        Some("rehearsal"),
+        "{}",
+        canter::canonical::canonical_text(&merged)
+    );
+    assert_eq!(
+        merged.get("merge_policy").and_then(Val::as_str),
+        Some("squash")
+    );
+    assert_eq!(merged.get("landed").and_then(Val::as_bool), Some(false));
+    assert_eq!(
+        git(&fixture.dir.join("repo"), &["rev-parse", "staging"]),
+        head,
+        "the rehearsal never lands in the integration checkout"
+    );
+
+    // The delivery alone does NOT complete the run: the cleanup is still owed
+    // and the record NAMES it instead of reading as a bare `done`.
+    let live = rpc_ok(
+        &fixture.socket,
+        &fresh_id(4),
+        "supervision.status",
+        Some(supervision::status_params(&run5)),
+    );
+    assert_ne!(
+        live.get("run")
+            .and_then(|run| run.get("status"))
+            .and_then(Val::as_str),
+        Some("done"),
+        "a run that still owes its cleanup stays live: {}",
+        canter::canonical::canonical_text(&live)
+    );
+    assert_eq!(
+        live.get("cursor")
+            .and_then(|cursor| cursor.get("next_step"))
+            .and_then(Val::as_str),
+        Some("c1")
+    );
+    assert_eq!(
+        live.get("cursor")
+            .and_then(|cursor| cursor.get("next_step_kind"))
+            .and_then(Val::as_str),
+        Some("cleanup")
+    );
+    assert_eq!(
+        attempt_status(&live, "r1").as_deref(),
+        Some("succeeded"),
+        "the attempt list names the steps that actually ran"
+    );
+    assert_eq!(attempt_status(&live, "m1").as_deref(), Some("succeeded"));
+    // The slot the delivering run still owns keeps issue 6 waiting.
+    let waiting = rpc_ok(
+        &fixture.socket,
+        &fresh_id(5),
+        "queue.status",
+        Some(object(vec![("submission_id", string(&submission_id))])),
+    );
+    assert_eq!(
+        live_item(&waiting, 6).get("status").and_then(Val::as_str),
+        Some("waiting")
+    );
+
+    // The LAST committed step (p8 cleanup) executes. The run completes only
+    // now, and the freed slot admits the waiting issue with NO further
+    // operator request.
+    let cleanup = rpc(
+        &fixture.socket,
+        &fresh_id(6),
+        "apply",
+        Some(step_apply_params(
+            6,
+            &fixture,
+            &run5,
+            5,
+            "gr_0000000000000005",
+            "c1",
+            "cleanup",
+            cleanup_params(),
+            &head,
+            &head,
+        )),
+    );
+    assert_eq!(
+        cleanup.get("ok").and_then(Val::as_bool),
+        Some(true),
+        "the delivering run's committed cleanup step must be dispatchable: {}",
+        canter::canonical::canonical_text(&cleanup)
+    );
+    assert!(
+        !fixture.dir.join("worktrees/issues-5").exists(),
+        "the cleanup removed the run's own worktree"
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut id = 100u64;
+    let settled = loop {
+        id += 1;
+        let doc = rpc_ok(
+            &fixture.socket,
+            &fresh_id(id),
+            "queue.status",
+            Some(object(vec![("submission_id", string(&submission_id))])),
+        );
+        if live_item(&doc, 6).get("status").and_then(Val::as_str) == Some("admitted") {
+            break doc;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "the queue never advanced after the delivering run's last step; last: {}",
+                canter::canonical::canonical_text(&doc)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_ne!(
+        live_item(&settled, 6)
+            .get("instance_id")
+            .and_then(Val::as_str),
+        Some(run5.as_str())
+    );
+    let done = rpc_ok(
+        &fixture.socket,
+        &fresh_id(500),
+        "supervision.status",
+        Some(supervision::status_params(&run5)),
+    );
+    assert_eq!(
+        done.get("run")
+            .and_then(|run| run.get("status"))
+            .and_then(Val::as_str),
+        Some("done"),
+        "the delivering run completed after its LAST committed step: {}",
+        canter::canonical::canonical_text(&done)
+    );
+    assert_eq!(
+        git(&fixture.dir.join("repo"), &["rev-parse", "staging"]),
+        head,
+        "no step ever landed in the integration checkout"
     );
     shutdown(daemon);
 }

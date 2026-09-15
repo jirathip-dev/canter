@@ -559,11 +559,19 @@ clears a repository/fleet-level hold or bypasses a gate.
 - **Completion-to-next-work (issue #96)**: a fresh VERIFIED delivery of an
   armed run — reviewed `pass` with every named check `passed` at one exact
   head, bound to the run's own workflow/policy pins, no durable hold and no
-  in-flight step claim — completes that run (`done`) and advances its
+  in-flight step claim — advances its
   already-authorized queue cursor EXACTLY ONCE, admitting the next eligible
   approved item of the SAME committed submission through the same
   guard-verifying admission path (the same approved caps and occupancy
   attestation), armed with the delivering run's supervision authorization.
+  The DELIVERING run is completed (`done`) by that same transaction only once
+  the delivery is its LAST committed spine step (issue #152): a run whose
+  committed spine still carries steps after the delivery (the merge, then the
+  cleanup) stays live and keeps its counted slot until those steps are
+  recorded as achieved, so its own authorized merge and cleanup stay
+  dispatchable and the completion is never a bare `done` over an unexecuted
+  plan. A spine that ends at its reviewed-evidence step completes exactly as
+  before.
   The consumption is keyed to the delivered membership item
   (`queue_advances`, m0012) and is durable across restarts: a duplicate
   delivery event, a replayed reconciliation or a crash can only observe the

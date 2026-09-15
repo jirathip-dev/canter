@@ -435,11 +435,18 @@ to journal fails closed — the mutation does not start.
 - **Completion-to-next-work**: a fresh verified delivery (reviewed `pass`
   with every named check `passed` at one exact head bound to the run's own
   workflow/policy pins, no durable hold, no in-flight step, live epoch)
-  completes the delivering run and advances that submission's cursor exactly
-  once; the candidate is the first `waiting` item in membership order and is
+  advances that submission's cursor exactly once; the candidate is the first
+  `waiting` item in membership order and is
   admitted through the SAME guard-verifying helper, caps and occupancy
   attestation the submission used, armed with the delivering run's
-  supervision authorization so the queue keeps continuing.
+  supervision authorization so the queue keeps continuing. That same
+  transaction completes the DELIVERING run (`done`) only once the delivery is
+  its LAST committed spine step (issue #152): a run whose committed spine
+  still carries steps after the delivery stays live and keeps its counted
+  slot until those steps are recorded as achieved, so its own authorized
+  merge and cleanup stay dispatchable and a `done` is never recorded over an
+  unexecuted plan; a spine that ends at its reviewed-evidence step completes
+  exactly as before.
 - **Dependency holds**: every declared requirement of the candidate must be
   delivered and verified — a requirement that is selected but not delivered
   is `queue.dependency_unsettled`, one outside the selected set is
