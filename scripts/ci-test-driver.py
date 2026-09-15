@@ -14,6 +14,8 @@ import subprocess
 import tempfile
 import time
 
+# CI pre-builds every test executable in its own bounded step, so this
+# deadline measures serial suite execution rather than a cold compilation.
 AGGREGATE_SECONDS = 18 * 60
 PER_SUITE_SECONDS = 300
 TAIL_LINES = 120

@@ -272,6 +272,13 @@ jobs:
       - name: Clippy (warnings denied)
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      # Issue #136 Linux 2-CPU cold measurement: test build 55s, then all
+      # serial suites 254s. The 5m build + 18m suite bounds leave 7m inside
+      # the 30m job for setup, check/clippy, docs, release, and artifact upload.
+      - name: Build test executables
+        timeout-minutes: 5
+        run: cargo test --locked --no-run
+
       - name: Tests
         run: python3 -u scripts/ci-test-driver.py
 
