@@ -220,6 +220,25 @@ pub enum RunRetryClaim {
 /// The number of bounded retries one (run, step) may ever authorize.
 pub const RUN_RETRY_MAX: i64 = 3;
 
+/// The recorded outcome of ONE explicit run release (issue #146): the run
+/// row as it stands AFTER the release commit, whether the release removed the
+/// unique ownership row that named this run, and the authorization window the
+/// run held when it was released.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunReleaseOutcome {
+    /// The released row (`status: "invalidated"`, pause state cleared).
+    pub run: InstanceRow,
+    /// Whether this release removed the ownership row that named the run
+    /// (`false` = the run owned no issue any more; nothing was removed).
+    pub ownership_freed: bool,
+    /// The run's own grant row at release time (`None` = the grant no longer
+    /// exists).
+    pub grant: Option<GrantRow>,
+    /// Whether that window was still usable when the run was released: the
+    /// row exists, is `active` and has not expired.
+    pub grant_usable: bool,
+}
+
 /// A workflow engine instance row (m0002: workflow pin, phase, node, review
 /// rounds, pause state). Issuance/advance decisions belong to the engine;
 /// this handle persists them durably.
@@ -2193,23 +2212,7 @@ impl State {
                         policy_hash, phase, scope, caps, expires_at, state_epoch, status, created_at
                    FROM grants WHERE grant_id = ?1",
                 params![grant_id],
-                |row| {
-                    Ok(GrantRow {
-                        grant_id: row.get(0)?,
-                        repository: row.get(1)?,
-                        issue_number: row.get(2)?,
-                        issue_revision: row.get(3)?,
-                        workflow_hash: row.get(4)?,
-                        policy_hash: row.get(5)?,
-                        phase: row.get(6)?,
-                        scope: row.get(7)?,
-                        caps: row.get(8)?,
-                        expires_at: row.get(9)?,
-                        state_epoch: row.get(10)?,
-                        status: row.get(11)?,
-                        created_at: row.get(12)?,
-                    })
-                },
+                grant_row_from,
             )
             .optional()
             .map_err(|err| StateError::from_sqlite("grant_by_id: query", err))?;
@@ -2428,8 +2431,155 @@ impl State {
 
     // ---------------------------------------------------------------------
     // Run-scoped controls (issue #86): safe-boundary pause, resume and
-    // bounded retry over the durable instance rows.
+    // bounded retry over the durable instance rows; plus the explicit
+    // release of ONE run that can never progress (issue #146).
     // ---------------------------------------------------------------------
+
+    /// Release ONE run that can never progress (issue #146) in ONE
+    /// transaction: the run's unique ownership row is removed, the run goes
+    /// terminal (`invalidated`, pause state cleared) so it stops counting
+    /// against the global/per-repository/per-harness occupancy, and the
+    /// audit records the reason, the exact run identity and the
+    /// authorization window that run held.
+    ///
+    /// Fail closed on anything genuinely live: a step of the run still in
+    /// flight (or an unattributable in-flight claim) refuses
+    /// `refusal.run.in_flight`, and an unconsumed bounded retry
+    /// authorization refuses `refusal.run.retry_pending` — a release never
+    /// burns an authorization and never abandons work. A terminal run
+    /// refuses `refusal.run.terminal` (so a second release with a fresh key
+    /// is typed, while a same-key retry replays the recorded response), and
+    /// an unknown run is `state.not_found`. Everything else — including a
+    /// run whose grant is missing, revoked or EXPIRED — is releasable: the
+    /// release frees the durable bookkeeping, it never resurrects or reuses
+    /// the window (a continuation needs a freshly minted grant window /
+    /// explicit rotation, never a silent reuse of an expired one).
+    pub fn release_run(
+        &self,
+        instance_id: &str,
+        reason: &str,
+        key: &str,
+        at: &str,
+    ) -> Result<RunReleaseOutcome, StateError> {
+        self.ensure_writable()?;
+        let mut conn = self.lock("release_run")?;
+        let tx = conn
+            .transaction()
+            .map_err(|err| StateError::from_sqlite("release_run: begin", err))?;
+        let row = tx
+            .query_row(
+                format!("{} WHERE instance_id = ?1", instance_select_sql()).as_str(),
+                params![instance_id],
+                instance_row_from,
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("release_run: read", err))?;
+        let Some(run) = row else {
+            return Err(state_error(
+                "state.not_found",
+                format!("no instance {instance_id:?}"),
+            ));
+        };
+        if matches!(run.status.as_str(), "done" | "invalidated") {
+            return Err(state_error(
+                "refusal.run.terminal",
+                format!(
+                    "run {instance_id} is {}; a terminal run has nothing to release",
+                    run.status
+                ),
+            ));
+        }
+        let in_flight = in_flight_steps_locked(&tx)?
+            .iter()
+            .any(|(named, _)| named == instance_id || named == "*");
+        if in_flight {
+            return Err(state_error(
+                "refusal.run.in_flight",
+                format!(
+                    "run {instance_id} has a step dispatch in flight; a release never abandons \
+                     live work (wait for its recorded boundary)"
+                ),
+            ));
+        }
+        if let Some((step_id, retry_id)) = unconsumed_retry_locked(&tx, instance_id)? {
+            return Err(state_error(
+                "refusal.run.retry_pending",
+                format!(
+                    "run {instance_id} still holds the unconsumed retry authorization {retry_id} \
+                     for step {step_id:?}; a release never burns an authorization"
+                ),
+            ));
+        }
+        // The window this run held is recorded, never re-presented: a
+        // missing, revoked or expired grant is exactly the case a release
+        // exists for.
+        let grant = tx
+            .query_row(
+                "SELECT grant_id, repository, issue_number, issue_revision, workflow_hash,
+                        policy_hash, phase, scope, caps, expires_at, state_epoch, status,
+                        created_at
+                   FROM grants WHERE grant_id = ?1",
+                params![run.grant_id],
+                grant_row_from,
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("release_run: grant", err))?;
+        let grant_usable = grant.as_ref().is_some_and(|grant| {
+            grant.status == "active" && !crate::mutation::is_expired(&grant.expires_at, at)
+        });
+        let affected = tx
+            .execute(
+                "UPDATE instances SET status = 'invalidated', paused = 0, pause_requested = 0,
+                        resume_digest = '', updated_at = ?2
+                  WHERE instance_id = ?1
+                    AND status IN ('new', 'running', 'paused', 'human_queue', 'blocked')",
+                params![instance_id, at],
+            )
+            .map_err(|err| StateError::from_sqlite("release_run: update", err))?;
+        if affected != 1 {
+            return Err(state_error(
+                "state.ownership_conflict",
+                format!("run {instance_id} moved before its release committed"),
+            ));
+        }
+        let ownership_freed = tx
+            .execute(
+                "DELETE FROM queue_ownership
+                  WHERE instance_id = ?1 AND repository = ?2 AND issue_number = ?3",
+                params![instance_id, run.repository, run.issue_number],
+            )
+            .map_err(|err| StateError::from_sqlite("release_run: ownership", err))?
+            == 1;
+        // The release record: the reason, the exact run identity, what was
+        // freed and the window the run held — in the same hash-chained audit
+        // as every other mutation, committed in the SAME transaction.
+        let target = format!(
+            "run:{instance_id}:repository:{}#{}@{}:ownership:{}:grant:{}:grant_usable:{}:reason:{}",
+            run.repository,
+            run.issue_number,
+            run.issue_revision,
+            if ownership_freed { "freed" } else { "absent" },
+            run.grant_id,
+            grant_usable,
+            reason
+        );
+        self.append_audit_locked(&tx, "run.release", &target, key, None, Some(&run.grant_id))?;
+        let released = tx
+            .query_row(
+                format!("{} WHERE instance_id = ?1", instance_select_sql()).as_str(),
+                params![instance_id],
+                instance_row_from,
+            )
+            .map_err(|err| StateError::from_sqlite("release_run: reread", err))?;
+        tx.commit()
+            .map_err(|err| StateError::from_sqlite("release_run: commit", err))?;
+        Ok(RunReleaseOutcome {
+            run: released,
+            ownership_freed,
+            grant,
+            grant_usable,
+        })
+    }
 
     /// The step id of a step-dispatch claim (`method:"apply"`) still in
     /// flight for one run, or `None` when nothing is in flight. An
@@ -7931,6 +8081,45 @@ fn in_flight_steps_locked(conn: &Connection) -> Result<Vec<(String, String)>, St
         }
     }
     Ok(out)
+}
+
+/// Map one grant row (the column order `grant_by_id` and the release
+/// transaction both use).
+fn grant_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<GrantRow> {
+    Ok(GrantRow {
+        grant_id: row.get(0)?,
+        repository: row.get(1)?,
+        issue_number: row.get(2)?,
+        issue_revision: row.get(3)?,
+        workflow_hash: row.get(4)?,
+        policy_hash: row.get(5)?,
+        phase: row.get(6)?,
+        scope: row.get(7)?,
+        caps: row.get(8)?,
+        expires_at: row.get(9)?,
+        state_epoch: row.get(10)?,
+        status: row.get(11)?,
+        created_at: row.get(12)?,
+    })
+}
+
+/// The next unconsumed bounded retry authorization of one run as
+/// `(step_id, retry_id)`, oldest first (issue #146: a release refuses while
+/// one exists, so an authorization is never burned by a bookkeeping
+/// operation).
+fn unconsumed_retry_locked(
+    conn: &Connection,
+    instance_id: &str,
+) -> Result<Option<(String, String)>, StateError> {
+    conn.query_row(
+        "SELECT step_id, retry_id FROM run_retries
+          WHERE instance_id = ?1 AND consumed_at = ''
+          ORDER BY step_id, attempt LIMIT 1",
+        params![instance_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map_err(|err| StateError::from_sqlite("unconsumed_retry: query", err))
 }
 
 /// Shared SELECT for instance rows (m0002 columns).

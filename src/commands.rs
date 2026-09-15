@@ -71,6 +71,7 @@ USAGE:
     canter run pause --run RUN_ID --reason TEXT [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run resume --run RUN_ID --digest HEX64 [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run retry --run RUN_ID --step STEP [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
+    canter run release --run RUN_ID --reason TEXT [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run resolve --run RUN_ID --step STEP --recorder IDENTITY --evidence FILE [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run dispatch --run RUN_ID --step STEP [--param KEY=VALUE]... [--topology FILE] [--admission FILE] [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run status --run RUN_ID [--socket PATH] [--config PATH] [--json]
@@ -170,6 +171,9 @@ pub enum RunAction {
     /// Authorize ONE bounded re-dispatch of ONE diagnosed step:
     /// `run retry`.
     Retry(RunRetryArgs),
+    /// Release ONE run that can never progress, freeing its issue ownership
+    /// and the occupancy it held: `run release` (issue #146).
+    Release(RunReleaseArgs),
     /// Resolve ONE diagnosed prompt from recorder-attributed artifact evidence
     /// without issuing its effect again: `run resolve`.
     Resolve(RunResolveArgs),
@@ -186,6 +190,20 @@ pub struct RunPauseArgs {
     /// Explicit run id (`run-` + 16 hex).
     pub run: String,
     /// Operator reason (1-300 printable characters).
+    pub reason: String,
+    /// `--idempotency-key`: replay-safe automation key.
+    pub idempotency_key: Option<String>,
+    /// Explicit daemon socket override.
+    pub socket: Option<String>,
+}
+
+/// `run release`: the exact target plus the recorded operator reason
+/// (issue #146).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunReleaseArgs {
+    /// Explicit run id (`run-` + 16 hex).
+    pub run: String,
+    /// Operator reason (1-300 printable characters; audited with the run).
     pub reason: String,
     /// `--idempotency-key`: replay-safe automation key.
     pub idempotency_key: Option<String>,
@@ -1519,6 +1537,7 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
         "pause" => "run pause",
         "resume" => "run resume",
         "retry" => "run retry",
+        "release" => "run release",
         "resolve" => "run resolve",
         "dispatch" => "run dispatch",
         "status" => "run status",
@@ -1715,6 +1734,25 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
             RunAction::Retry(RunRetryArgs {
                 run,
                 step,
+                idempotency_key,
+                socket,
+            })
+        }
+        "release" => {
+            if digest.is_some() || step.is_some() || !step_params.is_empty() {
+                return Err(ParseError::Usage(
+                    "run release takes --run and --reason only".to_string(),
+                ));
+            }
+            let Some(reason) = reason else {
+                return Err(ParseError::Usage(
+                    "run release: --reason TEXT is required (the audited release reason)"
+                        .to_string(),
+                ));
+            };
+            RunAction::Release(RunReleaseArgs {
+                run,
+                reason,
                 idempotency_key,
                 socket,
             })
@@ -5140,6 +5178,7 @@ fn execute_run(action: RunAction, invocation: &Invocation) -> CmdResult {
         RunAction::Pause(args) => execute_run_pause(&args, invocation),
         RunAction::Resume(args) => execute_run_resume(&args, invocation),
         RunAction::Retry(args) => execute_run_retry(&args, invocation),
+        RunAction::Release(args) => execute_run_release(&args, invocation),
         RunAction::Resolve(args) => execute_run_resolve(&args, invocation),
         RunAction::Dispatch(args) => execute_run_dispatch(&args, invocation),
         RunAction::Status(args) => execute_run_status(&args, invocation),
@@ -5226,6 +5265,28 @@ fn execute_run_retry(args: &RunRetryArgs, invocation: &Invocation) -> CmdResult 
         }
         Err(RpcError { code, message }) => {
             lane_error(&code, format!("run retry: {message}"), false)
+        }
+    }
+}
+
+/// `run release`: release exactly ONE run that can never progress — its
+/// durable issue ownership and the occupancy it held are freed and the run
+/// goes terminal (issue #146). The daemon refuses typed while a step is in
+/// flight or an unconsumed retry authorization exists.
+fn execute_run_release(args: &RunReleaseArgs, invocation: &Invocation) -> CmdResult {
+    let paths = match run_control_paths(args.socket.as_deref(), invocation) {
+        Ok(paths) => paths,
+        Err(result) => return result,
+    };
+    let key = args.idempotency_key.clone().unwrap_or_else(fresh_run_key);
+    let params = crate::run_control::release_params(&key, &args.run, &args.reason);
+    match client::call(&paths.socket_path, "run.release", Some(&params)) {
+        Ok(result) => {
+            let human = crate::run_control::render_human(&result);
+            ok_result(result, human)
+        }
+        Err(RpcError { code, message }) => {
+            lane_error(&code, format!("run release: {message}"), false)
         }
     }
 }
@@ -5811,7 +5872,7 @@ state.not_found) · 5 config error.
 ";
 
 const RUN_USAGE: &str = "\
-canter run <pause|resume|retry|resolve|dispatch|status> — run-scoped controls for ONE run
+canter run <pause|resume|retry|release|resolve|dispatch|status> — run-scoped controls for ONE run
 
 USAGE:
     canter run pause --run RUN_ID --reason TEXT [--idempotency-key IK] \
@@ -5819,6 +5880,8 @@ USAGE:
     canter run resume --run RUN_ID --digest HEX64 [--idempotency-key IK] \
 [--socket PATH] [--config PATH] [--json]
     canter run retry --run RUN_ID --step STEP [--idempotency-key IK] \
+[--socket PATH] [--config PATH] [--json]
+    canter run release --run RUN_ID --reason TEXT [--idempotency-key IK] \
 [--socket PATH] [--config PATH] [--json]
     canter run resolve --run RUN_ID --step STEP --recorder IDENTITY \
 --evidence FILE [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
@@ -5885,6 +5948,25 @@ enough to be attempted refuses typed (e.g. `refusal.request.malformed`)
 whatever its kind and leaves a pending bounded retry authorization
 unconsumed for the correction. A re-dispatch of a diagnosed step consumes
 exactly one unconsumed authorization.
+
+release frees the durable bookkeeping of ONE run that can never progress
+(daemon `run.release`, issue #146): the run's unique ownership of its issue
+and the global/per-repository/per-harness occupancy it held are released,
+and the run becomes terminal (`invalidated`) so it is never resumed,
+retried or dispatched again — the operator's --reason, the exact run
+identity and the authorization window it held are recorded in the audit.
+Eligibility is fenced daemon-side and refuses typed: a run with a step
+dispatch in flight refuses `refusal.run.in_flight` (nothing in flight is
+killed or abandoned), a run that still holds an unconsumed bounded retry
+authorization refuses `refusal.run.retry_pending` (the authorization is
+never burned), an already-terminal run refuses `refusal.run.terminal`
+(so a release replays only through the SAME --idempotency-key) and an
+unknown run is `state.not_found`. An expired, revoked or missing grant is
+NOT a fence: a run whose grant expired is exactly the case a release exists
+for, and the release records that window (`usable:false`) without ever
+presenting or reusing it — continuing that work needs a freshly minted
+grant window, never a silent reuse of the expired one. After the release
+the issue can be submitted again on its own merits.
 
 status reads the control state back read-only (daemon `run.status`):
 active / pause_requested (request durable, in-flight work still running) /

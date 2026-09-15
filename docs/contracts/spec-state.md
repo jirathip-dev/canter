@@ -380,6 +380,25 @@ to journal fails closed — the mutation does not start.
   (`run_step_attempts`) and the bound spine (`run_step_spine`) are read
   back from the durable apply claims and the committed submission's
   bound-input line — never from a caller.
+- **Release state (issue #146)**: `release_run` commits ONE transaction:
+  the run's unique `queue_ownership` row is removed, the run row goes
+  `invalidated` with the pause state cleared and the resume digest consumed
+  (so the run stops being an OWNED status and stops counting against the
+  global/per-repository/per-harness occupancy), and a hash-chained
+  `run.release` audit record carries the operator reason, the exact run
+  identity, what was freed and the authorization window the run held. No
+  table, column or schema version changes: the release is a state
+  TRANSITION over the existing rows. It refuses `refusal.run.in_flight` (a
+  claimed `apply` of the run is still in flight, or an unreadable claim's
+  attribution is unknown), `refusal.run.retry_pending` (an unconsumed
+  `run_retries` authorization exists — a release never burns one),
+  `refusal.run.terminal` (a `done`/`invalidated` run) and `state.not_found`;
+  a missing, revoked or expired grant is deliberately NOT a fence, and the
+  release records that window without presenting or reusing it. A released
+  run is inert on every other path: the engine refuses a terminal instance
+  (`refusal.instance.state`), the control surface refuses
+  `refusal.run.terminal`, supervision's dispatch intent returns nothing for
+  it, and a delivered-evidence advance skips it.
 - **Restart reconciliation**: an interrupted `run.*` claim is read back
   against its commit marker (the run's control rows) and logged
   (`reconcile.run-control`); no control is ever repeated and nothing is
