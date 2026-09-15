@@ -255,7 +255,7 @@ jobs:
   rust-ubuntu:
     name: rust-ubuntu
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -273,14 +273,14 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
       # Issue #136 Linux 2-CPU cold measurement: test build 55s, then all
-      # serial suites 254s. The 5m build + 18m suite bounds leave 7m inside
-      # the 30m job for setup, check/clippy, docs, release, and artifact upload.
+      # serial suites 254s. The 5m build + 20m15s OS cap leave 9m45s inside
+      # the 35m job for setup, check/clippy, docs, release, and artifact upload.
       - name: Build test executables
         timeout-minutes: 5
         run: cargo test --locked --no-run
 
       - name: Tests
-        run: python3 -u scripts/ci-test-driver.py
+        run: timeout -k 15 1200 python3 -u scripts/ci-test-driver.py
 
       - name: Upload Tests diagnostics
         if: ${{ always() }}

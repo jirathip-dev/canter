@@ -322,6 +322,7 @@ def run_suites(
                         "--nocapture",
                     ],
                     start_new_session=True,
+                    stdin=subprocess.DEVNULL,
                     stdout=stdout,
                     stderr=stderr,
                 )
