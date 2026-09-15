@@ -37,7 +37,7 @@ impl GroupChild {
 
     pub fn terminate(&mut self, label: &str) -> ExitStatus {
         let _ = self.try_wait();
-        if alive(-self.pid) {
+        if group_alive(self.pid) {
             signal(-self.pid, libc::SIGTERM).expect("SIGTERM fixture process group");
         }
         if !self.wait_group(REAP_WAIT) {
@@ -61,7 +61,7 @@ impl GroupChild {
         let deadline = Instant::now() + timeout;
         loop {
             let _ = self.try_wait();
-            if self.status.is_some() && !alive(-self.pid) {
+            if self.status.is_some() && !group_alive(self.pid) {
                 return true;
             }
             if Instant::now() >= deadline {
@@ -104,8 +104,12 @@ pub fn assert_no_process_for_socket(socket: &Path) {
 }
 
 fn assert_gone(pid: i32, label: &str) {
-    assert!(!alive(pid), "{label} leader {pid} is still alive");
-    assert!(!alive(-pid), "{label} process group {pid} is still alive");
+    assert!(!pid_alive(pid), "{label} leader {pid} is still alive");
+    let members = live_group_members(pid).expect("inspect fixture process group");
+    assert!(
+        members.is_empty(),
+        "{label} process group {pid} still has live member(s): {members:?}"
+    );
 }
 
 fn signal(target: i32, signal: i32) -> io::Result<()> {
@@ -113,18 +117,43 @@ fn signal(target: i32, signal: i32) -> io::Result<()> {
         return Ok(());
     }
     let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
+    if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::EPERM)) {
         Ok(())
     } else {
         Err(error)
     }
 }
 
-fn alive(target: i32) -> bool {
-    if unsafe { libc::kill(target, 0) } == 0 {
+fn pid_alive(pid: i32) -> bool {
+    if unsafe { libc::kill(pid, 0) } == 0 {
         return true;
     }
     io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+fn group_alive(pgid: i32) -> bool {
+    live_group_members(pgid)
+        .map(|members| !members.is_empty())
+        .unwrap_or_else(|_| pid_alive(-pgid))
+}
+
+fn live_group_members(pgid: i32) -> io::Result<Vec<String>> {
+    let output = Command::new("ps")
+        .args(["-Aww", "-o", "pid=,pgid=,state=,command="])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other("ps process-group inspection failed"));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let _pid = fields.next()?;
+            let row_pgid = fields.next()?.parse::<i32>().ok()?;
+            let state = fields.next()?;
+            (row_pgid == pgid && !state.starts_with('Z')).then(|| line.to_string())
+        })
+        .collect())
 }
 
 fn socket_processes(socket: &Path) -> io::Result<Vec<String>> {
