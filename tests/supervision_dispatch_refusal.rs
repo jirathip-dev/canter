@@ -1078,3 +1078,103 @@ fn a_repaired_frontier_is_dispatched_by_the_driver_without_any_operator_dispatch
     shutdown(daemon);
     assert_no_process_for_socket(&socket);
 }
+
+/// Refused continuation ATTEMPTS of one step, as the daemon log recorded them
+/// (item 4a of issue #144): one `supervision.dispatch_refused` line per
+/// attempt that reached the engine and was refused.
+fn refused_attempts(fixture: &DaemonFixture, step: &str, code: &str) -> usize {
+    std::fs::read_to_string(fixture.daemon_log())
+        .unwrap_or_default()
+        .matches(&format!("step {step}: {code}"))
+        .count()
+}
+
+/// The driver's committed checks of one run, read through the operator's own
+/// status surface.
+fn checks_of(fixture: &DaemonFixture, run: &str) -> i64 {
+    let doc = status_doc(&fixture.socket, &fresh_id(0x1444), run);
+    path_of(&doc, &["evaluation", "checks"])
+        .as_int()
+        .unwrap_or(0)
+}
+
+/// Item 4a of issue #144: a continuation the engine KEEPS refusing is not
+/// re-dispatched on every tick.
+///
+/// The measured defect (`run-604cf9439372a5e5`) re-attempted the same refused
+/// `p3` dispatch every 60 s for over an hour: the run could never progress and
+/// the tick cadence was the attempt cadence. The ladder paces the ATTEMPTS
+/// (doubling from the run's own check interval, capped), while the run's own
+/// surfaces still name the engine's refusal — the refusal itself is unchanged
+/// and nothing new is recorded for it.
+#[test]
+fn a_repeatedly_refused_continuation_is_not_redispatched_every_tick() {
+    let (fixture, daemon, run) = repaired_lane_scenario(
+        "refused-backoff",
+        qp::PlannedStep {
+            id: "p3".to_string(),
+            kind: "harness_start".to_string(),
+            params: Some(object(vec![("harness_key", string(HARNESS))])),
+        },
+    );
+    let code = "refusal.admission.proof_stale";
+
+    // The driver's own dispatch of the frontier, refused by the engine.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut first = 0usize;
+    while Instant::now() < deadline {
+        first = refused_attempts(&fixture, "p3", code);
+        if first > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(first > 0, "the driver attempted the frontier at least once");
+
+    // A measured window in which the driver KEEPS reconciling the armed run
+    // (this fixture's check interval is 5 s): the refused attempts must be
+    // strictly fewer than the ticks, not one per tick.
+    let checks_before = checks_of(&fixture, &run);
+    let window = Instant::now() + Duration::from_secs(21);
+    while Instant::now() < window {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let ticks = checks_of(&fixture, &run) - checks_before;
+    let attempts = refused_attempts(&fixture, "p3", code) - first;
+    let log = std::fs::read_to_string(fixture.daemon_log()).unwrap_or_default();
+    assert!(
+        ticks >= 3,
+        "the driver kept reconciling the armed run ({ticks} checks): {log}"
+    );
+    assert!(
+        attempts <= 2,
+        "a repeatedly refused continuation is paced against the ticks, not \
+         re-dispatched every tick: {ticks} checks produced {attempts} refused attempts\n{log}"
+    );
+    assert!(
+        log.contains("supervision.dispatch_backoff"),
+        "the back-off is named on the daemon log: {log}"
+    );
+
+    // The refusal itself is unchanged and still named by the run's own
+    // surface: the ladder records nothing new and reclassifies nothing.
+    let doc = status_doc(&fixture.socket, &fresh_id(0x1445), &run);
+    assert_eq!(
+        picked(&doc, &["evaluation", "reason"]),
+        "supervision.dispatch_refused"
+    );
+    assert_eq!(picked(&doc, &["evaluation", "detail"]), code);
+    assert_eq!(
+        path_of(&doc, &["evaluation", "eligible"]).as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        attempts_for(&fixture, &run, "p3"),
+        0,
+        "no attempt of the step itself ever ran: the refusal is before the claim"
+    );
+
+    let socket = fixture.socket.clone();
+    shutdown(daemon);
+    assert_no_process_for_socket(&socket);
+}

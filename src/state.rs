@@ -1412,6 +1412,9 @@ pub struct State {
     conn: Mutex<Connection>,
     retention: Retention,
     poisoned: AtomicBool,
+    /// The FIRST write that failed and poisoned this handle (item 4b of issue
+    /// #144): the cause every later `state.poisoned` refusal names.
+    poison_cause: Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for State {
@@ -1582,6 +1585,7 @@ impl State {
             conn: Mutex::new(conn),
             retention,
             poisoned: AtomicBool::new(false),
+            poison_cause: Mutex::new(None),
         };
         state.verify_chain()?;
         Ok(state)
@@ -7674,20 +7678,34 @@ impl State {
     // Internals
     // ---------------------------------------------------------------------
 
-    /// Refuse writes after a prior write failure (fail closed, AC5).
+    /// Refuse writes after a prior write failure (fail closed, AC5). The
+    /// refusal NAMES the write that failed (item 4b of issue #144): the
+    /// measured trigger was a data volume at 99% full, where the fail-closed
+    /// behaviour was correct but "writes previously failed" left the operator
+    /// nothing to act on.
     fn ensure_writable(&self) -> Result<(), StateError> {
         if self.poisoned.load(Ordering::SeqCst) {
+            let cause = self
+                .poison_cause
+                .lock()
+                .ok()
+                .and_then(|cause| cause.clone())
+                .unwrap_or_else(|| "cause not recorded".to_string());
             return Err(state_error(
                 "state.poisoned",
-                "state/audit writes previously failed; mutations are refused until the daemon restarts",
+                format!(
+                    "state/audit writes previously failed: {cause}; mutations are refused until \
+                     the daemon restarts"
+                ),
             ));
         }
         Ok(())
     }
 
     /// Flip the fail-closed flag when a write-class failure escapes a
-    /// mutation. Read-only queries keep working; every later mutation is
-    /// refused until the process restarts.
+    /// mutation, remembering WHICH write failed first (item 4b of issue
+    /// #144). Read-only queries keep working; every later mutation is refused
+    /// until the process restarts.
     fn poison_on(&self, err: &StateError) {
         let write_class = matches!(
             err.code,
@@ -7699,6 +7717,11 @@ impl State {
         );
         if write_class {
             self.poisoned.store(true, Ordering::SeqCst);
+            if let Ok(mut cause) = self.poison_cause.lock()
+                && cause.is_none()
+            {
+                *cause = Some(format!("{}: {}", err.code, err.message));
+            }
         }
     }
 
