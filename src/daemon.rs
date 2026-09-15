@@ -367,6 +367,7 @@ pub fn serve(paths: &DaemonPaths) -> Result<(), DaemonError> {
     // a dispatch always sees the same handle the request handlers use.
     let dispatch = Arc::new(DaemonDispatch {
         shared: std::sync::OnceLock::new(),
+        refusals: Mutex::new(std::collections::BTreeMap::new()),
     });
     let supervisor = crate::supervision::start(
         Arc::clone(&state),
@@ -1355,6 +1356,86 @@ fn admission_gate(
 /// idempotency gates all re-derive exactly as they do for a client request.
 struct DaemonDispatch {
     shared: std::sync::OnceLock<Arc<Shared>>,
+    /// The refused-continuation ladder per run (item 4a of issue #144).
+    refusals: Mutex<std::collections::BTreeMap<String, RefusedDispatch>>,
+}
+
+/// One run's refused-continuation ladder (item 4a of issue #144): the step
+/// whose supervised dispatch keeps being refused, how many times in a row,
+/// and when the next attempt is allowed.
+struct RefusedDispatch {
+    step: String,
+    streak: u32,
+    next_attempt_unix: i64,
+}
+
+/// Ceiling of the refused-dispatch back-off wait (item 4a of issue #144): the
+/// ladder doubles from the run's own check interval up to this bound, so a
+/// run nothing can progress is re-attempted a bounded number of times per
+/// hour instead of once per tick. The run is never abandoned — the ladder is
+/// cleared by any dispatch that succeeds, so an operator repair still
+/// recovers it.
+const DISPATCH_BACKOFF_MAX_SECS: i64 = 900;
+
+impl DaemonDispatch {
+    /// How long this run's next continuation attempt must wait, and the
+    /// streak that produced the wait: `None` when the ladder allows an
+    /// attempt now.
+    fn back_off_wait(&self, instance_id: &str, step: &str, now_unix: i64) -> Option<(i64, u32)> {
+        let ladders = self.refusals.lock().ok()?;
+        let entry = ladders.get(instance_id)?;
+        if entry.step != step || now_unix >= entry.next_attempt_unix {
+            return None;
+        }
+        Some((entry.next_attempt_unix - now_unix, entry.streak))
+    }
+
+    /// Record one refused continuation dispatch and move the ladder one step:
+    /// the wait doubles from the run's own check interval, capped. A refusal
+    /// of a DIFFERENT step starts a fresh ladder (the frontier moved).
+    fn note_refused(&self, instance_id: &str, step: &str, base_secs: i64, now_unix: i64) {
+        let Ok(mut ladders) = self.refusals.lock() else {
+            return;
+        };
+        let streak = match ladders.get(instance_id) {
+            Some(entry) if entry.step == step => entry.streak.saturating_add(1),
+            _ => 1,
+        };
+        let shift = streak.saturating_sub(1).min(16);
+        let wait = base_secs
+            .max(1)
+            .saturating_mul(1i64 << shift)
+            .min(DISPATCH_BACKOFF_MAX_SECS);
+        ladders.insert(
+            instance_id.to_string(),
+            RefusedDispatch {
+                step: step.to_string(),
+                streak,
+                next_attempt_unix: now_unix + wait,
+            },
+        );
+    }
+
+    /// A dispatch that reached the engine clears the run's ladder: the run
+    /// progressed, so the next refusal starts over.
+    fn note_dispatched(&self, instance_id: &str) {
+        if let Ok(mut ladders) = self.refusals.lock() {
+            ladders.remove(instance_id);
+        }
+    }
+}
+
+/// The run's own supervision check interval: the base of the refused-dispatch
+/// ladder (item 4a of issue #144). A run whose supervision row cannot be read
+/// uses the daemon default rather than blocking the attempt.
+fn supervision_interval_secs(shared: &Arc<Shared>, instance_id: &str) -> i64 {
+    let Ok(state) = shared.lock_state() else {
+        return crate::supervision::DEFAULT_CHECK_INTERVAL_SECS;
+    };
+    match state.supervision_by_id(instance_id) {
+        Ok(Some(row)) => row.check_interval_secs,
+        _ => crate::supervision::DEFAULT_CHECK_INTERVAL_SECS,
+    }
 }
 
 impl crate::supervision::SupervisedDispatch for DaemonDispatch {
@@ -1362,6 +1443,30 @@ impl crate::supervision::SupervisedDispatch for DaemonDispatch {
         let Some(shared) = self.shared.get() else {
             return Err("the daemon dispatch hook is not wired yet".to_string());
         };
+        let now_unix = time::unix_now();
+        // Issue #144 (4a): a continuation the engine keeps refusing is not
+        // re-attempted on every check. `run-604cf9439372a5e5` re-attempted the
+        // same refused `p3` dispatch every 60 s for over an hour; the ladder
+        // paces the attempts instead of the tick, and the run's status still
+        // names the engine's own refusal (nothing new is recorded here).
+        if let Some((wait, streak)) =
+            self.back_off_wait(&intent.instance_id, &intent.step_id, now_unix)
+        {
+            shared.log.write(
+                "warn",
+                "supervision.dispatch_backoff",
+                &format!(
+                    "run {} step {}: {streak} consecutive refused dispatches; next attempt in \
+                     {wait}s",
+                    intent.instance_id, intent.step_id
+                ),
+            );
+            return Err(format!(
+                "supervision.dispatch.backoff: run {} step {} is backed off after {streak} \
+                 consecutive refused dispatches ({wait}s until the next attempt)",
+                intent.instance_id, intent.step_id
+            ));
+        }
         let key = dispatch_key(format!("{}-{}", intent.instance_id, intent.step_id));
         let request = match build_dispatch_request(
             shared,
@@ -1378,6 +1483,12 @@ impl crate::supervision::SupervisedDispatch for DaemonDispatch {
                     &intent.step_id,
                     refusal_code_of(&message),
                     &key,
+                );
+                self.note_refused(
+                    &intent.instance_id,
+                    &intent.step_id,
+                    supervision_interval_secs(shared, &intent.instance_id),
+                    now_unix,
                 );
                 return Err(message);
             }
@@ -1398,12 +1509,19 @@ impl crate::supervision::SupervisedDispatch for DaemonDispatch {
                     intent.instance_id, intent.step_id
                 ),
             );
+            self.note_refused(
+                &intent.instance_id,
+                &intent.step_id,
+                supervision_interval_secs(shared, &intent.instance_id),
+                now_unix,
+            );
             return Err(format!("{code}: {message}"));
         }
         let response = method_apply(shared, &request);
         let doc = Val::parse_json(response.trim())
             .map_err(|message| format!("the dispatch response is unreadable ({message})"))?;
         if doc.get("ok").and_then(Val::as_bool) == Some(true) {
+            self.note_dispatched(&intent.instance_id);
             shared.log.write(
                 "info",
                 "supervision.dispatch",
@@ -1437,6 +1555,12 @@ impl crate::supervision::SupervisedDispatch for DaemonDispatch {
                 "run {} step {}: {code}: {message}",
                 intent.instance_id, intent.step_id
             ),
+        );
+        self.note_refused(
+            &intent.instance_id,
+            &intent.step_id,
+            supervision_interval_secs(shared, &intent.instance_id),
+            now_unix,
         );
         Err(format!("{code}: {message}"))
     }

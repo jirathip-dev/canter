@@ -1165,7 +1165,7 @@ fn readonly_state_dir_fails_closed_and_poisons_mutations() {
     // again, later mutations are refused until a restart.
     std::fs::set_permissions(&state_dir, dir_mode).expect("restore perms");
     let key2 = "ik_ac5-ro-00000002";
-    let (code2, _) = rpc_err(
+    let (code2, message2) = rpc_err(
         &fixture.socket,
         &fresh_id(81),
         "backup.create",
@@ -1174,6 +1174,18 @@ fn readonly_state_dir_fails_closed_and_poisons_mutations() {
     assert_eq!(
         code2, "state.poisoned",
         "fail-closed poison must hold: {code2}"
+    );
+    // Issue #144 (item 4b): the poison refusal NAMES the write that failed.
+    // The measured trigger was a data volume at 99% full, where the fail
+    // closed behaviour was correct but "writes previously failed" left the
+    // operator nothing to act on.
+    assert!(
+        message2.contains("state/audit writes previously failed:"),
+        "the poison refusal is the named form: {message2}"
+    );
+    assert!(
+        message2.contains(&code),
+        "the poison refusal names the failed write {code:?}: {message2}"
     );
 
     let mut daemon = daemon;

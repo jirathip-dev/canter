@@ -1370,6 +1370,13 @@ fn report_herdr_lifecycle(
 // human-gated clean-host smoke — the same status the pre-existing workspace
 // rows carry).
 //
+// Measured against herdr 0.9.0 (issue #144): `agent start` and
+// `pane report-metadata` are EFFECT rows — the metadata row prints no
+// document at all (exit 0, zero bytes of stdout) while its recording lands —
+// so their contract is the exit status ([`herdr_call_effect`]); the
+// `agent get` row nests its fields under `result.agent` and is read through
+// [`herdr_agent_get_row`]. Every other row above is flat.
+//
 // Generation safety: the lane binding carries the lane session id AND the
 // lane generation, and EVERY operation re-reads it before addressing the
 // pane/agent. A superseded generation, another lane's identity or another
@@ -1582,19 +1589,17 @@ fn herdr_role_args(profile: &Profile) -> Result<Vec<String>, AdapterError> {
     }
 }
 
-/// Run one Herdr CLI row and return its JSON result document. The CLI prints
-/// `{"id": …, "result": {…}, "type": …}`; a bare object is accepted as its
-/// own result. A missing/unusable workspace executable is remapped to the
-/// typed [`CODE_UNAVAILABLE_HERDR`] — the substrate is never bypassed.
-fn herdr_call(
+/// Run one Herdr CLI row and return its raw stdout. A missing/unusable
+/// workspace executable is remapped to the typed [`CODE_UNAVAILABLE_HERDR`] —
+/// the substrate is never bypassed.
+fn herdr_run(
     args: &[String],
     timeout: Duration,
     env: &BTreeMap<String, String>,
     cwd: Option<&Path>,
-) -> Result<Val, ProcessFailure> {
-    let out = run_typed(WORKSPACE_EXECUTABLE, args, timeout, env, cwd);
-    let text = match out {
-        ProcessOutcome::Ok(text) => text,
+) -> Result<String, ProcessFailure> {
+    match run_typed(WORKSPACE_EXECUTABLE, args, timeout, env, cwd) {
+        ProcessOutcome::Ok(text) => Ok(text),
         ProcessOutcome::Failed(mut err) => {
             if err.code == CODE_UNAVAILABLE {
                 err.code = CODE_UNAVAILABLE_HERDR;
@@ -1604,16 +1609,115 @@ fn herdr_call(
                     err.message
                 );
             }
-            return Err(err);
+            Err(err)
         }
-    };
-    let doc = Val::parse_json(&text).map_err(|message| ProcessFailure {
-        code: CODE_MALFORMED,
-        message: "the Herdr row returned unparsable JSON".to_string(),
-        detail: diagnostics(&format!("{message}: {text}")),
-    })?;
+    }
+}
+
+/// Run one Herdr CLI row and return its JSON result document. The CLI prints
+/// `{"id": …, "result": {…}, "type": …}`; a bare object (the CLI's own error
+/// envelope) is accepted as its own result.
+///
+/// A row whose stdout is not a JSON document refuses with the EXACT argv and
+/// the raw stdout it printed (item 1 of issue #144): a bare "unparsable JSON"
+/// named neither the row nor its payload, so a launch that had already
+/// happened could not be told apart from a broken read-back.
+fn herdr_call(
+    args: &[String],
+    timeout: Duration,
+    env: &BTreeMap<String, String>,
+    cwd: Option<&Path>,
+) -> Result<Val, ProcessFailure> {
+    let text = herdr_run(args, timeout, env, cwd)?;
+    let doc = Val::parse_json(&text)
+        .map_err(|parse_error| herdr_row_refusal(args, &text, &parse_error))?;
     Ok(match doc.get("result") {
         Some(result) => result.clone(),
+        None => doc,
+    })
+}
+
+/// Run one EFFECT-only Herdr row: the verb's contract is what it did, never a
+/// document.
+///
+/// `herdr pane report-metadata` — the row that RECORDS the lane↔pane/agent
+/// binding — prints nothing on success in herdr 0.9.0 (measured on the
+/// acceptance host: exit 0, zero bytes of stdout, the binding landed and
+/// `agent get` read its tokens back), so requiring a JSON document from it
+/// refused a recording that had already succeeded (item 2 of issue #144). A
+/// nonzero exit is classified exactly as [`herdr_call`] classifies it.
+fn herdr_call_effect(
+    args: &[String],
+    timeout: Duration,
+    env: &BTreeMap<String, String>,
+    cwd: Option<&Path>,
+) -> Result<(), ProcessFailure> {
+    herdr_run(args, timeout, env, cwd).map(|_| ())
+}
+
+/// Bounded bytes of one row's argv / stdout a refusal carries (issue #144):
+/// enough to name the row and show what it printed, small enough that a
+/// refusal never becomes a data channel of its own (a role argv can carry a
+/// whole prompt payload).
+const HERDR_RAW_CAP: usize = 400;
+
+/// The refusal of one Herdr row whose stdout is not a JSON document (item 1
+/// of issue #144): it names the EXACT argv and carries the raw stdout
+/// (bounded, single-line, redacted) instead of describing neither.
+fn herdr_row_refusal(args: &[String], text: &str, parse_error: &str) -> ProcessFailure {
+    let argv = bounded_raw(&args.join(" "));
+    ProcessFailure {
+        code: CODE_MALFORMED,
+        message: format!(
+            "the Herdr row `{WORKSPACE_EXECUTABLE} {argv}` returned output that is not a JSON \
+             document ({parse_error})"
+        ),
+        detail: format!(
+            "argv: {WORKSPACE_EXECUTABLE} {argv}\nstdout ({} bytes): {}",
+            text.len(),
+            bounded_raw(text)
+        ),
+    }
+}
+
+/// One bounded, single-line, redacted rendering of captured text (issue
+/// #144): newlines are escaped so an argv and a stdout payload stay one
+/// diagnosable line each, and truncation names the full size.
+fn bounded_raw(text: &str) -> String {
+    let escaped = redact(
+        &text
+            .replace('\\', "\\\\")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r"),
+    );
+    if escaped.len() <= HERDR_RAW_CAP {
+        return escaped;
+    }
+    let mut end = HERDR_RAW_CAP;
+    while end > 0 && !escaped.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... ({} bytes total)", &escaped[..end], text.len())
+}
+
+/// `herdr agent get <lane>`: the agent row of the CLI's `agent_info`
+/// envelope.
+///
+/// The verb nests its row under `result.agent` (`{"agent": {…}, "type":
+/// "agent_info"}`), while every other row of this substrate is flat, so the
+/// documented fields (`name`, `pane_id`, `cwd`, `agent_status`, `tokens`) are
+/// read from the row itself here (item 2 of issue #144). An agent the
+/// substrate does not know is the CLI's own `error` document, which is passed
+/// through unchanged so the lane-binding check names the identity mismatch.
+fn herdr_agent_get_row(
+    lane: &str,
+    timeout: Duration,
+    env: &BTreeMap<String, String>,
+    cwd: Option<&Path>,
+) -> Result<Val, ProcessFailure> {
+    let doc = herdr_call(&herdr_agent_get_args(lane), timeout, env, cwd)?;
+    Ok(match doc.get("agent") {
+        Some(agent) => agent.clone(),
         None => doc,
     })
 }
@@ -1775,6 +1879,28 @@ fn herdr_wait_ms(timeout: Duration) -> u128 {
     budget.saturating_sub(HERDR_WAIT_MARGIN_MS).max(1)
 }
 
+/// The pane identity of one `pane list` row (item 3 of issue #144): the row's
+/// own `pane_id`, which every measured `herdr pane list` row carries
+/// (`{"pane_id":"w2VE:p1","cwd":…,"tokens":…}`).
+///
+/// A row that resolved as THIS lane's pane but carries no identity refuses
+/// with the RAW ROW: it is a read-back this code cannot address, which the
+/// operator has to see — never a "unparsable JSON" (the row parsed fine) and
+/// never an empty detail.
+fn herdr_pane_identity(row: &Val) -> Result<String, ProcessFailure> {
+    let pane_id = herdr_str(row, "pane_id");
+    if pane_id.is_empty() {
+        return Err(ProcessFailure {
+            code: CODE_MALFORMED,
+            message: "a Herdr pane read-back carries no pane_id".to_string(),
+            detail: diagnostics(&String::from_utf8_lossy(
+                &crate::canonical::canonical_bytes(row),
+            )),
+        });
+    }
+    Ok(pane_id)
+}
+
 /// Resolve the pane the lane's workspace already owns, when there is one:
 /// the workspace label is the lane session id and the pane's reported cwd is
 /// the run's lane worktree. A workspace labelled for this lane WITHOUT a pane
@@ -1807,17 +1933,7 @@ fn herdr_lane_pane(
         .iter()
         .find(|pane| same_worktree(&herdr_str(pane, "cwd"), worktree));
     match pane {
-        Some(pane) => {
-            let pane_id = herdr_str(pane, "pane_id");
-            if pane_id.is_empty() {
-                return Err(ProcessFailure {
-                    code: CODE_MALFORMED,
-                    message: "a Herdr pane read-back carries no pane_id".to_string(),
-                    detail: String::new(),
-                });
-            }
-            Ok(Some(pane_id))
-        }
+        Some(pane) => Ok(Some(herdr_pane_identity(pane)?)),
         // The lane's label is already taken by a workspace whose panes are NOT
         // in this run's lane worktree: the identity was reused by another
         // generation, another lane or another worktree. Fail closed instead of
@@ -1995,36 +2111,24 @@ fn herdr_start(
         }
     };
     // Start the role agent in the pane, then RECORD the lane binding (session
-    // identity + generation) so every later operation can verify it.
-    let rows: Vec<Vec<String>> = vec![
+    // identity + generation) so every later operation can verify it. Both are
+    // EFFECT rows: `agent start` prints an `agent_started` document nobody
+    // reads, and `pane report-metadata` prints none at all (issue #144), so
+    // their contract is the exit status, never a parsed document.
+    for row in [
         herdr_agent_start_args(&lane, agent_kind, &pane, &role_args),
         herdr_pane_report_metadata_args(&pane, &lane, request.session.identity.generation),
-        herdr_agent_get_args(&lane),
-    ];
-    let mut read_back = None;
-    for (index, row) in rows.iter().enumerate() {
-        match herdr_call(row, timeout, env, Some(worktree)) {
-            Ok(doc) => {
-                if index == rows.len() - 1 {
-                    read_back = Some(doc);
-                }
-            }
-            Err(err) => {
-                return herdr_failure(profile, request, err, started);
-            }
+    ] {
+        if let Err(err) = herdr_call_effect(&row, timeout, env, Some(worktree)) {
+            return herdr_failure(profile, request, err, started);
         }
     }
-    let Some(read_back) = read_back else {
-        return op_result(
-            profile,
-            request,
-            "refused",
-            Some(CODE_MALFORMED),
-            Some("the Herdr pane substrate read back no agent after start".to_string()),
-            None,
-            None,
-            started,
-        );
+    // The state/identity read-back is the `agent_info` envelope's own row.
+    let read_back = match herdr_agent_get_row(&lane, timeout, env, Some(worktree)) {
+        Ok(doc) => doc,
+        Err(err) => {
+            return herdr_failure(profile, request, err, started);
+        }
     };
     match verify_lane_binding(&read_back, request.session, Some(worktree)) {
         Ok(binding) => op_result(
@@ -2116,7 +2220,7 @@ fn herdr_prompt(
     }
     let lane = request.session.session_id.clone();
     let timeout = request.timeout;
-    let read = match herdr_call(&herdr_agent_get_args(&lane), timeout, env, worktree) {
+    let read = match herdr_agent_get_row(&lane, timeout, env, worktree) {
         Ok(doc) => doc,
         Err(err) => {
             return herdr_failure(profile, request, err, started);
@@ -2138,7 +2242,7 @@ fn herdr_prompt(
     // The settled state comes from the Herdr agent surface, never from
     // process-exit inference: `agent prompt --wait` reports the settled state
     // it matched and `agent get` re-reads it.
-    let settled = herdr_call(&herdr_agent_get_args(&lane), timeout, env, worktree)
+    let settled = herdr_agent_get_row(&lane, timeout, env, worktree)
         .map(|doc| LaneBinding::read(&doc))
         .unwrap_or(binding.clone());
     let state = if settled.state.is_empty() {
@@ -2207,7 +2311,7 @@ fn herdr_agent_op(
     }
     let lane = request.session.session_id.clone();
     let timeout = request.timeout;
-    let read = match herdr_call(&herdr_agent_get_args(&lane), timeout, env, worktree) {
+    let read = match herdr_agent_get_row(&lane, timeout, env, worktree) {
         Ok(doc) => doc,
         Err(err) => {
             return herdr_failure(profile, request, err, started);
@@ -2266,7 +2370,7 @@ fn herdr_agent_op(
             {
                 return herdr_failure(profile, request, err, started);
             }
-            let after = herdr_call(&herdr_agent_get_args(&lane), timeout, env, worktree)
+            let after = herdr_agent_get_row(&lane, timeout, env, worktree)
                 .map(|doc| LaneBinding::read(&doc))
                 .unwrap_or_else(|_| binding.clone());
             let outcome = if after.state == "done" {
@@ -4615,6 +4719,64 @@ mod tests {
         assert_eq!(err.code, CODE_UNAVAILABLE);
         let slashed = resolve_executable("/etc/hosts", &env);
         assert_eq!(slashed.err().map(|e| e.code), Some(CODE_BAD_REQUEST));
+    }
+
+    /// Issue #144 item 1: a row whose stdout is not a JSON document refuses
+    /// NAMING the exact argv and CARRYING the raw stdout it printed —
+    /// bounded, single-line, with the true size named when truncated.
+    #[test]
+    fn a_herdr_row_refusal_names_its_argv_and_carries_the_bounded_stdout() {
+        let argv = ["pane", "list", "--workspace", "w1"]
+            .iter()
+            .map(|part| part.to_string())
+            .collect::<Vec<String>>();
+        let failure = herdr_row_refusal(&argv, "not json", "expected a value at byte 0");
+        assert_eq!(failure.code, CODE_MALFORMED);
+        assert!(
+            failure.message.contains("herdr pane list --workspace w1"),
+            "the refusal names the exact argv: {}",
+            failure.message
+        );
+        assert!(
+            failure
+                .detail
+                .contains("argv: herdr pane list --workspace w1"),
+            "the detail carries the argv: {}",
+            failure.detail
+        );
+        assert!(
+            failure.detail.contains("stdout (8 bytes): not json"),
+            "the detail carries the raw stdout and its size: {}",
+            failure.detail
+        );
+
+        // A long multi-line payload is truncated with its full size named and
+        // stays ONE diagnosable line (the argv line stays whole).
+        let long = format!("first line\n{}", "x".repeat(HERDR_RAW_CAP * 2));
+        let failure = herdr_row_refusal(&argv, &long, "trailing content at byte 0");
+        assert_eq!(failure.detail.lines().count(), 2, "{}", failure.detail);
+        let stdout_line = failure
+            .detail
+            .lines()
+            .find(|line| line.starts_with("stdout ("))
+            .expect("the stdout line");
+        assert!(
+            stdout_line.len() < HERDR_RAW_CAP + 64,
+            "the carried stdout is bounded: {stdout_line}"
+        );
+        assert!(
+            stdout_line.contains("bytes total"),
+            "truncation names the full size: {stdout_line}"
+        );
+        assert!(
+            stdout_line.contains("first line\\n"),
+            "the newline is escaped, never a second line: {stdout_line}"
+        );
+        assert!(
+            failure.detail.contains(&format!("({} bytes)", long.len())),
+            "the true stdout size is carried: {}",
+            failure.detail
+        );
     }
 
     #[test]
