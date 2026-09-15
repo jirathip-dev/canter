@@ -1430,11 +1430,15 @@ const HERDR_PROMPT_WINDOW_MS: u128 = 20_000;
 /// retry a just-created agent's readiness race instead of exiting once.
 const HERDR_PROMPT_ROW_MS: u128 = 5_000;
 
-/// Bounded read-back poll after one submission (issue #148 item 1): the
-/// delivery verdict is the agent's own state/transcript, so the poll gives
-/// the pane a bounded moment to render the submitted text before the attempt
-/// is judged undelivered.
-const HERDR_DELIVERY_POLL_MS: u128 = 2_000;
+/// Bounded read-back poll after one submission (issue #148 items 1 and 4):
+/// the delivery verdict is the agent's own state/transcript, so the poll gives
+/// the pane a bounded moment to render the submitted text AND the agent's own
+/// state machine a bounded moment to show it TOOK the submission. The bound is
+/// the CLI's own documented acceptance window (`herdr agent prompt --wait`
+/// requires an observed `working`/`blocked` state within 5000 ms of an
+/// accepted submission) plus margin, so a submission the agent accepted is
+/// observable here instead of being re-submitted by the retry.
+const HERDR_DELIVERY_POLL_MS: u128 = 6_000;
 
 /// Poll interval of the readiness gate and of the delivery poll.
 const HERDR_PROMPT_POLL_MS: u64 = 100;
@@ -1840,6 +1844,11 @@ struct LaneBinding {
     generation: Option<i64>,
     /// The settled agent state (`idle|working|blocked|done|unknown`).
     state: String,
+    /// The substrate's own agent state-change counter (`state_change_seq`),
+    /// when the row carries one: it advances when the hosted agent's lifecycle
+    /// moves, which is the delivery evidence a pane's scrollback cannot forge
+    /// (issue #148 round 1).
+    seq: Option<i64>,
 }
 
 impl LaneBinding {
@@ -1853,6 +1862,7 @@ impl LaneBinding {
             generation: herdr_token(doc, HERDR_TOKEN_GENERATION)
                 .and_then(|token| token.parse::<i64>().ok()),
             state: herdr_str(doc, "agent_status"),
+            seq: doc.get("state_change_seq").and_then(Val::as_int),
         }
     }
 }
@@ -1952,6 +1962,12 @@ fn herdr_delivery_probe(payload: &str) -> String {
 /// item 1): the probe of the payload is present in the whitespace-free
 /// transcript. A payload with no non-whitespace character proves nothing and
 /// is never treated as delivered.
+///
+/// This is only HALF of the delivery proof (issue #148 round 1): a pane's
+/// scrollback can show the task text without the agent ever receiving it —
+/// measured on the #148 pane itself, whose launch command line embedded the
+/// task text while the agent sat idle at its TUI placeholder. It is paired
+/// with [`herdr_agent_took_submission`] in [`herdr_prompt_delivered`].
 fn herdr_transcript_shows_delivery(transcript: &str, payload: &str) -> bool {
     let probe = herdr_delivery_probe(payload);
     if probe.is_empty() {
@@ -1962,6 +1978,46 @@ fn herdr_transcript_shows_delivery(transcript: &str, payload: &str) -> bool {
         .filter(|character| !character.is_whitespace())
         .collect::<String>()
         .contains(&probe)
+}
+
+/// Whether one agent read-back shows the agent TOOK the submission (issue
+/// #148 round 1): its own state machine moved — the reported state left the
+/// pre-submission state, or the substrate's own state-change counter
+/// (`state_change_seq`, the counter `herdr pane report-agent --seq` feeds)
+/// advanced past the value recorded before the submission.
+///
+/// This is the half a pane's scrollback CANNOT forge. The launch command
+/// line, the banner and the TUI placeholder are text the pane displays; this
+/// signal is the hosted agent's own lifecycle, and it only moves when an
+/// agent accepts work. `herdr agent prompt --wait` uses the same signal (it
+/// requires an observed `working`/`blocked` state within 5000 ms of an
+/// accepted submission), so an accepted submission is what this observes.
+/// A read-back that carries neither the state change nor the counter is never
+/// read as accepted (fail closed — no false verified delivery).
+fn herdr_agent_took_submission(before: &LaneBinding, after: &LaneBinding) -> bool {
+    if !after.state.is_empty() && after.state != before.state {
+        return true;
+    }
+    match (before.seq, after.seq) {
+        (Some(before), Some(after)) => after > before,
+        _ => false,
+    }
+}
+
+/// Whether one submission is DELIVERED (issue #148 round 1): the agent's own
+/// read-back shows BOTH that the task text arrived (transcript) AND that the
+/// agent took the submission (its lifecycle moved). Text alone is forgeable by
+/// the pane's own echo of the task (launch argv, banner, scrollback); a state
+/// move alone would not name the task. Neither the launch argv, the pane
+/// banner nor the TUI placeholder line can satisfy both.
+fn herdr_prompt_delivered(
+    before: &LaneBinding,
+    after: &LaneBinding,
+    transcript: &str,
+    payload: &str,
+) -> bool {
+    herdr_agent_took_submission(before, after)
+        && herdr_transcript_shows_delivery(transcript, payload)
 }
 
 /// The CLI's own error code of one prompt row: herdr 0.9.0 prints its error
@@ -2503,16 +2559,26 @@ fn herdr_prompt(
     // transient wait codes are retried, only inside the window.
     let mut attempts = 0u64;
     let mut last: Option<PromptAttempt> = None;
+    // The read-back recorded BEFORE any submission: the state machine and the
+    // transcript a delivery must move past (issue #148 round 1). A pane whose
+    // scrollback already shows the task text (launch argv, banner) can never
+    // be judged delivered from this snapshot alone.
+    let before = binding.clone();
     loop {
         if Instant::now() >= window_end {
-            let read_back = herdr_read_back_summary(&binding);
+            let read_back = format!(
+                "{} -> {}",
+                herdr_read_back_summary(&before),
+                herdr_read_back_summary(&binding)
+            );
             return prompt_undelivered(
                 profile,
                 request,
                 started,
                 &lane,
                 &binding,
-                "the bounded delivery window expired before the task text reached the agent",
+                "the bounded delivery window expired before the agent's own lifecycle and \
+                 transcript showed the task arriving",
                 last.as_ref(),
                 &read_back,
             );
@@ -2566,11 +2632,11 @@ fn herdr_prompt(
                     Err(err) => return herdr_failure(profile, request, err, started),
                 }
             }
-            if herdr_transcript_shows_delivery(&transcript, payload) {
-                // VERIFIED delivery: the agent's own transcript carries the
-                // task text. The settled state is read through the same
-                // agent surface, and the row's failure — if it had one — is
-                // irrelevant: the submission arrived and the agent has it.
+            if herdr_prompt_delivered(&before, &binding, &transcript, payload) {
+                // VERIFIED delivery: the agent's own read-back shows the task
+                // text arrived AND the agent's lifecycle moved (it took the
+                // submission). The row's exit status is irrelevant: the
+                // submission arrived and the agent has it.
                 let state = if binding.state.is_empty() {
                     row_state.clone()
                 } else {
@@ -2585,10 +2651,19 @@ fn herdr_prompt(
                     Some(object(vec![
                         ("transcript", string(&transcript)),
                         ("state", string(&state)),
+                        ("state_before", string(&before.state)),
+                        (
+                            "state_change_seq_before",
+                            before.seq.map(integer).unwrap_or_else(null),
+                        ),
+                        (
+                            "state_change_seq_after",
+                            binding.seq.map(integer).unwrap_or_else(null),
+                        ),
                         ("agent", string(&lane)),
                         ("pane", string(&binding.pane)),
                         ("delivered", bool_(true)),
-                        ("verified", string("agent-read-back")),
+                        ("verified", string("agent-lifecycle-and-transcript")),
                         ("attempts", integer(attempts as i64)),
                         ("readiness_ms", integer(readiness_ms as i64)),
                         (
@@ -2619,15 +2694,19 @@ fn herdr_prompt(
         // row that exited zero while nothing arrived, is a VERDICT: refuse
         // typed with everything the row printed instead of retrying blindly.
         if !attempt.transient() {
-            let read_back = herdr_read_back_summary(&binding);
+            let read_back = format!(
+                "{} -> {}",
+                herdr_read_back_summary(&before),
+                herdr_read_back_summary(&binding)
+            );
             return prompt_undelivered(
                 profile,
                 request,
                 started,
                 &lane,
                 &binding,
-                "the Herdr row did not submit the task and the agent's own read-back never showed \
-                 it",
+                "the Herdr row did not submit the task and the agent's own lifecycle and \
+                 transcript never showed it",
                 Some(&attempt),
                 &read_back,
             );
@@ -2638,11 +2717,22 @@ fn herdr_prompt(
 }
 
 /// The one-line summary of an agent read-back a refusal carries (issue #148
-/// item 4: the refusal names the agent AND the read-back it judged).
+/// item 4: the refusal names the agent AND the read-back it judged), including
+/// the substrate's state-change counter — so a refusal shows whether the
+/// agent's lifecycle moved at all.
 fn herdr_read_back_summary(binding: &LaneBinding) -> String {
     format!(
-        "agent {} pane {} cwd {} state {} (lane token {:?}, generation {:?})",
-        binding.agent, binding.pane, binding.cwd, binding.state, binding.lane, binding.generation
+        "agent {} pane {} cwd {} state {} seq {} (lane token {:?}, generation {:?})",
+        binding.agent,
+        binding.pane,
+        binding.cwd,
+        binding.state,
+        binding
+            .seq
+            .map(|seq| seq.to_string())
+            .unwrap_or_else(|| "absent".to_string()),
+        binding.lane,
+        binding.generation
     )
 }
 

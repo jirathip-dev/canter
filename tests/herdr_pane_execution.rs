@@ -122,8 +122,9 @@ read_state() { [ -f "$STATE/$1" ] && sed -n 1p "$STATE/$1" || printf '%s' "$2"; 
 report_lane() { printf '%s' "${HF_FAKE_HERDR_REPORT_LANE:-$(read_state lane '')}"; }
 report_generation() { printf '%s' "${HF_FAKE_HERDR_REPORT_GENERATION:-$(read_state generation '')}"; }
 agent_doc() {
-  printf '{"name":"%s","pane_id":"%s","cwd":"%s","agent_status":"%s","tokens":{"canter_lane":"%s","canter_generation":"%s"}%s}' \
+  printf '{"name":"%s","pane_id":"%s","cwd":"%s","agent_status":"%s","state_change_seq":%s,"tokens":{"canter_lane":"%s","canter_generation":"%s"}%s}' \
     "$(read_state lane '')" "$(read_state pane 'w1:p1')" "$(read_state cwd '')" "$(read_state state 'idle')" \
+    "$(read_state seq '0')" \
     "$(report_lane)" "$(report_generation)" "${1:-}"
 }
 case "$1 $2" in
@@ -252,8 +253,19 @@ case "$1 $2" in
         ;;
       no-delivery)
         # Issue #148: the row reports a submission (exit 0) but NOTHING
-        # reaches the pane — the agent's read-back never shows the task text.
+        # reaches the pane — the agent's read-back never shows the task text
+        # AND the agent's lifecycle never moved.
         printf '{"id":"cli:agent:prompt","result":{"agent_status":"idle","submitted":true},"type":"agent_prompt"}\n'
+        exit 0
+        ;;
+      accepted-no-text)
+        # Issue #148 round 1: the agent TOOK the submission (its lifecycle
+        # moved) but the task text never reached it — so the transcript half of
+        # the proof is load-bearing too.
+        printf 'working' > "$STATE/state"
+        advanced=$(( $(read_state seq 0) + 1 ))
+        printf '%s' "$advanced" > "$STATE/seq"
+        printf '{"id":"cli:agent:prompt","result":{"agent_status":"working","submitted":true},"type":"agent_prompt"}\n'
         exit 0
         ;;
       *)
@@ -261,13 +273,32 @@ case "$1 $2" in
         exit 1
         ;;
     esac
+    # A real delivery: the pane shows the submitted text AND the agent's own
+    # lifecycle moves (state + the substrate's state-change counter).
     printf '%s' "$4" > "$STATE/pane_content"
     printf 'done' > "$STATE/state"
+    advanced=$(( $(read_state seq 0) + 1 ))
+    printf '%s' "$advanced" > "$STATE/seq"
     printf '{"id":"cli:agent:prompt","result":{"agent_status":"done","submitted":true},"type":"agent_prompt"}\n'
     ;;
   "agent read")
     log "$*"
-    cat "$STATE/pane_content" 2>/dev/null
+    # A REALISTIC pane transcript (issue #148 round 1): a real pane's
+    # `agent read` returns the whole scrollback — the launch command line, the
+    # agent's banner and its TUI placeholder — and the launch line can carry
+    # the task text (measured live on the #148 pane). A text match alone is
+    # therefore not a delivery, and this double must be able to express that.
+    printf 'hermes -p lane-role --provider example-provider -m example-model\n'
+    if [ -f "$STATE/launch_echo" ]; then
+      cat "$STATE/launch_echo"
+      printf '\n'
+    fi
+    printf '\nWelcome to the harness.\n'
+    printf 'fleet-impl > Turn these notes into a to-do list\n'
+    if [ -f "$STATE/pane_content" ]; then
+      cat "$STATE/pane_content"
+      printf '\n'
+    fi
     ;;
   "agent send-keys")
     log "$*"
@@ -369,6 +400,17 @@ impl Fixture {
     fn seed(&self, name: &str, value: &str) {
         fs::create_dir_all(&self.state).expect("state dir");
         fs::write(self.state.join(name), value).expect("seed state");
+    }
+
+    /// Plant the launch command line the pane's scrollback shows BEFORE any
+    /// prompt (issue #148 round 1): the measured #148 pane's launch line
+    /// embedded the task text, so this double must be able to carry it — a
+    /// text match alone must never be read as a delivery.
+    fn seed_launch_echo(&self, task: &str) {
+        self.seed(
+            "launch_echo",
+            &format!("hermes -p lane-role --provider example-provider -m example-model \"{task}\""),
+        );
     }
 }
 
@@ -560,9 +602,12 @@ fn the_prompt_is_delivered_through_herdr_and_the_pane_shows_it() {
         .get("transcript")
         .and_then(Val::as_str)
         .unwrap_or_default();
-    assert_eq!(
-        transcript, payload,
-        "the pane content read back through `herdr agent read` shows the delivered prompt"
+    // A real pane's read-back is the whole scrollback (launch line, banner,
+    // placeholder); the delivered task is what must appear in it.
+    assert!(
+        transcript.contains(payload),
+        "the pane content read back through `herdr agent read` shows the delivered prompt: \
+         {transcript}"
     );
     assert_eq!(fixture.pane_content(), payload);
     assert!(
@@ -596,11 +641,15 @@ fn a_fresh_agents_prompt_waits_bounded_and_delivers_a_verified_read_back() {
     ]);
     let session = lane_session(1);
     let profile = lane_profile(ExecutionMode::HerdrPane);
+    let payload = "Implement jirathip-dev/canter#148 from its latest issue text.";
+    // The pane's scrollback ALREADY shows the task text (the measured #148
+    // launch echo), so this witness can only pass through the agent's own
+    // lifecycle — never through the text.
+    fixture.seed_launch_echo(payload);
     let started =
         execute_op_in_worktree(&profile, &start_request(&session), &env, &fixture.worktree);
     assert_eq!(started.status, "succeeded", "{:?}", started.message);
 
-    let payload = "Implement jirathip-dev/canter#148 from its latest issue text.";
     let result = execute_op_in_worktree(
         &profile,
         &prompt_request(&session, payload),
@@ -616,12 +665,34 @@ fn a_fresh_agents_prompt_waits_bounded_and_delivers_a_verified_read_back() {
     );
     assert_eq!(
         result_payload.get("verified").and_then(Val::as_str),
-        Some("agent-read-back"),
-        "the delivery is verified against the agent's own read-back"
+        Some("agent-lifecycle-and-transcript"),
+        "the delivery is verified against the agent's own lifecycle AND its read-back"
+    );
+    assert!(
+        result_payload
+            .get("transcript")
+            .and_then(Val::as_str)
+            .unwrap_or_default()
+            .contains(payload)
     );
     assert_eq!(
-        result_payload.get("transcript").and_then(Val::as_str),
-        Some(payload)
+        result_payload.get("state_before").and_then(Val::as_str),
+        Some("idle"),
+        "the pre-submission lifecycle is recorded"
+    );
+    assert_eq!(
+        result_payload
+            .get("state_change_seq_before")
+            .and_then(Val::as_int),
+        Some(0)
+    );
+    assert!(
+        result_payload
+            .get("state_change_seq_after")
+            .and_then(Val::as_int)
+            .unwrap_or(0)
+            > 0,
+        "the substrate's state-change counter advanced: {result_payload:?}"
     );
     assert_eq!(
         result_payload.get("state").and_then(Val::as_str),
@@ -681,20 +752,24 @@ fn an_undelivered_prompt_refuses_typed_with_argv_raw_output_exit_and_identity() 
         "HF_FAKE_HERDR_PROMPT_FAIL",
         "agent_prompt_stalled".to_string(),
     )]);
+    let payload = "Implement jirathip-dev/canter#148 from its latest issue text.";
+    // The pane's scrollback holds the task text (the measured #148 launch
+    // echo) while the agent receives nothing: the payload is in the read-back
+    // the whole time, so only the agent's own lifecycle can refuse this.
+    fixture.seed_launch_echo(payload);
     let session = lane_session(1);
     let profile = lane_profile(ExecutionMode::HerdrPane);
     let started =
         execute_op_in_worktree(&profile, &start_request(&session), &env, &fixture.worktree);
     assert_eq!(started.status, "succeeded", "{:?}", started.message);
 
-    let payload = "Implement jirathip-dev/canter#148 from its latest issue text.";
     // The operation's own deadline caps the delivery window, so the witness
     // is bounded: the prompt waits, retries the transient wait, and refuses.
     let request = OpRequest {
         op: Op::Prompt,
         session: &session,
         payload: Some(payload),
-        timeout: Duration::from_secs(7),
+        timeout: Duration::from_secs(14),
     };
     let result = execute_op_in_worktree(&profile, &request, &env, &fixture.worktree);
 
@@ -739,6 +814,12 @@ fn an_undelivered_prompt_refuses_typed_with_argv_raw_output_exit_and_identity() 
         detail.contains("read-back ("),
         "the read-back the verdict was judged against is recorded: {detail}"
     );
+    assert_eq!(
+        detail.matches("state idle seq 0").count(),
+        2,
+        "both snapshots show the agent's lifecycle NEVER moved (the task text was already in \
+         the scrollback — the launch echo — and that alone is not a delivery): {detail}"
+    );
     // The bounded window retried the transient wait and then refused: never a
     // single un-retried exit, and never an unbounded loop.
     let submissions = fixture
@@ -775,13 +856,16 @@ fn a_prompt_row_that_exited_zero_without_delivering_is_still_undelivered() {
     let fixture = Fixture::new("prompt-zero-no-delivery");
     fixture.install(FAKE_HERDR);
     let env = fixture.env(&[("HF_FAKE_HERDR_PROMPT_FAIL", "no-delivery".to_string())]);
+    let payload = "Implement jirathip-dev/canter#148 from its latest issue text.";
+    // Same fork as the witness above: the task text sits in the scrollback
+    // (launch echo) while the zero-exit row delivers nothing.
+    fixture.seed_launch_echo(payload);
     let session = lane_session(1);
     let profile = lane_profile(ExecutionMode::HerdrPane);
     let started =
         execute_op_in_worktree(&profile, &start_request(&session), &env, &fixture.worktree);
     assert_eq!(started.status, "succeeded", "{:?}", started.message);
 
-    let payload = "Implement jirathip-dev/canter#148 from its latest issue text.";
     let result = execute_op_in_worktree(
         &profile,
         &prompt_request(&session, payload),
@@ -811,6 +895,112 @@ fn a_prompt_row_that_exited_zero_without_delivering_is_still_undelivered() {
     assert!(
         fixture.pane_content().is_empty(),
         "the agent's own read-back never showed the task text"
+    );
+    assert!(!fixture.bare_spawned());
+}
+
+/// Issue #148 round 1, the reviewer's fork: a real pane's scrollback can hold
+/// the task text WITHOUT the agent ever receiving it — measured live on the
+/// #148 pane, whose launch command line embedded the task text while the agent
+/// sat idle at its TUI placeholder. Here the pane's read-back carries the task
+/// text from BEFORE the submission (the launch echo), the row reports an
+/// accepted-looking submission, and the agent's own lifecycle never moves: the
+/// prompt must be judged NOT delivered. The mutation probe that removes the
+/// lifecycle half of the proof turns this witness RED.
+#[test]
+fn a_launch_echo_of_the_task_text_is_not_a_delivery() {
+    let fixture = Fixture::new("prompt-launch-echo");
+    fixture.install(FAKE_HERDR);
+    // The row reports a submission (exit 0) and the read-back carries the task
+    // text — but only because the pane's scrollback already shows it.
+    let env = fixture.env(&[("HF_FAKE_HERDR_PROMPT_FAIL", "no-delivery".to_string())]);
+    let payload = "Implement jirathip-dev/canter#148 from its latest issue text.";
+    fixture.seed_launch_echo(payload);
+    let session = lane_session(1);
+    let profile = lane_profile(ExecutionMode::HerdrPane);
+    let started =
+        execute_op_in_worktree(&profile, &start_request(&session), &env, &fixture.worktree);
+    assert_eq!(started.status, "succeeded", "{:?}", started.message);
+
+    let result = execute_op_in_worktree(
+        &profile,
+        &prompt_request(&session, payload),
+        &env,
+        &fixture.worktree,
+    );
+
+    assert_eq!(
+        result.status, "refused",
+        "the task text in the scrollback is not a delivery: {:?}",
+        result.message
+    );
+    assert_eq!(result.code, Some(CODE_PROMPT_UNDELIVERED));
+    // The pane's own read-back DID carry the task text (the launch echo the
+    // measured #148 pane shows) — the verdict came from the agent's lifecycle.
+    let echo = fs::read_to_string(fixture.state.join("launch_echo")).unwrap_or_default();
+    assert!(
+        echo.contains(payload),
+        "the double's pane really carries the task text before any delivery: {echo}"
+    );
+    assert_eq!(
+        fixture.pane_content(),
+        "",
+        "and nothing was delivered to the agent"
+    );
+    let detail = result.detail.clone().unwrap_or_default();
+    assert_eq!(
+        detail.matches("state idle seq 0").count(),
+        2,
+        "the agent's lifecycle never moved in either snapshot: {detail}"
+    );
+    let message = result.message.clone().unwrap_or_default();
+    assert!(
+        message.contains("lifecycle") && message.contains("lane-abc123"),
+        "the refusal names what it judged and the agent: {message}"
+    );
+    assert!(!fixture.bare_spawned());
+}
+
+/// Issue #148 round 1, the other half: an agent that TOOK the submission
+/// (its lifecycle moved) while the task text never arrived must not be read as
+/// delivered either — the transcript half is load-bearing, so a state move for
+/// any other reason can never manufacture a delivery.
+#[test]
+fn a_prompt_the_agent_took_without_the_text_is_not_a_delivery() {
+    let fixture = Fixture::new("prompt-accepted-no-text");
+    fixture.install(FAKE_HERDR);
+    let env = fixture.env(&[("HF_FAKE_HERDR_PROMPT_FAIL", "accepted-no-text".to_string())]);
+    let payload = "Implement jirathip-dev/canter#148 from its latest issue text.";
+    let session = lane_session(1);
+    let profile = lane_profile(ExecutionMode::HerdrPane);
+    let started =
+        execute_op_in_worktree(&profile, &start_request(&session), &env, &fixture.worktree);
+    assert_eq!(started.status, "succeeded", "{:?}", started.message);
+
+    let result = execute_op_in_worktree(
+        &profile,
+        &prompt_request(&session, payload),
+        &env,
+        &fixture.worktree,
+    );
+
+    assert_eq!(
+        result.status, "refused",
+        "a lifecycle move without the text is not a delivery: {:?}",
+        result.message
+    );
+    assert_eq!(result.code, Some(CODE_PROMPT_UNDELIVERED));
+    let detail = result.detail.clone().unwrap_or_default();
+    assert!(
+        detail.contains("state idle seq 0")
+            && detail.contains("state working seq 1")
+            && detail.contains(" -> "),
+        "the recorded snapshots show the lifecycle moved but the text never arrived: {detail}"
+    );
+    assert_eq!(
+        fixture.pane_content(),
+        "",
+        "the agent never received the task text"
     );
     assert!(!fixture.bare_spawned());
 }

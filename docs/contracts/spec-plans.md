@@ -224,11 +224,12 @@ runs control-plane effects:
   pane and agent of a pane-substrate bind (`result.pane` / `result.agent`),
   and the settled Herdr state of a pane-substrate prompt
   (`result.harness_state`). A pane-substrate prompt is recorded as succeeded
-  only when the agent's own read-back shows the task text arrived (issue
-  #148: the prompt's transcript is the delivery evidence, its bounded window
-  is the retry bound, and a prompt that never arrives refuses
-  `refusal.prompt.undelivered` — see [spec-capabilities.md](spec-capabilities.md),
-  "Execution substrates").
+  only when the agent's own read-back proves BOTH that the task text arrived
+  and that the agent took the submission (issue #148 round 1: the pane's
+  scrollback can show the task text without the agent receiving it, so the
+  transcript alone is not a delivery; the prompt's bounded window is the retry
+  bound and a prompt that never arrives refuses `refusal.prompt.undelivered` —
+  see [spec-capabilities.md](spec-capabilities.md), "Execution substrates").
 
 ## 5. Typed outcomes: `hf-outcome/v1`
 
