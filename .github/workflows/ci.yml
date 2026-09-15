@@ -275,6 +275,17 @@ jobs:
       - name: Tests
         run: python3 -u scripts/ci-test-driver.py
 
+      - name: Upload Tests diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rust-ubuntu-tests-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/canter-test-summary.txt
+            ${{ runner.temp }}/canter-test-logs
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Docs
         run: cargo doc --locked --no-deps
 

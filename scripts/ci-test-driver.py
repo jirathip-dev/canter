@@ -20,6 +20,7 @@ TAIL_LINES = 120
 TEST_LINE = re.compile(r"^test (.+?)(?: \.\.\.| has been running)")
 _active_child: subprocess.Popen[bytes] | None = None
 _active_target: Path | None = None
+_suite_sessions: set[int] = set()
 
 
 @dataclass
@@ -29,6 +30,9 @@ class Result:
     duration: float
     last_test: str
     survivors: int
+    timed_out: bool
+    stdout_path: Path
+    stderr_path: Path
 
 
 def suites() -> list[list[str]]:
@@ -53,27 +57,27 @@ def select_suites(name: str | None) -> list[list[str]]:
         raise SystemExit(f"unknown suite {name!r}; choose one of: {choices}") from None
 
 
-def process_table() -> dict[int, tuple[int, str]]:
+def process_table() -> dict[int, tuple[int, int, str]]:
     output = subprocess.run(
-        ["ps", "-Aww", "-o", "pid=,ppid=,command="],
+        ["ps", "-Aww", "-o", "pid=,ppid=,sess=,command="],
         check=True,
         capture_output=True,
         text=True,
         timeout=5,
     ).stdout
-    rows: dict[int, tuple[int, str]] = {}
+    rows: dict[int, tuple[int, int, str]] = {}
     for line in output.splitlines():
-        fields = line.strip().split(None, 2)
-        if len(fields) != 3:
+        fields = line.strip().split(None, 3)
+        if len(fields) != 4:
             continue
         try:
-            rows[int(fields[0])] = (int(fields[1]), fields[2])
+            rows[int(fields[0])] = (int(fields[1]), int(fields[2]), fields[3])
         except ValueError:
             continue
     return rows
 
 
-def ancestor_pids(rows: dict[int, tuple[int, str]]) -> set[int]:
+def ancestor_pids(rows: dict[int, tuple[int, int, str]]) -> set[int]:
     ancestors = {os.getpid()}
     pid = os.getppid()
     while pid > 0 and pid not in ancestors:
@@ -85,7 +89,9 @@ def ancestor_pids(rows: dict[int, tuple[int, str]]) -> set[int]:
     return ancestors
 
 
-def matching_processes(target_dir: Path) -> list[tuple[int, int, str]]:
+def matching_processes(
+    target_dir: Path, session_ids: set[int] | None = None
+) -> list[tuple[int, int, str]]:
     rows = process_table()
     excluded = ancestor_pids(rows)
     # macOS spells /tmp processes as /tmp even though Path.resolve() yields
@@ -96,39 +102,71 @@ def matching_processes(target_dir: Path) -> list[tuple[int, int, str]]:
     }
     return [
         (pid, ppid, command)
-        for pid, (ppid, command) in rows.items()
-        if pid not in excluded and any(marker in command for marker in markers)
+        for pid, (ppid, sid, command) in rows.items()
+        if pid not in excluded
+        and (
+            any(marker in command for marker in markers)
+            or (session_ids is not None and sid in session_ids)
+        )
     ]
 
 
-def sweep_survivors(target_dir: Path) -> tuple[list[tuple[int, int, str]], list[int]]:
-    found = matching_processes(target_dir)
-    for pid, ppid, command in found:
-        # Re-read immediately before signalling so PID reuse cannot target an
-        # unrelated process. Ancestors are excluded by matching_processes.
-        current = {row[0]: row for row in matching_processes(target_dir)}.get(pid)
+def signal_rows(rows: list[tuple[int, int, str]], signum: int, target_dir: Path, session_ids: set[int] | None) -> None:
+    for pid, ppid, command in rows:
+        current = {
+            row[0]: row for row in matching_processes(target_dir, session_ids)
+        }.get(pid)
         if current is None:
             continue
-        print(f"Tests survivor: pid={pid} ppid={ppid} command={command[:500]}")
+        print(
+            f"Tests survivor signal={signum}: pid={pid} ppid={ppid} "
+            f"command={command[:500]}"
+        )
         try:
-            os.kill(pid, signal.SIGKILL)
+            os.kill(pid, signum)
         except ProcessLookupError:
             pass
-    deadline = time.monotonic() + 5
-    remaining = [row[0] for row in matching_processes(target_dir)]
+
+
+def wait_for_survivors(
+    target_dir: Path, session_ids: set[int] | None, seconds: float
+) -> list[tuple[int, int, str]]:
+    deadline = time.monotonic() + seconds
+    remaining = matching_processes(target_dir, session_ids)
     while remaining and time.monotonic() < deadline:
         time.sleep(0.05)
-        remaining = [row[0] for row in matching_processes(target_dir)]
-    return found, remaining
+        remaining = matching_processes(target_dir, session_ids)
+    return remaining
 
 
-def kill_group(child: subprocess.Popen[bytes]) -> None:
+def sweep_survivors(
+    target_dir: Path, session_ids: set[int] | None = None
+) -> tuple[list[tuple[int, int, str]], list[int]]:
+    found = matching_processes(target_dir, session_ids)
+    signal_rows(found, signal.SIGTERM, target_dir, session_ids)
+    remaining = wait_for_survivors(target_dir, session_ids, 5)
+    if remaining:
+        signal_rows(remaining, signal.SIGKILL, target_dir, session_ids)
+        remaining = wait_for_survivors(target_dir, session_ids, 5)
+    return found, [row[0] for row in remaining]
+
+
+def reap_group(child: subprocess.Popen[bytes]) -> None:
     if child.poll() is not None:
         return
     try:
-        os.killpg(child.pid, signal.SIGKILL)
+        os.killpg(child.pid, signal.SIGTERM)
     except ProcessLookupError:
         return
+    try:
+        child.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
     try:
         child.wait(timeout=5)
     except subprocess.TimeoutExpired:
@@ -137,31 +175,31 @@ def kill_group(child: subprocess.Popen[bytes]) -> None:
 
 def handle_signal(signum: int, _frame: object) -> None:
     if _active_child is not None:
-        kill_group(_active_child)
-    if _active_target is not None:
-        found, remaining = sweep_survivors(_active_target)
-        print(
-            f"Tests interrupted by signal {signum}; "
-            f"survivors={len(found)} remaining={len(remaining)}"
-        )
+        reap_group(_active_child)
+    print(f"Tests interrupted by signal {signum}")
     raise SystemExit(128 + signum)
 
 
-def tail(path: Path) -> None:
-    print(f"--- bounded tail: {path} ---")
+def bounded_tail_lines(path: Path) -> list[str]:
     try:
         with path.open(encoding="utf-8", errors="replace") as stream:
             lines = deque(stream, maxlen=TAIL_LINES)
     except OSError as error:
-        print(f"<unreadable: {error}>")
-        return
+        return [f"<unreadable: {error}>"]
     if not lines:
-        print("<empty>")
-    else:
-        for line in lines:
-            text = line.rstrip("\n")
-            suffix = "…" if len(text) > 2_000 else ""
-            print(text[:2_000] + suffix)
+        return ["<empty>"]
+    rendered = []
+    for line in lines:
+        text = line.rstrip("\n")
+        suffix = "…" if len(text) > 2_000 else ""
+        rendered.append(text[:2_000] + suffix)
+    return rendered
+
+
+def print_tail(path: Path) -> None:
+    print(f"--- bounded tail: {path} ---")
+    for line in bounded_tail_lines(path):
+        print(line)
 
 
 def last_test_name(*paths: Path) -> str:
@@ -179,15 +217,54 @@ def last_test_name(*paths: Path) -> str:
     return last.replace("\t", " ")
 
 
-def print_table(results: list[Result]) -> None:
-    print("TESTS_SUITE_TABLE_BEGIN")
-    print("suite\texit\tduration_s\tlast_test\tsurvivors")
+def table_lines(results: list[Result]) -> list[str]:
+    lines = [
+        "TESTS_SUITE_TABLE_BEGIN",
+        "suite\texit\tduration_s\tlast_test\tsurvivors\ttimeout",
+    ]
     for result in results:
-        print(
+        lines.append(
             f"{result.suite}\t{result.exit_code}\t{result.duration:.1f}\t"
-            f"{result.last_test}\t{result.survivors}"
+            f"{result.last_test}\t{result.survivors}\t{str(result.timed_out).lower()}"
         )
-    print("TESTS_SUITE_TABLE_END")
+    lines.append("TESTS_SUITE_TABLE_END")
+    return lines
+
+
+def print_table(results: list[Result]) -> None:
+    for line in table_lines(results):
+        print(line)
+
+
+def write_summary(
+    path: Path,
+    status: str,
+    results: list[Result],
+    failure: Result | None = None,
+    note: str | None = None,
+) -> None:
+    lines = [f"status\t{status}"]
+    if note:
+        lines.append(f"note\t{note}")
+    lines.extend(table_lines(results))
+    if failure is not None:
+        lines.extend(
+            [
+                "FAILURE_DETAIL_BEGIN",
+                f"suite\t{failure.suite}",
+                f"exit\t{failure.exit_code}",
+                f"last_test\t{failure.last_test}",
+                f"stdout\t{failure.stdout_path}",
+                *bounded_tail_lines(failure.stdout_path),
+                f"stderr\t{failure.stderr_path}",
+                *bounded_tail_lines(failure.stderr_path),
+                "FAILURE_DETAIL_END",
+            ]
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
 
 
 def parse_args() -> argparse.Namespace:
@@ -196,30 +273,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--aggregate-seconds", type=float, default=AGGREGATE_SECONDS)
     parser.add_argument("--per-suite-seconds", type=float, default=PER_SUITE_SECONDS)
     parser.add_argument("--log-dir", type=Path)
+    parser.add_argument("--summary-file", type=Path)
     return parser.parse_args()
 
 
-def main() -> int:
-    global _active_child, _active_target
-
-    args = parse_args()
-    chosen = select_suites(args.suite)
-    log_dir = args.log_dir or Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir())) / "canter-test-logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    target_dir = Path(os.environ.get("CARGO_TARGET_DIR", "target")).absolute()
-    _active_target = target_dir
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
-    started = time.monotonic()
-    deadline = started + args.aggregate_seconds
-    results: list[Result] = []
+def run_suites(
+    chosen: list[list[str]],
+    log_dir: Path,
+    summary_path: Path,
+    target_dir: Path,
+    started: float,
+    deadline: float,
+    per_suite_seconds: float,
+    results: list[Result],
+) -> int:
+    global _active_child
 
     for index, suite in enumerate(chosen, start=1):
         label = " ".join(suite)
-        budget = min(args.per_suite_seconds, deadline - time.monotonic())
+        budget = min(per_suite_seconds, deadline - time.monotonic())
         if budget <= 0:
-            print(f"::error::Tests aggregate deadline exceeded before {label}")
+            note = f"Tests aggregate deadline exceeded before {label}"
+            print(f"::error::{note}")
             print_table(results)
+            write_summary(summary_path, "deadline", results, note=note)
             return 124
 
         safe_label = "-".join(part.lstrip("-") for part in suite)
@@ -247,42 +324,120 @@ def main() -> int:
                     stderr=stderr,
                 )
                 _active_child = child
+                _suite_sessions.add(child.pid)
                 try:
                     code = child.wait(timeout=budget)
                 except subprocess.TimeoutExpired:
                     timed_out = True
                     code = 124
                     print(f"::error::Tests {label} exceeded {budget:.1f}s")
-                    kill_group(child)
+                    reap_group(child)
             finally:
                 if child is not None:
-                    kill_group(child)
+                    reap_group(child)
                 _active_child = None
 
-        found, remaining = sweep_survivors(target_dir)
+        found, remaining = sweep_survivors(
+            target_dir, {child.pid} if child is not None else None
+        )
+        if child is not None and not remaining:
+            _suite_sessions.discard(child.pid)
         if remaining:
             print(f"::error::Tests {label} survivor sweep could not reap pids {remaining}")
             code = code if code != 0 else 1
         elif found:
-            print(f"::error::Tests {label} leaked {len(found)} target process(es); sweep reaped all")
+            print(f"::error::Tests {label} leaked {len(found)} process(es); sweep reaped all")
             code = code if code != 0 else 1
         duration = time.monotonic() - suite_started
         last_test = last_test_name(stdout_path, stderr_path)
-        tail(stdout_path)
-        tail(stderr_path)
+        print_tail(stdout_path)
+        print_tail(stderr_path)
         print(
             f"Tests {label}: exit {code}; duration={duration:.1f}s; "
             f"last_test={last_test}; survivors={len(found)}; timeout={str(timed_out).lower()}"
         )
         print("::endgroup::")
-        results.append(Result(label, code, duration, last_test, len(found)))
+        result = Result(
+            label,
+            code,
+            duration,
+            last_test,
+            len(found),
+            timed_out,
+            stdout_path,
+            stderr_path,
+        )
+        results.append(result)
         if code != 0:
             print_table(results)
+            write_summary(summary_path, "failed", results, failure=result)
             return code if code > 0 else 1
+        write_summary(summary_path, "running", results)
 
     print_table(results)
     print(f"Tests aggregate: exit 0; duration={time.monotonic() - started:.1f}s; suites={len(results)}")
     return 0
+
+
+def main() -> int:
+    global _active_target
+
+    args = parse_args()
+    chosen = select_suites(args.suite)
+    runner_temp = Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir()))
+    log_dir = args.log_dir or runner_temp / "canter-test-logs"
+    summary_path = args.summary_file or runner_temp / "canter-test-summary.txt"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    target_dir = Path(os.environ.get("CARGO_TARGET_DIR", "target")).absolute()
+    _active_target = target_dir
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+    started = time.monotonic()
+    deadline = started + args.aggregate_seconds
+    results: list[Result] = []
+    write_summary(summary_path, "starting", results)
+
+    code = 1
+    interrupted: BaseException | None = None
+    try:
+        code = run_suites(
+            chosen,
+            log_dir,
+            summary_path,
+            target_dir,
+            started,
+            deadline,
+            args.per_suite_seconds,
+            results,
+        )
+    except BaseException as error:
+        interrupted = error
+    finally:
+        found, remaining = sweep_survivors(target_dir, _suite_sessions)
+        print(
+            f"Tests final survivor sweep: found={len(found)} "
+            f"remaining={len(remaining)}"
+        )
+        if found and code == 0:
+            code = 1
+        if remaining:
+            code = 1
+        failure = results[-1] if results and results[-1].exit_code != 0 else None
+        note = None
+        if interrupted is not None:
+            note = f"driver aborted: {type(interrupted).__name__}: {interrupted}"
+        elif found:
+            note = f"final survivor sweep found {len(found)} process(es)"
+        write_summary(
+            summary_path,
+            "passed" if code == 0 else "failed",
+            results,
+            failure=failure,
+            note=note,
+        )
+    if interrupted is not None:
+        raise interrupted
+    return code
 
 
 if __name__ == "__main__":
