@@ -7792,6 +7792,27 @@ impl State {
     }
 }
 
+/// Parse one recorded dispatch-refusal target (`<run>:<step>:<code>`) into
+/// its typed record. A target that does not belong to `instance_id` or does
+/// not carry all three parts is not readable evidence and yields `None`
+/// (never a guessed step or code).
+pub(crate) fn dispatch_refusal_of(
+    instance_id: &str,
+    target: &str,
+    at: &str,
+) -> Option<SupervisionDispatchRefusal> {
+    let rest = target.strip_prefix(instance_id)?.strip_prefix(':')?;
+    let (step, code) = rest.split_once(':')?;
+    if step.is_empty() || code.is_empty() {
+        return None;
+    }
+    Some(SupervisionDispatchRefusal {
+        step: step.to_string(),
+        code: code.to_string(),
+        at: at.to_string(),
+    })
+}
+
 /// Read a grant row out of an `hf-grant/v1` document (validated by the
 /// caller through [`crate::schema::validate_doc`]).
 fn grant_row_from_doc(doc: &Val) -> Result<GrantRow, StateError> {
@@ -11109,6 +11130,27 @@ pub struct SupervisionEvidence {
     /// The NEWEST recorded review-evidence row, when one exists (the same
     /// row the board read model and the merge gate read).
     pub newest_evidence: Option<EvidenceRow>,
+    /// The NEWEST recorded REFUSAL of this run's own continuation dispatch
+    /// (issue #141), when one exists.
+    pub dispatch_refusal: Option<SupervisionDispatchRefusal>,
+}
+
+/// One recorded refusal of a supervised continuation dispatch (issue #141).
+///
+/// A dispatch the apply engine refuses BEFORE its claim (fan-out admission,
+/// a malformed derived request) leaves no attempt row and no intent of its
+/// own, so this journal record is the only durable place a classification can
+/// name the refusal from. It carries the engine's own typed code, never a
+/// re-derivation: the refusal is recorded exactly where it happened.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SupervisionDispatchRefusal {
+    /// The bound-spine step whose continuation dispatch was refused.
+    pub step: String,
+    /// The engine's own typed refusal code (e.g.
+    /// `refusal.admission.proof_stale`).
+    pub code: String,
+    /// When the refusal was recorded (RFC3339 UTC).
+    pub at: String,
 }
 
 /// The recorded dispatch context of one run: the first topology it bound,
@@ -12515,6 +12557,27 @@ impl State {
             )
             .optional()
             .map_err(|err| StateError::from_sqlite("supervision_evidence: newest", err))?;
+        // Issue #141: the newest RECORDED refusal of this run's own
+        // continuation dispatch. The driver's dispatch runs through the apply
+        // engine, which refuses a fan-out step BEFORE any claim when the
+        // run's recorded admission inputs no longer admit it — leaving no
+        // attempt row to classify. The journal record is read here so the
+        // classification names the engine's own code instead of reporting the
+        // step as eligible while nothing happens.
+        let dispatch_refusal = conn
+            .query_row(
+                "SELECT target, at FROM audit
+                  WHERE action = ?2 AND target LIKE ?1
+                  ORDER BY seq DESC LIMIT 1",
+                params![
+                    format!("{instance_id}:%"),
+                    crate::supervision::codes::DISPATCH_REFUSED
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("supervision_evidence: dispatch refusal", err))?
+            .and_then(|(target, at)| dispatch_refusal_of(instance_id, &target, &at));
         Ok(Some(SupervisionEvidence {
             run,
             has_dispatch_context,
@@ -12529,6 +12592,7 @@ impl State {
             progress_at: row.progress_at,
             item,
             newest_evidence,
+            dispatch_refusal,
         }))
     }
 
@@ -12596,6 +12660,58 @@ impl State {
             out.push((step, status, code));
         }
         Ok(out)
+    }
+
+    /// Record ONE refused continuation dispatch of a supervised run (issue
+    /// #141).
+    ///
+    /// The apply engine refuses a fan-out dispatch BEFORE its claim when the
+    /// run's recorded admission inputs no longer admit it, so the refusal
+    /// leaves no attempt row, no pane and no intent to read: it exists only
+    /// in the daemon log. Journaling it here (after the fact — never a
+    /// mutation intent) makes the refusal durable AND auditable, and the
+    /// classification reads it back so a parked run names the engine's own
+    /// code instead of reporting its next step eligible while nothing runs.
+    ///
+    /// The record is journaling only: it claims nothing, authorizes nothing
+    /// and never becomes an attempt (no effect ran).
+    pub fn record_supervision_dispatch_refusal(
+        &self,
+        instance_id: &str,
+        step: &str,
+        code: &str,
+    ) -> Result<AuditRow, StateError> {
+        let outcome = self.record_supervision_dispatch_refusal_inner(instance_id, step, code);
+        if let Err(err) = &outcome {
+            self.poison_on(err);
+        }
+        outcome
+    }
+
+    fn record_supervision_dispatch_refusal_inner(
+        &self,
+        instance_id: &str,
+        step: &str,
+        code: &str,
+    ) -> Result<AuditRow, StateError> {
+        self.ensure_writable()?;
+        let mut conn = self.lock("record_supervision_dispatch_refusal")?;
+        let tx = conn
+            .transaction()
+            .map_err(|err| StateError::from_sqlite("supervision.dispatch_refused: begin", err))?;
+        let mut key = format!("ik_sv-refused-{instance_id}");
+        key.truncate(64);
+        let audit = self.append_audit_locked(
+            &tx,
+            crate::supervision::codes::DISPATCH_REFUSED,
+            &format!("{instance_id}:{step}:{code}"),
+            &key,
+            None,
+            None,
+        )?;
+        tx.commit()
+            .map_err(|err| StateError::from_sqlite("supervision.dispatch_refused: commit", err))?;
+        Ok(audit)
     }
 
     /// Commit ONE run-scoped reconciliation in one transaction: consume the

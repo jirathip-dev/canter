@@ -1274,6 +1274,7 @@ fn only_a_reviewed_pass_with_green_checks_at_the_run_pins_is_a_delivery() {
                 status: "admitted".to_string(),
             }),
             newest_evidence: newest,
+            dispatch_refusal: None,
         }
     }
     let green = r#"[{"name":"hosted-ci","status":"passed"}]"#;
