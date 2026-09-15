@@ -23,8 +23,8 @@ path = "src/bin/herdr-fleet.rs"
 # the typed TOML decode path. No async/HTTP/clap/tracing dependencies: the
 # core is stdlib-first and spawns only bounded child processes.
 serde = "1"
-sha2 = "0.10"
-toml = "0.8"
+sha2 = "0.11"
+toml = "1.1"
 
 # Daemon foundation (issue #5): bundled SQLite is the daemon-owned state
 # authority (leases, idempotency claims, journals, audit, epochs, recovery);
