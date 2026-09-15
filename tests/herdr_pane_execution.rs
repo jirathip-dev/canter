@@ -156,8 +156,15 @@ case "$1 $2" in
   "pane list")
     log "$*"
     if [ -f "$STATE/pane" ]; then
-      printf '{"id":"cli:pane:list","result":{"panes":[{"pane_id":"%s","cwd":"%s","tokens":{"canter_lane":"%s","canter_generation":"%s"}}],"type":"pane_list"}}\n' \
-        "$(read_state pane 'w1:p1')" "$(read_state cwd '')" "$(report_lane)" "$(report_generation)"
+      if [ -n "${HF_FAKE_HERDR_PANE_NO_ID:-}" ]; then
+        # Measured-shape control (issue #144 item 3): a pane row that resolves
+        # as this lane's pane but carries no pane_id.
+        printf '{"id":"cli:pane:list","result":{"panes":[{"cwd":"%s","tokens":{"canter_lane":"%s","canter_generation":"%s"}}],"type":"pane_list"}}\n' \
+          "$(read_state cwd '')" "$(report_lane)" "$(report_generation)"
+      else
+        printf '{"id":"cli:pane:list","result":{"panes":[{"pane_id":"%s","cwd":"%s","tokens":{"canter_lane":"%s","canter_generation":"%s"}}],"type":"pane_list"}}\n' \
+          "$(read_state pane 'w1:p1')" "$(read_state cwd '')" "$(report_lane)" "$(report_generation)"
+      fi
     else
       printf '{"id":"cli:pane:list","result":{"panes":[],"type":"pane_list"}}\n'
     fi
@@ -177,7 +184,8 @@ case "$1 $2" in
         *) shift ;;
       esac
     done
-    printf '{"id":"cli:pane:report-metadata","result":{"pane_id":"w1:p1"},"type":"pane_metadata"}\n'
+    # Measured herdr 0.9.0 (issue #144): this row prints NO document on
+    # success (exit 0, zero bytes of stdout) while its recording lands.
     ;;
   "agent list")
     log "$*"
@@ -191,12 +199,18 @@ case "$1 $2" in
     log "$*"
     lane="$3"
     printf '%s' "$lane" > "$STATE/lane"
-    printf '{"id":"cli:agent:start","result":{"name":"%s","pane_id":"%s"},"type":"agent_start"}\n' "$lane" "$(read_state pane 'w1:p1')"
+    # Measured herdr 0.9.0: the started agent rides under `result.agent`.
+    printf '{"id":"cli:agent:start","result":{"agent":%s,"argv":["hermes"],"type":"agent_started"}}\n' "$(agent_doc)"
     ;;
   "agent get")
     log "$*"
-    if [ -f "$STATE/pane" ]; then
-      printf '{"id":"cli:agent:get","result":%s,"type":"agent_info"}\n' "$(agent_doc)"
+    if [ -n "${HF_FAKE_HERDR_GET_RAW:-}" ]; then
+      # Measured-shape control (issue #144 item 1): a row whose stdout is not
+      # a JSON document at all (exit 0).
+      printf '%s' "$HF_FAKE_HERDR_GET_RAW"
+    elif [ -f "$STATE/pane" ]; then
+      # Measured herdr 0.9.0: the agent row rides under `result.agent`.
+      printf '{"id":"cli:agent:get","result":{"agent":%s,"type":"agent_info"}}\n' "$(agent_doc)"
     else
       printf '{"id":"cli:agent:get","result":null,"type":"agent_info"}\n'
       exit 3
@@ -1084,4 +1098,102 @@ fn a_plan_without_one_lane_worktree_refuses_typed_on_the_pane_substrate() {
         outcome.message
     );
     assert!(fixture.rows().is_empty(), "{:?}", fixture.rows());
+}
+
+// ---------------------------------------------------------------------------
+// Issue #144: the start path's own result/read-back contract
+// ---------------------------------------------------------------------------
+
+/// Item 1 of issue #144: a Herdr row whose stdout is not a JSON document
+/// refuses NAMING the exact argv and CARRYING the raw stdout it printed.
+///
+/// The measured defect was the opposite: `harness_start` created the pane and
+/// started the agent and then refused `refusal.malformed.output` with the
+/// message "the Herdr row returned unparsable JSON", which named neither the
+/// row nor what it printed — the launch that happened was indistinguishable
+/// from a broken read-back.
+#[test]
+fn a_non_json_row_refuses_with_its_exact_argv_and_raw_stdout() {
+    let fixture = Fixture::new("raw-row");
+    fixture.install(FAKE_HERDR);
+    let raw = "herdr: not a json document (upgrade in progress)";
+    let env = fixture.env(&[("HF_FAKE_HERDR_GET_RAW", raw.to_string())]);
+    let session = lane_session(1);
+    let profile = lane_profile(ExecutionMode::HerdrPane);
+
+    let result =
+        execute_op_in_worktree(&profile, &start_request(&session), &env, &fixture.worktree);
+
+    assert_eq!(result.status, "refused", "{:?}", result.message);
+    assert_eq!(result.code, Some("refusal.malformed.output"));
+    let message = result.message.clone().unwrap_or_default();
+    assert!(
+        message.contains("herdr agent get lane-abc123"),
+        "the refusal names the exact row: {message}"
+    );
+    assert!(
+        !message.contains("the Herdr row returned unparsable JSON"),
+        "the old unnamed message is gone: {message}"
+    );
+    let detail = result.detail.clone().unwrap_or_default();
+    assert!(
+        detail.contains("argv: herdr agent get lane-abc123"),
+        "the exact argv is carried: {detail}"
+    );
+    assert!(detail.contains(raw), "the raw stdout is carried: {detail}");
+    assert!(
+        !fixture.bare_spawned(),
+        "the pane substrate never falls back to the bare harness"
+    );
+}
+
+/// Item 3 of issue #144: a `pane list` row that resolves as THIS lane's pane
+/// but carries no `pane_id` refuses with the RAW ROW — never with the
+/// "unparsable JSON" message (the row parsed fine) and never with an empty
+/// detail, and without creating a second pane or starting an agent at no
+/// identity.
+#[test]
+fn a_pane_row_without_an_identity_refuses_with_the_raw_row() {
+    let fixture = Fixture::new("pane-no-id");
+    fixture.install(FAKE_HERDR);
+    fixture.seed("lane", "lane-abc123");
+    fixture.seed("generation", "1");
+    fixture.seed("cwd", &fixture.worktree.to_string_lossy());
+    fixture.seed("pane", "w9:p1");
+    fixture.seed("label", "lane-abc123");
+    fixture.seed("workspace", "w9");
+    fixture.seed("no_agent", "1");
+    let env = fixture.env(&[("HF_FAKE_HERDR_PANE_NO_ID", "1".to_string())]);
+    let session = lane_session(1);
+    let profile = lane_profile(ExecutionMode::HerdrPane);
+
+    let result =
+        execute_op_in_worktree(&profile, &start_request(&session), &env, &fixture.worktree);
+
+    assert_eq!(result.status, "refused", "{:?}", result.message);
+    assert_eq!(result.code, Some("refusal.malformed.output"));
+    let message = result.message.clone().unwrap_or_default();
+    assert_eq!(message, "a Herdr pane read-back carries no pane_id");
+    assert!(
+        !message.contains("unparsable JSON"),
+        "a row without an identity is not conflated with unparsable JSON: {message}"
+    );
+    let detail = result.detail.clone().unwrap_or_default();
+    assert!(
+        !detail.is_empty(),
+        "the refusal carries the raw row it could not address"
+    );
+    assert!(
+        detail.contains(&fixture.worktree.to_string_lossy().to_string()),
+        "the raw row is carried: {detail}"
+    );
+    let rows = fixture.rows();
+    assert!(
+        !rows.iter().any(|row| row.starts_with("workspace create")),
+        "a read-back without an identity creates no second pane: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.starts_with("agent start")),
+        "a read-back without an identity starts no agent: {rows:?}"
+    );
 }
