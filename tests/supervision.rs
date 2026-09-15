@@ -99,6 +99,21 @@ fn request_with(issues: Vec<qp::SelectedIssue>) -> qp::QueueRequest {
     }
 }
 
+/// A valid non-autonomous frontier for classification/timer tests. Those
+/// tests exercise supervision observations, not executor dispatch.
+fn observation_request(issues: Vec<qp::SelectedIssue>) -> qp::QueueRequest {
+    let mut request = request_with(issues);
+    request.steps = vec![qp::PlannedStep {
+        id: "p1".to_string(),
+        kind: "merge".to_string(),
+        params: Some(object(vec![
+            ("branch", string("issue-5")),
+            ("merge_policy", string("squash")),
+        ])),
+    }];
+    request
+}
+
 fn selected(id: &str, revision: &str) -> qp::SelectedIssue {
     qp::SelectedIssue {
         id: id.to_string(),
@@ -522,7 +537,7 @@ fn armed_run_is_evaluated_without_another_client_request_and_reads_are_inert() {
     let (bound, digest) = {
         let state = fixture.seed();
         seed_grant(&state, "gr_0000000000000095", 5);
-        render_bound(&state, &request_with(vec![selected("#5", REV_A)]))
+        render_bound(&state, &observation_request(vec![selected("#5", REV_A)]))
     };
     let daemon = fixture.spawn();
     wait_ready(&fixture);
@@ -727,7 +742,7 @@ fn supervision_is_disabled_by_default_and_a_foreign_target_refuses() {
     let (bound, digest) = {
         let state = fixture.seed();
         seed_grant(&state, "gr_0000000000000096", 5);
-        render_bound(&state, &request_with(vec![selected("#5", REV_A)]))
+        render_bound(&state, &observation_request(vec![selected("#5", REV_A)]))
     };
     let daemon = fixture.spawn();
     wait_ready(&fixture);
@@ -800,7 +815,7 @@ fn restart_preserves_the_pause_hold_and_yields_one_fresh_reconciliation() {
     let (bound, digest) = {
         let state = fixture.seed();
         seed_grant(&state, "gr_0000000000000097", 5);
-        render_bound(&state, &request_with(vec![selected("#5", REV_A)]))
+        render_bound(&state, &observation_request(vec![selected("#5", REV_A)]))
     };
     let daemon = fixture.spawn();
     wait_ready(&fixture);
@@ -989,7 +1004,7 @@ fn cli_supervision_status_reads_the_versioned_status_back_inert() {
     let (bound, digest) = {
         let state = fixture.seed();
         seed_grant(&state, "gr_0000000000000095", 5);
-        render_bound(&state, &request_with(vec![selected("#5", REV_A)]))
+        render_bound(&state, &observation_request(vec![selected("#5", REV_A)]))
     };
     let daemon = fixture.spawn();
     wait_ready(&fixture);
@@ -1075,7 +1090,7 @@ fn freshly_armed_run_is_held_and_never_opens_a_continuation_window() {
     let (bound, digest) = {
         let state = fixture.seed();
         seed_grant(&state, "gr_0000000000000095", 5);
-        render_bound(&state, &request_with(vec![selected("#5", REV_A)]))
+        render_bound(&state, &observation_request(vec![selected("#5", REV_A)]))
     };
     let daemon = fixture.spawn();
     wait_ready(&fixture);
@@ -1153,7 +1168,7 @@ fn a_genuine_deadline_reports_exactly_one_continuation() {
     let (bound, digest) = {
         let state = fixture.seed();
         seed_grant(&state, "gr_0000000000000095", 5);
-        render_bound(&state, &request_with(vec![selected("#5", REV_A)]))
+        render_bound(&state, &observation_request(vec![selected("#5", REV_A)]))
     };
     let daemon = fixture.spawn();
     wait_ready(&fixture);
@@ -1464,14 +1479,34 @@ fn an_armed_run_is_dispatched_only_while_it_is_live_and_underway() {
     // FIRST dispatch belongs to the caller that holds the topology, so the
     // armed run is not advanced yet (and the driver never invents one).
     assert!(dispatch_intent_of(&state, &run).is_none());
+    let row = state
+        .supervision_by_id(&run)
+        .unwrap()
+        .expect("supervision row");
+    let evidence = state
+        .supervision_evidence(&run)
+        .unwrap()
+        .expect("supervision evidence");
+    let verdict = supervision::classify(
+        &evidence,
+        &row.authorization_digest,
+        &supervision::Policy {
+            check_interval_secs: row.check_interval_secs,
+            progress_timeout_secs: row.progress_timeout_secs,
+        },
+        canter::time::unix_now(),
+    );
+    assert_eq!(verdict.class, "needs-attention");
+    assert_eq!(verdict.reason, supervision::codes::DISPATCH_CONTEXT_MISSING);
+    assert!(!verdict.eligible);
 
-    // Underway: one recorded attempt, and the armed run's continuation is the
-    // next unachieved step of its own reviewed spine.
+    // A recorded attempt does not create host-local topology. Without a
+    // committed dispatch context, the driver still refuses to invent one.
     seed_attempt(&state, &run, "p1", "ik_95-dispatch-0001", "succeeded");
-    let intent = dispatch_intent_of(&state, &run).expect("armed continuation");
-    assert_eq!(intent.step_id, "p2");
-    assert_eq!(intent.reason, canter::supervision::codes::DISPATCH);
-    assert_eq!(intent.kind, "hosted_check");
+    assert!(
+        dispatch_intent_of(&state, &run).is_none(),
+        "recorded progress alone is not dispatch authority"
+    );
 
     // A paused run is never advanced by supervision.
     state
@@ -1776,7 +1811,14 @@ fn an_armed_run_is_advanced_by_the_drivers_own_dispatch() {
         .find(|(step, _)| step == "p2")
         .unwrap_or_else(|| panic!("the driver never dispatched p2: {attempts:?}"));
     assert_eq!(p2.1, "succeeded", "the continuation ran: {attempts:?}");
-    let log = std::fs::read_to_string(fixture.daemon_log()).unwrap_or_default();
+    let log_deadline = Instant::now() + Duration::from_secs(2);
+    let log = loop {
+        let log = std::fs::read_to_string(fixture.daemon_log()).unwrap_or_default();
+        if log.contains("\"event\":\"supervision.dispatch\"") || Instant::now() >= log_deadline {
+            break log;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
     assert!(
         log.contains("\"event\":\"supervision.dispatch\""),
         "the dispatch is recorded in the daemon log:\n{log}"
@@ -2497,6 +2539,128 @@ fn run_param_case(case: &ParamCase) {
 }
 
 #[test]
+fn cycle2_collect_missing_base_is_refused_before_retry_consumption() {
+    let fixture = DaemonFixture::new("c2-collect");
+    let (bound, digest) = {
+        let state = fixture.seed();
+        seed_grant(&state, "gr_0000000000000095", 5);
+        let mut request = request_lane_steps(vec![selected("#5", REV_A)]);
+        request.steps = param_cases().remove(1).steps;
+        request.steps[1].params = Some(object(vec![("worktree", string("lane-p2"))]));
+        render_bound(&state, &request)
+    };
+    let integration = fixture.dir.join("integration");
+    init_repo(&integration);
+    let daemon = fixture.spawn();
+    wait_ready(&fixture);
+    let submitted = rpc_ok(
+        &fixture.socket,
+        &fresh_id(1),
+        "queue.submit",
+        Some(params_doc(
+            &idem_key("c2-collect"),
+            &bound,
+            &digest,
+            &role_revision(),
+            "gr_0000000000000095",
+            None,
+        )),
+    );
+    let run = instance_of(&submitted, 5);
+    rpc_ok(
+        &fixture.socket,
+        &fresh_id(2),
+        "apply",
+        Some(caller_apply_params(
+            &fixture,
+            &integration,
+            &bound,
+            &run,
+            "gr_0000000000000095",
+            ("p1", 5),
+            &idem_key("c2-first"),
+        )),
+    );
+    // A well-formed request reaches git and fails on an absent worktree.
+    let base = format!(
+        "base_head={}",
+        git_output(&integration, &["rev-parse", "HEAD"]).trim()
+    );
+    let (exit, out, err) = run_cli(
+        &fixture,
+        &[
+            "dispatch",
+            "--run",
+            &run,
+            "--step",
+            "p2",
+            "--param",
+            &base,
+            "--param",
+            "worktree=absent",
+        ],
+    );
+    assert_eq!(exit, 4, "{out} {err}");
+    assert!(err.contains("refusal.unavailable"), "{err}");
+    let (exit, out, err) = run_cli(&fixture, &["retry", "--run", &run, "--step", "p2"]);
+    assert_eq!(exit, 0, "{out} {err}");
+    let before = attempts_for(&fixture, &run, "p2");
+    // Exact asymmetry: valid worktree, no base_head and no observed base.
+    let refused = rpc_refusal(
+        &fixture.socket,
+        &fresh_id(3),
+        "apply",
+        Some(caller_apply_params(
+            &fixture,
+            &integration,
+            &bound,
+            &run,
+            "gr_0000000000000095",
+            ("p2", 5),
+            &idem_key("c2-missing-base"),
+        )),
+    );
+    eprintln!("COLLECT_REFUSAL={refused}");
+    assert!(refused.contains("refusal.request.malformed"), "{refused}");
+    assert!(
+        refused.contains("collect_outcome requires base_head"),
+        "{refused}"
+    );
+    assert_eq!(
+        attempts_for(&fixture, &run, "p2"),
+        before,
+        "pre-fence refusal records no attempt"
+    );
+    let retries = fixture.seed().run_retries(&run).unwrap();
+    assert_eq!(retries.len(), 1);
+    assert!(
+        retries[0].consumed_at.is_empty(),
+        "pre-fence refusal consumed retry"
+    );
+    let (exit, out, err) = run_cli(
+        &fixture,
+        &[
+            "dispatch",
+            "--run",
+            &run,
+            "--step",
+            "p2",
+            "--param",
+            &base,
+            "--param",
+            "worktree=lane-p2",
+        ],
+    );
+    assert_eq!(exit, 0, "{out} {err}");
+    assert!(
+        !fixture.seed().run_retries(&run).unwrap()[0]
+            .consumed_at
+            .is_empty()
+    );
+    shutdown(daemon);
+}
+
+#[test]
 fn f10_every_kind_refuses_a_malformed_dispatch_without_recording_an_attempt() {
     for case in param_cases() {
         run_param_case(&case);
@@ -2632,62 +2796,88 @@ fn an_uncontained_worktree_dispatch_is_refused_before_any_git_mutation() {
     let (exit, stdout, stderr) = run_cli(&fixture, &["retry", "--run", &run, "--step", "p2"]);
     assert_eq!(exit, 0, "retry exit; stdout: {stdout}; stderr: {stderr}");
 
-    // (1) The ESCAPING dispatch: refused typed BEFORE any git mutation, with
-    // the operator's authorization left UNCONSUMED (the refusal is raised by
-    // the pre-fence screen, not by the fence).
-    let (exit, stdout, stderr) = run_cli(
-        &fixture,
-        &[
-            "dispatch",
-            "--run",
-            &run,
-            "--step",
-            "p2",
-            "--param",
-            "branch=issue-130-escaped-lane",
-            "--param",
-            &format!("worktree={ESCAPING_WORKTREE}"),
-        ],
-    );
-    assert_eq!(
-        exit, 4,
-        "escaping dispatch exit; stdout: {stdout}; stderr: {stderr}"
-    );
-    assert!(
-        stderr.contains("refusal.path.uncontained"),
-        "the refusal is the containment code: {stderr}"
-    );
+    // Every escaping spelling must leave refs, worktrees and retry ownership unchanged.
+    std::fs::create_dir_all(fixture.dir.join("outside")).unwrap();
+    std::os::unix::fs::symlink(
+        fixture.dir.join("outside"),
+        fixture.dir.join("worktrees/link-out"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        fixture.dir.join("missing"),
+        fixture.dir.join("worktrees/dangle"),
+    )
+    .unwrap();
+    let absolute = fixture
+        .dir
+        .join("absolute-lane")
+        .to_string_lossy()
+        .into_owned();
+    let original_refs = branches_of(&integration);
+    for escaping in [
+        ESCAPING_WORKTREE,
+        absolute.as_str(),
+        "link-out/lane",
+        "dangle/lane",
+    ] {
+        let (exit, stdout, stderr) = run_cli(
+            &fixture,
+            &[
+                "dispatch",
+                "--run",
+                &run,
+                "--step",
+                "p2",
+                "--param",
+                "branch=issue-130-escaped-lane",
+                "--param",
+                &format!("worktree={escaping}"),
+            ],
+        );
+        assert_eq!(
+            exit, 4,
+            "escaping dispatch exit; stdout: {stdout}; stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("refusal.path.uncontained"),
+            "the refusal is the containment code: {stderr}"
+        );
 
-    // No directory, no worktree entry and no branch may be left behind.
-    let escaped = fixture.dir.join("escaped-lane");
-    assert!(
-        !escaped.exists(),
-        "nothing is created outside the worktrees root: {escaped:?}"
-    );
-    assert_eq!(
-        worktree_count(&integration),
-        1,
-        "the integration checkout stays the only worktree: {}",
-        git_output(&integration, &["worktree", "list", "--porcelain"])
-    );
-    let branches = branches_of(&integration);
-    assert!(
-        !branches.contains("issue-130-escaped-lane"),
-        "no escaping branch exists: {branches}"
-    );
+        // No directory, no worktree entry and no branch may be left behind.
+        let escaped = fixture.dir.join("escaped-lane");
+        assert!(
+            !escaped.exists(),
+            "nothing is created outside the worktrees root: {escaped:?}"
+        );
+        assert_eq!(
+            worktree_count(&integration),
+            1,
+            "the integration checkout stays the only worktree: {}",
+            git_output(&integration, &["worktree", "list", "--porcelain"])
+        );
+        let branches = branches_of(&integration);
+        assert_eq!(branches, original_refs, "no stray ref for {escaping}");
+        assert!(!fixture.dir.join("absolute-lane").exists());
+        assert!(!fixture.dir.join("outside/lane").exists());
+        assert!(!fixture.dir.join("missing").exists());
+        assert!(
+            !branches.contains("issue-130-escaped-lane"),
+            "no escaping branch exists: {branches}"
+        );
 
-    // Nothing burned, nothing attempted.
-    let retries = fixture.seed().run_retries(&run).expect("retries");
-    assert_eq!(retries.len(), 1, "still exactly one authorization");
-    assert!(
-        retries.iter().all(|retry| retry.consumed_at.is_empty()),
-        "the refused dispatch consumes no authorization: {retries:?}"
-    );
-    assert_eq!(
-        attempts_for(&fixture, &run, "p2"),
-        diagnosed,
-        "the refused dispatch attempts nothing"
-    );
+        // Nothing burned, nothing attempted.
+        let retries = fixture.seed().run_retries(&run).expect("retries");
+        assert_eq!(retries.len(), 1, "still exactly one authorization");
+        assert!(
+            retries.iter().all(|retry| retry.consumed_at.is_empty()),
+            "the refused dispatch consumes no authorization: {retries:?}"
+        );
+        assert_eq!(
+            attempts_for(&fixture, &run, "p2"),
+            diagnosed,
+            "the refused dispatch attempts nothing"
+        );
+    }
 
     // (2) The legitimate in-root shape still succeeds, reports
     // `contained: true`, and consumes exactly the one authorization.
@@ -2892,7 +3082,7 @@ fn the_prompt_runs_the_runs_declared_role_binding_and_continues_its_session() {
         let request = qp::QueueRequest {
             steps: harness_steps("lane-1"),
             role_config: harness_binding_doc(),
-            ..request_with(vec![selected("#5", REV_A)])
+            ..observation_request(vec![selected("#5", REV_A)])
         };
         render_bound(&state, &request)
     };

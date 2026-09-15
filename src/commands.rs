@@ -64,7 +64,7 @@ USAGE:
     canter lane preview --lane ID --generation N --session S --process P --role R --worktree W --reason TEXT [--profile KEY] [--socket PATH] [--config PATH] [--json]
     canter lane request --lane ID --generation N --session S --process P --role R --worktree W --reason TEXT [--profile KEY] [--confirm-digest HEX64 | --confirm | --yes] [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter lane status (--replacement RP_ID | --lane ID --generation N) [--socket PATH] [--config PATH] [--json]
-    canter queue submit --request FILE --confirm-digest HEX64 [--epoch N] [--grant REF=GRANT_ID]... [--resume INSTANCE=DIGEST]... [--host-available yes|no|unknown] [--harness-lanes N|unknown] [--supervise arm|off] [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
+    canter queue submit --request FILE --confirm-digest HEX64 [--epoch N] [--grant REF=GRANT_ID]... [--resume INSTANCE=DIGEST]... [--host-available yes|no|unknown] [--harness-lanes N|unknown] [--supervise arm|off] [--topology FILE] [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter queue status --submission QS_ID [--socket PATH] [--config PATH] [--json]
     canter queue preview --repository KEY --harness KEY --host HOST --issue N=HEX40... --caps G/R/H [--host-available yes|no|unknown] [--harness-lanes N|unknown] [--boundary-phase PHASE] [--integration-branch B] [--completion-branch B] [--out FILE] [--socket PATH] [--config PATH] [--json]
     canter run pause --run RUN_ID --reason TEXT [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
@@ -103,9 +103,9 @@ COMMANDS:
                      run (pause/resume/retry/resolve/dispatch are typed controls;
                      status is read-only; the surface is run-scoped only).
     supervision      Read the versioned supervision status of exactly ONE
-                     supervised run back (read-only; supervision is armed
-                     with the run's queue submission and evaluated by the
-                     daemon, and this surface never continues work).
+                     supervised run back (read-only; an armed driver may
+                     dispatch through apply, while this status/control
+                     surface never dispatches work).
     grant            Mint ONE route grant (`hf-grant/v1`) through the daemon
                      from a reviewed bound-input document, so the operator
                      authority path has a supported way to obtain the grant
@@ -356,9 +356,11 @@ pub struct QueueSubmitArgs {
     /// `--supervise arm|off`: whether the admitted runs carry an explicit
     /// supervision authorization (issue #95). Default `off`: supervision is
     /// disabled unless it is explicitly authorized as part of this
-    /// submission, and even `arm` only binds the run to an evaluation driver
-    /// that never continues work.
+    /// submission. `arm` requires the topology used by its gated apply path.
     pub supervise: String,
+    /// Dispatch topology committed with an armed submission. It gives the
+    /// supervisor the same immutable paths a first `run dispatch` accepts.
+    pub topology: Option<PathBuf>,
     /// `--idempotency-key`: replay-safe automation key.
     pub idempotency_key: Option<String>,
     /// Explicit daemon socket override.
@@ -2036,6 +2038,7 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
     // Issue #95: supervision is disabled unless this submission explicitly
     // authorizes it (`--supervise arm`).
     let mut supervise = "disabled".to_string();
+    let mut topology: Option<PathBuf> = None;
     let mut idempotency_key: Option<String> = None;
     let mut submission: Option<String> = None;
     // Plan-producer inputs (`queue preview`, issue #91).
@@ -2123,6 +2126,10 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
                         )));
                     }
                 };
+            }
+            "--topology" => {
+                let raw = flag_value(&rest, &mut index, "queue submit", "--topology")?;
+                topology = Some(PathBuf::from(raw));
             }
             "--idempotency-key" => {
                 let raw = flag_value(&rest, &mut index, "queue", "--idempotency-key")?;
@@ -2247,6 +2254,12 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
                     .to_string(),
             )
         })?;
+        if supervise == "armed" && topology.is_none() {
+            return Err(ParseError::Usage(
+                "queue submit: --supervise arm requires --topology FILE so the supervisor can dispatch the first step without an operator nudge"
+                    .to_string(),
+            ));
+        }
         QueueAction::Submit(QueueSubmitArgs {
             request_path,
             confirm_digest,
@@ -2257,6 +2270,7 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
             harness_lanes,
             caps,
             supervise,
+            topology,
             idempotency_key,
             socket,
         })
@@ -2269,6 +2283,7 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
             || idempotency_key.is_some()
             || submission.is_some()
             || supervise != "disabled"
+            || topology.is_some()
         {
             return Err(ParseError::Usage(
                 "queue preview: submission flags are not valid for a read-only preview render \
@@ -2335,6 +2350,7 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
             || harness_lanes_set
             || caps.is_some()
             || idempotency_key.is_some()
+            || topology.is_some()
             || preview_only
         {
             return Err(ParseError::Usage(
@@ -4703,7 +4719,7 @@ fn execute_queue_submit(args: &QueueSubmitArgs, invocation: &Invocation) -> CmdR
             },
         )
         .collect();
-    let params = crate::queue_executor::submit_params(
+    let mut params = crate::queue_executor::submit_params(
         &key,
         &args.confirm_digest,
         epoch,
@@ -4721,6 +4737,54 @@ fn execute_queue_submit(args: &QueueSubmitArgs, invocation: &Invocation) -> CmdR
         })
         .filter(|authorization| authorization.desired == "armed"),
     );
+    if let Some(path) = &args.topology {
+        let topology = match std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| Val::parse_json(&text).ok())
+        {
+            Some(topology @ Val::Obj(_)) => topology,
+            _ => {
+                return error_result(
+                    2,
+                    "usage.queue_topology",
+                    format!(
+                        "queue submit: --topology {} must be one JSON object",
+                        path.display()
+                    ),
+                    false,
+                );
+            }
+        };
+        if let Val::Obj(map) = &mut params {
+            map.insert(
+                "dispatch".to_string(),
+                object(vec![
+                    ("topology", topology),
+                    (
+                        "admission",
+                        object(vec![
+                            (
+                                "caps",
+                                object(vec![
+                                    ("global", integer(args.caps.global as i64)),
+                                    ("repository", integer(args.caps.per_repository as i64)),
+                                    ("harness", integer(args.caps.per_harness as i64)),
+                                ]),
+                            ),
+                            (
+                                "harness_lanes",
+                                args.harness_lanes.map(integer).unwrap_or_else(null),
+                            ),
+                            (
+                                "host_proof",
+                                object(vec![("measured_at", string(&crate::time::rfc3339_now()))]),
+                            ),
+                        ]),
+                    ),
+                ]),
+            );
+        }
+    }
     match client::call(&paths.socket_path, "queue.submit", Some(&params)) {
         Ok(result) => {
             let human = crate::queue_executor::render_human(&result);

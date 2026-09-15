@@ -48,6 +48,11 @@ Normative rules:
   the integration clone points at later. A plan may explicitly declare
   `requires_delta:false` for a legitimate no-op prompt; collection then
   succeeds with equal base/head while still enforcing the bound output branch.
+- The built-in `merge` step declares `merge_policy:"squash"`. `merge_policy`
+  is a closed `squash | ff` input and the effect is a read-only rehearsal: it
+  verifies the reviewed integration ref and policy-compatible result tree but
+  never moves the integration checkout or a ref. The orchestrator/forge owns
+  the actual policy merge; `post_merge_verify` proves its landed head.
 
 ### Canonical serialization and digest
 
@@ -88,6 +93,10 @@ Semantics: labels/comments alone never authorize (trust model T6). Grants
 are consumed/checked by the daemon, expire, and die with their epoch. A
 grant missing any binding is refused (`grant.malformed.json` removes
 `state_epoch`).
+For the same live binding, a later issuance may replace an expired window on
+the same durable run; the daemon records `grant.rotation` naming both grant
+rows and the new expiry. A live window remains the owner and refuses rotation.
+No expired row is replaced or silently reused.
 
 ## 3. State epochs: `hf-epoch/v1` (AC7)
 

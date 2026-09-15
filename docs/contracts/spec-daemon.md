@@ -275,7 +275,9 @@ outcome after the effect transaction commits.
   `{host_available, harness_lanes}` (both may be null = unknown, which is
   never readiness); optional `grants` (`[{id, grant_id}]`, the per-issue
   route-grant bindings) and `resume` (`[{instance_id, digest}]`, the
-  explicit engine-minted authorizations for paused runs).
+  explicit engine-minted authorizations for paused runs). An armed
+  submission also carries `dispatch:{topology, admission}`, sourced from
+  `--topology FILE` and the presented capacity/host observation.
 - Refusals happen BEFORE the claim (nothing is journaled, no effect
   exists): malformed params, a digest that does not match the freshly
   re-rendered preview (`refusal.plan.stale`), a stale epoch
@@ -291,7 +293,8 @@ outcome after the effect transaction commits.
   state/role/workflow/boundary block, per-issue items with their closed
   status (`admitted` | `waiting` | `refused`), stable reason code,
   bounded message and the bound run id, the executable spine, and an
-  explicit statement that no workflow step has been executed.
+  explicit statement that submission itself only admits; its armed driver
+  may separately dispatch through the gated apply path.
 - One transaction decides and writes: live ownership (a duplicate owner
   is refused `submission.already_owned`), grant status/epoch/expiry
   (`refusal.grant.*`, `refusal.state.epoch`), scope overlap
@@ -305,9 +308,10 @@ outcome after the effect transaction commits.
   unless a route grant for that exact selection was issued AFTER the owner's
   grant. Presenting that later, still-valid grant atomically invalidates the old
   run and rebinds the unique ownership row to the new run; presenting an older
-  grant remains stale, and the same-revision case remains
-  `submission.already_owned`. The grant insertion order is the normative
-  authorization-window order.
+  grant remains stale. A same-revision live window remains
+  `submission.already_owned`; a later issuance may rotate an expired window on
+  that same run, with `grant.rotation` naming both rows and the new expiry. The
+  grant insertion order is the normative authorization-window order.
 - `queue.status` requires `params.submission_id` (`qs_` + 16 hex) and
   returns the same document the submit response carried (a pure
   projection of the committed rows; `state.not_found` for an unknown id).
@@ -492,24 +496,29 @@ clears a repository/fleet-level hold or bypasses a gate.
   with reason `supervision.progress_timeout`.
 - **Armed continuation dispatch (issue #92 F4)**: an explicitly `armed`
   run whose authorization still matches its committed submission is
-  advanced by the driver itself — the check hands the run's NEXT UNACHIEVED
+  advanced by the driver itself from its FIRST step onward — the check hands
+  the run's NEXT UNACHIEVED
   step to the merged `apply` engine, which re-derives every gate
   (capability, grant, admission, ownership, journal, idempotency) and
   journals the intent before any effect. The dispatch exists only when the
   run is live (not paused/pause-requested/human-queued/blocked/invalidated/
   done, no terminal blocker), has no step claim in flight, has a committed
-  spine, has already dispatched at least one step (the durable topology and
-  admission inputs a dispatch re-presents come from the run's own applies —
-  none is invented), and the frontier step has NEVER been attempted. A
+  spine and dispatch context, and the frontier step has NEVER been attempted.
+  The initial context (topology plus the admission observation) is committed
+  by `queue submit --supervise arm --topology FILE`; later derived heads and
+  session identities come only from the run's recorded apply outcomes. None
+  is invented. A
   DIAGNOSED step (a recorded non-success) is never re-dispatched by the
   driver, with or without a pending `run.retry` authorization: re-dispatching
   it means carrying the operator's CORRECTED step params, which the driver
   does not hold — the operator's own `run.dispatch` owns it. A fan-out step
-  still needs the caller-presented
+  still needs the submission-presented
   admission inputs: supervision re-presents the run's committed caps and
   occupancy but never fabricates a host-resource measurement, so the
   admission gate refuses `refusal.admission.proof_missing` when no fresh
-  proof exists. Non-armed/unknown supervision keeps its classification-only,
+  proof exists. `review_evidence` remains a concrete
+  `supervision.waiting_approval` frontier until independent evidence is
+  presented. Non-armed/unknown supervision keeps its classification-only,
   zero-effect guarantee verbatim: without a row the run is never even read.
 - `continuation-eligible` remains a REPORT (the classification half), and
   an idle/done agent alone is neither completion (a `done` run without

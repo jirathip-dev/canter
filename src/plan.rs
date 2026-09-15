@@ -192,7 +192,7 @@ fn steps_value(steps: &[PlanStep]) -> Val {
 /// deduplicated. The caller also enforces the executable step bound
 /// (`queue_preview::STEPS_MAX`) — the spine grows by six steps per issue.
 pub fn queue_run_steps(
-    _repository: &str,
+    repository: &str,
     integration_branch: &str,
     harness_key: &str,
     issues: &[u64],
@@ -227,6 +227,12 @@ pub fn queue_run_steps(
             kind: "prompt".to_string(),
             params: Some(object(vec![
                 ("harness_key", string(harness_key)),
+                (
+                    "payload",
+                    string(&format!(
+                        "Implement {repository}#{number} from its latest issue text. Follow the repository instructions, run its required gates, commit the bounded change, push the feature branch, open or update its pull request to {integration_branch}, and report the exact delivery evidence."
+                    )),
+                ),
                 ("worktree", string(&worktree)),
                 ("branch", string(&branch)),
                 ("requires_delta", bool_(true)),
@@ -252,7 +258,10 @@ pub fn queue_run_steps(
         steps.push(PlanStep {
             id: format!("p7-{number}"),
             kind: "merge".to_string(),
-            params: Some(object(vec![("branch", string(&branch))])),
+            params: Some(object(vec![
+                ("branch", string(&branch)),
+                ("merge_policy", string("squash")),
+            ])),
         });
         steps.push(PlanStep {
             id: format!("p8-{number}"),
