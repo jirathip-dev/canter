@@ -1980,6 +1980,55 @@ fn herdr_transcript_shows_delivery(transcript: &str, payload: &str) -> bool {
         .contains(&probe)
 }
 
+/// The lifecycle half of an agent read-back, one line (issue #148 round 1):
+/// the settled state and the substrate's own state-change counter.
+fn herdr_lifecycle_summary(binding: &LaneBinding) -> String {
+    let state = if binding.state.is_empty() {
+        "unknown"
+    } else {
+        &binding.state
+    };
+    match binding.seq {
+        Some(seq) => format!("state {state} seq {seq}"),
+        None => format!("state {state} seq none"),
+    }
+}
+
+/// Which half of the delivery proof a failed prompt is missing (issue #148
+/// round 1). The two halves are separate vetoes, so the refusal names the one
+/// the agent's own read-back failed — an operator can tell "the agent never
+/// took the submission" from "it took something, but the task text never
+/// arrived".
+fn herdr_delivery_gap(
+    before: &LaneBinding,
+    after: &LaneBinding,
+    transcript: &str,
+    payload: &str,
+) -> String {
+    match (
+        herdr_agent_took_submission(before, after),
+        herdr_transcript_shows_delivery(transcript, payload),
+    ) {
+        (false, false) => "the agent's own lifecycle never moved and its transcript never showed \
+                           the task text"
+            .to_string(),
+        (false, true) => format!(
+            "the agent's transcript carries the task text but its own lifecycle never moved \
+             ({} -> {}), so the agent did not take the submission",
+            herdr_lifecycle_summary(before),
+            herdr_lifecycle_summary(after)
+        ),
+        (true, false) => {
+            "the agent's own lifecycle moved but its transcript never showed the task \
+                          text"
+                .to_string()
+        }
+        (true, true) => "the agent's own read-back only satisfied the delivery proof after the \
+                         bounded window"
+            .to_string(),
+    }
+}
+
 /// Whether one agent read-back shows the agent TOOK the submission (issue
 /// #148 round 1): its own state machine moved — the reported state left the
 /// pre-submission state, or the substrate's own state-change counter
@@ -2533,6 +2582,7 @@ fn herdr_prompt(
                     &binding,
                     "the agent never reported itself ready for input inside the bounded delivery \
                      window",
+                    "the agent's own lifecycle never moved and no submission was sent",
                     None,
                     &read_back,
                 );
@@ -2564,6 +2614,9 @@ fn herdr_prompt(
     // scrollback already shows the task text (launch argv, banner) can never
     // be judged delivered from this snapshot alone.
     let before = binding.clone();
+    // The most recent transcript read-back (issue #148 round 1): the refusal
+    // names which half of the delivery proof that read-back failed.
+    let mut last_transcript = String::new();
     loop {
         if Instant::now() >= window_end {
             let read_back = format!(
@@ -2579,6 +2632,7 @@ fn herdr_prompt(
                 &binding,
                 "the bounded delivery window expired before the agent's own lifecycle and \
                  transcript showed the task arriving",
+                &herdr_delivery_gap(&before, &binding, &last_transcript, payload),
                 last.as_ref(),
                 &read_back,
             );
@@ -2621,6 +2675,7 @@ fn herdr_prompt(
                 worktree,
             )
             .unwrap_or_default();
+            last_transcript = transcript.clone();
             if let Ok(doc) = herdr_agent_get_row(
                 &lane,
                 herdr_remaining(window_end, read_bound),
@@ -2707,6 +2762,7 @@ fn herdr_prompt(
                 &binding,
                 "the Herdr row did not submit the task and the agent's own lifecycle and \
                  transcript never showed it",
+                &herdr_delivery_gap(&before, &binding, &last_transcript, payload),
                 Some(&attempt),
                 &read_back,
             );
@@ -2750,12 +2806,12 @@ fn prompt_undelivered(
     lane: &str,
     binding: &LaneBinding,
     what: &str,
+    judged: &str,
     attempt: Option<&PromptAttempt>,
     read_back: &str,
 ) -> OpResult {
     let mut message = format!(
-        "the prompt was not delivered to Herdr agent {lane:?} in pane {:?}: {what}; the agent's \
-         own state/transcript never showed the task text",
+        "the prompt was not delivered to Herdr agent {lane:?} in pane {:?}: {what}; {judged}",
         binding.pane
     );
     if let Some(code) = attempt.and_then(|attempt| attempt.cli_code.as_deref()) {
