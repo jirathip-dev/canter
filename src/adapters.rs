@@ -153,6 +153,14 @@ pub const CODE_STALE_GENERATION: &str = "refusal.stale.generation";
 /// The kind has no documented pane row (issue #139): nothing is fabricated
 /// for it and no fallback is substituted.
 pub const CODE_EXECUTION_UNSUPPORTED: &str = "refusal.execution.unsupported";
+/// The prompt was NOT delivered into the addressed pane/agent (issue #148):
+/// the bounded delivery window expired, or the row failed in a way that did
+/// not put the task text in the agent's own state/transcript. The refusal
+/// names the agent, the pane and the read-back, and carries the failed row's
+/// exact argv, raw stdout, raw stderr and exit status. It is the concrete
+/// outcome of "nothing was delivered" — never a wait for workers that are
+/// not running and never a silent success.
+pub const CODE_PROMPT_UNDELIVERED: &str = "refusal.prompt.undelivered";
 
 /// A typed adapter error shaped like `hf-error/v1` (spec-cli.md §3).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1408,10 +1416,52 @@ pub const HERDR_INTERRUPT_KEY: &str = "ctrl+c";
 /// Bounded transcript excerpt lines read back after a delivered prompt.
 const HERDR_TRANSCRIPT_LINES: usize = 200;
 
-/// Margin between the Herdr row's own wait bound and the outer op deadline:
-/// the row reports its own timeout instead of being killed by the runner's
-/// deadline.
-const HERDR_WAIT_MARGIN_MS: u128 = 1_000;
+/// Bounded delivery window of one prompt (issue #148 item 3): how long the
+/// prompt may wait for a just-created agent to report itself ready and show
+/// the submitted task text before it refuses typed. It is bounded far below
+/// the prompt effect's own turn deadline (1800 s, `PROMPT_DEADLINE_DEFAULT_SECS`)
+/// because the delivery verdict comes from the agent's own read-back, never
+/// from waiting out a whole turn; the operation's own deadline caps it too.
+const HERDR_PROMPT_WINDOW_MS: u128 = 20_000;
+
+/// Per-submission bound of one `herdr agent prompt … --wait` row: the row is
+/// a SUBMISSION, not a turn. The submission is re-verified through the
+/// read-back poll, so a short row bound is what lets the bounded window
+/// retry a just-created agent's readiness race instead of exiting once.
+const HERDR_PROMPT_ROW_MS: u128 = 5_000;
+
+/// Bounded read-back poll after one submission (issue #148 item 1): the
+/// delivery verdict is the agent's own state/transcript, so the poll gives
+/// the pane a bounded moment to render the submitted text before the attempt
+/// is judged undelivered.
+const HERDR_DELIVERY_POLL_MS: u128 = 2_000;
+
+/// Poll interval of the readiness gate and of the delivery poll.
+const HERDR_PROMPT_POLL_MS: u64 = 100;
+
+/// Backoff between two submission attempts inside the delivery window.
+const HERDR_PROMPT_BACKOFF_MS: u64 = 250;
+
+/// Bounded, whitespace-free probe a delivered prompt is verified against
+/// (issue #148 item 1): the pane re-wraps and re-flows the submitted text, so
+/// both sides are compared with every whitespace character removed, and only
+/// this many leading characters of the payload have to be visible for the
+/// delivery to count as verified (a long task brief is proven by its own
+/// opening, and a bounded pane excerpt can never be read as a failure).
+const HERDR_DELIVERY_PROBE_CHARS: usize = 32;
+
+/// The closed set of Herdr CLI error codes that are a WAIT rather than a
+/// verdict, measured against `herdr 0.9.0 agent prompt --wait` on this host:
+/// a submission the substrate could not complete *yet* — the agent was
+/// created moments earlier and its terminal is not accepting input yet
+/// (`agent_prompt_stalled`: an accepted submission whose working/blocked
+/// state was not observed inside the CLI's own 5 s window; `agent_not_found`:
+/// an interrupted submission) or the row's own bound expired (`timeout`) —
+/// is retried inside the bounded delivery window. Every other code is a
+/// verdict and is refused at once with the row's raw evidence: the prompt
+/// path never guesses, and the retry itself is bounded.
+const HERDR_PROMPT_TRANSIENT_CODES: [&str; 3] =
+    ["agent_prompt_stalled", "agent_not_found", "timeout"];
 
 /// The Herdr agent kind of one adapter kind: the closed `herdr agent start
 /// --kind` set. `None` means the substrate has no documented row for this
@@ -1602,12 +1652,9 @@ fn herdr_run(
         ProcessOutcome::Ok(text) => Ok(text),
         ProcessOutcome::Failed(mut err) => {
             if err.code == CODE_UNAVAILABLE {
-                err.code = CODE_UNAVAILABLE_HERDR;
-                err.message = format!(
-                    "the Herdr workspace executable is unavailable; the pane substrate is refused \
-                     (no bare-subprocess fallback): {}",
-                    err.message
-                );
+                let unavailable = herdr_unavailable(err.message);
+                err.code = unavailable.code;
+                err.message = unavailable.message;
             }
             Err(err)
         }
@@ -1873,10 +1920,176 @@ fn verify_lane_binding(
     Ok(binding)
 }
 
-/// The wait bound (ms) a Herdr row gets inside an op deadline.
-fn herdr_wait_ms(timeout: Duration) -> u128 {
-    let budget = timeout.as_millis();
-    budget.saturating_sub(HERDR_WAIT_MARGIN_MS).max(1)
+/// Whether one Herdr agent read-back reports the agent promptable: the
+/// substrate's own readiness signal (`interactive_ready`, false while the
+/// role's terminal is still starting, and `launch_pending` while the launch
+/// is still in flight). `None` means the read-back carries NO readiness
+/// field at all — an older row — and the prompt is attempted at once: a
+/// missing signal is never read as "not ready", and the delivery verdict
+/// still comes from the read-back either way (issue #148 item 3).
+fn herdr_agent_promptable(doc: &Val) -> Option<bool> {
+    let ready = doc.get("interactive_ready").and_then(Val::as_bool);
+    let pending = doc.get("launch_pending").and_then(Val::as_bool);
+    if ready.is_none() && pending.is_none() {
+        return None;
+    }
+    Some(ready.unwrap_or(true) && !pending.unwrap_or(false))
+}
+
+/// The whitespace-free, bounded delivery probe of one prompt payload (issue
+/// #148 item 1). Every whitespace character is dropped before the comparison
+/// so the pane's own re-wrapping can never hide a delivered task, and the
+/// probe is capped at [`HERDR_DELIVERY_PROBE_CHARS`].
+fn herdr_delivery_probe(payload: &str) -> String {
+    payload
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .take(HERDR_DELIVERY_PROBE_CHARS)
+        .collect()
+}
+
+/// Whether the agent's own read-back shows the task text arrived (issue #148
+/// item 1): the probe of the payload is present in the whitespace-free
+/// transcript. A payload with no non-whitespace character proves nothing and
+/// is never treated as delivered.
+fn herdr_transcript_shows_delivery(transcript: &str, payload: &str) -> bool {
+    let probe = herdr_delivery_probe(payload);
+    if probe.is_empty() {
+        return false;
+    }
+    transcript
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>()
+        .contains(&probe)
+}
+
+/// The CLI's own error code of one prompt row: herdr 0.9.0 prints its error
+/// document on STDERR as `{"error":{"code":…,"message":…},"id":…}` and exits
+/// non-zero (measured on this host: an unknown target prints
+/// `{"error":{"code":"agent_not_found",…}}` on stderr with an EMPTY stdout,
+/// exit 1). The document's code is what tells a bounded wait apart from a
+/// verdict; it is read, never guessed from prose.
+fn herdr_prompt_cli_code(out: &ProcOut) -> Option<String> {
+    for text in [&out.stdout, &out.stderr] {
+        if let Ok(doc) = Val::parse_json(text)
+            && let Some(code) = doc
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(Val::as_str)
+        {
+            return Some(code.to_string());
+        }
+    }
+    None
+}
+
+/// The exact evidence line of ONE failed prompt row (issue #148 item 2): the
+/// argv it ran, the exit status it reported, its raw stdout and its raw
+/// stderr (each bounded, single-line, redacted) and the pane/agent identity
+/// the failure belongs to. A bare `adapter.exit` naming none of them is
+/// exactly the #147 defect.
+fn herdr_prompt_row_evidence(args: &[String], out: &ProcOut, lane: &str, pane: &str) -> String {
+    let exit = match out.status.exit_code() {
+        Some(code) => code.to_string(),
+        None => "no exit status (the row was killed at its bound)".to_string(),
+    };
+    format!(
+        "argv: {WORKSPACE_EXECUTABLE} {} | exit: {exit} | stdout ({} bytes): {} | stderr ({} \
+         bytes): {} | agent: {lane} | pane: {pane}",
+        bounded_raw(&args.join(" ")),
+        out.stdout.len(),
+        bounded_raw(&out.stdout),
+        out.stderr.len(),
+        bounded_raw(&out.stderr),
+    )
+}
+
+/// One `herdr agent prompt …` submission row: its exact argv, its raw process
+/// result and the CLI's own error code when its error document named one
+/// (issue #148 item 2).
+struct PromptAttempt {
+    /// The exact argv the row ran.
+    args: Vec<String>,
+    /// The raw process result (exit status, stdout, stderr).
+    out: ProcOut,
+    /// The CLI's own error code, when its error document carried one.
+    cli_code: Option<String>,
+}
+
+impl PromptAttempt {
+    /// Whether this row reports a WAIT rather than a verdict: the row was
+    /// killed at its own bound (`timeout`), or the CLI named one of the
+    /// closed transient codes (the agent was not accepting input yet). Only
+    /// these are retried, and only inside the bounded delivery window.
+    fn transient(&self) -> bool {
+        if self.out.status == ProcStatus::TimedOut {
+            return true;
+        }
+        self.cli_code
+            .as_deref()
+            .is_some_and(|code| HERDR_PROMPT_TRANSIENT_CODES.contains(&code))
+    }
+
+    /// The recorded evidence line of this attempt.
+    fn evidence(&self, lane: &str, pane: &str) -> String {
+        herdr_prompt_row_evidence(&self.args, &self.out, lane, pane)
+    }
+}
+
+/// The typed refusal of an unavailable Herdr substrate (issue #139): ONE
+/// wording for every row runner, so it can never drift.
+fn herdr_unavailable(message: String) -> ProcessFailure {
+    ProcessFailure {
+        code: CODE_UNAVAILABLE_HERDR,
+        message: format!(
+            "the Herdr workspace executable is unavailable; the pane substrate is refused (no \
+             bare-subprocess fallback): {message}"
+        ),
+        detail: String::new(),
+    }
+}
+
+/// Run one Herdr row and keep its RAW captured result — exit status, stdout
+/// AND stderr — instead of the merged diagnostic [`herdr_run`] produces
+/// (issue #148 item 2: the prompt path must record the split, because the
+/// CLI prints its error document on stderr while stdout stays empty). An
+/// unavailable substrate is the same typed refusal as every other row, and a
+/// non-zero exit is returned to the caller rather than classified here: the
+/// prompt row is judged by its read-back, not by its exit.
+fn herdr_run_raw(
+    args: &[String],
+    timeout: Duration,
+    env: &BTreeMap<String, String>,
+    cwd: Option<&Path>,
+) -> Result<ProcOut, ProcessFailure> {
+    let resolved = match resolve_executable(WORKSPACE_EXECUTABLE, env) {
+        Ok(path) => path,
+        Err(err) => return Err(herdr_unavailable(err.message)),
+    };
+    let spec = ProcSpec {
+        program: resolved.to_str().unwrap_or_default(),
+        args,
+        env,
+        cwd,
+        timeout,
+    };
+    let out = run(spec);
+    if let ProcStatus::SpawnFailed(message) = &out.status {
+        let mut failure = herdr_unavailable(format!(
+            "could not spawn {WORKSPACE_EXECUTABLE:?}: {message}"
+        ));
+        failure.detail = format!("while spawning {WORKSPACE_EXECUTABLE:?}: {message}");
+        return Err(failure);
+    }
+    Ok(out)
+}
+
+/// The remaining budget of one bounded wait against its window end, floored
+/// at the runner's minimum so a row always gets a positive bound.
+fn herdr_remaining(window_end: Instant, cap: Duration) -> Duration {
+    let left = window_end.saturating_duration_since(Instant::now());
+    left.min(cap).max(Duration::from_millis(1))
 }
 
 /// The pane identity of one `pane list` row (item 3 of issue #144): the row's
@@ -2187,10 +2400,18 @@ fn lane_start_payload(
 }
 
 /// Deliver one prompt through the Herdr path: the lane binding is verified
-/// FIRST (a stale or foreign pane/agent never receives the prompt), then
-/// `herdr agent prompt … --wait` submits it and the settled state is read
-/// back through `herdr agent get`, with a bounded `herdr agent read` excerpt
-/// as the pane-visible delivery evidence.
+/// FIRST (a stale or foreign pane/agent never receives the prompt), the
+/// agent's own readiness is awaited inside a bounded window (issue #148 item
+/// 3), `herdr agent prompt … --wait` submits the payload as ONE data
+/// element, and the operation reports success ONLY when the agent's own
+/// read-back shows the task text arrived (item 1) — never from the row's
+/// exit status. Every failure is diagnosable (item 2): the exact argv, the
+/// raw stdout and stderr, the exit status and the resolved pane/agent ride
+/// on the typed refusal, which is `refusal.prompt.undelivered` naming the
+/// agent and the read-back whenever the task did not arrive (item 4). A kind
+/// with no documented pane row, and a substrate that cannot be reached,
+/// refuse exactly as the start path refuses — there is no fallback to a bare
+/// subprocess (item 5).
 fn herdr_prompt(
     profile: &Profile,
     request: &OpRequest<'_>,
@@ -2220,61 +2441,253 @@ fn herdr_prompt(
     }
     let lane = request.session.session_id.clone();
     let timeout = request.timeout;
+    // The bounded DELIVERY window: the prompt's own bound, capped by the
+    // operation's deadline (a real prompt effect's deadline is a whole
+    // worker turn, and waiting out a turn is not what proves a delivery).
+    let window = Duration::from_millis(HERDR_PROMPT_WINDOW_MS as u64).min(timeout);
+    let window_end = started + window;
     let read = match herdr_agent_get_row(&lane, timeout, env, worktree) {
         Ok(doc) => doc,
         Err(err) => {
             return herdr_failure(profile, request, err, started);
         }
     };
-    let binding = match verify_lane_binding(&read, request.session, worktree) {
+    let mut binding = match verify_lane_binding(&read, request.session, worktree) {
         Ok(binding) => binding,
         Err(err) => {
             return herdr_failure(profile, request, err, started);
         }
     };
-    let args = herdr_agent_prompt_args(&lane, payload, herdr_wait_ms(timeout));
-    let delivered = match herdr_call(&args, timeout, env, worktree) {
-        Ok(doc) => doc,
-        Err(err) => {
-            return herdr_failure(profile, request, err, started);
+    // The readiness race (issue #148 item 3): the agent was created in the
+    // SAME second as this prompt, so wait — bounded — for the substrate to
+    // report it promptable instead of submitting once into a terminal that
+    // is not accepting input yet. A read-back with no readiness signal is
+    // never read as "not ready": the attempt happens at once.
+    let mut readiness_ms = 0u128;
+    if herdr_agent_promptable(&read) == Some(false) {
+        let gate = Instant::now();
+        loop {
+            if Instant::now() >= window_end {
+                let read_back = herdr_read_back_summary(&binding);
+                return prompt_undelivered(
+                    profile,
+                    request,
+                    started,
+                    &lane,
+                    &binding,
+                    "the agent never reported itself ready for input inside the bounded delivery \
+                     window",
+                    None,
+                    &read_back,
+                );
+            }
+            std::thread::sleep(Duration::from_millis(HERDR_PROMPT_POLL_MS));
+            match herdr_agent_get_row(&lane, herdr_remaining(window_end, timeout), env, worktree) {
+                Ok(doc) => {
+                    binding = match verify_lane_binding(&doc, request.session, worktree) {
+                        Ok(binding) => binding,
+                        Err(err) => return herdr_failure(profile, request, err, started),
+                    };
+                    if herdr_agent_promptable(&doc) != Some(false) {
+                        readiness_ms = gate.elapsed().as_millis();
+                        break;
+                    }
+                }
+                Err(err) => return herdr_failure(profile, request, err, started),
+            }
         }
-    };
-    // The settled state comes from the Herdr agent surface, never from
-    // process-exit inference: `agent prompt --wait` reports the settled state
-    // it matched and `agent get` re-reads it.
-    let settled = herdr_agent_get_row(&lane, timeout, env, worktree)
-        .map(|doc| LaneBinding::read(&doc))
-        .unwrap_or(binding.clone());
-    let state = if settled.state.is_empty() {
-        herdr_str(&delivered, "agent_status")
-    } else {
-        settled.state.clone()
-    };
-    let transcript =
-        herdr_call_text(&herdr_agent_read_args(&lane), timeout, env, worktree).unwrap_or_default();
+    }
+    // The bounded submission + verification loop (items 1 and 3): each
+    // attempt submits ONCE, and the agent's own read-back — not the row's
+    // exit status — decides whether the task arrived. Only the closed
+    // transient wait codes are retried, only inside the window.
+    let mut attempts = 0u64;
+    let mut last: Option<PromptAttempt> = None;
+    loop {
+        if Instant::now() >= window_end {
+            let read_back = herdr_read_back_summary(&binding);
+            return prompt_undelivered(
+                profile,
+                request,
+                started,
+                &lane,
+                &binding,
+                "the bounded delivery window expired before the task text reached the agent",
+                last.as_ref(),
+                &read_back,
+            );
+        }
+        let row_ms = HERDR_PROMPT_ROW_MS.min(
+            window_end
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .max(1),
+        );
+        let args = herdr_agent_prompt_args(&lane, payload, row_ms);
+        attempts += 1;
+        let out = match herdr_run_raw(
+            &args,
+            herdr_remaining(window_end, Duration::from_millis(row_ms as u64)),
+            env,
+            worktree,
+        ) {
+            Ok(out) => out,
+            // An unavailable substrate is a typed refusal, never a fallback.
+            Err(err) => return herdr_failure(profile, request, err, started),
+        };
+        // Issue #148 item 1: the row's exit is NOT the delivery verdict. Read
+        // the agent's own state/transcript back (bounded) and require the
+        // task text before this prompt may report success.
+        let row_state = Val::parse_json(&out.stdout)
+            .map(|doc| herdr_str(&doc, "agent_status"))
+            .unwrap_or_default();
+        let poll_end =
+            (Instant::now() + Duration::from_millis(HERDR_DELIVERY_POLL_MS as u64)).min(window_end);
+        // Every read of the poll is bounded by the remaining window too, so a
+        // hung read-back row can never outlive the delivery window it is
+        // judged inside.
+        let read_bound = Duration::from_millis(HERDR_PROMPT_ROW_MS as u64);
+        loop {
+            let transcript = herdr_call_text(
+                &herdr_agent_read_args(&lane),
+                herdr_remaining(window_end, read_bound),
+                env,
+                worktree,
+            )
+            .unwrap_or_default();
+            if let Ok(doc) = herdr_agent_get_row(
+                &lane,
+                herdr_remaining(window_end, read_bound),
+                env,
+                worktree,
+            ) {
+                match verify_lane_binding(&doc, request.session, worktree) {
+                    Ok(read_back) => binding = read_back,
+                    Err(err) => return herdr_failure(profile, request, err, started),
+                }
+            }
+            if herdr_transcript_shows_delivery(&transcript, payload) {
+                // VERIFIED delivery: the agent's own transcript carries the
+                // task text. The settled state is read through the same
+                // agent surface, and the row's failure — if it had one — is
+                // irrelevant: the submission arrived and the agent has it.
+                let state = if binding.state.is_empty() {
+                    row_state.clone()
+                } else {
+                    binding.state.clone()
+                };
+                return op_result(
+                    profile,
+                    request,
+                    "succeeded",
+                    None,
+                    None,
+                    Some(object(vec![
+                        ("transcript", string(&transcript)),
+                        ("state", string(&state)),
+                        ("agent", string(&lane)),
+                        ("pane", string(&binding.pane)),
+                        ("delivered", bool_(true)),
+                        ("verified", string("agent-read-back")),
+                        ("attempts", integer(attempts as i64)),
+                        ("readiness_ms", integer(readiness_ms as i64)),
+                        (
+                            "worktree",
+                            string(
+                                &worktree
+                                    .map(|path| path.to_string_lossy().to_string())
+                                    .unwrap_or_default(),
+                            ),
+                        ),
+                        ("execution", string(profile.execution.name())),
+                    ])),
+                    None,
+                    started,
+                );
+            }
+            if Instant::now() >= poll_end {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(HERDR_PROMPT_POLL_MS));
+        }
+        let attempt = PromptAttempt {
+            cli_code: herdr_prompt_cli_code(&out),
+            args,
+            out,
+        };
+        // A row the CLI refused for a reason that is not a bounded wait, or a
+        // row that exited zero while nothing arrived, is a VERDICT: refuse
+        // typed with everything the row printed instead of retrying blindly.
+        if !attempt.transient() {
+            let read_back = herdr_read_back_summary(&binding);
+            return prompt_undelivered(
+                profile,
+                request,
+                started,
+                &lane,
+                &binding,
+                "the Herdr row did not submit the task and the agent's own read-back never showed \
+                 it",
+                Some(&attempt),
+                &read_back,
+            );
+        }
+        last = Some(attempt);
+        std::thread::sleep(Duration::from_millis(HERDR_PROMPT_BACKOFF_MS));
+    }
+}
+
+/// The one-line summary of an agent read-back a refusal carries (issue #148
+/// item 4: the refusal names the agent AND the read-back it judged).
+fn herdr_read_back_summary(binding: &LaneBinding) -> String {
+    format!(
+        "agent {} pane {} cwd {} state {} (lane token {:?}, generation {:?})",
+        binding.agent, binding.pane, binding.cwd, binding.state, binding.lane, binding.generation
+    )
+}
+
+/// The typed outcome of a prompt that did NOT arrive (issue #148 items 2 and
+/// 4): `refusal.prompt.undelivered` naming the agent, the pane, what was
+/// awaited, the CLI's own error code when it named one, and the read-back
+/// that failed to show the task — with the failed row's exact argv, raw
+/// stdout, raw stderr and exit status in the detail (issue #144's refusal
+/// discipline, extended to the prompt path).
+#[allow(clippy::too_many_arguments)]
+fn prompt_undelivered(
+    profile: &Profile,
+    request: &OpRequest<'_>,
+    started: std::time::Instant,
+    lane: &str,
+    binding: &LaneBinding,
+    what: &str,
+    attempt: Option<&PromptAttempt>,
+    read_back: &str,
+) -> OpResult {
+    let mut message = format!(
+        "the prompt was not delivered to Herdr agent {lane:?} in pane {:?}: {what}; the agent's \
+         own state/transcript never showed the task text",
+        binding.pane
+    );
+    if let Some(code) = attempt.and_then(|attempt| attempt.cli_code.as_deref()) {
+        message.push_str(&format!("; the Herdr row reported {code:?}"));
+    }
+    let mut detail = format!(
+        "read-back ({} bytes): {}",
+        read_back.len(),
+        bounded_raw(read_back)
+    );
+    if let Some(attempt) = attempt {
+        detail.push_str(" | ");
+        detail.push_str(&attempt.evidence(lane, &binding.pane));
+    }
     op_result(
         profile,
         request,
-        "succeeded",
+        "refused",
+        Some(CODE_PROMPT_UNDELIVERED),
+        Some(message),
         None,
-        None,
-        Some(object(vec![
-            ("transcript", string(&transcript)),
-            ("state", string(&state)),
-            ("agent", string(&lane)),
-            ("pane", string(&settled.pane)),
-            ("delivered", bool_(true)),
-            (
-                "worktree",
-                string(
-                    &worktree
-                        .map(|path| path.to_string_lossy().to_string())
-                        .unwrap_or_default(),
-                ),
-            ),
-            ("execution", string(profile.execution.name())),
-        ])),
-        None,
+        Some(detail),
         started,
     )
 }

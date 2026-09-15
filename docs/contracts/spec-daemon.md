@@ -520,6 +520,21 @@ clears a repository/fleet-level hold or bypasses a gate.
   `supervision.waiting_approval` frontier until independent evidence is
   presented. Non-armed/unknown supervision keeps its classification-only,
   zero-effect guarantee verbatim: without a row the run is never even read.
+- **Diagnosed frontier (issue #148)**: the classification half of the same
+  honesty. The frontier step's own LATEST recorded attempt is read from the
+  run's claim/outcome material, and when it is not `succeeded` the run is
+  reported class `needs-attention`, reason `supervision.step_diagnosed`, the
+  recorded attempt's own error code as the detail, `eligible:false`. A step
+  that has already run and diagnosed a concrete failure or refusal — the
+  measured #147 prompt, whose outcome says nothing was delivered — is never
+  reported as `waiting-workers`/`waiting-CI`/`waiting-approval`: nothing is
+  in flight, the driver never re-dispatches a diagnosed step, and a wait for
+  workers that are not running is exactly the lie that parked that run. The
+  driver fence is unchanged (a diagnosed step is still never re-dispatched,
+  with or without a pending `run.retry` authorization), and a step with NO
+  recorded attempt keeps its own rules: the driver still dispatches a
+  never-attempted autonomous step, and the refusal-before-any-effect case
+  keeps `supervision.dispatch_refused` above.
 - **Refused continuation dispatch (issue #141)**: when the engine refuses the
   driver's continuation of the frontier step BEFORE its claim (a fan-out
   admission refusal such as `refusal.admission.proof_stale`, a derived

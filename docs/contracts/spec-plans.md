@@ -223,7 +223,12 @@ runs control-plane effects:
   The recorded step outcome names the substrate (`result.execution`), the
   pane and agent of a pane-substrate bind (`result.pane` / `result.agent`),
   and the settled Herdr state of a pane-substrate prompt
-  (`result.harness_state`).
+  (`result.harness_state`). A pane-substrate prompt is recorded as succeeded
+  only when the agent's own read-back shows the task text arrived (issue
+  #148: the prompt's transcript is the delivery evidence, its bounded window
+  is the retry bound, and a prompt that never arrives refuses
+  `refusal.prompt.undelivered` — see [spec-capabilities.md](spec-capabilities.md),
+  "Execution substrates").
 
 ## 5. Typed outcomes: `hf-outcome/v1`
 

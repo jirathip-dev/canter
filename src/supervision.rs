@@ -232,6 +232,14 @@ pub mod codes {
     /// the engine's own refusal code. The step is never reported eligible
     /// while the dispatch the driver names is refused.
     pub const DISPATCH_REFUSED: &str = "supervision.dispatch_refused";
+    /// The next unachieved step HAS been attempted and its own recorded
+    /// outcome is not `succeeded` (issue #148): the work ran and diagnosed a
+    /// concrete failure/refusal, and the driver never re-dispatches a
+    /// diagnosed step. Reporting such a frontier `waiting-workers`,
+    /// `waiting-CI` or `waiting-approval` presents a stalled run as if
+    /// something were still running; the recorded attempt's own code is the
+    /// named blocker instead.
+    pub const STEP_DIAGNOSED: &str = "supervision.step_diagnosed";
 }
 
 /// A typed supervision error/refusal (fail closed; stable codes).
@@ -816,6 +824,25 @@ pub fn classify(
         return Verdict::new("healthy", codes::DISPATCH, true, &next_step);
     }
     // 6. Known waits for external evidence: never a progress-timeout case.
+    //
+    // ...but a wait is only honest while nothing has DIAGNOSED the step
+    // (issue #148). A frontier step whose own latest attempt is recorded and
+    // is not `succeeded` has already run and produced a concrete
+    // failure/refusal — and the driver never re-dispatches a diagnosed step —
+    // so reporting it `waiting-workers`/`waiting-CI`/`waiting-approval`
+    // presents a stalled run as if work or CI were still in flight. The
+    // recorded attempt's own code is the named blocker instead (the same
+    // honesty #141/#144 apply to a refusal recorded before any attempt).
+    if let Some((_, status, code)) = latest_attempt_for(evidence, &next_step)
+        && status != "succeeded"
+    {
+        let detail = if code.is_empty() {
+            status.as_str()
+        } else {
+            code.as_str()
+        };
+        return Verdict::new("needs-attention", codes::STEP_DIAGNOSED, false, detail);
+    }
     if APPROVAL_STEP_KINDS.contains(&next_kind.as_str()) {
         return Verdict::new(
             "waiting-approval",
@@ -2181,6 +2208,89 @@ mod tests {
                 "a diagnosed frontier is never reported eligible"
             );
         }
+    }
+
+    /// Issue #148 item 4: the classification half of the MEASURED #147 defect.
+    /// The supervisor dispatched p1..p4-147 itself and p3 created the real
+    /// Herdr pane; p4-147 (the prompt) was then recorded as a non-succeeded
+    /// attempt (`adapter.exit`, nothing delivered) — and the run was reported
+    /// `waiting-workers`, exactly as if a busy worker would eventually deliver
+    /// it. Nothing was running: the attempt is on record, the driver never
+    /// re-dispatches a diagnosed step, and the step's own failure code is what
+    /// an operator has to act on.
+    #[test]
+    fn a_diagnosed_prompt_frontier_is_never_reported_as_waiting_for_workers() {
+        let policy = Policy {
+            check_interval_secs: 10,
+            progress_timeout_secs: 60,
+        };
+        let digest = "d".repeat(64);
+        let bound = Some(digest.as_str());
+        let steps = [
+            ("p1", "checkout"),
+            ("p2-147", "worktree_create"),
+            ("p3", "harness_start"),
+            ("p4-147", "prompt"),
+        ];
+        let dispatched = [
+            ("p1", "succeeded", ""),
+            ("p2-147", "succeeded", ""),
+            ("p3", "succeeded", ""),
+        ];
+        let diagnosed = [
+            ("p1", "succeeded", ""),
+            ("p2-147", "succeeded", ""),
+            ("p3", "succeeded", ""),
+            ("p4-147", "refused", "refusal.prompt.undelivered"),
+        ];
+        let at = "2026-09-15T18:10:38Z";
+        let now_unix = time::unix_from_rfc3339(at).expect("instant");
+        // The frontier step whose never-attempted continuation the driver owns
+        // is still dispatched (the class vocabulary is unchanged)...
+        let evidence = evidence_for(
+            run_row("run-89284da1da70a294"),
+            bound,
+            &steps,
+            &dispatched,
+            at,
+        );
+        let verdict = classify(&evidence, &digest, &policy, now_unix);
+        assert_eq!(verdict.reason, codes::DISPATCH);
+        assert!(verdict.eligible, "the untouched frontier is eligible");
+        // ...and the SAME frontier with its own recorded non-success is
+        // diagnosed, never a wait for workers that are not running.
+        let evidence = evidence_for(
+            run_row("run-89284da1da70a294"),
+            bound,
+            &steps,
+            &diagnosed,
+            at,
+        );
+        let verdict = classify(&evidence, &digest, &policy, now_unix);
+        assert_eq!(
+            verdict.class, "needs-attention",
+            "an undelivered prompt is not a wait: {verdict:?}"
+        );
+        assert_ne!(verdict.class, "waiting-workers");
+        assert_eq!(verdict.reason, codes::STEP_DIAGNOSED);
+        assert_eq!(
+            verdict.detail, "refusal.prompt.undelivered",
+            "the step's own recorded failure code is the named blocker"
+        );
+        assert!(!verdict.eligible, "a diagnosed step is never eligible");
+        // The same rule holds for the bare `adapter.exit` the #147 run
+        // actually recorded: the class names the diagnosis either way.
+        let bare = [
+            ("p1", "succeeded", ""),
+            ("p2-147", "succeeded", ""),
+            ("p3", "succeeded", ""),
+            ("p4-147", "failed", "adapter.exit"),
+        ];
+        let evidence = evidence_for(run_row("run-89284da1da70a294"), bound, &steps, &bare, at);
+        let verdict = classify(&evidence, &digest, &policy, now_unix);
+        assert_eq!(verdict.class, "needs-attention");
+        assert_eq!(verdict.reason, codes::STEP_DIAGNOSED);
+        assert_eq!(verdict.detail, "adapter.exit");
     }
 
     /// Issue #141: the refusal record is durable and auditable, and only the

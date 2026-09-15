@@ -1283,22 +1283,57 @@ fn request_two_steps(issues: Vec<qp::SelectedIssue>) -> qp::QueueRequest {
     request
 }
 
+/// The same request with `p2` as the WORKER step (issue #148): an undelivered
+/// PROMPT frontier is the one the #147 run was parked on.
+fn request_prompt_steps(issues: Vec<qp::SelectedIssue>) -> qp::QueueRequest {
+    let mut request = request_with(issues);
+    request.steps.push(qp::PlannedStep {
+        id: "p2".to_string(),
+        kind: "prompt".to_string(),
+        params: Some(object(vec![("harness_key", string(HARNESS))])),
+    });
+    request
+}
+
 /// Seed one recorded `apply` attempt of (run, step) into the durable claim
 /// table with a terminal outcome (the shape the driver's evidence reads).
 fn seed_attempt(state: &State, run: &str, step: &str, key: &str, status: &str) {
+    seed_attempt_full(state, run, step, key, status, "", false);
+}
+
+/// [`seed_attempt`] with the attempt's own recorded error code and, when the
+/// caller asks for it, the dispatch topology a real first dispatch carries
+/// (issue #92 F4: an apply intent that carried a topology IS the run's durable
+/// dispatch context, so the classification reaches its dispatch/worker rules
+/// instead of the no-context fence). Issue #148's witness needs both: the
+/// code the evidence read-back exposes as the step's diagnosis, and a real
+/// dispatch context.
+fn seed_attempt_full(
+    state: &State,
+    run: &str,
+    step: &str,
+    key: &str,
+    status: &str,
+    code: &str,
+    topology: bool,
+) {
     let request_id = fresh_id(0x9200);
+    let mut params = vec![
+        ("idempotency_key", string(key)),
+        ("instance_id", string(run)),
+        ("step", string(step)),
+    ];
+    if topology {
+        params.push((
+            "topology",
+            object(vec![("integration_branch", string("staging"))]),
+        ));
+    }
     let line = canter::canonical::canonical_text(&object(vec![
         ("schema", string("hf-rpc-request/v1")),
         ("id", string(&request_id)),
         ("method", string("apply")),
-        (
-            "params",
-            object(vec![
-                ("idempotency_key", string(key)),
-                ("instance_id", string(run)),
-                ("step", string(step)),
-            ]),
-        ),
+        ("params", object(params)),
     ]));
     state
         .journal_intent(
@@ -1312,6 +1347,16 @@ fn seed_attempt(state: &State, run: &str, step: &str, key: &str, status: &str) {
             &line,
         )
         .expect("claim the attempt");
+    let error = if code.is_empty() {
+        Val::Null
+    } else {
+        object(vec![
+            ("schema", string("hf-error/v1")),
+            ("code", string(code)),
+            ("message", string("recorded fixture diagnosis")),
+            ("retryable", Val::Bool(false)),
+        ])
+    };
     let outcome = canter::canonical::canonical_text(&object(vec![
         ("schema", string("hf-outcome/v1")),
         ("plan_id", string("hf_plan_0000000000000000")),
@@ -1320,7 +1365,7 @@ fn seed_attempt(state: &State, run: &str, step: &str, key: &str, status: &str) {
         ("idempotency_key", string(key)),
         ("observed_at", string("2026-09-14T00:00:00Z")),
         ("result", Val::Null),
-        ("error", Val::Null),
+        ("error", error),
     ]));
     // The claim status is the closed claim vocabulary (the recorded OUTCOME
     // document carries the typed step status the evidence reads).
@@ -1549,6 +1594,81 @@ fn f10_diagnosed_step_is_never_redispatched_by_supervision() {
     assert!(
         dispatch_intent_of(&state, &run).is_none(),
         "the operator's evidence/retry path owns a diagnosed step"
+    );
+}
+
+/// Issue #148 item 4, through the REAL evidence reader: the run's own recorded
+/// `apply` attempt drives the classification, so an undelivered prompt
+/// frontier is reported with the prompt's own refusal code — and never as
+/// `waiting-workers`, the class that parked the measured #147 run.
+#[test]
+fn an_undelivered_prompt_frontier_is_never_reported_as_waiting_for_workers() {
+    let fixture = Fixture::new("diagnosed-prompt");
+    let state = fixture.open();
+    seed_grant(&state, "gr_0000000000000095", 5);
+    let (bound, digest) = render_bound(&state, &request_prompt_steps(vec![selected("#5", REV_A)]));
+    let plan = submission_plan_for(
+        &state,
+        &idem_key("diagnosed-prompt"),
+        &bound,
+        &digest,
+        "gr_0000000000000095",
+        Some(armed(30, 60)),
+    );
+    let (_, items) = state.submit_queue_run(&plan).expect("submit");
+    let run = item_row_of(&items, 5).instance_id.expect("admitted run");
+    // p1 is the run's first real dispatch: the topology its apply carried IS
+    // the run's durable dispatch context (issue #92 F4).
+    seed_attempt_full(&state, &run, "p1", "ik_148-p1", "succeeded", "", true);
+    // p2 is the PROMPT, and its own recorded outcome says nothing was
+    // delivered (issue #148: a prompt reports success only when the agent's
+    // own read-back shows the task).
+    seed_attempt_full(
+        &state,
+        &run,
+        "p2",
+        "ik_148-p2",
+        "refused",
+        "refusal.prompt.undelivered",
+        false,
+    );
+
+    let row = state
+        .supervision_by_id(&run)
+        .expect("query row")
+        .expect("supervision row");
+    let evidence = state
+        .supervision_evidence(&run)
+        .expect("query evidence")
+        .expect("evidence");
+    assert!(
+        evidence.has_dispatch_context,
+        "the recorded topology is the run's dispatch context"
+    );
+    let policy = supervision::Policy {
+        check_interval_secs: row.check_interval_secs,
+        progress_timeout_secs: row.progress_timeout_secs,
+    };
+    let verdict = supervision::classify(
+        &evidence,
+        &row.authorization_digest,
+        &policy,
+        canter::time::unix_now(),
+    );
+    assert_eq!(
+        verdict.class, "needs-attention",
+        "an idle worker with an undelivered prompt is not a worker-wait: {verdict:?}"
+    );
+    assert_ne!(verdict.class, "waiting-workers");
+    assert_eq!(verdict.reason, supervision::codes::STEP_DIAGNOSED);
+    assert_eq!(
+        verdict.detail, "refusal.prompt.undelivered",
+        "the prompt's own refusal code is the named blocker"
+    );
+    assert!(!verdict.eligible);
+    assert!(
+        dispatch_intent_of(&state, &run).is_none(),
+        "the driver still never re-dispatches a diagnosed step"
     );
 }
 

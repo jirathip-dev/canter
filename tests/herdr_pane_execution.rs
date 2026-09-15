@@ -30,9 +30,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use canter::adapters::{
-    CODE_BAD_REQUEST, CODE_EXECUTION_UNSUPPORTED, CODE_STALE_GENERATION, CODE_UNAVAILABLE_HERDR,
-    ExecutionMode, HarnessKind, Op, OpRequest, Profile, bind_identity, execute_op_in_worktree,
-    new_session,
+    CODE_BAD_REQUEST, CODE_EXECUTION_UNSUPPORTED, CODE_PROMPT_UNDELIVERED, CODE_STALE_GENERATION,
+    CODE_UNAVAILABLE_HERDR, ExecutionMode, HarnessKind, Op, OpRequest, Profile, bind_identity,
+    execute_op_in_worktree, new_session,
 };
 use canter::canonical::canonical_bytes;
 use canter::canonical::sha256_hex;
@@ -122,9 +122,9 @@ read_state() { [ -f "$STATE/$1" ] && sed -n 1p "$STATE/$1" || printf '%s' "$2"; 
 report_lane() { printf '%s' "${HF_FAKE_HERDR_REPORT_LANE:-$(read_state lane '')}"; }
 report_generation() { printf '%s' "${HF_FAKE_HERDR_REPORT_GENERATION:-$(read_state generation '')}"; }
 agent_doc() {
-  printf '{"name":"%s","pane_id":"%s","cwd":"%s","agent_status":"%s","tokens":{"canter_lane":"%s","canter_generation":"%s"}}' \
+  printf '{"name":"%s","pane_id":"%s","cwd":"%s","agent_status":"%s","tokens":{"canter_lane":"%s","canter_generation":"%s"}%s}' \
     "$(read_state lane '')" "$(read_state pane 'w1:p1')" "$(read_state cwd '')" "$(read_state state 'idle')" \
-    "$(report_lane)" "$(report_generation)"
+    "$(report_lane)" "$(report_generation)" "${1:-}"
 }
 case "$1 $2" in
   "workspace list")
@@ -204,13 +204,28 @@ case "$1 $2" in
     ;;
   "agent get")
     log "$*"
+    reads=0
+    [ -f "$STATE/get_reads" ] && reads=$(sed -n 1p "$STATE/get_reads")
+    reads=$((reads + 1))
+    printf '%s' "$reads" > "$STATE/get_reads"
+    # Issue #148 readiness control: the first N read-backs report the agent
+    # NOT promptable (its terminal is still starting), so a prompt must wait
+    # for the substrate's own signal instead of submitting into it.
+    extra=""
+    if [ -n "${HF_FAKE_HERDR_NOT_READY_READS:-}" ]; then
+      if [ "$reads" -le "$HF_FAKE_HERDR_NOT_READY_READS" ]; then
+        extra=',"interactive_ready":false'
+      else
+        extra=',"interactive_ready":true'
+      fi
+    fi
     if [ -n "${HF_FAKE_HERDR_GET_RAW:-}" ]; then
       # Measured-shape control (issue #144 item 1): a row whose stdout is not
       # a JSON document at all (exit 0).
       printf '%s' "$HF_FAKE_HERDR_GET_RAW"
     elif [ -f "$STATE/pane" ]; then
       # Measured herdr 0.9.0: the agent row rides under `result.agent`.
-      printf '{"id":"cli:agent:get","result":{"agent":%s,"type":"agent_info"}}\n' "$(agent_doc)"
+      printf '{"id":"cli:agent:get","result":{"agent":%s,"type":"agent_info"}}\n' "$(agent_doc "$extra")"
     else
       printf '{"id":"cli:agent:get","result":null,"type":"agent_info"}\n'
       exit 3
@@ -218,6 +233,34 @@ case "$1 $2" in
     ;;
   "agent prompt")
     log "$*"
+    attempts=0
+    [ -f "$STATE/prompt_attempts" ] && attempts=$(sed -n 1p "$STATE/prompt_attempts")
+    attempts=$((attempts + 1))
+    printf '%s' "$attempts" > "$STATE/prompt_attempts"
+    case "${HF_FAKE_HERDR_PROMPT_FAIL:-}" in
+      "")
+        ;;
+      deliver-after-*)
+        # Issue #148 readiness race: the first N submissions are the CLI's own
+        # transient wait (`agent_prompt_stalled`, exit 1, stderr document);
+        # the submission then lands.
+        limit=${HF_FAKE_HERDR_PROMPT_FAIL#deliver-after-}
+        if [ "$attempts" -le "$limit" ]; then
+          printf '%s\n' '{"error":{"code":"agent_prompt_stalled","message":"no working or blocked state observed within 5000ms"},"id":"cli:agent:prompt"}' >&2
+          exit 1
+        fi
+        ;;
+      no-delivery)
+        # Issue #148: the row reports a submission (exit 0) but NOTHING
+        # reaches the pane — the agent's read-back never shows the task text.
+        printf '{"id":"cli:agent:prompt","result":{"agent_status":"idle","submitted":true},"type":"agent_prompt"}\n'
+        exit 0
+        ;;
+      *)
+        printf '%s\n' "{\"error\":{\"code\":\"$HF_FAKE_HERDR_PROMPT_FAIL\",\"message\":\"fixture refusal\"},\"id\":\"cli:agent:prompt\"}" >&2
+        exit 1
+        ;;
+    esac
     printf '%s' "$4" > "$STATE/pane_content"
     printf 'done' > "$STATE/state"
     printf '{"id":"cli:agent:prompt","result":{"agent_status":"done","submitted":true},"type":"agent_prompt"}\n'
@@ -533,6 +576,243 @@ fn the_prompt_is_delivered_through_herdr_and_the_pane_shows_it() {
         !fixture.bare_spawned(),
         "the pane substrate never spawns the bare harness executable for a prompt"
     );
+}
+
+/// Issue #148 witnesses 1 and 3: a prompt to a FRESHLY created agent waits —
+/// bounded — through the substrate's own readiness signal and through the
+/// CLI's transient wait codes, and it reports success ONLY because the
+/// agent's own read-back shows the task text arrived. The row's exit status
+/// is never the verdict.
+#[test]
+fn a_fresh_agents_prompt_waits_bounded_and_delivers_a_verified_read_back() {
+    let fixture = Fixture::new("prompt-readiness");
+    fixture.install(FAKE_HERDR);
+    // The substrate reports the agent not promptable for the first two
+    // read-backs (its terminal is still starting), and the CLI's own first
+    // submission is its transient "no working state observed" wait.
+    let env = fixture.env(&[
+        ("HF_FAKE_HERDR_NOT_READY_READS", "2".to_string()),
+        ("HF_FAKE_HERDR_PROMPT_FAIL", "deliver-after-1".to_string()),
+    ]);
+    let session = lane_session(1);
+    let profile = lane_profile(ExecutionMode::HerdrPane);
+    let started =
+        execute_op_in_worktree(&profile, &start_request(&session), &env, &fixture.worktree);
+    assert_eq!(started.status, "succeeded", "{:?}", started.message);
+
+    let payload = "Implement jirathip-dev/canter#148 from its latest issue text.";
+    let result = execute_op_in_worktree(
+        &profile,
+        &prompt_request(&session, payload),
+        &env,
+        &fixture.worktree,
+    );
+
+    assert_eq!(result.status, "succeeded", "{:?}", result.message);
+    let result_payload = result.payload.clone().expect("payload");
+    assert_eq!(
+        result_payload.get("delivered").and_then(Val::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        result_payload.get("verified").and_then(Val::as_str),
+        Some("agent-read-back"),
+        "the delivery is verified against the agent's own read-back"
+    );
+    assert_eq!(
+        result_payload.get("transcript").and_then(Val::as_str),
+        Some(payload)
+    );
+    assert_eq!(
+        result_payload.get("state").and_then(Val::as_str),
+        Some("done")
+    );
+    let attempts = result_payload
+        .get("attempts")
+        .and_then(Val::as_int)
+        .unwrap_or(0);
+    assert!(
+        attempts >= 2,
+        "the transient wait inside the bounded window was retried: {attempts}"
+    );
+    let readiness = result_payload
+        .get("readiness_ms")
+        .and_then(Val::as_int)
+        .unwrap_or(-1);
+    assert!(
+        readiness > 0,
+        "the prompt waited for the substrate's readiness signal: {readiness}"
+    );
+    // The readiness gate ran BEFORE any submission: the first two read-backs
+    // report not-ready, the third is promptable, and only then is the task
+    // submitted — the #147 race (start and prompt in the same second) cannot
+    // submit into a terminal that is not accepting input yet.
+    let rows = fixture.rows();
+    let first_prompt = rows
+        .iter()
+        .position(|row| row.starts_with("agent prompt"))
+        .expect("a submission row");
+    let reads_before = rows[..first_prompt]
+        .iter()
+        .filter(|row| row.starts_with("agent get"))
+        .count();
+    assert_eq!(
+        reads_before, 3,
+        "two not-ready read-backs, then the ready one: {rows:?}"
+    );
+    assert_eq!(fixture.pane_content(), payload);
+    assert!(
+        !fixture.bare_spawned(),
+        "the pane substrate never spawns the bare harness executable for a prompt"
+    );
+}
+
+/// Issue #148 witnesses 2 and 4: a prompt that never arrives refuses TYPED
+/// with everything the operator needs — the CLI's own error code, the exact
+/// argv, the raw stdout and the raw stderr, the exit status and the resolved
+/// pane/agent — and it never leaves the run claiming a worker is running: the
+/// concrete outcome is `refusal.prompt.undelivered`, reported by the
+/// classification as a diagnosed step (never `waiting-workers`).
+#[test]
+fn an_undelivered_prompt_refuses_typed_with_argv_raw_output_exit_and_identity() {
+    let fixture = Fixture::new("prompt-undelivered");
+    fixture.install(FAKE_HERDR);
+    let env = fixture.env(&[(
+        "HF_FAKE_HERDR_PROMPT_FAIL",
+        "agent_prompt_stalled".to_string(),
+    )]);
+    let session = lane_session(1);
+    let profile = lane_profile(ExecutionMode::HerdrPane);
+    let started =
+        execute_op_in_worktree(&profile, &start_request(&session), &env, &fixture.worktree);
+    assert_eq!(started.status, "succeeded", "{:?}", started.message);
+
+    let payload = "Implement jirathip-dev/canter#148 from its latest issue text.";
+    // The operation's own deadline caps the delivery window, so the witness
+    // is bounded: the prompt waits, retries the transient wait, and refuses.
+    let request = OpRequest {
+        op: Op::Prompt,
+        session: &session,
+        payload: Some(payload),
+        timeout: Duration::from_secs(7),
+    };
+    let result = execute_op_in_worktree(&profile, &request, &env, &fixture.worktree);
+
+    assert_eq!(result.status, "refused", "{:?}", result.message);
+    assert_eq!(result.code, Some(CODE_PROMPT_UNDELIVERED));
+    let message = result.message.clone().unwrap_or_default();
+    assert!(
+        message.contains("agent_prompt_stalled"),
+        "the CLI's own error code is named: {message}"
+    );
+    assert!(
+        message.contains("lane-abc123") && message.contains("w1:p1"),
+        "the refusal names the resolved agent and pane: {message}"
+    );
+    let detail = result.detail.clone().unwrap_or_default();
+    assert_eq!(
+        detail.lines().count(),
+        1,
+        "the recorded evidence stays ONE diagnosable line: {detail}"
+    );
+    assert!(
+        detail.contains("argv: herdr agent prompt lane-abc123"),
+        "the exact argv is recorded: {detail}"
+    );
+    assert!(
+        detail.contains("exit: 1"),
+        "the exit status is recorded: {detail}"
+    );
+    assert!(
+        detail.contains("stdout (0 bytes)"),
+        "the raw stdout (and its size) is recorded: {detail}"
+    );
+    assert!(
+        detail.contains("stderr (") && detail.contains("agent_prompt_stalled"),
+        "the raw stderr is recorded: {detail}"
+    );
+    assert!(
+        detail.contains("agent: lane-abc123") && detail.contains("pane: w1:p1"),
+        "the resolved identity is recorded: {detail}"
+    );
+    assert!(
+        detail.contains("read-back ("),
+        "the read-back the verdict was judged against is recorded: {detail}"
+    );
+    // The bounded window retried the transient wait and then refused: never a
+    // single un-retried exit, and never an unbounded loop.
+    let submissions = fixture
+        .rows()
+        .iter()
+        .filter(|row| row.starts_with("agent prompt"))
+        .count();
+    assert!(
+        submissions >= 2,
+        "the transient wait was retried inside the window: {submissions}"
+    );
+    assert!(
+        submissions <= 32,
+        "the retry stays inside the bounded window: {submissions}"
+    );
+    assert!(
+        fixture.pane_content().is_empty(),
+        "nothing was delivered to the pane"
+    );
+    assert!(
+        !fixture.bare_spawned(),
+        "no silent fallback: the bare harness executable must never run for an undelivered prompt"
+    );
+}
+
+/// Issue #148 witness 1 (and the mutation probe's target): a prompt row that
+/// exits ZERO while nothing reaches the agent is STILL undelivered. Success is
+/// tied to the agent's own read-back, so the run never records a delivery (and
+/// never parks as a worker-wait) because a subprocess happened to exit 0.
+/// Removing the read-back verification turns this test GREEN — the probe that
+/// proves the verification bites.
+#[test]
+fn a_prompt_row_that_exited_zero_without_delivering_is_still_undelivered() {
+    let fixture = Fixture::new("prompt-zero-no-delivery");
+    fixture.install(FAKE_HERDR);
+    let env = fixture.env(&[("HF_FAKE_HERDR_PROMPT_FAIL", "no-delivery".to_string())]);
+    let session = lane_session(1);
+    let profile = lane_profile(ExecutionMode::HerdrPane);
+    let started =
+        execute_op_in_worktree(&profile, &start_request(&session), &env, &fixture.worktree);
+    assert_eq!(started.status, "succeeded", "{:?}", started.message);
+
+    let payload = "Implement jirathip-dev/canter#148 from its latest issue text.";
+    let result = execute_op_in_worktree(
+        &profile,
+        &prompt_request(&session, payload),
+        &env,
+        &fixture.worktree,
+    );
+
+    assert_eq!(
+        result.status, "refused",
+        "a zero exit is not a delivery: {:?}",
+        result.message
+    );
+    assert_eq!(result.code, Some(CODE_PROMPT_UNDELIVERED));
+    let detail = result.detail.clone().unwrap_or_default();
+    assert!(
+        detail.contains("exit: 0"),
+        "the row's own exit status is recorded: {detail}"
+    );
+    assert!(
+        detail.contains("submitted"),
+        "the raw stdout document is recorded: {detail}"
+    );
+    assert!(
+        detail.contains("agent: lane-abc123") && detail.contains("pane: w1:p1"),
+        "the resolved identity is recorded: {detail}"
+    );
+    assert!(
+        fixture.pane_content().is_empty(),
+        "the agent's own read-back never showed the task text"
+    );
+    assert!(!fixture.bare_spawned());
 }
 
 /// Witness 3: Herdr unavailable is the typed refusal `refusal.unavailable.herdr`
