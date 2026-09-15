@@ -272,27 +272,86 @@ jobs:
       - name: Clippy (warnings denied)
         run: cargo clippy --locked --all-targets -- -D warnings
 
-      # Issue #136 Linux 2-CPU cold measurement: test build 55s, then all
-      # serial suites 254s. The 5m build + 15m15s OS cap leave 14m45s inside
-      # the 35m job for setup, check/clippy, docs, release, and artifact upload.
       - name: Build test executables
+        id: test-build
         timeout-minutes: 5
         run: cargo test --locked --no-run
 
       - name: Test driver regression checks
-        run: python3 scripts/test-ci-test-driver.py
+        id: driver-checks
+        timeout-minutes: 3
+        run: |
+          python3 scripts/test-ci-test-driver.py
+          python3 scripts/test-ci-test-scope.py
 
-      - name: Tests
-        run: timeout -k 15 900 python3 -u scripts/ci-test-driver.py --aggregate-seconds 600 --per-suite-seconds 150
+      # Refs #136: each group has an independent runner deadline and upload.
+      # The driver partitions its complete dynamic suite list; failures in one
+      # group do not skip the others or depend on a final all-suite upload.
+      - name: Tests group 1
+        if: ${{ always() && steps.test-build.outcome == 'success' && steps.driver-checks.outcome == 'success' }}
+        timeout-minutes: 6
+        env:
+          LOG_DIR: ${{ runner.temp }}/canter-test-group-1
+        run: python3 -u scripts/ci-test-scope.py --seconds 270 --log-dir "$LOG_DIR" -- python3 -u scripts/ci-test-driver.py --group 1 --aggregate-seconds 240 --per-suite-seconds 150
 
-      - name: Upload Tests diagnostics
+      - name: Upload group 1 diagnostics
         if: ${{ always() }}
+        timeout-minutes: 2
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: rust-ubuntu-tests-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/canter-test-summary.txt
-            ${{ runner.temp }}/canter-test-logs
+          name: rust-ubuntu-tests-1-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/canter-test-group-1
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Tests group 2
+        if: ${{ always() && steps.test-build.outcome == 'success' && steps.driver-checks.outcome == 'success' }}
+        timeout-minutes: 6
+        env:
+          LOG_DIR: ${{ runner.temp }}/canter-test-group-2
+        run: python3 -u scripts/ci-test-scope.py --seconds 270 --log-dir "$LOG_DIR" -- python3 -u scripts/ci-test-driver.py --group 2 --aggregate-seconds 240 --per-suite-seconds 150
+
+      - name: Upload group 2 diagnostics
+        if: ${{ always() }}
+        timeout-minutes: 2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rust-ubuntu-tests-2-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/canter-test-group-2
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Tests group 3
+        if: ${{ always() && steps.test-build.outcome == 'success' && steps.driver-checks.outcome == 'success' }}
+        timeout-minutes: 6
+        env:
+          LOG_DIR: ${{ runner.temp }}/canter-test-group-3
+        run: python3 -u scripts/ci-test-scope.py --seconds 270 --log-dir "$LOG_DIR" -- python3 -u scripts/ci-test-driver.py --group 3 --aggregate-seconds 240 --per-suite-seconds 150
+
+      - name: Upload group 3 diagnostics
+        if: ${{ always() }}
+        timeout-minutes: 2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rust-ubuntu-tests-3-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/canter-test-group-3
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Tests group 4
+        if: ${{ always() && steps.test-build.outcome == 'success' && steps.driver-checks.outcome == 'success' }}
+        timeout-minutes: 6
+        env:
+          LOG_DIR: ${{ runner.temp }}/canter-test-group-4
+        run: python3 -u scripts/ci-test-scope.py --seconds 270 --log-dir "$LOG_DIR" -- python3 -u scripts/ci-test-driver.py --group 4 --aggregate-seconds 240 --per-suite-seconds 150
+
+      - name: Upload group 4 diagnostics
+        if: ${{ always() }}
+        timeout-minutes: 2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rust-ubuntu-tests-4-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/canter-test-group-4
           if-no-files-found: error
           retention-days: 7
 

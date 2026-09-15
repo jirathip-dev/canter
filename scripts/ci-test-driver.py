@@ -11,8 +11,11 @@ from pathlib import Path
 import re
 import signal
 import subprocess
+import sys
 import tempfile
 import time
+
+from ci_test_processes import MARKER, fixture_environment, has_marker, proc_stat
 
 # CI pre-builds every test executable in its own bounded step, so this
 # deadline measures serial suite execution rather than a cold compilation.
@@ -24,6 +27,7 @@ TEST_LINE = re.compile(r"^test (.+?)(?: \.\.\.| has been running)")
 _active_child: subprocess.Popen[bytes] | None = None
 _active_target: Path | None = None
 _suite_sessions: set[int] = set()
+_fixture_tag: str | None = None
 
 
 @dataclass
@@ -45,8 +49,10 @@ def suites() -> list[list[str]]:
     return result
 
 
-def select_suites(name: str | None) -> list[list[str]]:
+def select_suites(name: str | None, group: int | None = None) -> list[list[str]]:
     available = suites()
+    if group is not None:
+        return available[group - 1::4]
     if name is None:
         return available
     aliases = {" ".join(suite): suite for suite in available}
@@ -102,6 +108,7 @@ def matching_processes(
 ) -> list[tuple[int, int, str]]:
     rows = process_table(deadline)
     excluded = ancestor_pids(rows)
+    since = int(proc_stat(os.getpid())[19]) if sys.platform == "linux" else 0
     # macOS spells /tmp processes as /tmp even though Path.resolve() yields
     # /private/tmp. Match both byte spellings; Linux normally has one.
     markers = {
@@ -115,6 +122,7 @@ def matching_processes(
         if pid not in excluded and (
             any(marker in command for marker in markers)
             or (session_ids is not None and sid in session_ids)
+            or (sys.platform == "linux" and has_marker(pid, _fixture_tag, since))
         ):
             found.append((pid, ppid, command))
     return found
@@ -289,7 +297,9 @@ def write_summary(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--suite", help="run one suite label or integration-test stem")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--suite", help="run one suite label or integration-test stem")
+    selection.add_argument("--group", type=int, choices=range(1, 5), help="run one of four complete-suite partitions")
     parser.add_argument("--aggregate-seconds", type=float, default=AGGREGATE_SECONDS)
     parser.add_argument("--per-suite-seconds", type=float, default=PER_SUITE_SECONDS)
     parser.add_argument("--log-dir", type=Path)
@@ -327,6 +337,7 @@ def run_suites(
         suite_started = time.monotonic()
         timed_out = False
         print(f"::group::Tests {label} at +{suite_started - started:.1f}s")
+        write_summary(summary_path, "running", results, note=f"current_suite={label}")
         child: subprocess.Popen[bytes] | None = None
         code = 1
         with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
@@ -341,6 +352,7 @@ def run_suites(
                         "--test-threads=1",
                         "--nocapture",
                     ],
+                    env=fixture_environment(),
                     start_new_session=True,
                     stdin=subprocess.DEVNULL,
                     stdout=stdout,
@@ -414,10 +426,12 @@ def run_suites(
 
 
 def main() -> int:
-    global _active_target
+    global _active_target, _fixture_tag
 
     args = parse_args()
-    chosen = select_suites(args.suite)
+    chosen = select_suites(args.suite, args.group)
+    _fixture_tag = fixture_environment()[MARKER]
+    os.environ[MARKER] = _fixture_tag
     runner_temp = Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir()))
     log_dir = args.log_dir or runner_temp / "canter-test-logs"
     summary_path = args.summary_file or runner_temp / "canter-test-summary.txt"

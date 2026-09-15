@@ -111,9 +111,31 @@ class InvocationTests(unittest.TestCase):
     def test_ci_budgets(self):
         workflow = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
         text = workflow.read_text()
-        self.assertIn("timeout -k 15 900 python3 -u scripts/ci-test-driver.py --aggregate-seconds 600 --per-suite-seconds 150", text)
         self.assertIn("timeout-minutes: 35", text)
         self.assertIn("cargo test --locked --no-run", text)
+        ubuntu = text.split("  rust-ubuntu:\n", 1)[1].split("  rust-macos:\n", 1)[0]
+        for group in range(1, 5):
+            with self.subTest(group=group):
+                step = ubuntu.split(f"      - name: Tests group {group}\n", 1)[1].split("      - name:", 1)[0]
+                self.assertIn("timeout-minutes: 6", step)
+                self.assertIn("always()", step)
+                self.assertNotIn("continue-on-error", step)
+                self.assertIn(f"python3 -u scripts/ci-test-scope.py --seconds 270 --log-dir \"$LOG_DIR\" -- python3 -u scripts/ci-test-driver.py --group {group} --aggregate-seconds 240 --per-suite-seconds 150", step)
+                upload = ubuntu.split(f"      - name: Upload group {group} diagnostics\n", 1)[1].split("      - name:", 1)[0]
+                self.assertIn("always()", upload)
+                self.assertIn("timeout-minutes: 2", upload)
+                self.assertIn(f"canter-test-group-{group}", upload)
+                self.assertIn("if-no-files-found: error", upload)
+        self.assertEqual(ubuntu.count("scripts/ci-test-driver.py --group"), 4)
+
+    def test_groups_enumerate_every_suite_once_including_new_tests(self):
+        expected = [("--lib",), ("--bins",), ("--doc",)]
+        expected += [("--test", path.stem) for path in Path("tests").glob("*.rs")]
+        actual = [tuple(suite) for group in range(1, 5) for suite in driver.select_suites(None, group)]
+        self.assertCountEqual(actual, expected)
+        with patch.object(driver, "suites", return_value=[["--test", "newly_added"], *driver.suites()]):
+            extended = [tuple(suite) for group in range(1, 5) for suite in driver.select_suites(None, group)]
+        self.assertCountEqual(extended, [("--test", "newly_added"), *expected])
 
     def test_real_driver_keeps_failure_last_test_and_serial_flags(self):
         with tempfile.TemporaryDirectory() as root:
