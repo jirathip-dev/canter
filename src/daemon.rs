@@ -1362,14 +1362,34 @@ impl crate::supervision::SupervisedDispatch for DaemonDispatch {
         let Some(shared) = self.shared.get() else {
             return Err("the daemon dispatch hook is not wired yet".to_string());
         };
-        let request = build_dispatch_request(
+        let key = dispatch_key(format!("{}-{}", intent.instance_id, intent.step_id));
+        let request = match build_dispatch_request(
             shared,
             &intent.instance_id,
             &intent.step_id,
             None,
-            &dispatch_key(format!("{}-{}", intent.instance_id, intent.step_id)),
-        )?;
+            &key,
+        ) {
+            Ok(request) => request,
+            Err(message) => {
+                record_unclaimed_dispatch_refusal(
+                    shared,
+                    &intent.instance_id,
+                    &intent.step_id,
+                    refusal_code_of(&message),
+                    &key,
+                );
+                return Err(message);
+            }
+        };
         if let Err((code, message)) = preflight_apply_request(&request) {
+            record_unclaimed_dispatch_refusal(
+                shared,
+                &intent.instance_id,
+                &intent.step_id,
+                &code,
+                &key,
+            );
             shared.log.write(
                 "info",
                 "supervision.input_required",
@@ -1404,6 +1424,12 @@ impl crate::supervision::SupervisedDispatch for DaemonDispatch {
             .and_then(|error| error.get("message"))
             .and_then(Val::as_str)
             .unwrap_or("the dispatch was refused");
+        // Issue #141: a refusal that left NO claim of its own (the fan-out
+        // admission gate refuses before journaling an intent) is journaled
+        // against the run, so the run's own surfaces can classify it instead
+        // of reporting the step eligible while nothing happens. A dispatch
+        // that reached its claim already has a recorded attempt.
+        record_unclaimed_dispatch_refusal(shared, &intent.instance_id, &intent.step_id, code, &key);
         shared.log.write(
             "warn",
             "supervision.dispatch_refused",
@@ -1414,6 +1440,66 @@ impl crate::supervision::SupervisedDispatch for DaemonDispatch {
         );
         Err(format!("{code}: {message}"))
     }
+}
+
+/// Journal ONE refused supervised dispatch that left no claim of its own
+/// (issue #141).
+///
+/// The apply path refuses a dispatch BEFORE journaling an intent when the
+/// request, the plan or the fan-out admission refuses it: such a refusal
+/// leaves no idempotency row (and therefore no attempt), no pane and no
+/// journal record, so the run's own evidence can never name it. Those are
+/// exactly the refusals recorded here; a dispatch that reached its claim has
+/// its own outcome row and is not recorded twice. A state that cannot record
+/// it is logged, and the refusal still returns to the driver (a missing
+/// journal record never becomes a silent success).
+fn record_unclaimed_dispatch_refusal(
+    shared: &Arc<Shared>,
+    instance_id: &str,
+    step: &str,
+    code: &str,
+    key: &str,
+) {
+    let state = match shared.lock_state() {
+        Ok(state) => state,
+        Err(message) => {
+            shared.log.write(
+                "error",
+                "supervision.dispatch_refused.record_failed",
+                &message,
+            );
+            return;
+        }
+    };
+    match state.claim(key) {
+        Ok(Some(_)) => return,
+        Ok(None) => {}
+        Err(err) => {
+            shared.log.write(
+                "error",
+                "supervision.dispatch_refused.record_failed",
+                &format!("{}: {}", err.code, err.message),
+            );
+            return;
+        }
+    }
+    if let Err(err) = state.record_supervision_dispatch_refusal(instance_id, step, code) {
+        shared.log.write(
+            "error",
+            "supervision.dispatch_refused.record_failed",
+            &format!("{}: {}", err.code, err.message),
+        );
+    }
+}
+
+/// The typed code of a refusal the dispatch hook could not classify further:
+/// the daemon's own `"<code>: <message>"` rendering, or the whole text when
+/// it carries no separator.
+fn refusal_code_of(message: &str) -> &str {
+    message
+        .split_once(": ")
+        .map(|(code, _)| code)
+        .unwrap_or(message)
 }
 
 /// The durable material of one committed-spine dispatch (issue #92), read

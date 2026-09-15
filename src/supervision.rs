@@ -15,6 +15,11 @@
 //!   engine. That preserves the committed grant, capability, admission,
 //!   ownership, topology, journal and idempotency gates; diagnosed steps still
 //!   require the operator's explicit corrected retry dispatch.
+//! - A continuation the apply engine REFUSES before its claim (a fan-out
+//!   admission refusal, a derived request the pre-screen rejects) leaves no
+//!   attempt of its own, so the driver records it against the run (issue
+//!   #141) and the classification reports the engine's own code as a named
+//!   blocker instead of claiming the frontier is an eligible continuation.
 //! - It also performs exactly ONE queue-continuation effect (issue #96): when
 //!   the recorded evidence of an
 //!   authorized run is a fresh VERIFIED delivery (reviewed `pass` with every
@@ -119,7 +124,7 @@ pub const TRIGGERS: [&str; 7] = [
 
 /// The statement every supervision document carries: what this surface does
 /// and provably does NOT do.
-pub const STATEMENT: &str = "an explicitly armed run is classified from recorded evidence and each unattempted autonomous next step is dispatched through the existing apply engine with the committed grant, capability, admission, ownership, topology, journal and idempotency gates; a fresh verified reviewed-and-CI-green delivery advances its authorized queue cursor exactly once under the same admission and ownership checks; supervision never resumes a pause, authorizes or consumes a retry, retries a diagnosed step, invents missing inputs or clears a hold";
+pub const STATEMENT: &str = "an explicitly armed run is classified from recorded evidence and each unattempted autonomous next step is dispatched through the existing apply engine with the committed grant, capability, admission, ownership, topology, journal and idempotency gates; a continuation the engine refuses before any effect is reported with the engine's own code and is never presented as an eligible next step; a fresh verified reviewed-and-CI-green delivery advances its authorized queue cursor exactly once under the same admission and ownership checks; supervision never resumes a pause, authorizes or consumes a retry, retries a diagnosed step, invents missing inputs or clears a hold";
 
 /// Default bounded timer fallback cadence (seconds).
 pub const DEFAULT_CHECK_INTERVAL_SECS: i64 = 60;
@@ -221,6 +226,12 @@ pub mod codes {
     /// The run was armed without the host-local topology/admission context
     /// required by the gated apply path.
     pub const DISPATCH_CONTEXT_MISSING: &str = "supervision.dispatch_context_missing";
+    /// The apply engine REFUSED the recorded continuation dispatch of the
+    /// next unachieved step BEFORE any effect ran (issue #141): the refusal
+    /// is the durable record this classification reads, and `detail` carries
+    /// the engine's own refusal code. The step is never reported eligible
+    /// while the dispatch the driver names is refused.
+    pub const DISPATCH_REFUSED: &str = "supervision.dispatch_refused";
 }
 
 /// A typed supervision error/refusal (fail closed; stable codes).
@@ -770,6 +781,30 @@ pub fn classify(
             codes::DISPATCH_CONTEXT_MISSING,
             false,
             &next_step,
+        );
+    }
+    // A RECORDED refusal of this frontier's own continuation dispatch (issue
+    // #141). The driver DID dispatch the step and the apply engine refused it
+    // before any effect (`latest_attempt_for` is None: no claim, no attempt, no
+    // pane), so the refusal is the only evidence there is: reporting the step
+    // as eligible with `supervision.dispatch.next_step` while the dispatch it
+    // names is refused is exactly the defect. The engine's own code is named
+    // instead, and the run is never reported eligible while that refusal
+    // stands. The refusal stays current until RECORDED progress supersedes it
+    // (`progress_at` moves whenever the evidence marker changes), so a
+    // repaired environment or a repaired frontier is classified from the new
+    // evidence alone — the driver keeps attempting the same continuation it
+    // would attempt for an untouched frontier.
+    if let Some(refusal) = &evidence.dispatch_refusal
+        && refusal.step == next_step
+        && latest_attempt_for(evidence, &next_step).is_none()
+        && refusal.at.as_str() >= evidence.progress_at.as_str()
+    {
+        return Verdict::new(
+            "needs-attention",
+            codes::DISPATCH_REFUSED,
+            false,
+            &refusal.code,
         );
     }
     // A never-attempted, fully authored executor step is eligible NOW. The
@@ -1683,7 +1718,7 @@ impl From<SupervisionError> for StateError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{InstanceRow, Retention, State};
+    use crate::state::{InstanceRow, Retention, State, dispatch_refusal_of};
     use std::path::PathBuf;
 
     /// Arm one run through the public state API (the same call the queue
@@ -1793,7 +1828,28 @@ mod tests {
             progress_at: progress_at.to_string(),
             item: None,
             newest_evidence: None,
+            dispatch_refusal: None,
         }
+    }
+
+    /// [`evidence_for`] with ONE recorded continuation-dispatch refusal
+    /// (issue #141) — the durable record a refused frontier dispatch leaves
+    /// behind instead of an attempt row.
+    fn evidence_with_refusal(
+        run: InstanceRow,
+        submission_digest: Option<&str>,
+        steps: &[(&str, &str)],
+        attempts: &[(&str, &str, &str)],
+        progress_at: &str,
+        refusal: (&str, &str, &str),
+    ) -> SupervisionEvidence {
+        let mut evidence = evidence_for(run, submission_digest, steps, attempts, progress_at);
+        evidence.dispatch_refusal = Some(crate::state::SupervisionDispatchRefusal {
+            step: refusal.0.to_string(),
+            code: refusal.1.to_string(),
+            at: refusal.2.to_string(),
+        });
+        evidence
     }
 
     #[test]
@@ -1984,6 +2040,182 @@ mod tests {
         let verdict = classify_at(failed, fresh_unix);
         assert_eq!(verdict.class, "needs-attention");
         assert_eq!(verdict.reason, codes::REVIEW_FAILED);
+    }
+
+    /// Issue #141: the frontier of the MEASURED defect. `p2-137` was repaired
+    /// by the operator (its latest attempt succeeded) and the cursor names
+    /// `p3`, whose continuation dispatch the apply engine refuses before any
+    /// effect — so no attempt row exists for `p3` and the refusal is the only
+    /// evidence. Reporting `p3` eligible with `supervision.dispatch.next_step`
+    /// while that dispatch is refused is the defect: the refusal is named with
+    /// the engine's own code instead, and the step is never eligible.
+    #[test]
+    fn a_refused_continuation_dispatch_names_the_engines_code_and_is_never_eligible() {
+        let policy = Policy {
+            check_interval_secs: 10,
+            progress_timeout_secs: 60,
+        };
+        let digest = "d".repeat(64);
+        let bound = Some(digest.as_str());
+        let steps = [
+            ("p1", "checkout"),
+            ("p2-137", "worktree_create"),
+            ("p3", "harness_start"),
+        ];
+        let repaired = [
+            ("p1", "succeeded", ""),
+            ("p2-137", "failed", "adapter.exit"),
+            ("p2-137", "succeeded", ""),
+        ];
+        let repaired_at = "2026-09-15T11:51:12Z";
+        let refused_at = "2026-09-15T11:52:12Z";
+        let now_unix = time::unix_from_rfc3339(refused_at).expect("instant");
+        // Without a recorded refusal the frontier is the plain continuation...
+        let evidence = evidence_for(
+            run_row("run-604cf9439372a5e5"),
+            bound,
+            &steps,
+            &repaired,
+            repaired_at,
+        );
+        let verdict = classify(&evidence, &digest, &policy, now_unix);
+        assert_eq!(verdict.reason, codes::DISPATCH);
+        assert!(verdict.eligible, "the untouched frontier is eligible");
+        // ...and with the engine's refusal on record it is named, never
+        // eligible, and never re-reported as a dispatchable next step.
+        let evidence = evidence_with_refusal(
+            run_row("run-604cf9439372a5e5"),
+            bound,
+            &steps,
+            &repaired,
+            repaired_at,
+            ("p3", "refusal.admission.proof_stale", refused_at),
+        );
+        let verdict = classify(&evidence, &digest, &policy, now_unix);
+        assert_eq!(verdict.class, "needs-attention");
+        assert_eq!(verdict.reason, codes::DISPATCH_REFUSED);
+        assert!(!verdict.eligible);
+        assert_eq!(
+            verdict.detail, "refusal.admission.proof_stale",
+            "the engine's own refusal code is the named blocker"
+        );
+        // A refusal for a DIFFERENT step never speaks for this frontier.
+        let evidence = evidence_with_refusal(
+            run_row("run-604cf9439372a5e5"),
+            bound,
+            &steps,
+            &repaired,
+            repaired_at,
+            ("p1", "refusal.admission.proof_stale", refused_at),
+        );
+        assert_eq!(
+            classify(&evidence, &digest, &policy, now_unix).reason,
+            codes::DISPATCH
+        );
+        // Recorded progress SUPERSEDES the refusal (the operator's repair of
+        // the environment or of the frontier): the classification returns to
+        // the plain continuation of the new evidence alone.
+        let evidence = evidence_with_refusal(
+            run_row("run-604cf9439372a5e5"),
+            bound,
+            &steps,
+            &repaired,
+            "2026-09-15T12:01:26Z",
+            ("p3", "refusal.admission.proof_stale", refused_at),
+        );
+        let later = time::unix_from_rfc3339("2026-09-15T12:02:26Z").expect("instant");
+        let verdict = classify(&evidence, &digest, &policy, later);
+        assert_eq!(verdict.reason, codes::DISPATCH);
+        assert!(verdict.eligible);
+    }
+
+    /// Issue #141, the preserved rule: a refusal of a continuation dispatch is
+    /// NOT an attempt and never authorizes the driver to re-dispatch a
+    /// DIAGNOSED step. The diagnosed frontier keeps its own fence with or
+    /// without a recorded refusal elsewhere in the run.
+    #[test]
+    fn a_diagnosed_frontier_stays_fenced_with_a_recorded_refusal() {
+        let state = temp_state("diagnosed-fence-refusal");
+        let digest = "d".repeat(64);
+        let run = "run-0123456789abcdef";
+        state
+            .arm_supervision_for_test(
+                run,
+                "armed",
+                &digest,
+                "merge",
+                Policy {
+                    check_interval_secs: 10,
+                    progress_timeout_secs: 60,
+                },
+                "2026-09-15T11:00:00Z",
+            )
+            .expect("arm");
+        let row = state.supervision_by_id(run).expect("read").expect("row");
+        let steps = [("p1", "checkout"), ("p2", "worktree_create")];
+        let attempts = [("p1", "succeeded", ""), ("p2", "failed", "adapter.exit")];
+        let at = "2026-09-15T11:51:12Z";
+        let policy = Policy {
+            check_interval_secs: 10,
+            progress_timeout_secs: 60,
+        };
+        let now_unix = time::unix_from_rfc3339(at).expect("instant");
+        for refusal in [None, Some(("p2", "refusal.admission.proof_stale", at))] {
+            let evidence = match refusal {
+                Some(refusal) => evidence_with_refusal(
+                    run_row(run),
+                    Some(&digest),
+                    &steps,
+                    &attempts,
+                    at,
+                    refusal,
+                ),
+                None => evidence_for(run_row(run), Some(&digest), &steps, &attempts, at),
+            };
+            assert!(
+                dispatch_intent(&row, &evidence).is_none(),
+                "a diagnosed step is never re-dispatched: the operator's corrected dispatch owns it"
+            );
+            assert!(
+                !classify(&evidence, &digest, &policy, now_unix).eligible,
+                "a diagnosed frontier is never reported eligible"
+            );
+        }
+    }
+
+    /// Issue #141: the refusal record is durable and auditable, and only the
+    /// target's own run may read it back. A foreign or malformed target is
+    /// never read as this run's refusal (the read invents nothing).
+    #[test]
+    fn a_recorded_dispatch_refusal_is_journaled_and_read_back_by_its_own_run() {
+        let state = temp_state("refusal-record");
+        let run = "run-0123456789abcdef";
+        state
+            .record_supervision_dispatch_refusal(run, "p3", "refusal.admission.proof_stale")
+            .expect("record");
+        let (_, lines) = state.journal_tail(0, 1_000).expect("journal");
+        let target = format!("{run}:p3:refusal.admission.proof_stale");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(codes::DISPATCH_REFUSED) && line.contains(&target)),
+            "the refusal is a journal record of this run: {lines:?}"
+        );
+        let read = dispatch_refusal_of(run, &target, "2026-09-15T11:52:12Z").expect("read back");
+        assert_eq!(read.step, "p3");
+        assert_eq!(read.code, "refusal.admission.proof_stale");
+        assert_eq!(read.at, "2026-09-15T11:52:12Z");
+        for (instance, foreign) in [
+            ("run-ffffffffffffffff", target.as_str()),
+            (run, "run-0123456789abcdef"),
+            (run, "run-0123456789abcdef:p3"),
+            (run, "run-0123456789abcdef::refusal.admission.proof_stale"),
+        ] {
+            assert!(
+                dispatch_refusal_of(instance, foreign, "2026-09-15T11:52:12Z").is_none(),
+                "not this run's refusal: {foreign:?}"
+            );
+        }
     }
 
     #[test]

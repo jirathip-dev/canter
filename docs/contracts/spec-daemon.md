@@ -520,6 +520,23 @@ clears a repository/fleet-level hold or bypasses a gate.
   `supervision.waiting_approval` frontier until independent evidence is
   presented. Non-armed/unknown supervision keeps its classification-only,
   zero-effect guarantee verbatim: without a row the run is never even read.
+- **Refused continuation dispatch (issue #141)**: when the engine refuses the
+  driver's continuation of the frontier step BEFORE its claim (a fan-out
+  admission refusal such as `refusal.admission.proof_stale`, a derived
+  request the pre-screen rejects), the refusal leaves no attempt row, no pane
+  and no intent of its own. It is therefore journaled against the run as
+  `supervision.dispatch_refused` with the engine's own code (the target is
+  `<run>:<step>:<code>`), and the classification reports it — class
+  `needs-attention`, reason `supervision.dispatch_refused`, the engine's code
+  as the detail, `eligible:false` — for as long as that refusal is the newest
+  recorded evidence of the run. A frontier whose dispatch is refused is never
+  reported eligible with `supervision.dispatch.next_step`, and the refusal is
+  never an attempt: a *currently* DIAGNOSED frontier keeps its own
+  no-redispatch fence unchanged. The driver keeps attempting the same
+  continuation it would attempt for an untouched frontier, so a repaired
+  environment (a refreshed admission attestation) is admitted as soon as the
+  apply gate accepts it, and any recorded progress supersedes the reported
+  refusal.
 - `continuation-eligible` remains a REPORT (the classification half), and
   an idle/done agent alone is neither completion (a `done` run without
   passing review evidence stays unknown) nor permission to resume (a paused
