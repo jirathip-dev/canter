@@ -10,12 +10,17 @@ on:
   push:
     branches: [staging, main]
   workflow_dispatch:
+    inputs:
+      matrix_witness:
+        description: 'Deliberately hang --lib and fail --bins; other suites run normally'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ inputs.matrix_witness || false }}
   cancel-in-progress: true
 
 jobs:
@@ -252,10 +257,10 @@ jobs:
           fi
           echo "staging guard: refs/heads/staging exists on origin ($REF)"
 
-  rust-ubuntu:
-    name: rust-ubuntu
+  rust-ubuntu-build:
+    name: rust-ubuntu-build
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -284,82 +289,132 @@ jobs:
           python3 scripts/test-ci-test-driver.py
           python3 scripts/test-ci-test-scope.py
 
-      # Refs #136: each group has an independent runner deadline and upload.
-      # The driver partitions its complete dynamic suite list; failures in one
-      # group do not skip the others or depend on a final all-suite upload.
-      - name: Tests group 1
-        if: ${{ always() && steps.test-build.outcome == 'success' && steps.driver-checks.outcome == 'success' }}
-        timeout-minutes: 6
-        env:
-          LOG_DIR: ${{ runner.temp }}/canter-test-group-1
-        run: python3 -u scripts/ci-test-scope.py --seconds 270 --log-dir "$LOG_DIR" -- python3 -u scripts/ci-test-driver.py --group 1 --aggregate-seconds 240 --per-suite-seconds 150
+      # Preserve source and build mtimes together so downstream cargo reuses
+      # the hoisted build. Only tracked sources and target are archived, not .git.
+      - name: Package test build
+        run: |
+          git ls-files -z > "$RUNNER_TEMP/test-sources"
+          tar --format=posix --exclude=target/debug/incremental -cf "$RUNNER_TEMP/test-build.tar" --null -T "$RUNNER_TEMP/test-sources" target
 
-      - name: Upload group 1 diagnostics
-        if: ${{ always() }}
-        timeout-minutes: 2
+      - name: Upload test build
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: rust-ubuntu-tests-1-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/canter-test-group-1
+          name: rust-ubuntu-test-build
+          path: ${{ runner.temp }}/test-build.tar
           if-no-files-found: error
-          retention-days: 7
-
-      - name: Tests group 2
-        if: ${{ always() && steps.test-build.outcome == 'success' && steps.driver-checks.outcome == 'success' }}
-        timeout-minutes: 6
-        env:
-          LOG_DIR: ${{ runner.temp }}/canter-test-group-2
-        run: python3 -u scripts/ci-test-scope.py --seconds 270 --log-dir "$LOG_DIR" -- python3 -u scripts/ci-test-driver.py --group 2 --aggregate-seconds 240 --per-suite-seconds 150
-
-      - name: Upload group 2 diagnostics
-        if: ${{ always() }}
-        timeout-minutes: 2
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: rust-ubuntu-tests-2-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/canter-test-group-2
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: Tests group 3
-        if: ${{ always() && steps.test-build.outcome == 'success' && steps.driver-checks.outcome == 'success' }}
-        timeout-minutes: 6
-        env:
-          LOG_DIR: ${{ runner.temp }}/canter-test-group-3
-        run: python3 -u scripts/ci-test-scope.py --seconds 270 --log-dir "$LOG_DIR" -- python3 -u scripts/ci-test-driver.py --group 3 --aggregate-seconds 240 --per-suite-seconds 150
-
-      - name: Upload group 3 diagnostics
-        if: ${{ always() }}
-        timeout-minutes: 2
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: rust-ubuntu-tests-3-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/canter-test-group-3
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: Tests group 4
-        if: ${{ always() && steps.test-build.outcome == 'success' && steps.driver-checks.outcome == 'success' }}
-        timeout-minutes: 6
-        env:
-          LOG_DIR: ${{ runner.temp }}/canter-test-group-4
-        run: python3 -u scripts/ci-test-scope.py --seconds 270 --log-dir "$LOG_DIR" -- python3 -u scripts/ci-test-driver.py --group 4 --aggregate-seconds 240 --per-suite-seconds 150
-
-      - name: Upload group 4 diagnostics
-        if: ${{ always() }}
-        timeout-minutes: 2
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: rust-ubuntu-tests-4-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/canter-test-group-4
-          if-no-files-found: error
-          retention-days: 7
+          retention-days: 1
 
       - name: Docs
         run: cargo doc --locked --no-deps
 
       - name: Release build
         run: cargo build --release --locked
+
+  # Refs #136: a wedged runner cannot hide the suite's job identity.
+  rust-ubuntu-suite:
+    name: rust-ubuntu (${{ matrix.suite }})
+    needs: rust-ubuntu-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        suite: [
+          "--lib",
+          "--bins",
+          "--test board_read_model",
+          "--test checkpoint",
+          "--test cli_readonly",
+          "--test cli_smoke",
+          "--test commands",
+          "--test daemon_lifecycle",
+          "--test daemon_rpc",
+          "--test executor_authoring",
+          "--test executor_lifecycle",
+          "--test grant_issue",
+          "--test handoff_crash_acceptance",
+          "--test harness_adapters",
+          "--test herdr_compatibility",
+          "--test lane_cli",
+          "--test lane_replacement",
+          "--test mutation_engine",
+          "--test no_network_surface",
+          "--test profile_binding",
+          "--test queue_advance",
+          "--test queue_cli",
+          "--test queue_preview",
+          "--test queue_submit",
+          "--test redact_scale",
+          "--test rename_compat",
+          "--test rename_sweep",
+          "--test restart_pause_continuity",
+          "--test retirement",
+          "--test run_control",
+          "--test run_control_cli",
+          "--test service_plans",
+          "--test start_adopt",
+          "--test supervision",
+          "--test tui_board",
+          "--test tui_live_wiring",
+          "--test tui_operator",
+          "--test tui_supervision",
+          "--doc"
+        ]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned toolchain from rust-toolchain.toml
+        run: rustup toolchain install 1.97.1 --profile minimal
+
+      - name: Download test build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: rust-ubuntu-test-build
+          path: ${{ runner.temp }}
+
+      - name: Restore test build
+        run: |
+          tar -xf "$RUNNER_TEMP/test-build.tar"
+          git diff --exit-code
+
+      - name: Install deliberate matrix witness
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.matrix_witness }}
+        run: python3 scripts/ci-matrix-witness.py
+
+      - name: Tests group
+        timeout-minutes: 4
+        env:
+          SUITE: ${{ matrix.suite }}
+          LOG_DIR: ${{ runner.temp }}/canter-test-group
+        run: python3 -u scripts/ci-test-scope.py --seconds 200 --log-dir "$LOG_DIR" -- python3 -u scripts/ci-test-driver.py --suite="$SUITE" --aggregate-seconds 180 --per-suite-seconds 150
+
+      - name: Upload group diagnostics
+        if: ${{ always() }}
+        timeout-minutes: 2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rust-ubuntu-tests-${{ matrix.suite }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/canter-test-group
+          if-no-files-found: error
+          retention-days: 7
+
+  # Preserve the stable required-check name; skipped/cancelled is not success.
+  rust-ubuntu:
+    name: rust-ubuntu
+    needs: [rust-ubuntu-build, rust-ubuntu-suite]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Require every suite and build to pass
+        env:
+          BUILD_RESULT: ${{ needs.rust-ubuntu-build.result }}
+          SUITE_RESULT: ${{ needs.rust-ubuntu-suite.result }}
+        run: |
+          printf 'build=%s suites=%s\n' "$BUILD_RESULT" "$SUITE_RESULT"
+          test "$BUILD_RESULT" = success
+          test "$SUITE_RESULT" = success
 
   rust-macos:
     name: rust-macos

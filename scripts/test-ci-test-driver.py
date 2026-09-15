@@ -4,7 +4,9 @@ import contextlib
 import importlib.util
 import inspect
 import io
+import json
 import os
+import re
 from pathlib import Path
 import signal
 import subprocess
@@ -108,25 +110,87 @@ class SweepTests(unittest.TestCase):
 
 
 class InvocationTests(unittest.TestCase):
+    def job(self, name):
+        text = (Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml").read_text()
+        match = re.search(rf"(?ms)^  {re.escape(name)}:\n(.*?)(?=^  [\w-]+:|\Z)", text)
+        self.assertIsNotNone(match, f"missing independent job {name}")
+        return match[1]
+
+    def test_matrix_enumerates_every_suite_once(self):
+        job = self.job("rust-ubuntu-suite")
+        # JSON is a YAML subset; a closed single-axis strategy cannot exclude
+        # suites or silently expand them into duplicate matrix combinations.
+        strategy = job.split("    strategy:\n", 1)[1].split("    steps:\n", 1)[0]
+        prefix = "      fail-fast: false\n      max-parallel: 8\n      matrix:\n        suite: "
+        self.assertTrue(strategy.startswith(prefix), "independent, non-fail-fast suite matrix")
+        actual = json.loads(strategy[len(prefix):])
+        root = Path(__file__).resolve().parents[1]
+        expected = ["--lib", "--bins"] + ["--test " + p.stem for p in sorted((root / "tests").glob("*.rs"))] + ["--doc"]
+        self.assertCountEqual(actual, expected, "matrix must match every tests/*.rs plus lib/bins/doc")
+        for suite in actual:
+            self.assertEqual(driver.select_suites(suite), [suite.split()], suite)
+
     def test_ci_budgets(self):
-        workflow = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
-        text = workflow.read_text()
-        self.assertIn("timeout-minutes: 35", text)
-        self.assertIn("cargo test --locked --no-run", text)
-        ubuntu = text.split("  rust-ubuntu:\n", 1)[1].split("  rust-macos:\n", 1)[0]
-        for group in range(1, 5):
-            with self.subTest(group=group):
-                step = ubuntu.split(f"      - name: Tests group {group}\n", 1)[1].split("      - name:", 1)[0]
-                self.assertIn("timeout-minutes: 6", step)
-                self.assertIn("always()", step)
-                self.assertNotIn("continue-on-error", step)
-                self.assertIn(f"python3 -u scripts/ci-test-scope.py --seconds 270 --log-dir \"$LOG_DIR\" -- python3 -u scripts/ci-test-driver.py --group {group} --aggregate-seconds 240 --per-suite-seconds 150", step)
-                upload = ubuntu.split(f"      - name: Upload group {group} diagnostics\n", 1)[1].split("      - name:", 1)[0]
-                self.assertIn("always()", upload)
-                self.assertIn("timeout-minutes: 2", upload)
-                self.assertIn(f"canter-test-group-{group}", upload)
-                self.assertIn("if-no-files-found: error", upload)
-        self.assertEqual(ubuntu.count("scripts/ci-test-driver.py --group"), 4)
+        job = self.job("rust-ubuntu-suite")
+        header = job.split("    steps:\n", 1)[0]
+        self.assertIn("    name: rust-ubuntu (${{ matrix.suite }})\n", header)
+        self.assertIn("    timeout-minutes: 5\n", header)
+        self.assertIn("    needs: rust-ubuntu-build\n", header)
+        self.assertNotIn("    if:", header)
+        self.assertNotIn("continue-on-error", job)
+        self.assertNotRegex(job, r"\|\|\s*true")
+        step = job.split("      - name: Tests group\n", 1)[1].split("      - name:", 1)[0]
+        self.assertIn("timeout-minutes: 4", step)
+        self.assertNotIn("if:", step)
+        self.assertIn("SUITE: ${{ matrix.suite }}", step)
+        self.assertIn('run: python3 -u scripts/ci-test-scope.py --seconds 200 --log-dir "$LOG_DIR" -- python3 -u scripts/ci-test-driver.py --suite="$SUITE" --aggregate-seconds 180 --per-suite-seconds 150\n', step)
+        self.assertEqual(job.count("scripts/ci-test-driver.py --suite="), 1)
+        upload = job.split("      - name: Upload group diagnostics\n", 1)[1]
+        self.assertIn("if: ${{ always() }}", upload)
+        self.assertIn("timeout-minutes: 2", upload)
+        self.assertIn("if-no-files-found: error", upload)
+        self.assertIn("name: rust-ubuntu-tests-${{ matrix.suite }}-${{ github.run_id }}-${{ github.run_attempt }}", upload)
+        self.assertEqual(job.count("${{ runner.temp }}/canter-test-group"), 2)
+        build = self.job("rust-ubuntu-build")
+        self.assertIn("run: cargo test --locked --no-run", build)
+        self.assertIn("python3 scripts/test-ci-test-driver.py", build)
+        self.assertIn("python3 scripts/test-ci-test-scope.py", build)
+        self.assertIn("name: rust-ubuntu-test-build", build)
+        self.assertIn("name: rust-ubuntu-test-build", job)
+
+    def test_matrix_aggregate_rejects_failure_cancelled_and_skipped(self):
+        gate = self.job("rust-ubuntu")
+        self.assertIn("needs: [rust-ubuntu-build, rust-ubuntu-suite]", gate)
+        self.assertIn("if: ${{ always() }}", gate)
+        self.assertIn("BUILD_RESULT: ${{ needs.rust-ubuntu-build.result }}", gate)
+        self.assertIn("SUITE_RESULT: ${{ needs.rust-ubuntu-suite.result }}", gate)
+        script = gate.split("        run: |\n", 1)[1]
+        for build in ("success", "failure", "cancelled", "skipped"):
+            for suites in ("success", "failure", "cancelled", "skipped"):
+                result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], env=dict(os.environ, BUILD_RESULT=build, SUITE_RESULT=suites), capture_output=True, text=True, timeout=3)
+                self.assertEqual(result.returncode == 0, build == suites == "success", (build, suites, result.stdout))
+
+    def test_matrix_witness_is_explicit_manual_only(self):
+        text = (Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml").read_text()
+        self.assertIn("matrix_witness:\n        description: 'Deliberately hang --lib and fail --bins; other suites run normally'\n        type: boolean\n        default: false", text)
+        step = self.job("rust-ubuntu-suite").split("      - name: Install deliberate matrix witness\n", 1)[1].split("      - name:", 1)[0]
+        self.assertIn("if: ${{ github.event_name == 'workflow_dispatch' && inputs.matrix_witness }}", step)
+        self.assertIn("run: python3 scripts/ci-matrix-witness.py", step)
+
+    def test_matrix_witness_really_hangs_fails_and_delegates(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            real_cargo = root / "cargo"
+            real_cargo.write_text("#!/bin/sh\nprintf 'test real_cargo_delegate ... FAILED\\n'\nexit 23\n")
+            real_cargo.chmod(0o755)
+            github_path = root / "github-path"
+            env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ["PATH"], RUNNER_TEMP=str(root), GITHUB_PATH=str(github_path), CARGO_TARGET_DIR=str(root / "target"))
+            subprocess.run([sys.executable, str(Path(__file__).with_name("ci-matrix-witness.py"))], env=env, check=True, timeout=5)
+            env["PATH"] = github_path.read_text().strip() + os.pathsep + env["PATH"]
+            for suite, expected in [("--lib", 124), ("--bins", 42), ("--test cli_smoke", 23)]:
+                result = subprocess.run([sys.executable, "-u", driver.__file__, "--suite=" + suite, "--aggregate-seconds", "8", "--per-suite-seconds", "2"], env=env, capture_output=True, text=True, timeout=12)
+                self.assertEqual(result.returncode, expected, (suite, result.stdout, result.stderr))
+                self.assertIn("remaining=0", result.stdout)
 
     def test_groups_enumerate_every_suite_once_including_new_tests(self):
         expected = [("--lib",), ("--bins",), ("--doc",)]
