@@ -273,14 +273,17 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
       # Issue #136 Linux 2-CPU cold measurement: test build 55s, then all
-      # serial suites 254s. The 5m build + 20m15s OS cap leave 9m45s inside
+      # serial suites 254s. The 5m build + 15m15s OS cap leave 14m45s inside
       # the 35m job for setup, check/clippy, docs, release, and artifact upload.
       - name: Build test executables
         timeout-minutes: 5
         run: cargo test --locked --no-run
 
+      - name: Test driver regression checks
+        run: python3 scripts/test-ci-test-driver.py
+
       - name: Tests
-        run: timeout -k 15 1200 python3 -u scripts/ci-test-driver.py
+        run: timeout -k 15 900 python3 -u scripts/ci-test-driver.py --aggregate-seconds 600 --per-suite-seconds 150
 
       - name: Upload Tests diagnostics
         if: ${{ always() }}

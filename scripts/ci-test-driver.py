@@ -18,6 +18,7 @@ import time
 # deadline measures serial suite execution rather than a cold compilation.
 AGGREGATE_SECONDS = 18 * 60
 PER_SUITE_SECONDS = 300
+CLEANUP_SECONDS = 10
 TAIL_LINES = 120
 TEST_LINE = re.compile(r"^test (.+?)(?: \.\.\.| has been running)")
 _active_child: subprocess.Popen[bytes] | None = None
@@ -59,16 +60,21 @@ def select_suites(name: str | None) -> list[list[str]]:
         raise SystemExit(f"unknown suite {name!r}; choose one of: {choices}") from None
 
 
-def process_table() -> dict[int, tuple[int, int, str]]:
+def process_table(deadline: float) -> dict[int, tuple[int, int, str]]:
+    budget = deadline - time.monotonic()
+    if budget <= 0:
+        raise TimeoutError("survivor sweep deadline exhausted before snapshot")
     output = subprocess.run(
         ["ps", "-Aww", "-o", "pid=,ppid=,sess=,command="],
         check=True,
         capture_output=True,
         text=True,
-        timeout=5,
+        timeout=min(5, budget),
     ).stdout
     rows: dict[int, tuple[int, int, str]] = {}
     for line in output.splitlines():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("survivor sweep deadline exhausted parsing snapshot")
         fields = line.strip().split(None, 3)
         if len(fields) != 4:
             continue
@@ -92,9 +98,9 @@ def ancestor_pids(rows: dict[int, tuple[int, int, str]]) -> set[int]:
 
 
 def matching_processes(
-    target_dir: Path, session_ids: set[int] | None = None
+    target_dir: Path, session_ids: set[int] | None, deadline: float
 ) -> list[tuple[int, int, str]]:
-    rows = process_table()
+    rows = process_table(deadline)
     excluded = ancestor_pids(rows)
     # macOS spells /tmp processes as /tmp even though Path.resolve() yields
     # /private/tmp. Match both byte spellings; Linux normally has one.
@@ -102,82 +108,94 @@ def matching_processes(
         str(target_dir.absolute()) + os.sep,
         str(target_dir.resolve()) + os.sep,
     }
-    return [
-        (pid, ppid, command)
-        for pid, (ppid, sid, command) in rows.items()
-        if pid not in excluded
-        and (
+    found = []
+    for pid, (ppid, sid, command) in rows.items():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("survivor sweep deadline exhausted selecting snapshot")
+        if pid not in excluded and (
             any(marker in command for marker in markers)
             or (session_ids is not None and sid in session_ids)
-        )
-    ]
+        ):
+            found.append((pid, ppid, command))
+    return found
 
 
-def signal_rows(rows: list[tuple[int, int, str]], signum: int, target_dir: Path, session_ids: set[int] | None) -> None:
-    for pid, ppid, command in rows:
-        current = {
-            row[0]: row for row in matching_processes(target_dir, session_ids)
-        }.get(pid)
-        if current is None:
-            continue
-        print(
-            f"Tests survivor signal={signum}: pid={pid} ppid={ppid} "
-            f"command={command[:500]}"
-        )
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass  # Permission denied is not proof of absence.
+    return True
+
+
+def signal_rows(
+    rows: list[tuple[int, int, str]], signum: int, deadline: float
+) -> None:
+    for index, (pid, ppid, command) in enumerate(rows):
+        if time.monotonic() >= deadline:
+            break
         try:
-            os.kill(pid, signum)
-        except ProcessLookupError:
-            pass
+            if pid_alive(pid):
+                if index < 20:
+                    print(f"Tests survivor signal={signum}: pid={pid} ppid={ppid} command={command[:500]}")
+                os.kill(pid, signum)
+        except (ProcessLookupError, PermissionError):
+            pass  # The liveness check below keeps denied/live PIDs visible.
 
 
 def wait_for_survivors(
-    target_dir: Path, session_ids: set[int] | None, seconds: float
+    rows: list[tuple[int, int, str]], deadline: float
 ) -> list[tuple[int, int, str]]:
-    deadline = time.monotonic() + seconds
-    remaining = matching_processes(target_dir, session_ids)
-    while remaining and time.monotonic() < deadline:
-        time.sleep(0.05)
-        remaining = matching_processes(target_dir, session_ids)
-    return remaining
+    while rows:
+        remaining = []
+        for index, row in enumerate(rows):
+            if time.monotonic() >= deadline:
+                return remaining + rows[index:]  # Unchecked is not gone.
+            if pid_alive(row[0]):
+                remaining.append(row)
+        rows = remaining
+        if rows:
+            time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+    return rows
 
 
 def sweep_survivors(
-    target_dir: Path, session_ids: set[int] | None = None
+    target_dir: Path, session_ids: set[int] | None = None, *, deadline: float
 ) -> tuple[list[tuple[int, int, str]], list[int]]:
-    found = matching_processes(target_dir, session_ids)
-    signal_rows(found, signal.SIGTERM, target_dir, session_ids)
-    remaining = wait_for_survivors(target_dir, session_ids, 5)
+    deadline = min(deadline, time.monotonic() + CLEANUP_SECONDS)
+    found = matching_processes(target_dir, session_ids, deadline)
+    signal_rows(found, signal.SIGTERM, deadline)
+    remaining = wait_for_survivors(found, min(deadline, time.monotonic() + 5))
     if remaining:
-        signal_rows(remaining, signal.SIGKILL, target_dir, session_ids)
-        remaining = wait_for_survivors(target_dir, session_ids, 5)
+        signal_rows(remaining, signal.SIGKILL, deadline)
+        remaining = wait_for_survivors(remaining, deadline)
     return found, [row[0] for row in remaining]
 
 
-def reap_group(child: subprocess.Popen[bytes]) -> None:
-    if child.poll() is not None:
-        return
-    try:
-        os.killpg(child.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    try:
-        child.wait(timeout=5)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(child.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    try:
-        child.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        print(f"::error::test process group {child.pid} survived SIGKILL")
+def reap_group(child: subprocess.Popen[bytes], deadline: float) -> None:
+    for signum in (signal.SIGTERM, signal.SIGKILL):
+        if child.poll() is not None:
+            return
+        if time.monotonic() >= deadline:
+            break
+        try:
+            os.killpg(child.pid, signum)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            break
+        try:
+            child.wait(timeout=max(0, min(5, deadline - time.monotonic())))
+            return
+        except subprocess.TimeoutExpired:
+            pass
+    print(f"::error::test process group {child.pid} not reaped within cleanup deadline")
 
 
 def handle_signal(signum: int, _frame: object) -> None:
-    if _active_child is not None:
-        reap_group(_active_child)
+    # Unwind through the same deadline-bounded cleanup as an ordinary failure.
     print(f"Tests interrupted by signal {signum}")
     raise SystemExit(128 + signum)
 
@@ -291,9 +309,11 @@ def run_suites(
 ) -> int:
     global _active_child
 
+    # Keep teardown inside the aggregate, including when its last suite stalls.
+    execution_deadline = deadline - min(CLEANUP_SECONDS, (deadline - started) / 2)
     for index, suite in enumerate(chosen, start=1):
         label = " ".join(suite)
-        budget = min(per_suite_seconds, deadline - time.monotonic())
+        budget = min(per_suite_seconds, execution_deadline - time.monotonic())
         if budget <= 0:
             note = f"Tests aggregate deadline exceeded before {label}"
             print(f"::error::{note}")
@@ -334,16 +354,24 @@ def run_suites(
                     timed_out = True
                     code = 124
                     print(f"::error::Tests {label} exceeded {budget:.1f}s")
-                    reap_group(child)
             finally:
+                cleanup_deadline = min(deadline, time.monotonic() + CLEANUP_SECONDS)
                 if child is not None:
-                    reap_group(child)
+                    reap_group(child, cleanup_deadline)
                 _active_child = None
 
-        found, remaining = sweep_survivors(
-            target_dir, {child.pid} if child is not None else None
-        )
-        if child is not None and not remaining:
+        found, remaining = [], []
+        cleanup_note = None
+        try:
+            found, remaining = sweep_survivors(
+                target_dir, {child.pid} if child is not None else None,
+                deadline=cleanup_deadline,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            cleanup_note = f"Tests {label} survivor sweep incomplete: {error}"
+            print(f"::error::{cleanup_note}")
+            code = code or 1
+        if child is not None and not remaining and cleanup_note is None:
             _suite_sessions.discard(child.pid)
         if remaining:
             print(f"::error::Tests {label} survivor sweep could not reap pids {remaining}")
@@ -351,6 +379,9 @@ def run_suites(
         elif found:
             print(f"::error::Tests {label} leaked {len(found)} process(es); sweep reaped all")
             code = code if code != 0 else 1
+        if time.monotonic() >= deadline:
+            timed_out = True
+            code = code or 124
         duration = time.monotonic() - suite_started
         last_test = last_test_name(stdout_path, stderr_path)
         print_tail(stdout_path)
@@ -373,7 +404,7 @@ def run_suites(
         results.append(result)
         if code != 0:
             print_table(results)
-            write_summary(summary_path, "failed", results, failure=result)
+            write_summary(summary_path, "failed", results, failure=result, note=cleanup_note)
             return code if code > 0 else 1
         write_summary(summary_path, "running", results)
 
@@ -416,20 +447,29 @@ def main() -> int:
     except BaseException as error:
         interrupted = error
     finally:
-        found, remaining = sweep_survivors(target_dir, _suite_sessions)
-        print(
-            f"Tests final survivor sweep: found={len(found)} "
-            f"remaining={len(remaining)}"
-        )
+        found, remaining = [], []
+        note = None
+        try:
+            found, remaining = sweep_survivors(target_dir, _suite_sessions, deadline=deadline)
+            print(
+                f"Tests final survivor sweep: found={len(found)} "
+                f"remaining={len(remaining)} pids={remaining}"
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            note = f"final survivor sweep incomplete: {error}; unchecked sessions={sorted(_suite_sessions)}"
+            print(f"::error::{note}")
+            code = code or 1
         if found and code == 0:
             code = 1
         if remaining:
             code = 1
+            note = f"final survivor sweep could not reap pids {remaining}"
+        if time.monotonic() >= deadline:
+            code = code or 124
         failure = results[-1] if results and results[-1].exit_code != 0 else None
-        note = None
         if interrupted is not None:
-            note = f"driver aborted: {type(interrupted).__name__}: {interrupted}"
-        elif found:
+            note = f"driver aborted: {type(interrupted).__name__}: {interrupted}; {note or ''}"
+        elif found and note is None:
             note = f"final survivor sweep found {len(found)} process(es)"
         write_summary(
             summary_path,
