@@ -2688,10 +2688,23 @@ fn effect_prompt(ctx: &EffectContext<'_>) -> EffectOutcome {
     };
     let result = crate::adapters::execute_op_in_worktree(&profile, &request, ctx.env, &worktree);
     if result.status != "succeeded" {
+        // Issue #148 item 2: every failed prompt is DIAGNOSABLE on the run's
+        // own records. The adapter's detail carries what actually happened —
+        // the exact Herdr argv, the raw stdout, the raw stderr, the exit
+        // status and the resolved pane/agent — and the apply path records ONE
+        // message, so dropping the detail here is what left the #147 run with
+        // a bare `adapter.exit` and the operator with nothing to act on.
+        let message = match (result.message.clone(), result.detail.clone()) {
+            (Some(message), Some(detail)) if !detail.is_empty() => {
+                Some(format!("{message} | {detail}"))
+            }
+            (Some(message), _) => Some(message),
+            (None, detail) => detail,
+        };
         return EffectOutcome {
             status: result.status,
             code: result.code.map(str::to_string),
-            message: result.message.clone().or_else(|| result.detail.clone()),
+            message,
             result: null(),
         };
     }

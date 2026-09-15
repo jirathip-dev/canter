@@ -123,6 +123,11 @@ can run with **no harness credentials** (AC7).
   documented pane row — issue #139),
   `refusal.request.malformed`, `refusal.session.unbound` (a harness step
   addressed the run's bound session but the run bound none; issue #92 F2),
+  `refusal.prompt.undelivered` (the pane substrate's prompt did not reach the
+  addressed agent inside its bounded delivery window; the refusal names the
+  agent, the pane and the read-back it judged, and carries the failed
+  `herdr agent prompt` row's exact argv, raw stdout, raw stderr and exit
+  status — issue #148),
   `adapter.timeout` (deadline exceeded, and the child's process group is
   verified empty by the bounded reaping loop — a best-effort
   `kill -9 -<pgid>` helper attempt first, then the group's live members
@@ -155,6 +160,36 @@ can run with **no harness credentials** (AC7).
     process exit, and an interruption records `outcome: "interrupted"`
     distinctly from a settled terminal state. A kind with no documented Herdr
     kind (Jcode, `argv`) refuses `refusal.execution.unsupported`;
+  - **Prompt delivery is VERIFIED or refused (issue #148)**: a pane-substrate
+    prompt reports success only when the agent's OWN read-back proves BOTH
+    halves of a delivery (issue #148 round 1):
+    (1) the task text arrived — `agent read` transcript, whitespace-normalized
+    — and (2) the agent TOOK the submission — its lifecycle moved past the
+    pre-submission read-back (the reported `agent_status` changed, or the
+    substrate's own `state_change_seq` counter advanced). Text alone is not a
+    proof: the pane's scrollback can display the task text without the agent
+    ever receiving it (measured on the #148 pane, whose launch command line
+    embedded the task text while the agent sat idle at its TUI placeholder),
+    and a lifecycle move alone would not name the task. The outcome carries
+    `delivered`, `verified: "agent-lifecycle-and-transcript"`, the settled
+    `state`, `state_before`, both `state_change_seq_*` values, the transcript
+    and the attempt count; the row's exit status is never the delivery
+    verdict, so a submission the CLI accepted but the agent never received can
+    no longer be recorded as work in flight. The
+    delivery runs inside a BOUNDED window (the prompt's own bound, capped by
+    the step's `deadline_secs`): a not-yet-promptable agent is waited for
+    through the substrate's own readiness signal, and the CLI's closed
+    transient wait codes (`agent_prompt_stalled`, `agent_not_found`,
+    `timeout`) are retried with back-off inside that window (its read-back
+    poll is the CLI's own documented 5 s acceptance window plus margin, so an
+    accepted submission is observed instead of being re-submitted). A prompt
+    that never arrives refuses `refusal.prompt.undelivered` naming the agent,
+    the pane and both read-backs, with the failed row's exact argv, raw
+    stdout, raw stderr and exit status; the run is then classified from that
+    recorded refusal instead of waiting for workers that are not running.
+    Every row is still run through the Herdr CLI only: an unavailable
+    substrate refuses `refusal.unavailable.herdr` and there is **no**
+    bare-subprocess fallback;
   - `headless`: the pre-#139 bare-subprocess row, kept ONLY as a documented
     fallback an operator selects explicitly on the reviewed step. It is never
     selected silently.
