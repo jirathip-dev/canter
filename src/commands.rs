@@ -15,6 +15,7 @@
 
 use std::path::PathBuf;
 
+use crate::adapters::ExecutionMode;
 use crate::canonical::canonical_bytes;
 use crate::client::{self, RpcError};
 use crate::config::{
@@ -66,7 +67,7 @@ USAGE:
     canter lane status (--replacement RP_ID | --lane ID --generation N) [--socket PATH] [--config PATH] [--json]
     canter queue submit --request FILE --confirm-digest HEX64 [--epoch N] [--grant REF=GRANT_ID]... [--resume INSTANCE=DIGEST]... [--host-available yes|no|unknown] [--harness-lanes N|unknown] [--supervise arm|off] [--topology FILE] [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter queue status --submission QS_ID [--socket PATH] [--config PATH] [--json]
-    canter queue preview --repository KEY --harness KEY --host HOST --issue N=HEX40... --caps G/R/H [--host-available yes|no|unknown] [--harness-lanes N|unknown] [--boundary-phase PHASE] [--integration-branch B] [--completion-branch B] [--out FILE] [--socket PATH] [--config PATH] [--json]
+    canter queue preview --repository KEY --harness KEY --host HOST --issue N=HEX40... --caps G/R/H [--host-available yes|no|unknown] [--harness-lanes N|unknown] [--boundary-phase PHASE] [--integration-branch B] [--completion-branch B] [--execution herdr|headless] [--out FILE] [--socket PATH] [--config PATH] [--json]
     canter run pause --run RUN_ID --reason TEXT [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run resume --run RUN_ID --digest HEX64 [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run retry --run RUN_ID --step STEP [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
@@ -411,6 +412,12 @@ pub struct QueuePreviewArgs {
     /// `--out PATH`: write the bound-input document (the exact
     /// `--request`/`--plan` material) to this path.
     pub out: Option<PathBuf>,
+    /// `--execution herdr|headless`: the execution substrate every authored
+    /// harness step declares (issue #139). `herdr` (the default) runs the
+    /// role inside a Herdr pane in the run's lane worktree; `headless` is the
+    /// documented bare-subprocess fallback and is only ever selected here,
+    /// explicitly.
+    pub execution: ExecutionMode,
     /// Explicit daemon socket override (path derivation only).
     pub socket: Option<String>,
 }
@@ -2050,6 +2057,10 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
     let mut integration_branch: Option<String> = None;
     let mut completion_branch: Option<String> = None;
     let mut out: Option<PathBuf> = None;
+    // Issue #139: the reviewed execution substrate of the authored spine.
+    // `herdr` is the default (the product substrate); `headless` must be
+    // selected explicitly here.
+    let mut execution: Option<ExecutionMode> = None;
     let mut index = 0;
     while index < rest.len() {
         match rest[index].as_str() {
@@ -2203,6 +2214,17 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
                 }
                 out = Some(PathBuf::from(raw));
             }
+            "--execution" => {
+                let raw = flag_value(&rest, &mut index, "queue", "--execution")?;
+                let parsed = ExecutionMode::parse(&raw).ok_or_else(|| {
+                    ParseError::Usage(format!(
+                        "queue preview: --execution takes herdr|headless, got {raw:?} (the \
+                         substrate is never defaulted; `herdr` is the product substrate and \
+                         `headless` is the documented bare-subprocess fallback)"
+                    ))
+                })?;
+                execution = Some(parsed);
+            }
             "-h" | "--help" => return Err(ParseError::Help(help_request("queue"))),
             flag => {
                 return Err(ParseError::Usage(format!(
@@ -2221,7 +2243,8 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
         || boundary_phase.is_some()
         || integration_branch.is_some()
         || completion_branch.is_some()
-        || out.is_some();
+        || out.is_some()
+        || execution.is_some();
     let queue_action = if command == "queue submit" {
         if submission.is_some() {
             return Err(ParseError::Usage(
@@ -2338,6 +2361,7 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
             integration_branch,
             completion_branch,
             out,
+            execution: execution.unwrap_or(ExecutionMode::HerdrPane),
             socket,
         })
     } else {
@@ -4945,7 +4969,13 @@ fn execute_queue_preview(args: &QueuePreviewArgs, invocation: &Invocation) -> Cm
         .unwrap_or_else(|| "merge".to_string());
     // The declared executable spine: the doctrine spine bound to the
     // reviewed run, with every step resolved.
-    let steps = queue_run_steps(&repository.identity(), &integration, &args.harness, &issues);
+    let steps = queue_run_steps(
+        &repository.identity(),
+        &integration,
+        &args.harness,
+        &issues,
+        args.execution,
+    );
     if steps.len() > crate::queue_preview::STEPS_MAX {
         return error_result(
             2,
@@ -5722,7 +5752,8 @@ USAGE:
     canter queue preview --repository KEY --harness KEY --host HOST \
 --issue N=HEX40... --caps G/R/H [--host-available yes|no|unknown] \
 [--harness-lanes N|unknown] [--boundary-phase PHASE] \
-[--integration-branch B] [--completion-branch B] [--out FILE] \
+[--integration-branch B] [--completion-branch B] \
+[--execution herdr|headless] [--out FILE] \
 [--socket PATH] [--config PATH] [--json]
     canter queue submit --request FILE --confirm-digest HEX64 [--epoch N] \
 [--grant REF=GRANT_ID]... [--resume INSTANCE=DIGEST]... \
@@ -5736,7 +5767,11 @@ preview service and produces its bound-input document: the repository
 identity, branch and the reviewed role configuration come from the config
 (re-observed, never free text), each --issue carries its exact 40-hex spec
 revision, and the declared step spine is the doctrine spine with every step
-resolved. --out writes the exact bound-input document (the material
+resolved. `--execution herdr|headless` (default `herdr`) is bound into every
+authored harness step: `herdr` runs the role inside a Herdr pane created in
+the run's lane worktree, while `headless` is the documented bare-subprocess
+fallback and must be selected explicitly — a Herdr failure never falls back
+to it. --out writes the exact bound-input document (the material
 --request/--plan read); the printed digest is sha256 over that document's
 canonical bytes, i.e. the exact authorization submit binds. It reads the
 recorded state store the daemon writes and never creates one, spawns

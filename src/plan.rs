@@ -196,6 +196,7 @@ pub fn queue_run_steps(
     integration_branch: &str,
     harness_key: &str,
     issues: &[u64],
+    execution: crate::adapters::ExecutionMode,
 ) -> Vec<PlanStep> {
     let mut steps = vec![PlanStep {
         id: "p1".to_string(),
@@ -214,10 +215,18 @@ pub fn queue_run_steps(
             ])),
         });
     }
+    // Issue #139: the authored spine NAMES its execution substrate on every
+    // harness step, so the reviewed plan (and the digest an approval binds)
+    // carries the operator's explicit selection instead of relying on an
+    // implicit default. `herdr` is the product substrate; `headless` is the
+    // documented bare-subprocess fallback the operator must select.
     steps.push(PlanStep {
         id: "p3".to_string(),
         kind: "harness_start".to_string(),
-        params: Some(object(vec![("harness_key", string(harness_key))])),
+        params: Some(object(vec![
+            ("harness_key", string(harness_key)),
+            ("execution", string(execution.name())),
+        ])),
     });
     for number in issues {
         let branch = format!("issue-{number}");
@@ -236,6 +245,7 @@ pub fn queue_run_steps(
                 ("worktree", string(&worktree)),
                 ("branch", string(&branch)),
                 ("requires_delta", bool_(true)),
+                ("execution", string(execution.name())),
             ])),
         });
         steps.push(PlanStep {
@@ -507,7 +517,13 @@ mod tests {
         // Issue #91: the queue-run producer binds this spine into the
         // bound-input document; the preview and the submission refuse an
         // unresolved step, so every emitted step carries its params.
-        let one = queue_run_steps("example-org/widgets", "staging", "lane-1", &[5]);
+        let one = queue_run_steps(
+            "example-org/widgets",
+            "staging",
+            "lane-1",
+            &[5],
+            crate::adapters::ExecutionMode::HerdrPane,
+        );
         assert_eq!(one.len(), 8, "the single-issue spine is the doctrine spine");
         assert!(
             one.iter().all(|step| step.params.is_some()),
@@ -577,7 +593,13 @@ mod tests {
         );
 
         // Deterministic: identical inputs, byte-identical steps.
-        let again = queue_run_steps("example-org/widgets", "staging", "lane-1", &[5]);
+        let again = queue_run_steps(
+            "example-org/widgets",
+            "staging",
+            "lane-1",
+            &[5],
+            crate::adapters::ExecutionMode::HerdrPane,
+        );
         assert_eq!(
             canonical_bytes(&steps_value(&one)),
             canonical_bytes(&steps_value(&again)),
@@ -586,7 +608,13 @@ mod tests {
 
         // Two issues: one issue-scoped step set per issue, unique ids, and
         // not a silent rebinding of the first issue's steps.
-        let two = queue_run_steps("example-org/widgets", "staging", "lane-1", &[5, 6]);
+        let two = queue_run_steps(
+            "example-org/widgets",
+            "staging",
+            "lane-1",
+            &[5, 6],
+            crate::adapters::ExecutionMode::HerdrPane,
+        );
         assert_eq!(two.len(), 14, "two issues carry two issue-scoped sets");
         let mut seen: Vec<&str> = two.iter().map(|step| step.id.as_str()).collect();
         let count = seen.len();
@@ -602,7 +630,13 @@ mod tests {
         // its own declared spine — one derivation, never a second copy: a
         // 64-hex lowercase digest that is a pure function of the declared
         // step labels (id + kind), stable across parameter updates.
-        let spine = queue_run_steps("example-org/widgets", "staging", "lane-1", &[5]);
+        let spine = queue_run_steps(
+            "example-org/widgets",
+            "staging",
+            "lane-1",
+            &[5],
+            crate::adapters::ExecutionMode::HerdrPane,
+        );
         let derived = doctrine_workflow_hash(&spine);
         assert_eq!(derived.len(), 64);
         assert!(
@@ -616,7 +650,8 @@ mod tests {
                 "example-org/widgets",
                 "staging",
                 "lane-1",
-                &[5]
+                &[5],
+                crate::adapters::ExecutionMode::HerdrPane
             )),
             "the derivation is deterministic"
         );
@@ -626,7 +661,8 @@ mod tests {
                 "example-org/widgets",
                 "integration",
                 "lane-1",
-                &[5]
+                &[5],
+                crate::adapters::ExecutionMode::HerdrPane
             )),
             "binding parameters are not part of the workflow hash (labels are)"
         );
@@ -636,7 +672,8 @@ mod tests {
                 "example-org/widgets",
                 "staging",
                 "lane-1",
-                &[6]
+                &[6],
+                crate::adapters::ExecutionMode::HerdrPane
             )),
             "a different declared spine derives a different hash"
         );

@@ -352,6 +352,91 @@ fn produce_plan(fixture: &Fixture, out: &Path) -> (String, String, Val) {
 // 1. The plan producer: `canter queue preview`
 // ---------------------------------------------------------------------------
 
+/// Issue #139: the operator selects the execution substrate explicitly, and
+/// the authored spine carries it on EVERY harness step (so the reviewed plan
+/// — and the digest an approval binds — names the substrate instead of
+/// relying on an implicit default). The default is the Herdr pane.
+#[test]
+fn queue_preview_binds_the_selected_execution_substrate_into_every_harness_step() {
+    let fixture = Fixture::new("preview-substrate");
+    fixture.seed_operator_state();
+    let harness_params = |request: &Val| -> Vec<String> {
+        request
+            .get("steps")
+            .and_then(Val::as_array)
+            .expect("steps")
+            .iter()
+            .filter(|step| {
+                matches!(
+                    step.get("kind").and_then(Val::as_str),
+                    Some("harness_start") | Some("prompt")
+                )
+            })
+            .map(|step| {
+                step.get("params")
+                    .and_then(|params| params.get("execution"))
+                    .and_then(Val::as_str)
+                    .expect("every harness step names its substrate")
+                    .to_string()
+            })
+            .collect()
+    };
+
+    // Default: the Herdr pane substrate, stated explicitly on both steps.
+    let plan_path = fixture.dir.join("default-plan.json");
+    let (_, _, request) = produce_plan(&fixture, &plan_path);
+    assert_eq!(
+        harness_params(&request),
+        vec!["herdr".to_string(), "herdr".to_string()],
+        "the default substrate is the Herdr pane: {}",
+        canter::canonical::canonical_text(&request)
+    );
+
+    // The documented fallback is selectable, and only explicitly.
+    let headless_path = fixture.dir.join("headless-plan.json");
+    let mut owned = preview_invocation(
+        &fixture,
+        "widgets",
+        &[format!("5={REVISION}")],
+        &["--execution", "headless"],
+        &headless_path,
+    );
+    owned.push("--json".to_string());
+    let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let (code, envelope, stderr) = fixture.cli_json(&refs);
+    assert_eq!(code, 0, "{stderr}");
+    let request = envelope
+        .get("data")
+        .and_then(|data| data.get("request"))
+        .expect("bound-input document");
+    assert_eq!(
+        harness_params(request),
+        vec!["headless".to_string(), "headless".to_string()],
+        "the operator's explicit selection is what the plan binds"
+    );
+
+    // An unknown substrate is a usage refusal, never a default.
+    let mut bad = preview_invocation(
+        &fixture,
+        "widgets",
+        &[format!("5={REVISION}")],
+        &["--execution", "ssh"],
+        &fixture.dir.join("bad-plan.json"),
+    );
+    bad.push("--json".to_string());
+    let refs: Vec<&str> = bad.iter().map(String::as_str).collect();
+    let (code, _stdout, stderr) = fixture.cli(&refs);
+    assert_eq!(code, 2, "an unknown substrate is a usage error: {stderr}");
+    assert!(
+        stderr.contains("--execution takes herdr|headless"),
+        "the usage refusal names the closed set: {stderr}"
+    );
+    assert!(
+        !fixture.dir.join("bad-plan.json").exists(),
+        "a refused invocation writes no bound-input document"
+    );
+}
+
 #[test]
 fn queue_preview_produces_the_bound_input_document_the_operator_path_consumes() {
     let fixture = Fixture::new("preview-produces");
@@ -504,6 +589,7 @@ fn queue_preview_derives_the_workflow_hash_when_no_pin_is_configured() {
         "staging",
         HARNESS,
         &[5],
+        canter::adapters::ExecutionMode::HerdrPane,
     ));
     assert_eq!(
         emitted, expected,
