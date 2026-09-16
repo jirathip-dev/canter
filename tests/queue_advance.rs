@@ -1548,10 +1548,11 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// A disposable integration repo plus the run's own lane worktree. The lane
-/// branch sits AT the integration head, so the reviewed base is current and
-/// the branch is provably merged: the merge step is a read-only REHEARSAL
-/// (it never lands) and the cleanup may only delete a verified branch.
+/// A disposable integration repo with a published local origin plus the run's
+/// own lane worktree. The lane branch sits AT the published integration head,
+/// so the reviewed base is current and the branch is provably merged: the
+/// merge step is a read-only REHEARSAL (it never lands) and the cleanup may
+/// only delete a verified branch.
 fn repos_with_lane_branch(fixture: &DaemonFixture) -> String {
     let repo = fixture.dir.join("repo");
     std::fs::create_dir_all(&repo).expect("repo dir");
@@ -1561,6 +1562,13 @@ fn repos_with_lane_branch(fixture: &DaemonFixture) -> String {
     std::fs::write(repo.join("base.txt"), "base\n").expect("base file");
     git(&repo, &["add", "base.txt"]);
     git(&repo, &["commit", "-q", "-m", "fixture base"]);
+    // Merge certification reads the published ref, not just local staging.
+    // Keep that boundary real without contacting a network remote.
+    let origin = fixture.dir.join("origin.git");
+    let origin_path = origin.to_str().expect("origin path");
+    git(&fixture.dir, &["init", "-q", "--bare", origin_path]);
+    git(&repo, &["remote", "add", "origin", origin_path]);
+    git(&repo, &["push", "-q", "origin", "staging"]);
     let head = git(&repo, &["rev-parse", "HEAD"]);
     git(&repo, &["branch", "issue-5"]);
     std::fs::create_dir_all(fixture.dir.join("worktrees")).expect("worktrees root");
