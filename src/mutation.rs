@@ -3495,10 +3495,153 @@ fn effect_hosted_check(ctx: &EffectContext<'_>) -> EffectOutcome {
     }
 }
 
+/// How a lane branch's delivered work was proven to have landed in the
+/// integration ref (issue #132).
+///
+/// The repository's policy here is SQUASH-merge the PR into the integration
+/// branch: the delivered commits are rewritten into a single integration
+/// commit, so a squash-landed branch head is never an ancestor of the
+/// integration ref. An ancestry-only landed proof therefore refuses that
+/// branch forever — which is what kept a run on a squash-policy repository
+/// from ever completing its sanctioned cleanup.
+enum LandedProof {
+    /// The branch head is an ancestor of the integration ref (an ff landing).
+    Ancestor,
+    /// Every path the branch changed relative to its fork point already
+    /// carries the branch's exact content in the integration ref — the same
+    /// content fact the merge rehearsal certifies for the `squash` policy.
+    Content {
+        /// The fork point the content proof compared from.
+        merge_base: String,
+    },
+}
+
+/// Prove `branch_head`'s work landed in the integration ref, or refuse the
+/// unverified deletion with `refusal.cleanup.unmerged`.
+///
+/// The content route keeps the fail-closed boundary intact: the deletion is
+/// refused unless every path the branch changed is byte-identical in the
+/// integration ref (a dropped path, a deletion that did not land, or any
+/// later divergence refuses). Only the *shape* of the landed proof widens;
+/// no deletion happens without a proof.
+fn landed_in_integration(
+    ctx: &EffectContext<'_>,
+    branch: &str,
+    branch_head: &str,
+) -> Result<LandedProof, EffectOutcome> {
+    if run_git(
+        ctx,
+        ctx.integration_repo,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            branch_head,
+            ctx.integration_branch,
+        ],
+    )
+    .is_ok()
+    {
+        return Ok(LandedProof::Ancestor);
+    }
+    let merge_base = match run_git(
+        ctx,
+        ctx.integration_repo,
+        &["merge-base", branch_head, ctx.integration_branch],
+    ) {
+        Ok(out) => out.stdout.trim().to_string(),
+        Err(_) => {
+            return Err(refusal(
+                code::CLEANUP_UNMERGED,
+                format!(
+                    "branch {branch:?} head {branch_head} is not merged into {:?} and shares no fork point with it; cleanup refuses unverified deletion",
+                    ctx.integration_branch
+                ),
+            ));
+        }
+    };
+    let changed = run_git(
+        ctx,
+        ctx.integration_repo,
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "--ignore-submodules=none",
+            "-z",
+            &merge_base,
+            branch_head,
+            "--",
+        ],
+    )?;
+    // NUL records preserve whitespace and avoid Git's C-quoting. Renames
+    // must contribute BOTH endpoints, including the deleted source path.
+    // ProcOut is lossy UTF-8: reject replacement characters (even a literal
+    // U+FFFD) rather than ever reusing a possibly altered path as a proof.
+    let paths: Vec<&str> = changed.stdout.split_terminator('\0').collect();
+    if changed.stdout.contains('\u{fffd}')
+        || (!changed.stdout.is_empty() && !changed.stdout.ends_with('\0'))
+        || paths.iter().any(|path| path.is_empty())
+    {
+        return Err(refusal(
+            code::CLEANUP_UNMERGED,
+            "cleanup cannot compare changed paths losslessly; refusing unverified deletion",
+        ));
+    }
+    if paths.is_empty() {
+        // Independently confirm the empty delta; never turn a missing path
+        // list into a vacuous proof or an unrestricted comparison by accident.
+        run_git(
+            ctx,
+            ctx.integration_repo,
+            &[
+                "diff",
+                "--quiet",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--ignore-submodules=none",
+                &merge_base,
+                branch_head,
+                "--",
+            ],
+        )?;
+        return Ok(LandedProof::Content { merge_base });
+    }
+    let mut args: Vec<&str> = vec![
+        "--literal-pathspecs",
+        "diff",
+        "--name-only",
+        "--no-renames",
+        "--ignore-submodules=none",
+        "-z",
+        branch_head,
+        ctx.integration_branch,
+        "--",
+    ];
+    args.extend(paths.iter().copied());
+    let differing = run_git(ctx, ctx.integration_repo, &args)?;
+    let missing: Vec<&str> = differing.stdout.split_terminator('\0').collect();
+    if !missing.is_empty() {
+        // The refusal names the real cause (issue #132): the branch is not
+        // ancestry-merged AND its changed content has not landed either.
+        return Err(refusal(
+            code::CLEANUP_UNMERGED,
+            format!(
+                "branch {branch:?} head {branch_head} is not merged into {:?} and {} of the {} path(s) it changed relative to {merge_base} are not content-identical there (first {missing:?}); cleanup refuses unverified deletion",
+                ctx.integration_branch,
+                missing.len(),
+                paths.len(),
+            ),
+        ));
+    }
+    Ok(LandedProof::Content { merge_base })
+}
+
 /// `cleanup`: deterministic lane cleanup. Refuses dirty worktrees,
 /// uncontained paths, unknown targets, and unverified (unmerged) branches
 /// (AC8). The daemon journals the salvage evidence (`mutate.salvage`)
-/// before invoking this effect.
+/// before invoking this effect. The landed proof is ancestry or — for a
+/// policy SQUASH landing, which is never an ancestor — content-equivalence
+/// (issue #132).
 fn effect_cleanup(ctx: &EffectContext<'_>) -> EffectOutcome {
     let inputs = match cleanup_inputs(ctx.params, &ctx.param_contract()) {
         Ok(inputs) => inputs,
@@ -3590,31 +3733,17 @@ fn effect_cleanup(ctx: &EffectContext<'_>) -> EffectOutcome {
             ),
         );
     }
-    // Refuse unverified (unmerged) branches.
+    // Refuse unverified (unmerged) branches: ancestry, or — under the
+    // repository's squash policy — the delivered content proven identical in
+    // the integration ref (issue #132).
     let branch_head = match run_git(ctx, &worktree, &["rev-parse", "--verify", "HEAD"]) {
         Ok(out) => out.stdout.trim().to_string(),
         Err(outcome) => return outcome,
     };
-    let merged = run_git(
-        ctx,
-        ctx.integration_repo,
-        &[
-            "merge-base",
-            "--is-ancestor",
-            &branch_head,
-            ctx.integration_branch,
-        ],
-    )
-    .is_ok();
-    if !merged {
-        return refusal(
-            code::CLEANUP_UNMERGED,
-            format!(
-                "branch {branch:?} head is not merged into {:?}; cleanup refuses unverified deletion",
-                ctx.integration_branch
-            ),
-        );
-    }
+    let landed = match landed_in_integration(ctx, &branch, &branch_head) {
+        Ok(landed) => landed,
+        Err(outcome) => return outcome,
+    };
     let integration_head = match run_git(
         ctx,
         ctx.integration_repo,
@@ -3624,13 +3753,21 @@ fn effect_cleanup(ctx: &EffectContext<'_>) -> EffectOutcome {
         Err(outcome) => return outcome,
     };
     // The salvage document the daemon journals BEFORE the deletion.
-    let salvage = object(vec![
+    let mut salvage_pairs = vec![
         ("worktree", string(&worktree.to_string_lossy())),
         ("branch", string(&branch)),
         ("head", string(&branch_head)),
         ("merged_into", string(ctx.integration_branch)),
         ("integration_head", string(&integration_head)),
-    ]);
+    ];
+    match &landed {
+        LandedProof::Ancestor => salvage_pairs.push(("landed_by", string("ancestor"))),
+        LandedProof::Content { merge_base } => {
+            salvage_pairs.push(("landed_by", string("content")));
+            salvage_pairs.push(("merge_base", string(merge_base)));
+        }
+    }
+    let salvage = object(salvage_pairs);
     // p8 retires the owned workspace BEFORE deleting its checkout. Headless
     // plans have no pane; never probe or close unrelated fleet workspaces.
     let pane_start = ctx
@@ -3669,7 +3806,14 @@ fn effect_cleanup(ctx: &EffectContext<'_>) -> EffectOutcome {
         Ok(_) => {}
         Err(outcome) => return outcome,
     }
-    match run_git(ctx, ctx.integration_repo, &["branch", "-d", &branch]) {
+    // A squash landing is not an ancestor, so git's own merged check cannot
+    // pass for it; there the effect already proved the landing above and
+    // deletes with `-D`. The ancestor route keeps git's own `-d` safety.
+    let delete_arg = match landed {
+        LandedProof::Ancestor => "-d",
+        LandedProof::Content { .. } => "-D",
+    };
+    match run_git(ctx, ctx.integration_repo, &["branch", delete_arg, &branch]) {
         Ok(_) => {}
         Err(outcome) => return outcome,
     }

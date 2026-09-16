@@ -821,6 +821,26 @@ release process activates (docs/RELEASING.md), then semver applies.
   their own outcomes untouched. Regression witnesses cover both routes in
   `tests/mutation_engine.rs`.
 
+### Fixed (issues #132, #172 — fail-closed squash-landed cleanup)
+
+- The spine's `cleanup` accepts ancestry or content-equivalence against the
+  local integration ref, allowing complete squash landings. The content
+  proof uses NUL-delimited paths, disables rename detection to retain both
+  endpoints, and compares literal pathspecs. Non-ASCII names no longer turn
+  into unmatched quoted paths; glob/pathspec syntax is never interpreted.
+- Partial landings (any changed path absent, modified, or still present
+  after the lane deleted it, including a rename source) refuse
+  `refusal.cleanup.unmerged`. Malformed path records and replacement
+  characters also refuse: the text adapter cannot safely compare non-UTF-8
+  paths, even when landed. An empty path list requires an independent empty
+  delta check; Git failures/timeouts do not authorize deletion.
+- Salvage records identify `landed_by: ancestor | content`, with `merge_base`
+  for content. Only proven content uses branch deletion `-D`; ancestry uses
+  `-d`. This is not a published-remote/forge-merge proof, and standalone
+  `branch_delete` still requires ancestry. Real-daemon regressions in
+  `tests/mutation_engine.rs` check refusal plus surviving branches, complete
+  landings with unrelated integration work, and the ancestor proof label.
+
 ### Changed
 
 - Documentation polish (issue #12, PR #13): security recipe doc line fix
