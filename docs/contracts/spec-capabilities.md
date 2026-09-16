@@ -146,20 +146,39 @@ can run with **no harness credentials** (AC7).
     through the Herdr CLI ([awaiting-evidence] for the interactive rows until
     the human-gated clean-host smoke, like the workspace rows above; fakes pin
     the exact argv shape in `tests/herdr_pane_execution.rs`):
-    `workspace create --cwd <lane worktree> --label <session> --no-focus`
-    (reuse is READ BACK through `workspace list` + `pane list`, never
-    assumed), `agent start <session> --kind <kind> --pane <pane> [-- <role
-    args>]` (the profile-authoritative binding rides on the start row, as on
+    `worktree open --cwd <repo root> --path <lane worktree> --label <label>
+    --no-focus` (issue #154: linked identity is present at creation and read
+    back through `workspace list` + `pane list`, never inferred from a label),
+    `agent start <agent name> --kind <kind> --pane <pane> [-- <role args>]` (the profile-authoritative binding rides on the start row, as on
     the headless rows), `pane report-metadata … --token canter_lane=<session>
     --token canter_generation=<n>` (the lane↔pane/agent binding),
-    `agent prompt <session> <payload> --wait`, `agent get`/`agent read`
-    (state + delivery evidence), and `agent send-keys <session> ctrl+c`
+    `agent prompt <agent name> <payload> --wait`, `agent get`/`agent read`
+    (state + delivery evidence), and `agent send-keys <agent name> ctrl+c`
     (interruption). The recorded step outcome names the substrate, the pane
     and the agent, and the settled Herdr state (`harness_state`) — the
     terminal outcome is collected through Herdr, never inferred from a
     process exit, and an interruption records `outcome: "interrupted"`
     distinctly from a settled terminal state. A kind with no documented Herdr
     kind (Jcode, `argv`) refuses `refusal.execution.unsupported`;
+  - **Lane registration (issue #154)**: the reviewed issue plus
+    `lane_role` (`implementer` by default, or `reviewer`) and positive
+    `lane_round` (default `1`) derive names: `impl-154` / `154-impl`,
+    `rev-152-r1` / `152-rev1`. The run hash is INTERNAL metadata only.
+    A retry/fix round of the same lane retains its original workspace and
+    agent names. Another lane holding the name or checkout refuses
+    `refusal.lane.name_collision`; no suffix, rename or adoption is allowed.
+    Git resolves the actual repository root, including an isolated clone's
+    own named repo group; no checkout is moved or sandbox boundary changed.
+    Herdr can create a repository-root workspace for a new group as well as
+    the linked lane workspace. Existing repository groups are not retired by
+    lane cleanup. The verified `workspace`, `workspace_label`, `agent`,
+    `pane` and `worktree_identity` are saved in both the step response and
+    the durable start outcome. Operations resolve the public name from the
+    lane token and recheck generation/cwd before delivery. Failed starts
+    roll back only their newly allocated lane workspace; failures to confirm
+    rollback are reported, not hidden. p8 closes the owned, inactive lane
+    workspace before removing its clean, merged checkout; dirty, active,
+    foreign or superseded lanes are preserved.
   - **Prompt delivery is VERIFIED or refused (issue #148)**: a pane-substrate
     prompt reports success only when the agent's OWN read-back proves BOTH
     halves of a delivery (issue #148 round 1):

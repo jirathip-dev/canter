@@ -212,7 +212,7 @@ runs control-plane effects:
   (`harness_start`, `prompt`) may declare `params.execution`, a closed token
   (`herdr` | `headless`):
   - absent ⇒ `herdr`, the product substrate: the role runs inside a Herdr
-    pane created in the run's lane worktree (`workspace create --cwd …`), the
+    pane registered for the run's linked worktree (`worktree open --cwd … --path …`), the
     prompt is delivered through `herdr agent prompt`, and observation/
     interruption/terminal outcome are collected through the `herdr agent`
     rows (see [spec-capabilities.md](spec-capabilities.md), "Execution
@@ -227,6 +227,12 @@ runs control-plane effects:
     plan digest and can never move at effect time;
   - a token outside the closed set refuses `refusal.request.malformed`; it is
     never defaulted.
+  `harness_start` also accepts `lane_role` (`implementer` or `reviewer`,
+  default `implementer`) and a positive integer `lane_round` (default `1`).
+  With the plan's issue number these produce human-readable names; they do
+  not replace the opaque session/generation ownership tokens. The verified
+  workspace id, label and worktree identity accompany the pane and agent in
+  the response AND the durable start outcome (issue #154).
   The recorded step outcome names the substrate (`result.execution`), the
   pane and agent of a pane-substrate bind (`result.pane` / `result.agent`),
   and the settled Herdr state of a pane-substrate prompt

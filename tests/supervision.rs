@@ -3092,46 +3092,56 @@ fn write_fake_herdr(dir: &Path) -> PathBuf {
 const FAKE_HERDR_BODY: &str = r#"#!/bin/sh
 PATH=/usr/bin:/bin
 export PATH
-LOG="herdr-argv.txt"
-STATE="herdr-state"
+LOG="$HOME/herdr-argv.txt"
+STATE="$HOME/herdr-state"
 mkdir -p "$STATE"
 log() { printf '%s\n' "$*" >> "$LOG"; }
 read_state() { [ -f "$STATE/$1" ] && sed -n 1p "$STATE/$1" || printf '%s' "$2"; }
 agent_doc() {
   printf '{"name":"%s","pane_id":"%s","cwd":"%s","agent_status":"%s","tokens":{"canter_lane":"%s","canter_generation":"%s"}}' \
-    "$(read_state lane '')" "$(read_state pane 'w1:p1')" "$(read_state cwd '')" "$(read_state state 'idle')" \
+    "$(read_state name '')" "$(read_state pane 'w1:p1')" "$(read_state cwd '')" "$(read_state state 'idle')" \
     "$(read_state lane '')" "$(read_state generation '')"
 }
+workspace_doc() {
+  printf '{"workspace_id":"w1","label":"%s","worktree":{"repo_root":"%s","checkout_path":"%s","is_linked_worktree":true,"repo_name":"widgets"}}' \
+    "$(read_state label '')" "$(read_state root '')" "$(read_state cwd '')"
+}
 case "$1 $2" in
+  "workspace close")
+    log "$*"
+    rm -f "$STATE/pane" "$STATE/name"
+    printf '{"result":{}}\n'
+    ;;
   "workspace list")
     log "$*"
     if [ -f "$STATE/pane" ]; then
-      printf '{"id":"cli:workspace:list","result":{"workspaces":[{"workspace_id":"w1","label":"%s","cwd":"%s"}],"type":"workspace_list"}}\n' \
-        "$(read_state label '')" "$(read_state cwd '')"
+      printf '{"result":{"workspaces":[%s]}}\n' "$(workspace_doc)"
     else
       printf '{"id":"cli:workspace:list","result":{"workspaces":[],"type":"workspace_list"}}\n'
     fi
     ;;
-  "workspace create")
+  "worktree open")
     log "$*"
     cwd=""; label=""
     shift 2
     while [ $# -gt 0 ]; do
       case "$1" in
-        --cwd) cwd="$2"; shift 2 ;;
+        --cwd) root="$2"; shift 2 ;;
+        --path) cwd="$2"; shift 2 ;;
         --label) label="$2"; shift 2 ;;
         *) shift ;;
       esac
     done
+    printf '%s' "$root" > "$STATE/root"
     printf '%s' "$cwd" > "$STATE/cwd"
     printf '%s' "$label" > "$STATE/label"
     printf 'w1' > "$STATE/workspace"
     printf 'w1:p1' > "$STATE/pane"
-    printf '{"id":"cli:workspace:create","result":{"workspace":{"workspace_id":"w1"},"root_pane":{"pane_id":"w1:p1","cwd":"%s"},"type":"workspace_create"}}\n' "$cwd"
+    printf '{"result":{"workspace":%s,"already_open":false}}\n' "$(workspace_doc)"
     ;;
   "pane list")
     log "$*"
-    printf '{"id":"cli:pane:list","result":{"panes":[{"pane_id":"w1:p1","cwd":"%s"}],"type":"pane_list"}}\n' "$(read_state cwd '')"
+    printf '{"result":{"panes":[{"pane_id":"w1:p1","cwd":"%s","tokens":{"canter_lane":"%s","canter_generation":"%s"}}]}}\n' "$(read_state cwd '')" "$(read_state lane '')" "$(read_state generation '')"
     ;;
   "pane report-metadata")
     log "$*"
@@ -3152,7 +3162,7 @@ case "$1 $2" in
     ;;
   "agent list")
     log "$*"
-    if [ -f "$STATE/pane" ]; then
+    if [ -f "$STATE/name" ]; then
       printf '{"id":"cli:agent:list","result":{"agents":[%s],"type":"agent_list"}}\n' "$(agent_doc)"
     else
       printf '{"id":"cli:agent:list","result":{"agents":[],"type":"agent_list"}}\n'
@@ -3160,7 +3170,7 @@ case "$1 $2" in
     ;;
   "agent start")
     log "$*"
-    printf '%s' "$3" > "$STATE/lane"
+    printf '%s' "$3" > "$STATE/name"
     printf '{"id":"cli:agent:start","result":{"name":"%s","pane_id":"w1:p1"},"type":"agent_start"}\n' "$3"
     ;;
   "agent get")
@@ -3220,6 +3230,14 @@ fn harness_pane_steps(harness_key: &str) -> Vec<qp::PlannedStep> {
                 ("payload", string("do the bounded work")),
             ])),
         },
+        qp::PlannedStep {
+            id: "p8-5".to_string(),
+            kind: "cleanup".to_string(),
+            params: Some(object(vec![
+                ("worktree", string("issues-5")),
+                ("branch", string("issue-5")),
+            ])),
+        },
     ]
 }
 
@@ -3228,12 +3246,24 @@ fn the_supervised_run_starts_its_worker_in_a_herdr_pane_in_the_lane_worktree() {
     let fixture = DaemonFixture::new("pane-substrate");
     let (bound, digest) = {
         let state = fixture.seed();
-        seed_grant(&state, "gr_0000000000000095", 5);
-        let request = qp::QueueRequest {
+        let mut grant = grant_doc_at(
+            "gr_0000000000000095",
+            5,
+            REV_A,
+            state.current_epoch().unwrap(),
+        );
+        if let Val::Obj(fields) = &mut grant
+            && let Some(Val::Arr(caps)) = fields.get_mut("caps")
+        {
+            caps.push(string("cleanup"));
+        }
+        state.issue_grant(&grant).expect("grant includes cleanup");
+        let mut request = qp::QueueRequest {
             steps: harness_pane_steps(HARNESS),
             role_config: harness_binding_doc(),
             ..observation_request(vec![selected("#5", REV_A)])
         };
+        request.boundary.caps.push("cleanup".to_string());
         render_bound(&state, &request)
     };
     let integration = fixture.dir.join("integration");
@@ -3300,52 +3330,67 @@ fn the_supervised_run_starts_its_worker_in_a_herdr_pane_in_the_lane_worktree() {
         "the recorded bind names the Herdr pane: {}",
         canter::canonical::canonical_text(&started)
     );
-    assert_eq!(
-        started.get("agent").and_then(Val::as_str),
-        Some(session.as_str())
-    );
+    assert_eq!(started.get("agent").and_then(Val::as_str), Some("impl-5"));
     assert_eq!(
         started.get("execution").and_then(Val::as_str),
         Some("herdr"),
         "the default substrate is the Herdr pane: {}",
         canter::canonical::canonical_text(&started)
     );
-    let rows = std::fs::read_to_string(lane.join("herdr-argv.txt")).expect("herdr rows");
+    let rows = std::fs::read_to_string(fixture.dir.join("herdr-argv.txt")).expect("herdr rows");
     assert!(
         rows.lines().any(|row| row
             == format!(
-                "workspace create --cwd {} --label {session} --no-focus",
+                "worktree open --cwd {} --path {} --label 5-impl --no-focus",
+                integration.canonicalize().unwrap().display(),
                 lane.display()
             )),
         "the pane is created in the run's lane worktree: {rows}"
     );
     assert!(
         rows.lines().any(|row| row
-            == format!(
-                "agent start {session} --kind hermes --pane w1:p1 -- -p lane-1 --provider \
-                 provider-a -m model-a"
-            )),
+            == "agent start impl-5 --kind hermes --pane w1:p1 -- -p lane-1 --provider \
+                 provider-a -m model-a"),
         "the role starts in that pane with the run's declared binding: {rows}"
     );
     assert_eq!(
-        std::fs::read_to_string(lane.join("herdr-state/cwd")).expect("pane cwd"),
+        std::fs::read_to_string(fixture.dir.join("herdr-state/cwd")).expect("pane cwd"),
         lane.to_string_lossy(),
         "the pane's cwd is the run's lane worktree"
+    );
+
+    assert_eq!(started.get("workspace").and_then(Val::as_str), Some("w1"));
+    assert_eq!(
+        started.get("workspace_label").and_then(Val::as_str),
+        Some("5-impl")
+    );
+    assert_eq!(
+        started.get("session_id").and_then(Val::as_str),
+        Some(session.as_str())
+    );
+    assert_eq!(
+        started
+            .get("worktree_identity")
+            .unwrap()
+            .get("is_linked_worktree")
+            .and_then(Val::as_bool),
+        Some(true)
     );
 
     // The prompt is delivered through the Herdr path (the pane content shows
     // it), the settled state is read back through Herdr, and the bare harness
     // executable was never spawned.
     let prompted = apply(4, "p3", "pane-prompt-0001");
-    let rows = std::fs::read_to_string(lane.join("herdr-argv.txt")).expect("herdr rows");
+    let rows = std::fs::read_to_string(fixture.dir.join("herdr-argv.txt")).expect("herdr rows");
     assert!(
-        rows.lines().any(|row| row.starts_with(&format!(
-            "agent prompt {session} do the bounded work --wait --timeout "
-        ))),
+        rows.lines().any(|row| row.starts_with(
+            "agent prompt impl-5 do the bounded work --wait --timeout "
+        )),
         "the prompt is delivered through the Herdr row: {rows}"
     );
     assert_eq!(
-        std::fs::read_to_string(lane.join("herdr-state/pane_content")).expect("pane content"),
+        std::fs::read_to_string(fixture.dir.join("herdr-state/pane_content"))
+            .expect("pane content"),
         "do the bounded work",
         "the pane content shows the delivered prompt"
     );
@@ -3359,8 +3404,32 @@ fn the_supervised_run_starts_its_worker_in_a_herdr_pane_in_the_lane_worktree() {
         !lane.join("argv.txt").exists(),
         "the pane substrate never spawns the bare harness executable"
     );
+    let cleaned = apply(5, "p8-5", "pane-cleanup-0001");
+    assert_eq!(cleaned.get("removed").and_then(Val::as_bool), Some(true));
+    assert!(!fixture.dir.join("herdr-state/pane").exists());
+    assert!(!lane.exists());
 
     shutdown(daemon);
+    // Reopen durable state after shutdown, not the in-memory apply response.
+    let state = fixture.seed();
+    let claim = state.claim(&idem_key("pane-bind-0001")).unwrap().unwrap();
+    let outcome = Val::parse_json(claim.outcome.as_deref().expect("journal outcome")).unwrap();
+    let recorded = outcome.get("result").expect("journal start identity");
+    for field in [
+        "agent",
+        "pane",
+        "workspace",
+        "workspace_label",
+        "worktree_identity",
+        "session_id",
+        "generation",
+    ] {
+        assert_eq!(
+            recorded.get(field),
+            started.get(field),
+            "journal lost {field}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

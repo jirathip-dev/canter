@@ -1149,7 +1149,7 @@ fn resolve_run_binding(
     kind: &str,
     presented: Option<&crate::config::ProfileBinding>,
 ) -> Result<RunBinding, (String, String)> {
-    if !matches!(kind, "harness_start" | "prompt") {
+    if !matches!(kind, "harness_start" | "prompt" | "cleanup") {
         return Ok(RunBinding {
             role: None,
             session: None,
@@ -1159,6 +1159,27 @@ fn resolve_run_binding(
         Ok(state) => state,
         Err(message) => return Err(("state.unavailable".to_string(), message)),
     };
+    if kind == "cleanup" {
+        let bound = state
+            .run_bound_start_step(instance_id)
+            .map_err(|err| (err.code.to_string(), err.message))?;
+        let session = if bound.is_some() {
+            Some(
+                crate::mutation::run_session_handle(instance_id).map_err(|outcome| {
+                    (
+                        crate::mutation::code::SESSION_UNBOUND.to_string(),
+                        outcome.message.unwrap_or_default(),
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
+        return Ok(RunBinding {
+            role: None,
+            session,
+        });
+    }
     let identity = state
         .run_role_identity(instance_id)
         .map_err(|err| (err.code.to_string(), err.message))?;
@@ -2915,11 +2936,18 @@ fn resolve_apply_effect(
 ) -> String {
     let succeeded = effect.status == "succeeded";
     let (claim_status, response, outcome) = if succeeded {
+        // Keep the read-back identity in BOTH the response and the durable
+        // start outcome, so journal replay never loses the created agent.
+        let journal_result = if action == "mutate.harness_start" {
+            result.clone()
+        } else {
+            null()
+        };
         let response = ok_response(&request.id, result);
         (
             "spent",
             response.clone(),
-            apply_outcome(plan_id, step_id, key, "succeeded", null(), None),
+            apply_outcome(plan_id, step_id, key, "succeeded", journal_result, None),
         )
     } else {
         let code = effect

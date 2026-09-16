@@ -11,8 +11,8 @@
 //! per-op deadline, capped + redacted output, typed exits. Prompts and
 //! untrusted issue text are transported as data — a single final argv
 //! element on the prompt operation — and can never alter adapter argv or
-//! policy. Adapters never write files, never read the host environment
-//! directly (the caller passes an allowlisted environment map), and never
+//! policy. Pane registration locks a file in Git metadata; adapters never
+//! read the host environment directly (the caller passes an allowlisted map), and never
 //! store tokens or transcripts (trust model T5 / AC8).
 //!
 //! - Hermes / Claude Code / Codex / Pi / Jcode are the five official 1.0
@@ -73,6 +73,9 @@ use crate::process::{ProcOut, ProcSpec, ProcStatus, run};
 use crate::redact::redact;
 use crate::schema::{Family, validate_doc};
 use crate::value::{Val, bool_, integer, null, object, string};
+
+mod herdr_lane;
+pub use herdr_lane::{LaneNames, close_lane_workspace};
 
 /// Closed `harness` axis capability set (`hf-capability/v1`, mirror of
 /// schema.rs and the fixture probe).
@@ -161,6 +164,8 @@ pub const CODE_EXECUTION_UNSUPPORTED: &str = "refusal.execution.unsupported";
 /// outcome of "nothing was delivered" — never a wait for workers that are
 /// not running and never a silent success.
 pub const CODE_PROMPT_UNDELIVERED: &str = "refusal.prompt.undelivered";
+/// A display name or checkout is already owned by another lane.
+pub const CODE_NAME_COLLISION: &str = "refusal.lane.name_collision";
 
 /// A typed adapter error shaped like `hf-error/v1` (spec-cli.md §3).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -617,6 +622,8 @@ pub struct Profile {
     /// reviewed step (`params.execution`). Headless is only ever selected
     /// explicitly; nothing falls back to it.
     pub execution: ExecutionMode,
+    /// Human names for pane creation, derived from the reviewed issue/role/round.
+    pub lane_names: Option<LaneNames>,
 }
 
 impl Profile {
@@ -637,6 +644,7 @@ impl Profile {
             model: None,
             op_args: BTreeMap::new(),
             execution: ExecutionMode::default(),
+            lane_names: None,
         })
     }
 
@@ -708,6 +716,7 @@ impl Profile {
             model: None,
             op_args,
             execution: ExecutionMode::default(),
+            lane_names: None,
         })
     }
 
@@ -757,6 +766,7 @@ impl Profile {
             model: None,
             op_args: BTreeMap::new(),
             execution: ExecutionMode::default(),
+            lane_names: None,
         };
         // The explicit provider/model binding pair (issue #80): carried
         // only when both tokens are declared; a half pair is refused
@@ -1486,21 +1496,6 @@ fn herdr_workspace_list_args() -> Vec<String> {
     vec!["workspace".to_string(), "list".to_string()]
 }
 
-/// `herdr workspace create --cwd <lane worktree> --label <lane> --no-focus`:
-/// the pane is created IN the run's lane worktree, never at a bare cwd, and
-/// the caller's focus is left alone.
-fn herdr_workspace_create_args(worktree: &str, lane: &str) -> Vec<String> {
-    vec![
-        "workspace".to_string(),
-        "create".to_string(),
-        "--cwd".to_string(),
-        worktree.to_string(),
-        "--label".to_string(),
-        lane.to_string(),
-        "--no-focus".to_string(),
-    ]
-}
-
 /// `herdr pane list --workspace <id>` — the pane read-back of one workspace.
 fn herdr_pane_list_args(workspace_id: &str) -> Vec<String> {
     vec![
@@ -1593,7 +1588,7 @@ fn herdr_pane_report_metadata_args(pane: &str, lane: &str, generation: u64) -> V
         "--source".to_string(),
         HERDR_LANE_SOURCE.to_string(),
         "--agent".to_string(),
-        lane.to_string(),
+        "canter".to_string(),
         "--token".to_string(),
         format!("{HERDR_TOKEN_LANE}={lane}"),
         "--token".to_string(),
@@ -1899,7 +1894,7 @@ fn verify_lane_binding(
     let generation = session.identity.generation;
     let binding = LaneBinding::read(doc);
     let mut stale = Vec::new();
-    if binding.agent != lane {
+    if binding.agent.is_empty() || binding.pane.is_empty() {
         stale.push(format!("agent {:?}", binding.agent));
     }
     match binding.lane.as_deref() {
@@ -2170,61 +2165,7 @@ fn herdr_pane_identity(row: &Val) -> Result<String, ProcessFailure> {
     Ok(pane_id)
 }
 
-/// Resolve the pane the lane's workspace already owns, when there is one:
-/// the workspace label is the lane session id and the pane's reported cwd is
-/// the run's lane worktree. A workspace labelled for this lane WITHOUT a pane
-/// in that worktree is a binding mismatch and refuses typed (never a silent
-/// "reuse whatever pane is there").
-fn herdr_lane_pane(
-    lane: &str,
-    worktree: &Path,
-    timeout: Duration,
-    env: &BTreeMap<String, String>,
-    cwd: Option<&Path>,
-) -> Result<Option<String>, ProcessFailure> {
-    let list = herdr_call(&herdr_workspace_list_args(), timeout, env, cwd)?;
-    let workspace = herdr_items(&list, "workspaces")
-        .iter()
-        .find(|workspace| herdr_str(workspace, "label") == lane);
-    let Some(workspace) = workspace else {
-        return Ok(None);
-    };
-    let workspace_id = herdr_str(workspace, "workspace_id");
-    if workspace_id.is_empty() {
-        return Err(ProcessFailure {
-            code: CODE_MALFORMED,
-            message: "a Herdr workspace read-back carries no workspace_id".to_string(),
-            detail: String::new(),
-        });
-    }
-    let panes = herdr_call(&herdr_pane_list_args(&workspace_id), timeout, env, cwd)?;
-    let pane = herdr_items(&panes, "panes")
-        .iter()
-        .find(|pane| same_worktree(&herdr_str(pane, "cwd"), worktree));
-    match pane {
-        Some(pane) => Ok(Some(herdr_pane_identity(pane)?)),
-        // The lane's label is already taken by a workspace whose panes are NOT
-        // in this run's lane worktree: the identity was reused by another
-        // generation, another lane or another worktree. Fail closed instead of
-        // creating a second workspace under the same label or reusing a pane
-        // that belongs elsewhere.
-        None => Err(ProcessFailure {
-            code: CODE_STALE_GENERATION,
-            message: format!(
-                "the Herdr workspace labelled {lane:?} carries no pane in the run's lane worktree \
-                 {}: the lane↔pane identity was reused elsewhere, so the bind refuses rather than \
-                 creating a duplicate workspace or reusing another lane's pane",
-                worktree.display()
-            ),
-            detail: diagnostics(&format!("workspace {workspace_id}")),
-        }),
-    }
-}
-
-/// Start — or REUSE — the lane's role agent inside a Herdr pane created in
-/// the run's lane worktree (issue #139). The lane binding is recorded in the
-/// substrate and read back before the op reports success, so a run never
-/// records a pane/agent it did not verify.
+/// Start through the worktree registration path; outcome identity is read back.
 fn herdr_start(
     profile: &Profile,
     request: &OpRequest<'_>,
@@ -2232,200 +2173,65 @@ fn herdr_start(
     env: &BTreeMap<String, String>,
     started: std::time::Instant,
 ) -> OpResult {
-    let Some(agent_kind) = herdr_agent_kind(profile.kind) else {
-        return op_result(
+    if herdr_agent_kind(profile.kind).is_none() {
+        return herdr_failure(
             profile,
             request,
-            "refused",
-            Some(CODE_EXECUTION_UNSUPPORTED),
-            Some(format!(
-                "adapter kind {:?} has no documented Herdr pane row; declare \
-                 params.execution = \"headless\" to run the bare-subprocess fallback explicitly",
-                profile.kind.name()
-            )),
-            None,
-            None,
+            ProcessFailure {
+                code: CODE_EXECUTION_UNSUPPORTED,
+                message: "no documented Herdr pane row; select headless explicitly".to_string(),
+                detail: String::new(),
+            },
             started,
         );
-    };
+    }
     let Some(worktree) = worktree else {
-        return op_result(
+        return herdr_failure(
             profile,
             request,
-            "refused",
-            Some(CODE_BAD_REQUEST),
-            Some(
-                "the Herdr pane substrate creates the pane in the run's lane worktree and this \
-                 step bound none; declare params.execution = \"headless\" to run the \
-                 bare-subprocess fallback explicitly"
-                    .to_string(),
-            ),
-            None,
-            None,
+            ProcessFailure {
+                code: CODE_BAD_REQUEST,
+                message: "Herdr pane start requires the run's linked lane worktree".to_string(),
+                detail: String::new(),
+            },
             started,
         );
     };
-    let worktree_text = worktree.to_string_lossy().to_string();
-    let lane = request.session.session_id.clone();
-    let role_args = match herdr_role_args(profile) {
-        Ok(args) => args,
-        Err(err) => {
-            return op_result(
-                profile,
-                request,
-                "refused",
-                Some(err.code),
-                Some(err.message),
-                None,
-                None,
-                started,
-            );
-        }
-    };
-    let timeout = request.timeout;
-    // Reuse probe: an agent already registered under this lane name is
-    // REUSED only when its binding verifies (lane + generation + worktree).
-    match herdr_call(&herdr_agent_list_args(), timeout, env, Some(worktree)) {
-        Ok(list) => {
-            let existing = herdr_items(&list, "agents")
-                .iter()
-                .find(|agent| herdr_str(agent, "name") == lane);
-            if let Some(existing) = existing {
-                return match verify_lane_binding(existing, request.session, Some(worktree)) {
-                    Ok(binding) => op_result(
-                        profile,
-                        request,
-                        "succeeded",
-                        None,
-                        None,
-                        Some(lane_start_payload(
-                            profile,
-                            request,
-                            &binding,
-                            &worktree_text,
-                            true,
-                        )),
-                        None,
-                        started,
-                    ),
-                    Err(err) => op_result(
-                        profile,
-                        request,
-                        err.status(),
-                        Some(err.code),
-                        Some(err.message),
-                        None,
-                        Some(err.detail),
-                        started,
-                    ),
-                };
-            }
-        }
-        Err(err) => {
-            return herdr_failure(profile, request, err, started);
-        }
-    }
-    // Create (or reuse) the lane's workspace and pane IN the lane worktree.
-    let pane = match herdr_lane_pane(&lane, worktree, timeout, env, Some(worktree)) {
-        Ok(Some(pane)) => pane,
-        Ok(None) => {
-            let created = match herdr_call(
-                &herdr_workspace_create_args(&worktree_text, &lane),
-                timeout,
-                env,
-                Some(worktree),
-            ) {
-                Ok(doc) => doc,
-                Err(err) => {
-                    return herdr_failure(profile, request, err, started);
-                }
-            };
-            let root = created.get("root_pane").cloned().unwrap_or_else(null);
-            let pane = herdr_str(&root, "pane_id");
-            if pane.is_empty() {
-                return op_result(
-                    profile,
-                    request,
-                    "refused",
-                    Some(CODE_MALFORMED),
-                    Some("a Herdr workspace create read-back carries no root pane".to_string()),
-                    None,
-                    Some(diagnostics(&String::from_utf8_lossy(
-                        &crate::canonical::canonical_bytes(&created),
-                    ))),
-                    started,
-                );
-            }
-            let reported = herdr_str(&root, "cwd");
-            if !reported.is_empty() && !same_worktree(&reported, worktree) {
-                return op_result(
-                    profile,
-                    request,
-                    "refused",
-                    Some(CODE_STALE_GENERATION),
-                    Some(format!(
-                        "the Herdr pane {} was created in {reported:?}, not in the run's lane \
-                         worktree {worktree_text:?}",
-                        pane
-                    )),
-                    None,
-                    None,
-                    started,
-                );
-            }
-            pane
-        }
-        Err(err) => {
-            return herdr_failure(profile, request, err, started);
-        }
-    };
-    // Start the role agent in the pane, then RECORD the lane binding (session
-    // identity + generation) so every later operation can verify it. Both are
-    // EFFECT rows: `agent start` prints an `agent_started` document nobody
-    // reads, and `pane report-metadata` prints none at all (issue #144), so
-    // their contract is the exit status, never a parsed document.
-    for row in [
-        herdr_agent_start_args(&lane, agent_kind, &pane, &role_args),
-        herdr_pane_report_metadata_args(&pane, &lane, request.session.identity.generation),
-    ] {
-        if let Err(err) = herdr_call_effect(&row, timeout, env, Some(worktree)) {
-            return herdr_failure(profile, request, err, started);
-        }
-    }
-    // The state/identity read-back is the `agent_info` envelope's own row.
-    let read_back = match herdr_agent_get_row(&lane, timeout, env, Some(worktree)) {
-        Ok(doc) => doc,
-        Err(err) => {
-            return herdr_failure(profile, request, err, started);
-        }
-    };
-    match verify_lane_binding(&read_back, request.session, Some(worktree)) {
-        Ok(binding) => op_result(
-            profile,
-            request,
-            "succeeded",
-            None,
-            None,
-            Some(lane_start_payload(
+    match herdr_lane::start_with_env(profile, request, worktree, env) {
+        Ok((binding, workspace, reused)) => {
+            let mut payload = lane_start_payload(
                 profile,
                 request,
                 &binding,
-                &worktree_text,
-                false,
-            )),
-            None,
-            started,
-        ),
-        Err(err) => op_result(
-            profile,
-            request,
-            err.status(),
-            Some(err.code),
-            Some(err.message),
-            None,
-            Some(err.detail),
-            started,
-        ),
+                &worktree.to_string_lossy(),
+                reused,
+            );
+            if let Val::Obj(fields) = &mut payload {
+                fields.insert(
+                    "workspace".to_string(),
+                    string(&herdr_str(&workspace, "workspace_id")),
+                );
+                fields.insert(
+                    "workspace_label".to_string(),
+                    string(&herdr_str(&workspace, "label")),
+                );
+                fields.insert(
+                    "worktree_identity".to_string(),
+                    workspace.get("worktree").cloned().unwrap_or_else(null),
+                );
+            }
+            op_result(
+                profile,
+                request,
+                "succeeded",
+                None,
+                None,
+                Some(payload),
+                None,
+                started,
+            )
+        }
+        Err(err) => herdr_failure(profile, request, err, started),
     }
 }
 
@@ -2495,8 +2301,11 @@ fn herdr_prompt(
             started,
         );
     }
-    let lane = request.session.session_id.clone();
     let timeout = request.timeout;
+    let lane = match herdr_lane::agent_name(request.session, timeout, env, worktree) {
+        Ok(name) => name,
+        Err(err) => return herdr_failure(profile, request, err, started),
+    };
     // The bounded DELIVERY window: the prompt's own bound, capped by the
     // operation's deadline (a real prompt effect's deadline is a whole
     // worker turn, and waiting out a turn is not what proves a delivery).
@@ -2812,8 +2621,11 @@ fn herdr_agent_op(
             started,
         );
     }
-    let lane = request.session.session_id.clone();
     let timeout = request.timeout;
+    let lane = match herdr_lane::agent_name(request.session, timeout, env, worktree) {
+        Ok(name) => name,
+        Err(err) => return herdr_failure(profile, request, err, started),
+    };
     let read = match herdr_agent_get_row(&lane, timeout, env, worktree) {
         Ok(doc) => doc,
         Err(err) => {

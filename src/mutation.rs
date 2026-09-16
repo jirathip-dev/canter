@@ -2497,10 +2497,27 @@ fn effect_harness_start(ctx: &EffectContext<'_>) -> EffectOutcome {
     };
     // The start operation validates the capability set; a declared
     // declarative start row runs as the real session bind.
-    let profile = match harness_profile(ctx, params) {
+    let mut profile = match harness_profile(ctx, params) {
         Ok(profile) => profile,
         Err(outcome) => return outcome,
     };
+    if profile.execution == crate::adapters::ExecutionMode::HerdrPane {
+        let role = match params.get("lane_role") {
+            None => "implementer",
+            Some(Val::Str(role)) => role.as_str(),
+            Some(_) => return refusal(code::BAD_PARAMS, "lane_role must be implementer|reviewer"),
+        };
+        let round = match params.get("lane_round") {
+            None => 1,
+            Some(Val::Int(round)) if *round > 0 => *round as u64,
+            Some(_) => return refusal(code::BAD_PARAMS, "lane_round must be a positive integer"),
+        };
+        profile.lane_names =
+            match crate::adapters::LaneNames::new(ctx.plan.issue_number as u64, role, round) {
+                Ok(names) => Some(names),
+                Err(err) => return refusal(err.code, err.message),
+            };
+    }
     let deadline = match effect_deadline_secs(ctx.kind, ctx.params) {
         Ok(secs) => secs,
         Err(outcome) => return outcome,
@@ -2543,7 +2560,14 @@ fn effect_harness_start(ctx: &EffectContext<'_>) -> EffectOutcome {
         _ => unreachable!("the session binding result is an object"),
     };
     fields.insert("execution".to_string(), string(profile.execution.name()));
-    for key in ["pane", "agent", "reused"] {
+    for key in [
+        "pane",
+        "agent",
+        "workspace",
+        "workspace_label",
+        "worktree_identity",
+        "reused",
+    ] {
         fields.insert(
             key.to_string(),
             result
@@ -3428,6 +3452,35 @@ fn effect_cleanup(ctx: &EffectContext<'_>) -> EffectOutcome {
         ("merged_into", string(ctx.integration_branch)),
         ("integration_head", string(&integration_head)),
     ]);
+    // p8 retires the owned workspace BEFORE deleting its checkout. Headless
+    // plans have no pane; never probe or close unrelated fleet workspaces.
+    let pane_start = ctx
+        .plan
+        .doc
+        .get("steps")
+        .and_then(Val::as_array)
+        .and_then(|steps| {
+            steps
+                .iter()
+                .find(|step| step.get("kind").and_then(Val::as_str) == Some("harness_start"))
+        });
+    if let Some(start) = pane_start
+        && declared_execution(start.get("params"))
+            .is_ok_and(|mode| mode == crate::adapters::ExecutionMode::HerdrPane)
+    {
+        let session = match resolve_session(ctx, None, "cleanup") {
+            Ok(session) => session,
+            Err(outcome) => return outcome,
+        };
+        if let Err(err) = crate::adapters::close_lane_workspace(
+            &session,
+            &worktree,
+            ctx.env,
+            crate::adapters::ADAPTER_TIMEOUT,
+        ) {
+            return refusal(err.code, err.message);
+        }
+    }
     // Remove the worktree (clean, so no --force) then the local branch.
     match run_git(
         ctx,
