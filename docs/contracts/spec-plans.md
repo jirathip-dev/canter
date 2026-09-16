@@ -61,7 +61,11 @@ Normative rules:
   checkout cannot read at all (absent, unreachable, unauthenticated), which
   keeps the read's git diagnostics in the message — rather than certifying an
   unprovable base. The orchestrator/forge owns the actual policy merge;
-  `post_merge_verify` proves its landed head.
+  `post_merge_verify` proves its landed head. The spine's `cleanup` step
+  asks the same landed question and answers it under the same policy: a lane
+  branch is verified by ancestry, or — for a squash landing, which is never
+  an ancestor — by content-equivalence, so a run can complete on a
+  repository whose policy is squash (issue #132).
 
 ### Canonical serialization and digest
 

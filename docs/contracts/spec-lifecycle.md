@@ -113,6 +113,18 @@ when any applicable admission input is missing, stale, or exceeded:
   and a repeat archive within the same second refuses to overwrite
   (`effect.archive.failed`). Byte-for-byte probes live in
   `tests/mutation_engine.rs`.
+- The deletion's landed proof is ancestry **or**, for a policy squash
+  landing, content-equivalence (issue #132): a squash rewrites the delivered
+  commits, so a squash-landed branch head is never an ancestor of the
+  integration ref. The content route requires every path the branch changed
+  relative to its fork point to be byte-identical in the integration ref
+  (`git diff --name-only <branch> <integration> -- <changed paths>` is
+  empty); a dropped path, an unlanded deletion or any later divergence
+  still refuses `refusal.cleanup.unmerged` with the count of paths that do
+  not match. The salvage record names which proof cleared the deletion
+  (`landed_by`: `ancestor` | `content`, the latter with the `merge_base`
+  compared from). This is what lets a run complete on a repository whose
+  delivery policy is squash-merge.
 
 ## 6. Remote transport contract (AC5/AC6, capability C16)
 

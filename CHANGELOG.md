@@ -821,6 +821,25 @@ release process activates (docs/RELEASING.md), then semver applies.
   their own outcomes untouched. Regression witnesses cover both routes in
   `tests/mutation_engine.rs`.
 
+### Fixed (issue #132 — a run completes on a repository whose policy is squash)
+
+- The built-in spine's `cleanup` step no longer refuses a squash-landed lane
+  forever. Its landed proof now accepts, besides ancestry, the policy-squash
+  content fact the merge rehearsal already certifies: every path the lane
+  branch changed relative to its fork point carries the branch's exact
+  content in the integration ref. A squash rewrites the delivered commits,
+  so the branch head is never an ancestor afterward — the ancestry-only
+  proof is what kept a run on this repository (squash-merge policy) from
+  ever completing its sanctioned `cleanup`. The salvage record names which
+  proof cleared the deletion (`landed_by`: `ancestor` | `content`, the
+  latter with the `merge_base` the content route compared from). An unlanded
+  branch, a dropped path, an unlanded deletion or any later divergence still
+  refuses `refusal.cleanup.unmerged`, now naming the count of paths that are
+  not content-identical; no deletion happens without a proof. Regression
+  witnesses: `tests/mutation_engine.rs`
+  (`cleanup_accepts_a_squash_landed_lane_and_still_refuses_unlanded_content`,
+  plus the ancestor route's own label in the lane-flow witness).
+
 ### Changed
 
 - Documentation polish (issue #12, PR #13): security recipe doc line fix

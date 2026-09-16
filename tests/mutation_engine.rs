@@ -1253,6 +1253,14 @@ fn lane_flow_rehearses_then_verifies_landed_head_and_cleans_with_salvage() {
     // Cleanup removes the lane and journals the salvage evidence (AC8).
     let cleaned = scenario.apply_ok(18, "x1", Some(&feature_head), Some(&integration_base));
     assert_eq!(cleaned.get("removed").and_then(Val::as_bool), Some(true));
+    assert_eq!(
+        cleaned
+            .get("salvage")
+            .and_then(|salvage| salvage.get("landed_by"))
+            .and_then(Val::as_str),
+        Some("ancestor"),
+        "the ff landing keeps its own proof label"
+    );
     assert!(!scenario.repos.worktrees_root.join("issues-123").exists());
 
     let tail = rpc_ok(
@@ -1710,6 +1718,39 @@ fn dirty_and_unmerged_cleanup_refuses_and_no_direct_push_path_exists() {
     // own remote path): allowed for feature lanes only; the branch itself
     // stays pushable so assert the *local* feature head is intact.
     ck.run(&["rev-parse", "--verify", "issue-123"]);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #132 (the run completes on a repo whose policy is squash): a
+// squash-landed lane is cleanable by CONTENT; unlanded content still refuses
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cleanup_accepts_a_squash_landed_lane_and_still_refuses_unlanded_content() {
+    // The repository's policy SQUASH lands the lane's content in the
+    // integration ref: the rewritten integration head is NOT an ancestor of
+    // the lane branch, so an ancestry-only proof refused that branch forever
+    // and the run could never complete its own sanctioned cleanup.
+    let (landed, _feature, _base) = cycle2_reviewed_merge("squash", true);
+    let cleaned = landed.apply_ok(20, "x1", None, None);
+    assert_eq!(cleaned.get("removed").and_then(Val::as_bool), Some(true));
+    assert_eq!(
+        cleaned
+            .get("salvage")
+            .and_then(|salvage| salvage.get("landed_by"))
+            .and_then(Val::as_str),
+        Some("content"),
+        "the squash landing is proven by content, not ancestry"
+    );
+    assert!(!landed.repos.worktrees_root.join("issues-123").exists());
+
+    // The same shape WITHOUT the landing: the branch's changed content is not
+    // in the integration ref, so the unverified deletion still refuses.
+    let (unlanded, _feature2, _base2) = cycle2_reviewed_merge("squash", false);
+    let (code, message) = unlanded.apply_err(21, "x1", None, None);
+    assert_eq!(code, "refusal.cleanup.unmerged", "{message}");
+    assert!(message.contains("not content-identical"), "{message}");
+    assert!(unlanded.repos.worktrees_root.join("issues-123").exists());
 }
 
 // ---------------------------------------------------------------------------
