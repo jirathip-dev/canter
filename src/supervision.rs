@@ -107,9 +107,10 @@ pub const AUTHORIZATION_SCHEMA: &str = "hf-supervision-authorization/v1";
 pub const DESIRED: [&str; 2] = ["armed", "disabled"];
 
 /// Closed classification vocabulary (issue #95 AC3).
-pub const CLASSES: [&str; 10] = [
+pub const CLASSES: [&str; 11] = [
     "healthy",
     "waiting-workers",
+    "worker-timeout",
     "waiting-CI",
     "waiting-approval",
     "blocked-capacity",
@@ -338,6 +339,8 @@ pub mod codes {
     /// something were still running; the recorded attempt's own code is the
     /// named blocker instead.
     pub const STEP_DIAGNOSED: &str = "supervision.step_diagnosed";
+    /// Collection exhausted its bounded worker wait, without a retry.
+    pub const WORKER_TIMEOUT: &str = "supervision.worker_timeout";
 }
 
 /// A typed supervision error/refusal (fail closed; stable codes).
@@ -880,6 +883,9 @@ pub fn classify(
     }
     // 5. Live work: an in-flight step claim is legitimate long-running work.
     if evidence.in_flight.is_some() {
+        if next_kind == "collect_outcome" && evidence.in_flight.as_deref() == Some(&next_step) {
+            return Verdict::new("waiting-workers", codes::WAITING_WORKERS, true, &next_step);
+        }
         return Verdict::new("healthy", codes::IN_FLIGHT, false, &next_step);
     }
     if driver_dispatchable_kind(evidence, &next_step, &next_kind)
@@ -940,6 +946,9 @@ pub fn classify(
     if let Some((_, status, code)) = latest_attempt_for(evidence, &next_step)
         && status != "succeeded"
     {
+        if next_kind == "collect_outcome" && code == crate::mutation::code::WORKER_TIMEOUT {
+            return Verdict::new("worker-timeout", codes::WORKER_TIMEOUT, false, &next_step);
+        }
         let detail = if code.is_empty() {
             status.as_str()
         } else {

@@ -45,6 +45,7 @@ impl Fixture {
         std::fs::create_dir(fixture.path("trees")).unwrap();
         let worktrees_root = std::fs::canonicalize(fixture.path("trees")).unwrap();
         fixture.git(&["init", "-b", "staging"]);
+        fixture.git(&["remote", "add", "origin", "."]);
         fixture.git(&[
             "-c",
             "user.name=Fixture",

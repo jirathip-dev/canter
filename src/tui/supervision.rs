@@ -91,6 +91,8 @@ pub enum RunClass {
     Healthy,
     /// A known wait for workers.
     WaitingWorkers,
+    /// The worker exhausted its collection deadline.
+    WorkerTimeout,
     /// A known wait for CI evidence.
     WaitingCi,
     /// A known wait for a human approval.
@@ -115,6 +117,7 @@ impl RunClass {
         match self {
             Self::Healthy => "healthy",
             Self::WaitingWorkers => "waiting-workers",
+            Self::WorkerTimeout => "worker-timeout",
             Self::WaitingCi => "waiting-CI",
             Self::WaitingApproval => "waiting-approval",
             Self::BlockedCapacity => "blocked-capacity",
@@ -132,6 +135,7 @@ impl RunClass {
         [
             Self::Healthy,
             Self::WaitingWorkers,
+            Self::WorkerTimeout,
             Self::WaitingCi,
             Self::WaitingApproval,
             Self::BlockedCapacity,
@@ -152,7 +156,7 @@ impl RunClass {
             Self::Paused | Self::Unknown => Tone::Muted,
             Self::ContinuationEligible | Self::WaitingApproval => Tone::Warn,
             Self::WaitingWorkers | Self::WaitingCi => Tone::Muted,
-            Self::BlockedCapacity | Self::NeedsAttention => Tone::Alert,
+            Self::BlockedCapacity | Self::NeedsAttention | Self::WorkerTimeout => Tone::Alert,
         }
     }
 }

@@ -497,7 +497,7 @@ clears a repository/fleet-level hold or bypasses a gate.
   past falls back to a fresh snapshot wake.
 - `supervision.status` requires `params.instance_id` (`run-` + 16 hex) and
   renders `hf-supervision/v1` read-only: the recorded authorization and
-  policy, the closed classification (`healthy`, `waiting-workers`,
+  policy, the closed classification (`healthy`, `waiting-workers`, `worker-timeout`,
   `waiting-CI`, `waiting-approval`, `blocked-capacity`,
   `continuation-eligible`, `paused`, `completed`, `needs-attention`, or
   `unknown` when evidence is missing/stale) with its stable reason and the
@@ -568,6 +568,22 @@ clears a repository/fleet-level hold or bypasses a gate.
   engine's own code exactly like any other continuation refusal. The
   classification reads the SAME predicate, so a frontier reported eligible
   with `supervision.dispatch.next_step` is exactly a dispatchable one.
+- **Pane collection (issue #147)**: a collection following a pane prompt
+  polls that run's own Herdr agent, verifying lane token, generation and
+  worktree on every read. While it waits, its single claim remains in flight:
+  `waiting-workers` / `supervision.waiting_workers`, eligible for continued
+  checks, not a second dispatch. Collection runs off the reconciliation
+  thread so other runs and timer checks continue. Only `idle`, `done` or
+  `blocked` permits reading the committed delta; a stopped worker with none
+  still refuses `refusal.collect.empty_delta`. Exhausting the collection
+  step's deadline records `effect.worker_timeout` as ambiguous and parks as
+  `worker-timeout` / `supervision.worker_timeout`, ineligible. Neither a
+  waiting claim nor a timed-out attempt is re-dispatched by the supervisor.
+- **Lane base (issue #164)**: checkout and lane creation use the exact
+  observed integration base, or resolve the published origin ref when no
+  observation exists yet; never the local branch. Missing objects are fetched
+  without moving that frozen base. Existing lane directories refuse typed
+  (`refusal.worktree.exists`); they are not reset or silently reused.
 - **Diagnosed frontier (issue #148)**: the classification half of the same
   honesty. The frontier step's own LATEST recorded attempt is read from the
   run's claim/outcome material, and when it is not `succeeded` the run is

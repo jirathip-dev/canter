@@ -789,6 +789,94 @@ impl Drop for Scenario {
 }
 
 #[test]
+fn worktree_base_is_observed_or_published_never_a_stale_local_branch() {
+    let mut steps = vec![step("checkout", "checkout", None)];
+    steps.push(flow_steps()[0].clone());
+    let scenario = Scenario::new("published-base", "2999-01-01T00:00:00Z", steps);
+    let git = Git::new(&scenario.repos.checkout);
+    let old = git.head("staging");
+    for _ in 0..3 {
+        git.run(&["commit", "--allow-empty", "-m", "published progress"]);
+    }
+    let published = git.head("HEAD");
+    git.run(&["push", "origin", "staging"]);
+    git.run(&["checkout", "--detach", &published]);
+    git.run(&["branch", "-f", "staging", &old]);
+    assert_ne!(git.head("staging"), published);
+    let checkout = scenario.apply_ok(164, "checkout", None, None);
+    assert_eq!(
+        checkout.get("integration_base").and_then(Val::as_str),
+        Some(published.as_str())
+    );
+    let created = scenario.apply_ok(165, "w1", None, Some(&published));
+    assert_eq!(
+        created.get("head").and_then(Val::as_str),
+        Some(published.as_str())
+    );
+    let lane = scenario.repos.worktrees_root.join("issues-123");
+    assert_eq!(Git::new(&lane).head("HEAD"), published);
+    // Refuse existing lanes instead of resetting or silently adopting their work.
+    let (code, _) = scenario.apply_err(166, "w1", None, Some(&old));
+    assert_eq!(code, "refusal.worktree.exists");
+    assert_eq!(Git::new(&lane).head("HEAD"), published);
+}
+
+#[test]
+fn worktree_base_keeps_the_recorded_observation_when_origin_moves() {
+    let scenario = Scenario::new(
+        "recorded-base",
+        "2999-01-01T00:00:00Z",
+        vec![flow_steps()[0].clone()],
+    );
+    let git = Git::new(&scenario.repos.checkout);
+    let admitted = git.head("HEAD");
+    git.run(&["commit", "--allow-empty", "-m", "later publication"]);
+    git.run(&["push", "origin", "staging"]);
+    assert_ne!(git.head("HEAD"), admitted);
+    let created = scenario.apply_ok(164, "w1", None, Some(&admitted));
+    assert_eq!(
+        created.get("head").and_then(Val::as_str),
+        Some(admitted.as_str())
+    );
+    assert_eq!(
+        Git::new(&scenario.repos.worktrees_root.join("issues-123")).head("HEAD"),
+        admitted
+    );
+}
+
+#[test]
+fn worktree_base_fetches_the_published_commit_missing_from_the_checkout() {
+    let scenario = Scenario::new(
+        "fetch-base",
+        "2999-01-01T00:00:00Z",
+        vec![flow_steps()[0].clone()],
+    );
+    let publisher = scenario.sandbox.path("publisher");
+    Git::new(&scenario.sandbox.root).run(&[
+        "clone",
+        "-q",
+        "-b",
+        "staging",
+        "origin.git",
+        "publisher",
+    ]);
+    let git = Git::new(&publisher);
+    git.run(&["commit", "--allow-empty", "-qm", "remote progress"]);
+    git.run(&["push", "origin", "staging"]);
+    let published = git.head("HEAD");
+    assert_ne!(scenario.integration_base(), published);
+    let created = scenario.apply_ok(164, "w1", None, None);
+    assert_eq!(
+        created.get("head").and_then(Val::as_str),
+        Some(published.as_str())
+    );
+    assert_eq!(
+        Git::new(&scenario.repos.worktrees_root.join("issues-123")).head("HEAD"),
+        published
+    );
+}
+
+#[test]
 fn mutation_fixture_reaps_its_daemon_group() {
     let socket;
     {

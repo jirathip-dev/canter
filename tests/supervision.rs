@@ -1715,6 +1715,7 @@ fn init_repo(path: &Path) {
     std::fs::create_dir_all(path).expect("repo dir");
     for args in [
         vec!["init", "-q", "-b", "staging"],
+        vec!["remote", "add", "origin", "."],
         vec!["config", "user.email", "lane@example.invalid"],
         vec!["config", "user.name", "lane"],
         vec!["commit", "--allow-empty", "-q", "-m", "base"],
@@ -3175,13 +3176,29 @@ case "$1 $2" in
     ;;
   "agent get")
     log "$*"
+    if [ -f "$HOME/collect-mode" ] && [ -f "$STATE/pane_content" ]; then
+      log "worker-poll $(read_state state idle)"
+      if [ -f "$HOME/allow-stop" ] && [ "$(read_state state idle)" = working ]; then
+        if [ "$(cat "$HOME/collect-mode")" = delta ]; then
+          checkout=$(read_state cwd '')
+          printf 'worker delivery\n' > "$checkout/delivery.txt"
+          git -C "$checkout" add delivery.txt || exit 8
+          git -C "$checkout" -c commit.gpgsign=false commit -qm delivery || exit 8
+        fi
+        printf done > "$STATE/state"
+      fi
+    fi
     printf '{"id":"cli:agent:get","result":%s,"type":"agent_info"}\n' "$(agent_doc)"
     ;;
   "agent prompt")
     log "$*"
     printf '%s' "$4" > "$STATE/pane_content"
-    printf 'done' > "$STATE/state"
-    printf '{"id":"cli:agent:prompt","result":{"agent_status":"done","submitted":true},"type":"agent_prompt"}\n'
+    if [ -f "$HOME/collect-mode" ]; then
+      printf working > "$STATE/state"
+    else
+      printf done > "$STATE/state"
+    fi
+    printf '{"id":"cli:agent:prompt","result":{"agent_status":"%s","submitted":true},"type":"agent_prompt"}\n' "$(read_state state idle)"
     ;;
   "agent read")
     log "$*"
@@ -3239,6 +3256,250 @@ fn harness_pane_steps(harness_key: &str) -> Vec<qp::PlannedStep> {
             ])),
         },
     ]
+}
+
+// The worker is held by a fixture latch, not a timing guess. Only the fake
+// Herdr's own read-back commits the delivery and reports the terminal state.
+fn supervised_collection(mode: &str) {
+    let fixture = DaemonFixture::new(&format!("collect-{mode}"));
+    let integration = fixture.dir.join("integration");
+    init_repo(&integration);
+    let old = git_output(&integration, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+    for _ in 0..3 {
+        git_output(
+            &integration,
+            &["commit", "--allow-empty", "-qm", "published progress"],
+        );
+    }
+    let published = git_output(&integration, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+    let origin = fixture.dir.join("origin.git");
+    git_output(
+        &integration,
+        &["clone", "--bare", ".", origin.to_str().unwrap()],
+    );
+    git_output(
+        &integration,
+        &["remote", "set-url", "origin", origin.to_str().unwrap()],
+    );
+    git_output(&integration, &["checkout", "--detach", &published]);
+    git_output(&integration, &["branch", "-f", "staging", &old]);
+    assert_ne!(old, published);
+    let (bound, digest) = {
+        let state = fixture.seed();
+        seed_grant(&state, "gr_0000000000000095", 5);
+        let mut steps = harness_pane_steps(HARNESS);
+        steps.pop(); // The witness stops after collection, before review/merge.
+        steps.insert(
+            0,
+            qp::PlannedStep {
+                id: "checkout".to_string(),
+                kind: "checkout".to_string(),
+                params: Some(resolved()),
+            },
+        );
+        steps.push(qp::PlannedStep {
+            id: "collect".to_string(),
+            kind: "collect_outcome".to_string(),
+            params: Some(object(vec![
+                ("worktree", string("issues-5")),
+                ("branch", string("issue-5")),
+                ("requires_delta", Val::Bool(true)),
+                (
+                    "deadline_secs",
+                    integer(if mode == "timeout" { 1 } else { 30 }),
+                ),
+            ])),
+        });
+        render_bound(
+            &state,
+            &qp::QueueRequest {
+                steps,
+                role_config: harness_binding_doc(),
+                ..request_with(vec![selected("#5", REV_A)])
+            },
+        )
+    };
+    std::fs::write(fixture.dir.join("collect-mode"), mode).unwrap();
+    let fakebin = write_fake_herdr(&fixture.dir);
+    let daemon = fixture.spawn_with_path(&format!(
+        "{}:{}",
+        fakebin.display(),
+        std::env::var("PATH").unwrap()
+    ));
+    wait_ready(&fixture);
+    let mut params = harness_submit_params(&idem_key(mode), &bound, &digest, "gr_0000000000000095");
+    let topology = caller_apply_params(
+        &fixture,
+        &integration,
+        &bound,
+        "unused",
+        "gr_0000000000000095",
+        ("checkout", 5),
+        "unused",
+    );
+    if let Val::Obj(fields) = &mut params {
+        fields.insert(
+            "supervision".to_string(),
+            object(vec![
+                ("schema", string("hf-supervision-authorization/v1")),
+                ("desired", string("armed")),
+                (
+                    "policy",
+                    object(vec![
+                        ("check_interval_secs", integer(5)),
+                        ("progress_timeout_secs", integer(60)),
+                    ]),
+                ),
+            ]),
+        );
+        fields.insert(
+            "dispatch".to_string(),
+            object(vec![
+                ("topology", topology.get("topology").unwrap().clone()),
+                (
+                    "admission",
+                    topology
+                        .get("flags")
+                        .unwrap()
+                        .get("admission")
+                        .unwrap()
+                        .clone(),
+                ),
+            ]),
+        );
+    }
+    let submitted = rpc_ok(&fixture.socket, &fresh_id(1), "queue.submit", Some(params));
+    let run = instance_of(&submitted, 5);
+    let lane = fixture.dir.join("worktrees/issues-5");
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let mut waiting_checks = None;
+    loop {
+        let doc = status_doc(&fixture.socket, &fresh_id(2), &run);
+        let attempts = fixture
+            .seed()
+            .supervision_evidence(&run)
+            .unwrap()
+            .unwrap()
+            .attempts;
+        if attempts.iter().any(|(step, _, _)| step == "collect") {
+            break;
+        }
+        if class_of(&doc) == "waiting-workers" {
+            assert_eq!(evaluation(&doc).get("eligible"), Some(&Val::Bool(true)));
+            if !fixture.dir.join("allow-stop").exists() {
+                assert_eq!(
+                    git_output(&lane, &["rev-parse", "HEAD"]).trim(),
+                    published,
+                    "the lane uses the published base, not stale staging"
+                );
+            }
+            let first = *waiting_checks.get_or_insert(checks_of(&doc));
+            let reads = std::fs::read_to_string(fixture.dir.join("herdr-argv.txt")).unwrap();
+            if mode != "timeout"
+                && checks_of(&doc) > first
+                && reads.matches("worker-poll working").count() >= 3
+            {
+                std::fs::write(fixture.dir.join("allow-stop"), "stop").unwrap();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "collection never settled: {}\n{}",
+            canter::canonical::canonical_text(&doc),
+            std::fs::read_to_string(fixture.daemon_log()).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let attempts = fixture
+        .seed()
+        .supervision_evidence(&run)
+        .unwrap()
+        .unwrap()
+        .attempts;
+    let collected: Vec<_> = attempts
+        .iter()
+        .filter(|(step, _, _)| step == "collect")
+        .collect();
+    assert_eq!(collected.len(), 1, "one collection attempt, never a retry");
+    match mode {
+        "delta" => {
+            assert!(
+                waiting_checks.is_some(),
+                "the worker must WAIT before collection"
+            );
+            assert_eq!(collected[0].1, "succeeded", "{attempts:?}");
+            assert_ne!(git_output(&lane, &["rev-parse", "HEAD"]).trim(), published);
+            assert_eq!(
+                std::fs::read_to_string(lane.join("delivery.txt")).unwrap(),
+                "worker delivery\n"
+            );
+        }
+        "empty" => {
+            assert!(
+                waiting_checks.is_some(),
+                "empty delta cannot diagnose a live worker"
+            );
+            assert_eq!(collected[0].1, "refused");
+            assert_eq!(collected[0].2, "refusal.collect.empty_delta");
+        }
+        "timeout" => {
+            assert_eq!(collected[0].1, "ambiguous");
+            assert_eq!(collected[0].2, "effect.worker_timeout");
+            let first = status_doc(&fixture.socket, &fresh_id(3), &run);
+            let settled = wait_for_checks(&fixture, &run, checks_of(&first) + 2);
+            assert_eq!(class_of(&settled), "worker-timeout");
+            assert_eq!(
+                evaluation(&settled).get("eligible"),
+                Some(&Val::Bool(false))
+            );
+            assert_eq!(
+                fixture
+                    .seed()
+                    .supervision_evidence(&run)
+                    .unwrap()
+                    .unwrap()
+                    .attempts,
+                attempts,
+                "timeout is never redispatched"
+            );
+        }
+        _ => unreachable!(),
+    }
+    let conn = rusqlite::Connection::open(fixture.db()).unwrap();
+    let keys: Vec<String> = conn
+        .prepare("SELECT key FROM idempotency WHERE method = 'apply' ORDER BY rowid")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(keys.len(), 5, "one dispatch per spine step: {keys:?}");
+    assert!(
+        keys.iter()
+            .all(|key| key.starts_with(&format!("ik_{run}-"))),
+        "zero operator keys: {keys:?}"
+    );
+    assert!(fixture.seed().run_retries(&run).unwrap().is_empty());
+    shutdown(daemon);
+}
+
+#[test]
+fn collection_waits_for_pane_delivery_without_operator_dispatch() {
+    supervised_collection("delta");
+}
+
+#[test]
+fn collection_stopped_without_delta_is_still_refused() {
+    supervised_collection("empty");
+}
+
+#[test]
+fn collection_deadline_parks_worker_timeout_without_redispatch() {
+    supervised_collection("timeout");
 }
 
 #[test]

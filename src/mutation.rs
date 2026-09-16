@@ -100,7 +100,7 @@ pub fn effect_deadline_secs(kind: &str, params: Option<&Val>) -> Result<u64, Eff
 /// documented rows (see the constants above).
 pub fn default_deadline_secs(kind: &str) -> u64 {
     match kind {
-        "prompt" => PROMPT_DEADLINE_DEFAULT_SECS,
+        "prompt" | "collect_outcome" => PROMPT_DEADLINE_DEFAULT_SECS,
         "harness_start" => HARNESS_START_DEADLINE_DEFAULT_SECS,
         _ => EFFECT_DEADLINE_DEFAULT_SECS,
     }
@@ -199,6 +199,10 @@ pub mod code {
     pub const MALFORMED_OUTPUT: &str = "refusal.malformed.output";
     /// A delta-required collection found no committed content change.
     pub const COLLECT_EMPTY_DELTA: &str = "refusal.collect.empty_delta";
+    /// The pane worker did not settle within the collection deadline.
+    pub const WORKER_TIMEOUT: &str = "effect.worker_timeout";
+    /// An existing lane cannot safely be created at the recorded base.
+    pub const WORKTREE_EXISTS: &str = "refusal.worktree.exists";
     /// The addressed worktree is not the worker output location the run bound.
     pub const OUTPUT_LOCATION: &str = "refusal.worker.output_location";
 }
@@ -1461,21 +1465,11 @@ pub fn bounded_effect_deadline(kind: &str, params: Option<&Val>) -> Option<u64> 
 /// `checkout`: read the exact current head of the integration branch on the
 /// integration checkout (the base every later read-back is compared to).
 fn effect_checkout(ctx: &EffectContext<'_>) -> EffectOutcome {
-    match run_git(
-        ctx,
-        ctx.integration_repo,
-        &["rev-parse", "--verify", ctx.integration_branch],
-    ) {
-        Ok(out) => {
-            let head = out.stdout.trim().to_string();
-            if !is_hex40(&head) {
-                return failed(code::MALFORMED_OUTPUT, "git head read-back is not 40-hex");
-            }
-            ok(object(vec![
-                ("integration_branch", string(ctx.integration_branch)),
-                ("integration_base", string(&head)),
-            ]))
-        }
+    match lane_integration_base(ctx) {
+        Ok(head) => ok(object(vec![
+            ("integration_branch", string(ctx.integration_branch)),
+            ("integration_base", string(&head)),
+        ])),
         Err(outcome) => outcome,
     }
 }
@@ -2413,8 +2407,27 @@ pub fn check_step_params(
         .map_err(typed)
 }
 
-/// `worktree_create`: create an isolated lane worktree + branch off the
-/// current integration head (path-contained under the lane root).
+/// Freeze the observed base, or read the published ref for the first checkout.
+/// Never substitute a local branch (including a stale remote-tracking ref).
+fn lane_integration_base(ctx: &EffectContext<'_>) -> Result<String, EffectOutcome> {
+    let base = match ctx.observed_integration_base {
+        Some(base) if is_hex40(base) => base.to_string(),
+        Some(_) => return Err(refusal(code::BAD_PARAMS, "integration base must be 40-hex")),
+        None => published_integration_head(ctx)?,
+    };
+    let commit = format!("{base}^{{commit}}");
+    if run_git(ctx, ctx.integration_repo, &["cat-file", "-e", &commit]).is_err() {
+        run_git(
+            ctx,
+            ctx.integration_repo,
+            &["fetch", "origin", ctx.integration_branch],
+        )?;
+        run_git(ctx, ctx.integration_repo, &["cat-file", "-e", &commit])?;
+    }
+    Ok(base)
+}
+
+/// Create a contained lane at the recorded/published integration base.
 fn effect_worktree_create(ctx: &EffectContext<'_>) -> EffectOutcome {
     let (branch, relative) = match worktree_create_inputs(ctx.params, &ctx.param_contract()) {
         Ok(inputs) => inputs,
@@ -2425,14 +2438,18 @@ fn effect_worktree_create(ctx: &EffectContext<'_>) -> EffectOutcome {
         Err(err) => return refusal(err.code, err.message),
     };
     if worktree.exists() {
-        return failed(
-            code::EXIT,
+        return refusal(
+            code::WORKTREE_EXISTS,
             format!(
                 "worktree {} already exists; a duplicate lane cannot be created",
                 worktree.display()
             ),
         );
     }
+    let base = match lane_integration_base(ctx) {
+        Ok(base) => base,
+        Err(outcome) => return outcome,
+    };
     if let Some(parent) = worktree.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -2445,7 +2462,7 @@ fn effect_worktree_create(ctx: &EffectContext<'_>) -> EffectOutcome {
             "-b",
             &branch,
             worktree.to_str().unwrap_or_default(),
-            ctx.integration_branch,
+            &base,
         ],
     ) {
         Ok(out) => {
@@ -2463,6 +2480,7 @@ fn effect_worktree_create(ctx: &EffectContext<'_>) -> EffectOutcome {
                 ("branch", string(&branch)),
                 ("worktree", string(&worktree.to_string_lossy())),
                 ("head", string(&head)),
+                ("base_head", string(&base)),
                 ("dirty", bool_(!status.trim().is_empty())),
                 (
                     "contained",
@@ -2806,6 +2824,67 @@ fn observed_worktree_branch(
     Ok(branch)
 }
 
+/// Wait for a pane turn to stop before inspecting its committed delivery.
+fn await_pane_worker(
+    ctx: &EffectContext<'_>,
+    relative: &str,
+    worktree: &Path,
+) -> Result<(), EffectOutcome> {
+    let prompt = ctx
+        .plan
+        .doc
+        .get("steps")
+        .and_then(Val::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .take_while(|step| step.get("id").and_then(Val::as_str) != Some(ctx.step_id))
+        .filter(|step| step.get("kind").and_then(Val::as_str) == Some("prompt"))
+        .filter_map(|step| step.get("params"))
+        .filter(|params| params.get("worktree").and_then(Val::as_str) == Some(relative))
+        .last();
+    let Some(prompt) = prompt else {
+        return Ok(());
+    };
+    if declared_execution(Some(prompt))? == crate::adapters::ExecutionMode::Headless {
+        return Ok(());
+    }
+    let inputs = prompt_inputs(Some(prompt), &ctx.param_contract())?;
+    let session = resolve_session(ctx, inputs.declared, "collect_outcome")?;
+    let seconds = effect_deadline_secs(ctx.kind, ctx.params)?;
+    let end = std::time::Instant::now() + Duration::from_secs(seconds);
+    loop {
+        let remaining = end.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(EffectOutcome {
+                status: "ambiguous",
+                code: Some(code::WORKER_TIMEOUT.to_string()),
+                message: Some(format!(
+                    "pane worker did not stop within {seconds}s; collection parked without redispatch"
+                )),
+                result: object(vec![("deadline_secs", integer(seconds as i64))]),
+            });
+        }
+        match crate::adapters::observe_pane_worker(&session, worktree, remaining, ctx.env) {
+            Ok(state) if matches!(state.as_str(), "idle" | "done" | "blocked") => return Ok(()),
+            Ok(_) => {}
+            Err(err) if err.code == crate::adapters::CODE_TIMEOUT => continue,
+            Err(err) => {
+                return Err(EffectOutcome {
+                    status: err.status(),
+                    code: Some(err.code.to_string()),
+                    message: Some(format!("{}: {}", err.message, err.detail)),
+                    result: null(),
+                });
+            }
+        }
+        std::thread::sleep(
+            Duration::from_millis(100)
+                .min(end.saturating_duration_since(std::time::Instant::now())),
+        );
+    }
+}
+
 /// `collect_outcome`: collect the lane's commits/head since the integration
 /// base and read the harness terminal outcome through the workspace
 /// protocol (herdr workspace executable; fake-pinned in tests).
@@ -2818,6 +2897,9 @@ fn effect_collect_outcome(ctx: &EffectContext<'_>) -> EffectOutcome {
         Ok(path) => path,
         Err(err) => return refusal(err.code, err.message),
     };
+    if let Err(outcome) = await_pane_worker(ctx, &inputs.worktree, &worktree) {
+        return outcome;
+    }
     let base_head = inputs.base_head;
     let head_out = match run_git(ctx, &worktree, &["rev-parse", "--verify", "HEAD"]) {
         Ok(out) => out,
@@ -3683,6 +3765,7 @@ mod tests {
             effect_deadline_secs("prompt", None).expect("default"),
             PROMPT_DEADLINE_DEFAULT_SECS
         );
+        assert_eq!(effect_deadline_secs("collect_outcome", None).unwrap(), 1800);
         // A reviewed plan may declare its own bounded deadline...
         let declared = object(vec![("deadline_secs", integer(120))]);
         assert_eq!(

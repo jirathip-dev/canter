@@ -434,6 +434,7 @@ fn init_repo(path: &Path) {
     std::fs::create_dir_all(path).expect("repo dir");
     for args in [
         vec!["init", "-q", "-b", "staging"],
+        vec!["remote", "add", "origin", "."],
         vec!["config", "user.email", "lane@example.invalid"],
         vec!["config", "user.name", "lane"],
         vec!["commit", "--allow-empty", "-q", "-m", "base"],
