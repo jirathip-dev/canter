@@ -113,18 +113,29 @@ when any applicable admission input is missing, stale, or exceeded:
   and a repeat archive within the same second refuses to overwrite
   (`effect.archive.failed`). Byte-for-byte probes live in
   `tests/mutation_engine.rs`.
-- The deletion's landed proof is ancestry **or**, for a policy squash
-  landing, content-equivalence (issue #132): a squash rewrites the delivered
-  commits, so a squash-landed branch head is never an ancestor of the
-  integration ref. The content route requires every path the branch changed
-  relative to its fork point to be byte-identical in the integration ref
-  (`git diff --name-only <branch> <integration> -- <changed paths>` is
-  empty); a dropped path, an unlanded deletion or any later divergence
-  still refuses `refusal.cleanup.unmerged` with the count of paths that do
-  not match. The salvage record names which proof cleared the deletion
-  (`landed_by`: `ancestor` | `content`, the latter with the `merge_base`
-  compared from). This is what lets a run complete on a repository whose
-  delivery policy is squash-merge.
+- Cleanup first accepts ancestry into the **local** integration ref. If
+  ancestry fails (as it normally does after a squash), the content route
+  compares every path changed since the merge base against that ref. Git
+  supplies NUL-delimited names with rename detection disabled, so both the
+  deleted source and added destination of a rename must match. Comparisons
+  use literal pathspecs: Unicode, whitespace, glob characters and leading
+  pathspec magic are names, not quoting or patterns. Git compares content,
+  existence and modes; submodule changes are not ignored. Integration-only
+  changes outside the lane's changed paths do not block cleanup.
+- A **partial landing** means at least one changed path differs from the
+  lane's final state: an addition is absent/modified, a deletion survives,
+  or only one half of a rename landed. It refuses `refusal.cleanup.unmerged`,
+  as does later divergence on those paths. The text-only subprocess adapter
+  cannot guarantee lossless non-UTF-8 names: any replacement character
+  (including a literal U+FFFD), malformed NUL framing or empty name refuses
+  the same code, even if the content landed. An empty path list is accepted
+  only after a separate unrestricted quiet diff confirms an empty lane
+  delta. Git errors/timeouts propagate without deletion.
+- The salvage record names `landed_by: ancestor | content` (the latter also
+  records `merge_base`). Cleanup removes the clean worktree then deletes
+  the branch using `-d` for ancestry or `-D` for proven content. Content proof
+  does not establish a forge merge or check the published remote; standalone
+  `branch_delete` remains ancestry-only. Refs #132, #172.
 
 ## 6. Remote transport contract (AC5/AC6, capability C16)
 

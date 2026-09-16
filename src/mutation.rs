@@ -3526,32 +3526,64 @@ fn landed_in_integration(
     let changed = run_git(
         ctx,
         ctx.integration_repo,
-        &["diff", "--name-only", &merge_base, branch_head, "--"],
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "--ignore-submodules=none",
+            "-z",
+            &merge_base,
+            branch_head,
+            "--",
+        ],
     )?;
-    let paths: Vec<&str> = changed
-        .stdout
-        .lines()
-        .filter(|line| !line.is_empty())
-        .collect();
+    // NUL records preserve whitespace and avoid Git's C-quoting. Renames
+    // must contribute BOTH endpoints, including the deleted source path.
+    // ProcOut is lossy UTF-8: reject replacement characters (even a literal
+    // U+FFFD) rather than ever reusing a possibly altered path as a proof.
+    let paths: Vec<&str> = changed.stdout.split_terminator('\0').collect();
+    if changed.stdout.contains('\u{fffd}')
+        || (!changed.stdout.is_empty() && !changed.stdout.ends_with('\0'))
+        || paths.iter().any(|path| path.is_empty())
+    {
+        return Err(refusal(
+            code::CLEANUP_UNMERGED,
+            "cleanup cannot compare changed paths losslessly; refusing unverified deletion",
+        ));
+    }
     if paths.is_empty() {
-        // The branch carries no content of its own beyond its fork point:
-        // nothing the integration ref could be missing.
+        // Independently confirm the empty delta; never turn a missing path
+        // list into a vacuous proof or an unrestricted comparison by accident.
+        run_git(
+            ctx,
+            ctx.integration_repo,
+            &[
+                "diff",
+                "--quiet",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--ignore-submodules=none",
+                &merge_base,
+                branch_head,
+                "--",
+            ],
+        )?;
         return Ok(LandedProof::Content { merge_base });
     }
     let mut args: Vec<&str> = vec![
+        "--literal-pathspecs",
         "diff",
         "--name-only",
+        "--no-renames",
+        "--ignore-submodules=none",
+        "-z",
         branch_head,
         ctx.integration_branch,
         "--",
     ];
     args.extend(paths.iter().copied());
     let differing = run_git(ctx, ctx.integration_repo, &args)?;
-    let missing: Vec<&str> = differing
-        .stdout
-        .lines()
-        .filter(|line| !line.is_empty())
-        .collect();
+    let missing: Vec<&str> = differing.stdout.split_terminator('\0').collect();
     if !missing.is_empty() {
         // The refusal names the real cause (issue #132): the branch is not
         // ancestry-merged AND its changed content has not landed either.

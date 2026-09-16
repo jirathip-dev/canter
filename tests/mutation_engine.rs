@@ -1753,6 +1753,123 @@ fn cleanup_accepts_a_squash_landed_lane_and_still_refuses_unlanded_content() {
     assert!(unlanded.repos.worktrees_root.join("issues-123").exists());
 }
 
+// One daemon, real git trees, and no sleeps: each refusal is followed by a
+// branch read-back before the assertion, including when a mutant deletes it.
+#[test]
+fn cleanup_content_proof_preserves_exact_paths_and_partial_landings() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let scenario = Scenario::new("paths", "2999-01-01T00:00:00Z", flow_steps());
+    let git = Git::new(&scenario.repos.checkout);
+    let base = git.head("staging");
+    let lane = scenario.repos.worktrees_root.join("issues-123");
+    let lane_git = Git::new(&lane);
+    let cases: &[(&str, &[u8], bool)] = &[
+        ("unicode", "lane-café.txt".as_bytes(), false),
+        ("controls", b"line\n\t\"\\.txt", false),
+        ("pathspec", b":(exclude)*.txt", false),
+        ("glob", b"lane[1]*?.txt", false),
+        ("rename", b"renamed.txt", true),
+        ("replacement", "lane-\u{fffd}.txt".as_bytes(), false),
+        // APFS rejects such filenames before Git runs; ext4 permits them.
+        #[cfg(target_os = "linux")]
+        ("non-utf8", b"lane-\xff.txt", false),
+    ];
+    for (index, (label, bytes, rename)) in cases.iter().enumerate() {
+        let seed = 200 + index as u32 * 3;
+        // Explicit config makes the pre-fix quoting/rename defects repeatable.
+        git.run(&["config", "core.quotePath", "true"]);
+        git.run(&["config", "diff.renames", "true"]);
+        git.run(&["reset", "--hard", &base]);
+        scenario.apply_ok(seed, "w1", None, None);
+        let path = std::ffi::OsString::from_vec(bytes.to_vec());
+        if *rename {
+            std::fs::rename(lane.join("base.txt"), lane.join(&path)).unwrap();
+        } else {
+            std::fs::write(lane.join(&path), "lane change\n").unwrap();
+        }
+        lane_git.run(&["add", "-A"]);
+        lane_git.run(&["commit", "-m", "fixture lane change"]);
+        let head = lane_git.head("HEAD");
+        if *rename {
+            git.run(&["merge", "--squash", "issue-123"]);
+            // Partial landing: addition landed, deletion of base.txt did not.
+            std::fs::write(scenario.repos.checkout.join("base.txt"), "base\n").unwrap();
+            git.run(&["add", "-A"]);
+            git.run(&["commit", "-m", "fixture partial landing"]);
+        }
+        let response = rpc(
+            &scenario.fixture.socket,
+            &fresh_id(seed + 1),
+            "apply",
+            Some(scenario.params(seed + 1, "x1", None, None, None, false)),
+        );
+        let branches = git.run(&["branch", "--list", "issue-123"]);
+        println!("{label}: {}", canter::canonical::canonical_text(&response));
+        println!("{label}: git branch --list issue-123 = {branches:?}");
+        assert_eq!(
+            response.get("ok").and_then(Val::as_bool),
+            Some(false),
+            "{label}"
+        );
+        assert_eq!(
+            response
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(Val::as_str),
+            Some("refusal.cleanup.unmerged"),
+            "{label}: {response:?}"
+        );
+        assert!(
+            branches.contains("issue-123"),
+            "{label}: branch must survive"
+        );
+        assert_eq!(git.head("issue-123"), head);
+        assert!(lane.exists(), "{label}: worktree must survive");
+
+        git.run(&["reset", "--hard", &base]);
+        git.run(&["merge", "--squash", "issue-123"]);
+        git.run(&["commit", "-m", "fixture complete landing"]);
+        // Integration-only work is not part of the lane's proof.
+        std::fs::write(
+            scenario.repos.checkout.join("unrelated.txt"),
+            "other lane\n",
+        )
+        .unwrap();
+        git.run(&["add", "-A"]);
+        git.run(&["commit", "-m", "fixture independent work"]);
+        if matches!(*label, "non-utf8" | "replacement") {
+            // The subprocess adapter is text-only: even a landed undecodable
+            // path must refuse rather than compare replacement characters.
+            let (code, message) = scenario.apply_err(seed + 2, "x1", None, None);
+            assert_eq!(code, "refusal.cleanup.unmerged", "{message}");
+            assert!(message.contains("cannot compare"), "{message}");
+            assert!(
+                git.run(&["branch", "--list", "issue-123"])
+                    .contains("issue-123")
+            );
+            git.run(&["worktree", "remove", lane.to_str().unwrap()]);
+            git.run(&["branch", "-D", "issue-123"]);
+        } else {
+            let cleaned = scenario.apply_ok(seed + 2, "x1", None, None);
+            assert_eq!(
+                cleaned.get("removed").and_then(Val::as_bool),
+                Some(true),
+                "{label}"
+            );
+            assert_eq!(
+                cleaned
+                    .get("salvage")
+                    .and_then(|salvage| salvage.get("landed_by"))
+                    .and_then(Val::as_str),
+                Some("content"),
+                "{label}"
+            );
+            assert!(git.run(&["branch", "--list", "issue-123"]).is_empty());
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // F1 (AC7): premature issue closure refuses on the LIVE daemon path through
 // the same unit-tested gate (mutation::check_issue_closure) the daemon calls
