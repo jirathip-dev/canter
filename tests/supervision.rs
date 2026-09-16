@@ -2125,8 +2125,8 @@ fn retry_lane_scenario(name: &str) -> (DaemonFixture, GroupChild, String) {
             panic!("the driver never dispatched p2: {attempts:?}\n{log}")
         });
     assert_eq!(
-        p2.1, "failed",
-        "the existing branch makes the adapter fail (the diagnosis): {attempts:?}"
+        p2.1, "refused",
+        "the existing lane is refused (the diagnosis): {attempts:?}"
     );
     std::fs::remove_dir(fixture.dir.join("worktrees/lane-p2"))
         .expect("remove the fixture obstruction before the corrected retry");
@@ -2907,8 +2907,8 @@ fn an_uncontained_worktree_dispatch_is_refused_before_any_git_mutation() {
         )),
     );
     assert!(
-        refusal.contains("adapter.exit"),
-        "the adapter failure is the recorded diagnosis: {refusal}"
+        refusal.contains("refusal.worktree.exists"),
+        "the existing-lane refusal is the recorded diagnosis: {refusal}"
     );
     let diagnosed = attempts_for(&fixture, &run, "p2");
     assert!(diagnosed > 0, "the diagnosis is recorded: {diagnosed}");
