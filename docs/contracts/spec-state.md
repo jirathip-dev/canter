@@ -381,24 +381,28 @@ to journal fails closed — the mutation does not start.
   back from the durable apply claims and the committed submission's
   bound-input line — never from a caller.
 - **Release state (issue #146)**: `release_run` commits ONE transaction:
-  the run's unique `queue_ownership` row is removed, the run row goes
-  `invalidated` with the pause state cleared and the resume digest consumed
-  (so the run stops being an OWNED status and stops counting against the
-  global/per-repository/per-harness occupancy), and a hash-chained
-  `run.release` audit record carries the operator reason, the exact run
-  identity, what was freed and the authorization window the run held. No
-  table, column or schema version changes: the release is a state
+  the run's own `queue_ownership` row is removed without touching a successor's
+  ownership, and the run is terminal afterward (`done` stays `done`, otherwise
+  `invalidated`) with the pause state cleared and the resume digest consumed
+  (so the run holds no global/per-repository/per-harness occupancy). A
+  hash-chained `run.release` audit record carries the operator reason, the
+  exact run identity, what was freed and the authorization window the run held.
+  Terminal runs (`done` or `invalidated`) can release leftover ownership.
+  The daemon replays the recorded response for the same idempotency key;
+  a fresh key records an audited ownership-absent no-op if already freed.
+  No table, column or schema version changes: the release is a state
   TRANSITION over the existing rows. It refuses `refusal.run.in_flight` (a
   claimed `apply` of the run is still in flight, or an unreadable claim's
   attribution is unknown), `refusal.run.retry_pending` (an unconsumed
-  `run_retries` authorization exists — a release never burns one),
-  `refusal.run.terminal` (a `done`/`invalidated` run) and `state.not_found`;
-  a missing, revoked or expired grant is deliberately NOT a fence, and the
-  release records that window without presenting or reusing it. A released
-  run is inert on every other path: the engine refuses a terminal instance
-  (`refusal.instance.state`), the control surface refuses
-  `refusal.run.terminal`, supervision's dispatch intent returns nothing for
-  it, and a delivered-evidence advance skips it.
+  `run_retries` authorization exists — a release never burns one) and
+  `state.not_found`; a missing, revoked or expired grant is deliberately NOT
+  a fence, and the release records that window without presenting or reusing
+  it. Terminal runs remain non-dispatchable: the engine refuses
+  `refusal.instance.state`, pause/resume/retry/dispatch refuse
+  `refusal.run.terminal`, and supervision's dispatch intent returns nothing.
+  Separately, the completing `advance_queue_in_tx` frees only the delivering
+  run's ownership in the same transaction that marks it `done`, so a fresh
+  submission for that issue can be admitted on its own merits.
 - **Restart reconciliation**: an interrupted `run.*` claim is read back
   against its commit marker (the run's control rows) and logged
   (`reconcile.run-control`); no control is ever repeated and nothing is

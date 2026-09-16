@@ -431,7 +431,8 @@ fn a_verified_delivery_advances_the_cursor_once_and_never_twice_across_restart()
     assert_ne!(run6, run5);
     assert_eq!(state.list_instances().expect("instances").len(), 2);
     let ownership = state.queue_ownership_rows().expect("ownership");
-    assert_eq!(ownership.len(), 2);
+    assert_eq!(ownership.len(), 1);
+    assert!(!ownership.iter().any(|row| row.instance_id == run5));
     assert!(
         ownership
             .iter()
@@ -889,6 +890,22 @@ fn run_status(state: &State, run: &str) -> String {
         .status
 }
 
+fn read_ownership(db: &Path) -> Vec<(i64, String)> {
+    let conn =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("read-only connection");
+    let sql = "SELECT issue_number, instance_id FROM queue_ownership ORDER BY issue_number";
+    let rows = conn
+        .prepare(sql)
+        .expect("prepare ownership read")
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("read ownership")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("ownership rows");
+    println!("{sql}: {rows:?}");
+    rows
+}
+
 fn submission_items(state: &State, submission: &str) -> Vec<canter::state::QueueSubmissionItemRow> {
     state
         .queue_submission_by_id(submission)
@@ -980,6 +997,7 @@ fn a_delivering_run_with_committed_steps_after_the_delivery_stays_live_until_its
         "done",
         "the cleanup is still owed: the run stays live after the merge"
     );
+    assert!(read_ownership(&fixture.db()).contains(&(5, run5.clone())));
 
     // The LAST committed step executes: the run completes only NOW, and the
     // freed slot admits the waiting issue in the same transaction.
@@ -989,6 +1007,11 @@ fn a_delivering_run_with_committed_steps_after_the_delivery_stays_live_until_its
         run_status(&state, &run5),
         "done",
         "the delivering run completes after its LAST committed step"
+    );
+    assert!(
+        !read_ownership(&fixture.db())
+            .iter()
+            .any(|(issue, _)| *issue == 5)
     );
     let after = submission_items(&state, &submission.submission_id);
     assert_eq!(item_of(&after, 6).status, "admitted");
@@ -1034,6 +1057,8 @@ fn a_plan_that_ends_at_the_delivery_still_completes_at_the_delivery() {
         .instance_id
         .clone()
         .expect("issue 5 admitted");
+    println!("BEFORE completing advance: {}", run_status(&state, &run5));
+    assert_eq!(read_ownership(&fixture.db()), vec![(5, run5.clone())]);
     record_delivery(&state, &run5, HEAD_A);
 
     // ONE reconciliation: the delivery IS the run's last committed spine
@@ -1058,6 +1083,82 @@ fn a_plan_that_ends_at_the_delivery_still_completes_at_the_delivery() {
     assert_eq!(advances[0].delivered_ordinal, delivery.item_ordinal);
     assert_eq!(advances[0].next_instance_id.as_deref(), Some(run6.as_str()));
     assert_eq!(advances[0].reason, None);
+
+    println!("AFTER completing advance: {}", run_status(&state, &run5));
+    assert_eq!(read_ownership(&fixture.db()), vec![(6, run6.clone())]);
+    // A fresh submission for the SAME issue is admitted on its own merits.
+    let request = request_with(vec![selected("#5", &[])]);
+    let (bound, digest) = render_bound(&state, &request);
+    let fresh_plan = submission_plan(
+        &state,
+        "ik_146-fresh-completed",
+        &bound,
+        &digest,
+        &[("#5", "gr_0000000000000005")],
+        request.caps,
+    );
+    let (_, fresh) = state
+        .submit_queue_run(&fresh_plan)
+        .expect("fresh submission");
+    println!("FRESH submission: {fresh:?}");
+    assert_eq!(fresh[0].status, "admitted");
+    let new_run = fresh[0].instance_id.clone().expect("fresh run");
+    assert_ne!(new_run, run5);
+
+    // Reconciliation and release of the old terminal run must not steal its
+    // successor's ownership, nor turn the completed run back into a live one.
+    reconcile(&state, &run5, true);
+    let released = state
+        .release_run(
+            &run5,
+            "completed predecessor",
+            "ik_146-release-done",
+            &canter::time::rfc3339_now(),
+        )
+        .expect("done runs can be released");
+    println!("RELEASE completed run: {released:?}");
+    assert!(!released.ownership_freed);
+    assert_eq!(released.run.status, "done");
+    assert_eq!(read_ownership(&fixture.db()), vec![(5, new_run), (6, run6)]);
+}
+
+#[test]
+fn release_frees_an_invalidated_owner_without_state_forgery() {
+    let fixture = Fixture::new("release-invalidated");
+    let state = fixture.open();
+    seed_grant(&state, "gr_0000000000000005", 5);
+    let request = request_with(vec![selected("#5", &[])]);
+    let (bound, digest) = render_bound(&state, &request);
+    let plan = submission_plan(
+        &state,
+        "ik_146-invalidated",
+        &bound,
+        &digest,
+        &[("#5", "gr_0000000000000005")],
+        request.caps,
+    );
+    let (_, items) = state.submit_queue_run(&plan).expect("submit");
+    let run = items[0].instance_id.clone().expect("admitted run");
+    // The product's epoch rotation invalidates the run; no SQL writes or
+    // operator-assigned status is needed to reach this terminal owner.
+    state.rotate_epoch("security_rotation").expect("rotate");
+    state.invalidate_grants_below_current().expect("invalidate");
+    assert_eq!(run_status(&state, &run), "invalidated");
+    println!("BEFORE release: invalidated");
+    assert_eq!(read_ownership(&fixture.db()), vec![(5, run.clone())]);
+    let released = state
+        .release_run(
+            &run,
+            "epoch invalidated predecessor",
+            "ik_146-release-invalidated",
+            &canter::time::rfc3339_now(),
+        )
+        .expect("terminal owner can be released");
+    println!("RELEASE: {released:?}");
+    assert!(released.ownership_freed);
+    assert_eq!(released.run.status, "invalidated");
+    println!("AFTER release: invalidated");
+    assert!(read_ownership(&fixture.db()).is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -1501,6 +1602,43 @@ fn the_real_daemon_advances_the_queue_to_the_next_issue_without_another_request(
     assert!(
         !log.contains("supervision.continue") && !log.contains("spawn"),
         "no continuation effect may be logged: {log}"
+    );
+
+    // Issue #146: completion frees the issue, not just its capacity slot.
+    println!("AFTER daemon completion:");
+    assert_eq!(read_ownership(&fixture.db()), vec![(6, run6.clone())]);
+    let (bound, digest) = render_bound(&fixture.seed(), &request_with(vec![selected("#5", &[])]));
+    let fresh = rpc_ok(
+        &fixture.socket,
+        &fresh_id(401),
+        "queue.submit",
+        Some(submit_params_doc(
+            &idem_key("fresh-completed"),
+            &bound,
+            &digest,
+            &[("#5", "gr_0000000000000005")],
+            ConcurrencyCaps {
+                global: 4,
+                per_repository: 2,
+                per_harness: 2,
+            },
+            5,
+            60,
+        )),
+    );
+    println!(
+        "FRESH queue.submit: {}",
+        canter::canonical::canonical_text(&fresh)
+    );
+    assert_eq!(
+        live_item(&fresh, 5).get("status").and_then(Val::as_str),
+        Some("admitted")
+    );
+    assert_ne!(
+        live_item(&fresh, 5)
+            .get("instance_id")
+            .and_then(Val::as_str),
+        Some(run5.as_str())
     );
     shutdown(daemon);
 }

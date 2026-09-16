@@ -403,20 +403,21 @@ clears a repository/fleet-level hold or bypasses a gate.
 - `run.release` (issue #146) requires `params.instance_id`,
   `params.reason` (1-300 printable characters) and
   `params.idempotency_key`. It releases exactly ONE run that can never
-  progress, in ONE transaction: the run's unique ownership row is removed,
-  the run goes terminal (`invalidated`, pause state cleared and the resume
-  digest consumed) so it stops counting against the global,
-  per-repository and per-harness occupancy, and a `run.release` audit
-  record carries the operator reason, the exact run identity
+  progress, in ONE transaction: only that run's ownership row is removed
+  (never a successor's), and the run is terminal afterward (`done` stays `done`,
+  otherwise `invalidated`, pause state cleared and the resume digest consumed)
+  so it holds no global, per-repository or per-harness occupancy. A
+  `run.release` audit record carries the operator reason, the exact run identity
   (repository/issue/revision), what was freed and the authorization window
   the run held. It refuses BEFORE any effect while anything of that run is
   genuinely live: a step-dispatch claim still in flight
   (`refusal.run.in_flight` — nothing is killed, cancelled or cleaned up),
   an unconsumed bounded retry authorization (`refusal.run.retry_pending` —
-  the authorization is never burned), a terminal run
-  (`refusal.run.terminal`, so a second release needs the SAME idempotency
-  key to replay the recorded response) and an unknown run
-  (`state.not_found`). A missing, revoked or EXPIRED grant is deliberately
+  the authorization is never burned) and an unknown run (`state.not_found`).
+  Terminal runs (`done` or `invalidated`) can release leftover ownership.
+  The same idempotency key replays the recorded response; a fresh key records
+  an audited ownership-absent no-op if ownership is already freed.
+  A missing, revoked or EXPIRED grant is deliberately
   NOT a fence: such a run is exactly what a release exists for, and the
   release records that window (`release.authorization.status` /
   `expires_at` / `usable:false`) without presenting or reusing it — a

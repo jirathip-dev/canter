@@ -5952,18 +5952,22 @@ exactly one unconsumed authorization.
 release frees the durable bookkeeping of ONE run that can never progress
 (daemon `run.release`, issue #146): the run's unique ownership of its issue
 and the global/per-repository/per-harness occupancy it held are released,
-and the run becomes terminal (`invalidated`) so it is never resumed,
-retried or dispatched again — the operator's --reason, the exact run
-identity and the authorization window it held are recorded in the audit.
+and the run is terminal afterward (`done` stays `done`, otherwise `invalidated`)
+so it is never resumed, retried or dispatched again — the operator's
+--reason, the exact run identity and the authorization window it held are
+recorded in the audit.
 Eligibility is fenced daemon-side and refuses typed: a run with a step
 dispatch in flight refuses `refusal.run.in_flight` (nothing in flight is
 killed or abandoned), a run that still holds an unconsumed bounded retry
 authorization refuses `refusal.run.retry_pending` (the authorization is
-never burned), an already-terminal run refuses `refusal.run.terminal`
-(so a release replays only through the SAME --idempotency-key) and an
-unknown run is `state.not_found`. An expired, revoked or missing grant is
-NOT a fence: a run whose grant expired is exactly the case a release exists
-for, and the release records that window (`usable:false`) without ever
+never burned), and an unknown run is `state.not_found`.
+Terminal runs (`done` or `invalidated`) can release leftover ownership.
+If ownership is already absent, a fresh --idempotency-key records an
+audited no-op (`ownership: absent`); the SAME --idempotency-key replays
+the recorded response. No other run's ownership is touched.
+An expired, revoked or missing grant is NOT a fence: a run whose grant
+expired is exactly the case a release exists for, and the release records
+that window (`usable:false`) without ever
 presenting or reusing it — continuing that work needs a freshly minted
 grant window, never a silent reuse of the expired one. After the release
 the issue can be submitted again on its own merits.

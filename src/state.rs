@@ -2437,19 +2437,19 @@ impl State {
 
     /// Release ONE run that can never progress (issue #146) in ONE
     /// transaction: the run's unique ownership row is removed, the run goes
-    /// terminal (`invalidated`, pause state cleared) so it stops counting
-    /// against the global/per-repository/per-harness occupancy, and the
-    /// audit records the reason, the exact run identity and the
-    /// authorization window that run held.
+    /// terminal (`done` stays done, otherwise `invalidated`, pause cleared)
+    /// so it stops counting against global/per-repository/per-harness
+    /// occupancy. The audit records the reason, the exact run identity and
+    /// the authorization window that run held.
     ///
     /// Fail closed on anything genuinely live: a step of the run still in
     /// flight (or an unattributable in-flight claim) refuses
     /// `refusal.run.in_flight`, and an unconsumed bounded retry
     /// authorization refuses `refusal.run.retry_pending` — a release never
-    /// burns an authorization and never abandons work. A terminal run
-    /// refuses `refusal.run.terminal` (so a second release with a fresh key
-    /// is typed, while a same-key retry replays the recorded response), and
-    /// an unknown run is `state.not_found`. Everything else — including a
+    /// burns an authorization and never abandons work. Terminal runs can
+    /// release leftover ownership; an already freed row is an audited no-op.
+    /// A same-key retry replays the recorded response, and an unknown run is
+    /// `state.not_found`. Everything else — including a
     /// run whose grant is missing, revoked or EXPIRED — is releasable: the
     /// release frees the durable bookkeeping, it never resurrects or reuses
     /// the window (a continuation needs a freshly minted grant window /
@@ -2480,15 +2480,6 @@ impl State {
                 format!("no instance {instance_id:?}"),
             ));
         };
-        if matches!(run.status.as_str(), "done" | "invalidated") {
-            return Err(state_error(
-                "refusal.run.terminal",
-                format!(
-                    "run {instance_id} is {}; a terminal run has nothing to release",
-                    run.status
-                ),
-            ));
-        }
         let in_flight = in_flight_steps_locked(&tx)?
             .iter()
             .any(|(named, _)| named == instance_id || named == "*");
@@ -2529,10 +2520,11 @@ impl State {
         });
         let affected = tx
             .execute(
-                "UPDATE instances SET status = 'invalidated', paused = 0, pause_requested = 0,
+                "UPDATE instances SET status = CASE WHEN status = 'done' THEN 'done' ELSE 'invalidated' END,
+                        paused = 0, pause_requested = 0,
                         resume_digest = '', updated_at = ?2
                   WHERE instance_id = ?1
-                    AND status IN ('new', 'running', 'paused', 'human_queue', 'blocked')",
+                    AND status IN ('new', 'running', 'paused', 'human_queue', 'blocked', 'done', 'invalidated')",
                 params![instance_id, at],
             )
             .map_err(|err| StateError::from_sqlite("release_run: update", err))?;
@@ -12075,6 +12067,13 @@ fn advance_queue_in_tx(
             params![delivering_instance, at],
         )
         .map_err(|err| StateError::from_sqlite("queue_advance: complete", err))?;
+        // Free only this run's ownership, atomically with completion. A
+        // replay must never delete a fresh successor's ownership.
+        tx.execute(
+            "DELETE FROM queue_ownership WHERE instance_id = ?1",
+            params![delivering_instance],
+        )
+        .map_err(|err| StateError::from_sqlite("queue_advance: ownership", err))?;
     }
     // 4. The idempotency fence + the candidate: a consumed delivery with a
     //    dispatch (or an exhausted queue) is final; a recorded HOLD is

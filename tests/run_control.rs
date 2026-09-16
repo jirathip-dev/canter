@@ -1845,15 +1845,23 @@ fn state_release_frees_the_issue_for_a_fresh_submission() {
     assert_eq!(owners[0].instance_id, other);
     assert!(state.run_step_spine(&victim).expect("spine").is_some());
 
-    // A second release is typed, never a second effect.
-    let err = state
+    // A fresh-key release of an already freed terminal run is an audited no-op.
+    let again = state
         .release_run(&victim, "again", "ik_release-146-0002", AT)
-        .expect_err("a terminal run has nothing to release");
-    assert_eq!(err.code, "refusal.run.terminal");
+        .expect("terminal release is safe to repeat");
+    assert!(!again.ownership_freed);
+    assert_eq!(again.run.status, "invalidated");
 
     // The audit carries the reason, the exact run identity and the window.
     let records = release_records(&state);
-    assert_eq!(records.len(), 1, "exactly ONE release record: {records:?}");
+    assert_eq!(records.len(), 2, "one record per fresh key: {records:?}");
+    assert!(
+        records[1]
+            .get("target")
+            .and_then(Val::as_str)
+            .expect("target")
+            .contains("ownership:absent")
+    );
     let target = records[0]
         .get("target")
         .and_then(Val::as_str)
@@ -1989,6 +1997,7 @@ fn state_release_refuses_while_an_unconsumed_authorization_exists() {
     let err = state
         .release_run(&run, "dead predecessor", "ik_release-146-0004", AT)
         .expect_err("a live authorization fences the release");
+    println!("LIVE retry authorization release: {err:?}");
     assert_eq!(err.code, "refusal.run.retry_pending");
     assert!(err.message.contains(&retry.retry_id), "{}", err.message);
 
@@ -2142,6 +2151,7 @@ fn wire_release_refuses_a_run_with_a_step_in_flight_then_frees_it_once_settled()
         )),
     );
     assert_eq!(code, "refusal.run.in_flight", "{message}");
+    println!("LIVE in-flight release: {code}: {message}");
     {
         let state = fixture.seed();
         assert_eq!(state.queue_ownership_rows().expect("ownership").len(), 1);
@@ -2229,8 +2239,8 @@ fn wire_release_refuses_a_run_with_a_step_in_flight_then_frees_it_once_settled()
         canonical_text(&released),
         "the recorded release response is replayed"
     );
-    // A FRESH key is a terminal refusal, never a second release.
-    let (code, _) = rpc_err(
+    // A FRESH key records an ownership-absent no-op, never another deletion.
+    let again = rpc_ok(
         &fixture.socket,
         &fresh_id(5),
         "run.release",
@@ -2240,7 +2250,8 @@ fn wire_release_refuses_a_run_with_a_step_in_flight_then_frees_it_once_settled()
             "again",
         )),
     );
-    assert_eq!(code, "refusal.run.terminal");
+    assert_eq!(text(&again, &["release", "ownership"]), "absent");
+    assert_eq!(text(&again, &["run", "status"]), "invalidated");
 
     // The released run is inert: the daemon refuses every effect for it ...
     let (code, _) = rpc_err(
@@ -2250,9 +2261,9 @@ fn wire_release_refuses_a_run_with_a_step_in_flight_then_frees_it_once_settled()
         Some(apply_params(&run, "p1", &idem_key("release-after-0001"), 5)),
     );
     assert_eq!(code, "refusal.instance.state");
-    // ... exactly ONE release record exists, and the issue is free again.
+    // ... one release record per fresh key exists, and the issue is free again.
     let state = fixture.seed();
-    assert_eq!(release_records(&state).len(), 1);
+    assert_eq!(release_records(&state).len(), 2);
     assert!(state.queue_ownership_rows().expect("ownership").is_empty());
     let readmitted = submit_with_id(&state, "qs_0000000000000401", &[(5, GRANT_5)]);
     assert_eq!(readmitted[0].status, "admitted");

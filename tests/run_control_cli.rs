@@ -622,6 +622,47 @@ fn cli_run_duplicate_key_refuses_a_reused_key_and_usage_errors_exit_two() {
 }
 
 #[test]
+fn cli_run_help_documents_terminal_release_and_live_refusals() {
+    let output = Command::new(bin())
+        .args(["run", "--help"])
+        .output()
+        .expect("run help");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 help");
+    let release = stdout
+        .split_once("release frees")
+        .expect("release help")
+        .1
+        .split_once("status reads")
+        .expect("end of release help")
+        .0
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        !release.contains("refusal.run.terminal"),
+        "terminal status is not a release refusal: {release}"
+    );
+    for fact in [
+        "`done` stays `done`, otherwise `invalidated`",
+        "never resumed, retried or dispatched again",
+        "Terminal runs (`done` or `invalidated`) can release leftover ownership",
+        "a fresh --idempotency-key records an audited no-op (`ownership: absent`)",
+        "the SAME --idempotency-key replays the recorded response",
+        "No other run's ownership is touched",
+        "refusal.run.in_flight",
+        "refusal.run.retry_pending",
+        "the authorization is never burned",
+        "state.not_found",
+    ] {
+        assert!(
+            release.contains(fact),
+            "help must document {fact}: {release}"
+        );
+    }
+}
+
+#[test]
 fn cli_run_controls_refuse_a_stale_daemon_and_absent_daemon_typed() {
     // No daemon: the socket is absent and every control (including the
     // read-only status) reports the absent daemon typed — never a crash.
@@ -662,7 +703,7 @@ fn fixture_seed_yields_exactly_one_run() {
 /// entry point — two separate invocations against one daemon, raw exits, and
 /// the daemon's own readback.
 #[test]
-fn cli_run_release_frees_the_run_and_refuses_a_second_release_typed() {
+fn cli_run_release_frees_the_run_and_records_a_second_release_as_absent() {
     let fixture = Fixture::new("release");
     let run = {
         let state = fixture.seed();
@@ -729,8 +770,7 @@ fn cli_run_release_frees_the_run_and_refuses_a_second_release_typed() {
         Some("invalidated")
     );
 
-    // A SECOND release with a fresh key is a typed refusal (exit 4), never a
-    // second release.
+    // A SECOND release with a fresh key is an audited ownership-absent no-op.
     let (exit, stdout, stderr) = fixture.cli(&[
         "run",
         "release",
@@ -744,11 +784,14 @@ fn cli_run_release_frees_the_run_and_refuses_a_second_release_typed() {
         &config_arg,
         "--json",
     ]);
+    assert_eq!(exit, 0, "terminal release: {stdout} {stderr}");
     assert_eq!(
-        exit, 4,
-        "a terminal run refuses the release: {stdout} {stderr}"
+        data_of(&envelope(&stdout))
+            .get("release")
+            .and_then(|release| release.get("ownership"))
+            .and_then(Val::as_str),
+        Some("absent")
     );
-    assert_eq!(error_code(&envelope(&stdout)), "refusal.run.terminal");
 
     shutdown(daemon);
 }

@@ -933,7 +933,8 @@ fn assert_advanced_exactly_once(fixture: &DaemonFixture, seeded: &Seeded) {
         "exactly one dispatch, never a duplicate"
     );
     let ownership = state.queue_ownership_rows().expect("ownership");
-    assert_eq!(ownership.len(), 2);
+    assert_eq!(ownership.len(), 1);
+    assert!(!ownership.iter().any(|row| row.instance_id == seeded.run5));
     assert!(
         ownership
             .iter()
