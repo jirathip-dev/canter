@@ -1359,6 +1359,55 @@ fn cycle2_rehearsal_refuses_when_the_published_integration_ref_moved() {
 }
 
 #[test]
+fn cycle2_rehearsal_refuses_an_unprovable_published_base_on_both_routes() {
+    let (scenario, feature, base) = cycle2_reviewed_merge("squash", false);
+    let root = scenario
+        .repos
+        .checkout
+        .parent()
+        .expect("sandbox root")
+        .to_path_buf();
+    let origin = root.join("origin.git");
+    let checkout = Git::new(&scenario.repos.checkout);
+
+    // Route 1 — an ABSENT published ref: `origin` answers, but publishes no
+    // integration branch (it was deleted there), so `git ls-remote` exits 0
+    // with no ref, which is not a head. The fail-closed branch must refuse the
+    // step's own typed code rather than certifying an unprovable base (the
+    // branch the exact-head review of PR #156 found had no witness).
+    Git::new(&origin).run(&["update-ref", "-d", "refs/heads/staging"]);
+    let (code, message) = scenario.apply_err(15, "m1", Some(&feature), Some(&base));
+    assert_eq!(code, "effect.merge.failed");
+    assert!(message.contains("not readable"), "{message}");
+    assert!(message.contains("staging"), "{message}");
+    assert_eq!(
+        scenario.integration_base(),
+        base,
+        "the refusal must not move integration"
+    );
+
+    // Route 2 — an UNREADABLE `origin`: the published ref cannot be read at
+    // all (the bare origin is gone), so the read fails instead of answering.
+    // It must refuse the SAME typed unprovable-base code (issue #132's review
+    // finding) — never a bare `adapter.exit` that reads like an adapter fault
+    // — and keep the read's git diagnostics in the message.
+    checkout.run(&["push", "origin", "staging"]);
+    std::fs::remove_dir_all(&origin).expect("remove the origin remote");
+    let (code, message) = scenario.apply_err(16, "m1", Some(&feature), Some(&base));
+    assert_eq!(code, "effect.merge.failed");
+    assert!(message.contains("not readable"), "{message}");
+    assert!(
+        message.contains("origin.git"),
+        "the refusal keeps the unreadable remote's git diagnostics: {message}"
+    );
+    assert_eq!(
+        scenario.integration_base(),
+        base,
+        "the refusal must not move integration"
+    );
+}
+
+#[test]
 fn moved_integration_base_invalidates_stale_evidence_and_refuses_merge() {
     let scenario = Scenario::new("stale-evidence", "2999-01-01T00:00:00Z", flow_steps());
     let integration_base = scenario.integration_base();

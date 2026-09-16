@@ -2921,7 +2921,7 @@ fn effect_review_evidence(ctx: &EffectContext<'_>) -> EffectOutcome {
 /// or absent published ref refuses fail-closed: a rehearsal that cannot prove
 /// the published base must not certify a merge.
 fn published_integration_head(ctx: &EffectContext<'_>) -> Result<String, EffectOutcome> {
-    let out = run_git(
+    let out = match run_git(
         ctx,
         ctx.integration_repo,
         &[
@@ -2929,7 +2929,32 @@ fn published_integration_head(ctx: &EffectContext<'_>) -> Result<String, EffectO
             "origin",
             &format!("refs/heads/{}", ctx.integration_branch),
         ],
-    )?;
+    ) {
+        Ok(out) => out,
+        Err(outcome) => {
+            // An `origin` the checkout cannot read at all (absent, unreachable,
+            // unauthenticated) proves no base either, so it refuses this step's
+            // own unprovable-base code — never a bare `adapter.exit` that reads
+            // like an adapter fault (issue #132's review finding) — and keeps
+            // the git read's diagnostics in the message. Ambiguous and
+            // timed-out reads are NOT "not readable": they keep their own
+            // outcomes untouched.
+            if outcome.code.as_deref() != Some(code::EXIT) {
+                return Err(outcome);
+            }
+            let detail = outcome
+                .message
+                .as_deref()
+                .unwrap_or("the read failed without a message");
+            return Err(failed(
+                code::MERGE_FAILED,
+                format!(
+                    "the published integration ref {:?} is not readable from origin: {detail}",
+                    ctx.integration_branch
+                ),
+            ));
+        }
+    };
     let head = out.stdout.split_whitespace().next().unwrap_or_default();
     if !is_hex40(head) {
         return Err(failed(
