@@ -662,7 +662,7 @@ fn fixture_seed_yields_exactly_one_run() {
 /// entry point — two separate invocations against one daemon, raw exits, and
 /// the daemon's own readback.
 #[test]
-fn cli_run_release_frees_the_run_and_refuses_a_second_release_typed() {
+fn cli_run_release_frees_the_run_and_records_a_second_release_as_absent() {
     let fixture = Fixture::new("release");
     let run = {
         let state = fixture.seed();
@@ -729,8 +729,7 @@ fn cli_run_release_frees_the_run_and_refuses_a_second_release_typed() {
         Some("invalidated")
     );
 
-    // A SECOND release with a fresh key is a typed refusal (exit 4), never a
-    // second release.
+    // A SECOND release with a fresh key is an audited ownership-absent no-op.
     let (exit, stdout, stderr) = fixture.cli(&[
         "run",
         "release",
@@ -744,11 +743,14 @@ fn cli_run_release_frees_the_run_and_refuses_a_second_release_typed() {
         &config_arg,
         "--json",
     ]);
+    assert_eq!(exit, 0, "terminal release: {stdout} {stderr}");
     assert_eq!(
-        exit, 4,
-        "a terminal run refuses the release: {stdout} {stderr}"
+        data_of(&envelope(&stdout))
+            .get("release")
+            .and_then(|release| release.get("ownership"))
+            .and_then(Val::as_str),
+        Some("absent")
     );
-    assert_eq!(error_code(&envelope(&stdout)), "refusal.run.terminal");
 
     shutdown(daemon);
 }
