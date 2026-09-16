@@ -1743,32 +1743,63 @@ fn the_supervisor_itself_drives_the_committed_merge_and_cleanup_to_the_last_step
 
     // From here on NO client dispatch of m1/c1 happens: the driver owns the
     // committed tail. Poll the product's own status surface (bounded, no
-    // fixed sleep) and record the observed frontier progression.
+    // fixed sleep) until the driver has driven the WHOLE tail, and record
+    // every sample: the driver may finish both tail steps between two
+    // samples, so the ORDER of its dispatches and of the recorded attempts —
+    // not one transient cursor value — is what proves the progression.
     let mut timeline: Vec<String> = Vec::new();
     let mut id = 700u64;
     let deadline = Instant::now() + Duration::from_secs(90);
-    let (next_step, next_kind) = loop {
+    let (next_step, next_kind, attempts) = loop {
         id += 1;
         let (status, step, kind, attempts) = cursor_sample(&fixture.socket, &run5, id);
         timeline.push(format!(
             "t{} status={status} next={step}/{kind} attempts={attempts:?}",
             id - 700
         ));
-        if achieved(&attempts, "m1") {
-            break (step, kind);
+        if status == "done" {
+            break (step, kind, attempts);
         }
         assert!(
             Instant::now() < deadline,
-            "the driver never dispatched the run's committed merge step; observed: {timeline:?}"
+            "the driver never drove the run's committed tail to its last step; observed: {timeline:?}"
         );
         std::thread::sleep(Duration::from_millis(250));
     };
     eprintln!("SUPERVISOR_TAIL_TIMELINE={timeline:?}");
-    assert_eq!(
-        next_step, "c1",
-        "the frontier must advance PAST the merge to the cleanup: {next_step}/{next_kind}"
+    assert!(
+        achieved(&attempts, "m1"),
+        "the driver's merge attempt must be recorded achieved: {attempts:?}"
     );
-    assert_eq!(next_kind, "cleanup");
+    assert!(
+        achieved(&attempts, "c1"),
+        "the driver's cleanup attempt must be recorded achieved: {attempts:?}"
+    );
+    // The merge was achieved BEFORE the cleanup was attempted: the ledger is
+    // in claim order.
+    let merge_at = attempts
+        .iter()
+        .position(|(step, _)| step == "m1")
+        .expect("m1 in the ledger");
+    let cleanup_at = attempts
+        .iter()
+        .position(|(step, _)| step == "c1")
+        .expect("c1 in the ledger");
+    assert!(
+        merge_at < cleanup_at,
+        "the tail runs IN ORDER (merge, then cleanup): {attempts:?}"
+    );
+    // The run completed only after its LAST committed step: the frontier is
+    // EXHAUSTED (nothing owed), never parked on the merge.
+    assert_ne!(
+        next_step, "m1",
+        "the frontier must not still be the merge: {next_step}/{next_kind}"
+    );
+    assert_eq!(
+        next_step, "",
+        "a completed run owes nothing: the committed spine is fully achieved"
+    );
+    assert_eq!(next_kind, "");
     // The daemon's OWN log names the driver's dispatch of the merge step and
     // never a refusal of it.
     let log = std::fs::read_to_string(fixture.daemon_log()).unwrap_or_default();
@@ -1776,33 +1807,23 @@ fn the_supervisor_itself_drives_the_committed_merge_and_cleanup_to_the_last_step
         log.contains("dispatched step m1"),
         "the driver's own dispatch record must name the merge step:\n{log}"
     );
+    // The driver drove the tail IN ORDER: its own records name the merge
+    // first and the cleanup after it (the frontier advanced past the merge).
+    let merge_dispatch = log.find("dispatched step m1").expect("merge dispatch");
+    let cleanup_dispatch = log
+        .find("dispatched step c1")
+        .unwrap_or_else(|| panic!("the driver must dispatch the cleanup too:\n{log}"));
+    assert!(
+        merge_dispatch < cleanup_dispatch,
+        "the driver's own dispatch records must be ordered merge -> cleanup:\n{log}"
+    );
     assert!(
         !log.contains("step m1: refusal.") && !log.contains("supervision.dispatch_refused"),
         "no refusal may stand between the driver and its committed tail:\n{log}"
     );
 
-    // The driver then drives the LAST committed step too: the run completes
-    // only after it, and the freed slot admits the waiting issue.
-    let mut done_sample: Option<Vec<(String, String)>> = None;
-    let deadline = Instant::now() + Duration::from_secs(90);
-    while Instant::now() < deadline && done_sample.is_none() {
-        id += 1;
-        let (status, _, _, attempts) = cursor_sample(&fixture.socket, &run5, id);
-        if status == "done" {
-            done_sample = Some(attempts.clone());
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    let attempts = done_sample.expect("the driver completes the run after its last committed step");
-    assert!(
-        achieved(&attempts, "m1"),
-        "the merge must be recorded achieved: {attempts:?}"
-    );
-    assert!(
-        achieved(&attempts, "c1"),
-        "the cleanup must be recorded achieved BEFORE the run completes: {attempts:?}"
-    );
+    // The freed slot admits the waiting issue only now — after the run reached
+    // its last committed step.
     let queue = rpc_ok(
         &fixture.socket,
         &fresh_id(900),
