@@ -56,10 +56,12 @@ Normative rules:
   remote (`git ls-remote` — a bare-remote move is visible without a fetch,
   never from the checkout's own refs) and a checkout that disagrees with it
   refuses `effect.merge.not_fast_forward`, naming the published head and the
-  local head; an unreadable or absent published ref refuses
-  `effect.merge.failed` rather than certifying an unprovable base. The
-  orchestrator/forge owns the actual policy merge; `post_merge_verify` proves
-  its landed head.
+  local head; an unreadable or absent published ref refuses the same typed
+  `effect.merge.failed` on both routes — an absent ref, or an `origin` the
+  checkout cannot read at all (absent, unreachable, unauthenticated), which
+  keeps the read's git diagnostics in the message — rather than certifying an
+  unprovable base. The orchestrator/forge owns the actual policy merge;
+  `post_merge_verify` proves its landed head.
 
 ### Canonical serialization and digest
 

@@ -809,6 +809,18 @@ release process activates (docs/RELEASING.md), then semver applies.
   refuses `effect.merge.failed`: an unprovable base is never certified. No new
   step params, no schema change, and still no ref/checkout/remote mutation.
 
+### Fixed (issue #132 — the unprovable-base refusal is the merge step's own code)
+
+- The merge rehearsal's published-ref read now refuses `effect.merge.failed`
+  on BOTH unprovable-base routes: an absent published ref, and an `origin` the
+  checkout cannot read at all (absent, unreachable, unauthenticated). The
+  latter used to surface the read's ordinary non-zero exit as a bare
+  `adapter.exit`, which is not the published-ref contract the plan spec
+  states (found by the exact-head review of PR #156). The refusal keeps the
+  read's git diagnostics in its message; ambiguous and timed-out reads keep
+  their own outcomes untouched. Regression witnesses cover both routes in
+  `tests/mutation_engine.rs`.
+
 ### Changed
 
 - Documentation polish (issue #12, PR #13): security recipe doc line fix
