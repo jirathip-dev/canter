@@ -3083,9 +3083,17 @@ PATH=/usr/bin:/bin
 export PATH
 LOG="$HOME/herdr-argv.txt"
 STATE="$HOME/herdr-state"
-mkdir -p "$STATE"
+[ -d "$STATE" ] || mkdir -p "$STATE"
 log() { printf '%s\n' "$*" >> "$LOG"; }
-read_state() { [ -f "$STATE/$1" ] && sed -n 1p "$STATE/$1" || printf '%s' "$2"; }
+# Hot polling reads use shell builtins, not a new sed process per field.
+read_state() {
+  if [ -f "$STATE/$1" ]; then
+    IFS= read -r value < "$STATE/$1" || :
+    printf '%s' "$value"
+  else
+    printf '%s' "$2"
+  fi
+}
 agent_doc() {
   printf '{"name":"%s","pane_id":"%s","cwd":"%s","agent_status":"%s","tokens":{"canter_lane":"%s","canter_generation":"%s"}}' \
     "$(read_state name '')" "$(read_state pane 'w1:p1')" "$(read_state cwd '')" "$(read_state state 'idle')" \
@@ -3298,7 +3306,7 @@ fn supervised_collection(mode: &str) {
                 ("requires_delta", Val::Bool(true)),
                 (
                     "deadline_secs",
-                    integer(if mode == "timeout" { 1 } else { 15 }),
+                    integer(if mode == "timeout" { 1 } else { 30 }),
                 ),
             ])),
         });
