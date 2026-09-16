@@ -3177,11 +3177,15 @@ case "$1 $2" in
       if [ -f "$HOME/allow-stop" ] && [ "$(read_state state idle)" = working ]; then
         if [ "$(cat "$HOME/collect-mode")" = delta ]; then
           checkout=$(read_state cwd '')
-          printf 'worker delivery\n' > "$checkout/delivery.txt"
-          git -C "$checkout" add delivery.txt || exit 8
-          git -C "$checkout" -c commit.gpgsign=false commit -qm delivery || exit 8
+          if [ ! -f "$checkout/delivery.txt" ]; then
+            printf 'worker delivery\n' > "$checkout/delivery.txt"
+            git -C "$checkout" add delivery.txt || exit 8
+            git -C "$checkout" -c commit.gpgsign=false commit -qm delivery || exit 8
+          fi
+          # Delivery lands mid-turn: the worker stays working after the commit.
+        else
+          printf done > "$STATE/state"
         fi
-        printf done > "$STATE/state"
       fi
     fi
     printf '{"id":"cli:agent:get","result":%s,"type":"agent_info"}\n' "$(agent_doc)"
@@ -3428,6 +3432,11 @@ fn supervised_collection(mode: &str) {
                 "the worker must WAIT before collection"
             );
             assert_eq!(collected[0].1, "succeeded", "{attempts:?}");
+            assert_eq!(
+                std::fs::read_to_string(fixture.dir.join("herdr-state/state")).unwrap(),
+                "working",
+                "delivery must be collected while the worker is still live"
+            );
             assert_ne!(git_output(&lane, &["rev-parse", "HEAD"]).trim(), published);
             assert_eq!(
                 std::fs::read_to_string(lane.join("delivery.txt")).unwrap(),

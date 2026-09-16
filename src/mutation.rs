@@ -2824,12 +2824,13 @@ fn observed_worktree_branch(
     Ok(branch)
 }
 
-/// Wait for a pane turn to stop before inspecting its committed delivery.
+/// Collect a pane's delivery even while it is live. An empty result needs a
+/// confirmed stop, not a single transient idle/done/blocked read-back.
 fn await_pane_worker(
     ctx: &EffectContext<'_>,
-    relative: &str,
+    inputs: &CollectOutcomeInputs,
     worktree: &Path,
-) -> Result<(), EffectOutcome> {
+) -> Result<Option<EffectOutcome>, EffectOutcome> {
     let prompt = ctx
         .plan
         .doc
@@ -2841,25 +2842,29 @@ fn await_pane_worker(
         .take_while(|step| step.get("id").and_then(Val::as_str) != Some(ctx.step_id))
         .filter(|step| step.get("kind").and_then(Val::as_str) == Some("prompt"))
         .filter_map(|step| step.get("params"))
-        .filter(|params| params.get("worktree").and_then(Val::as_str) == Some(relative))
+        .filter(|params| {
+            params.get("worktree").and_then(Val::as_str) == Some(inputs.worktree.as_str())
+        })
         .last();
     let Some(prompt) = prompt else {
-        return Ok(());
+        return Ok(None);
     };
     if declared_execution(Some(prompt))? == crate::adapters::ExecutionMode::Headless {
-        return Ok(());
+        return Ok(None);
     }
-    let inputs = prompt_inputs(Some(prompt), &ctx.param_contract())?;
-    let session = resolve_session(ctx, inputs.declared, "collect_outcome")?;
+    let prompt = prompt_inputs(Some(prompt), &ctx.param_contract())?;
+    let session = resolve_session(ctx, prompt.declared, "collect_outcome")?;
     let seconds = effect_deadline_secs(ctx.kind, ctx.params)?;
     let start = std::time::Instant::now();
     poll_pane_worker(
         Duration::from_secs(seconds),
         Duration::from_millis(100),
         |remaining| crate::adapters::observe_pane_worker(&session, worktree, remaining, ctx.env),
+        || collect_worktree_outcome(ctx, inputs, worktree),
         || start.elapsed(),
         std::thread::sleep,
     )
+    .map(Some)
 }
 
 /// The production loop, with explicit deadline, cadence and clock/wait seams.
@@ -2868,10 +2873,12 @@ fn poll_pane_worker(
     deadline: Duration,
     interval: Duration,
     mut observe: impl FnMut(Duration) -> Result<String, crate::adapters::ProcessFailure>,
+    mut collect: impl FnMut() -> EffectOutcome,
     elapsed: impl Fn() -> Duration,
     mut sleep: impl FnMut(Duration),
-) -> Result<(), EffectOutcome> {
+) -> Result<EffectOutcome, EffectOutcome> {
     let seconds = deadline.as_secs();
+    let mut previous_stop = None;
     loop {
         let remaining = deadline.saturating_sub(elapsed());
         if remaining.is_zero() {
@@ -2879,15 +2886,17 @@ fn poll_pane_worker(
                 status: "ambiguous",
                 code: Some(code::WORKER_TIMEOUT.to_string()),
                 message: Some(format!(
-                    "pane worker did not stop within {seconds}s; collection parked without redispatch"
+                    "pane worker has no verified delivery or confirmed stop within {seconds}s; worker may still be running; collection parked without redispatch"
                 )),
                 result: object(vec![("deadline_secs", integer(seconds as i64))]),
             });
         }
-        match observe(remaining) {
-            Ok(state) if matches!(state.as_str(), "idle" | "done" | "blocked") => return Ok(()),
-            Ok(_) => {}
-            Err(err) if err.code == crate::adapters::CODE_TIMEOUT => continue,
+        let state = match observe(remaining) {
+            Ok(state) => state,
+            Err(err) if err.code == crate::adapters::CODE_TIMEOUT => {
+                previous_stop = None;
+                continue;
+            }
             Err(err) => {
                 return Err(EffectOutcome {
                     status: err.status(),
@@ -2896,7 +2905,25 @@ fn poll_pane_worker(
                     result: null(),
                 });
             }
+        };
+        let outcome = collect();
+        let empty = outcome.code.as_deref() == Some(code::COLLECT_EMPTY_DELTA)
+            || (outcome.status == "succeeded"
+                && outcome
+                    .result
+                    .get("changed_files")
+                    .and_then(Val::as_array)
+                    .is_some_and(Vec::is_empty));
+        // A committed delivery (or a different collection failure) is actionable
+        // without waiting for the worker to exit. Only emptiness needs a stop.
+        if !empty {
+            return Ok(outcome);
         }
+        let stopped = matches!(state.as_str(), "idle" | "done" | "blocked");
+        if stopped && previous_stop.as_deref() == Some(state.as_str()) {
+            return Ok(outcome);
+        }
+        previous_stop = stopped.then_some(state);
         sleep(interval.min(deadline.saturating_sub(elapsed())));
     }
 }
@@ -2913,14 +2940,14 @@ fn effect_collect_outcome(ctx: &EffectContext<'_>) -> EffectOutcome {
         Ok(path) => path,
         Err(err) => return refusal(err.code, err.message),
     };
-    let base_head = inputs.base_head;
+    let base_head = &inputs.base_head;
     // A missing/unrelated base or wrong checkout cannot become a valid
     // collection by waiting for a worker. Refuse before observing that worker,
     // using only the recorded object, never the runner's refs or remotes.
     if run_git(
         ctx,
         &worktree,
-        &["merge-base", "--is-ancestor", &base_head, "HEAD"],
+        &["merge-base", "--is-ancestor", base_head, "HEAD"],
     )
     .is_err()
     {
@@ -2934,22 +2961,31 @@ fn effect_collect_outcome(ctx: &EffectContext<'_>) -> EffectOutcome {
     if let Err(outcome) = observed_worktree_branch(ctx, &worktree, inputs.branch.as_deref()) {
         return outcome;
     }
-    if let Err(outcome) = await_pane_worker(ctx, &inputs.worktree, &worktree) {
-        return outcome;
+    match await_pane_worker(ctx, &inputs, &worktree) {
+        Ok(Some(outcome)) | Err(outcome) => outcome,
+        Ok(None) => collect_worktree_outcome(ctx, &inputs, &worktree),
     }
-    let head_out = match run_git(ctx, &worktree, &["rev-parse", "--verify", "HEAD"]) {
+}
+
+fn collect_worktree_outcome(
+    ctx: &EffectContext<'_>,
+    inputs: &CollectOutcomeInputs,
+    worktree: &Path,
+) -> EffectOutcome {
+    let base_head = &inputs.base_head;
+    let head_out = match run_git(ctx, worktree, &["rev-parse", "--verify", "HEAD"]) {
         Ok(out) => out,
         Err(outcome) => return outcome,
     };
     let head = head_out.stdout.trim().to_string();
-    let branch = match observed_worktree_branch(ctx, &worktree, inputs.branch.as_deref()) {
+    let branch = match observed_worktree_branch(ctx, worktree, inputs.branch.as_deref()) {
         Ok(branch) => branch,
         Err(outcome) => return outcome,
     };
     if run_git(
         ctx,
-        &worktree,
-        &["merge-base", "--is-ancestor", &base_head, &head],
+        worktree,
+        &["merge-base", "--is-ancestor", base_head, &head],
     )
     .is_err()
     {
@@ -2963,12 +2999,12 @@ fn effect_collect_outcome(ctx: &EffectContext<'_>) -> EffectOutcome {
     }
     let log_out = match run_git(
         ctx,
-        &worktree,
+        worktree,
         &[
             "log",
             "--format=%H",
             "--max-count=32",
-            &format!("{base_head}..HEAD"),
+            &format!("{base_head}..{head}"),
         ],
     ) {
         Ok(out) => out,
@@ -2982,8 +3018,8 @@ fn effect_collect_outcome(ctx: &EffectContext<'_>) -> EffectOutcome {
         .collect();
     let delta = match run_git(
         ctx,
-        &worktree,
-        &["diff", "--name-only", &base_head, &head, "--"],
+        worktree,
+        &["diff", "--name-only", base_head, &head, "--"],
     ) {
         Ok(out) => out,
         Err(outcome) => return outcome,
@@ -2994,7 +3030,7 @@ fn effect_collect_outcome(ctx: &EffectContext<'_>) -> EffectOutcome {
         .filter(|line| !line.is_empty())
         .map(string)
         .collect();
-    if inputs.requires_delta && (head == base_head || commits.is_empty() || changed.is_empty()) {
+    if inputs.requires_delta && (&head == base_head || commits.is_empty() || changed.is_empty()) {
         return refusal(
             code::COLLECT_EMPTY_DELTA,
             format!(
@@ -3006,7 +3042,7 @@ fn effect_collect_outcome(ctx: &EffectContext<'_>) -> EffectOutcome {
     ok(object(vec![
         ("head", string(&head)),
         ("commits", Val::Arr(commits)),
-        ("base_head", string(&base_head)),
+        ("base_head", string(base_head)),
         ("worktree", string(&inputs.worktree)),
         ("branch", string(&branch)),
         ("requires_delta", bool_(inputs.requires_delta)),
@@ -3807,28 +3843,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn collection_live_mid_turn_at_deadline_is_worker_timeout() {
+        use std::cell::Cell;
+        let elapsed = Cell::new(Duration::ZERO);
+        let mut states = [
+            "working", "idle", "working", "blocked", "working", "done", "working",
+        ]
+        .into_iter();
+        let outcome = poll_pane_worker(
+            Duration::from_millis(7),
+            Duration::from_millis(1),
+            |_| Ok(states.next().expect("bounded reads").to_string()),
+            || refusal(code::COLLECT_EMPTY_DELTA, "no committed delta"),
+            || elapsed.get(),
+            |wait| elapsed.set(elapsed.get() + wait),
+        )
+        .expect_err("a transient stop report is not a stopped worker");
+        assert_eq!(outcome.status, "ambiguous");
+        assert_eq!(outcome.code.as_deref(), Some(code::WORKER_TIMEOUT));
+        assert_eq!(elapsed.get(), Duration::from_millis(7));
+    }
+
+    #[test]
     fn collection_polling_uses_injected_time_and_live_state() {
         use std::cell::Cell;
         let elapsed = Cell::new(Duration::ZERO);
         let mut reads = Vec::new();
-        let mut states = ["working", "working", "done"].into_iter();
-        poll_pane_worker(
-            Duration::from_millis(3),
+        let mut states = ["working", "working", "done", "done"].into_iter();
+        let stopped = poll_pane_worker(
+            Duration::from_millis(4),
             Duration::from_millis(1),
             |remaining| {
                 reads.push(remaining.as_millis());
                 Ok(states.next().expect("bounded reads").to_string())
             },
+            || refusal(code::COLLECT_EMPTY_DELTA, "no committed delta"),
             || elapsed.get(),
             |wait| elapsed.set(elapsed.get() + wait),
         )
         .unwrap();
         assert_eq!(
             reads,
-            [3, 2, 1],
+            [4, 3, 2, 1],
             "consult live state until the worker stops"
         );
-        assert_eq!(elapsed.get(), Duration::from_millis(2));
+        assert_eq!(elapsed.get(), Duration::from_millis(3));
+        assert_eq!(stopped.code.as_deref(), Some(code::COLLECT_EMPTY_DELTA));
 
         reads.clear();
         elapsed.set(Duration::ZERO);
@@ -3840,6 +3900,7 @@ mod tests {
                 reads.push(remaining.as_millis());
                 Ok("working".to_string())
             },
+            || refusal(code::COLLECT_EMPTY_DELTA, "no committed delta"),
             || elapsed.get(),
             |wait| elapsed.set(elapsed.get() + wait),
         )
@@ -3852,6 +3913,73 @@ mod tests {
         );
         assert_eq!(outcome.status, "ambiguous");
         assert_eq!(outcome.code.as_deref(), Some(code::WORKER_TIMEOUT));
+    }
+
+    #[test]
+    fn collection_delivery_while_live_is_collected() {
+        use std::cell::Cell;
+        let elapsed = Cell::new(Duration::ZERO);
+        let reads = Cell::new(0);
+        let mut collections = 0;
+        let outcome = poll_pane_worker(
+            Duration::from_millis(3),
+            Duration::from_millis(1),
+            |_| {
+                reads.set(reads.get() + 1);
+                Ok("working".to_string())
+            },
+            || {
+                collections += 1;
+                if collections < 3 {
+                    refusal(code::COLLECT_EMPTY_DELTA, "no committed delta")
+                } else {
+                    ok(object(vec![(
+                        "changed_files",
+                        Val::Arr(vec![string("delivery.txt")]),
+                    )]))
+                }
+            },
+            || elapsed.get(),
+            |wait| elapsed.set(elapsed.get() + wait),
+        )
+        .expect("delivery does not require a stopped worker");
+        assert_eq!(outcome.status, "succeeded");
+        assert_eq!(
+            outcome.result.get("changed_files"),
+            Some(&Val::Arr(vec![string("delivery.txt")]))
+        );
+        assert_eq!(reads.get(), 3);
+        assert_eq!(collections, 3);
+        assert_eq!(elapsed.get(), Duration::from_millis(2));
+    }
+
+    #[test]
+    fn collection_confirmed_stopped_empty_still_refuses() {
+        use std::cell::Cell;
+        for state in ["idle", "done", "blocked"] {
+            let elapsed = Cell::new(Duration::ZERO);
+            let reads = Cell::new(0);
+            let outcome = poll_pane_worker(
+                Duration::from_millis(3),
+                Duration::from_millis(1),
+                |_| {
+                    reads.set(reads.get() + 1);
+                    Ok(state.to_string())
+                },
+                || refusal(code::COLLECT_EMPTY_DELTA, "no committed delta"),
+                || elapsed.get(),
+                |wait| elapsed.set(elapsed.get() + wait),
+            )
+            .expect("a confirmed stopped worker settles before the deadline");
+            assert_eq!(outcome.status, "refused");
+            assert_eq!(outcome.code.as_deref(), Some(code::COLLECT_EMPTY_DELTA));
+            assert_eq!(
+                reads.get(),
+                2,
+                "confirm the stop across collection read-back"
+            );
+            assert_eq!(elapsed.get(), Duration::from_millis(1));
+        }
     }
 
     // Issue #92 F1: the documented per-effect deadline table, the reviewed
