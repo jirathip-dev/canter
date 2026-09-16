@@ -130,8 +130,18 @@ agent_doc() {
     "$(report_lane)" "$(report_generation)" "${1:-}"
 }
 workspace_doc() {
-  printf '{"workspace_id":"w1","label":"%s","cwd":"%s","worktree":{"repo_root":"%s","checkout_path":"%s","is_linked_worktree":true,"repo_name":"widgets"}}' \
-    "$(read_state label '')" "$(read_state cwd '')" "$(read_state root '')" "$(read_state cwd '')"
+  root=$(read_state root ''); checkout=$(read_state cwd ''); linked=true; repo=widgets
+  case "${HF_FAKE_HERDR_BAD_IDENTITY:-}" in
+    missing)
+      printf '{"workspace_id":"w1","label":"%s","cwd":"%s"}' "$(read_state label '')" "$checkout"
+      return ;;
+    root) root="$root/other-repo" ;;
+    checkout) checkout="$checkout/other-lane" ;;
+    unlinked) linked=false ;;
+    unnamed) repo="" ;;
+  esac
+  printf '{"workspace_id":"w1","label":"%s","cwd":"%s","worktree":{"repo_root":"%s","checkout_path":"%s","is_linked_worktree":%s,"repo_name":"%s"}}' \
+    "$(read_state label '')" "$(read_state cwd '')" "$root" "$checkout" "$linked" "$repo"
 }
 case "$1 $2" in
   "workspace close")
@@ -691,6 +701,51 @@ fn worktree_identity_is_required_and_returned_with_the_workspace() {
             .iter()
             .any(|row| row.starts_with("workspace create"))
     );
+}
+
+#[test]
+fn malformed_workspace_identity_is_refused_and_rolled_back() {
+    for mode in ["missing", "root", "checkout", "unlinked", "unnamed"] {
+        let fixture = Fixture::new(mode);
+        fixture.install(FAKE_HERDR);
+        let session = lane_session(1);
+        let profile = lane_profile(ExecutionMode::HerdrPane);
+        let result = execute_op_in_worktree(
+            &profile,
+            &start_request(&session),
+            &fixture.env(&[("HF_FAKE_HERDR_BAD_IDENTITY", mode.to_string())]),
+            &fixture.worktree,
+        );
+        assert_eq!(result.status, "refused", "{mode}: {result:?}");
+        assert_eq!(
+            result.code,
+            Some(canter::adapters::CODE_INCOMPLETE_IDENTITY),
+            "{mode}: {result:?}"
+        );
+        let rows = fixture.rows();
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.starts_with("worktree open"))
+                .count(),
+            1,
+            "{mode}: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| *row == "workspace close w1")
+                .count(),
+            1,
+            "{mode}: {rows:?}"
+        );
+        assert_eq!(rows.last().map(String::as_str), Some("workspace list"));
+        assert!(
+            !rows.iter().any(|row| row.starts_with("agent start")),
+            "{mode}: {rows:?}"
+        );
+        assert!(!fixture.state.join("pane").exists(), "{mode}");
+        assert!(!fixture.state.join("workspace").exists(), "{mode}");
+        assert!(!fixture.bare_spawned(), "{mode}");
+    }
 }
 
 #[test]
