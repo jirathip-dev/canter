@@ -2852,9 +2852,28 @@ fn await_pane_worker(
     let inputs = prompt_inputs(Some(prompt), &ctx.param_contract())?;
     let session = resolve_session(ctx, inputs.declared, "collect_outcome")?;
     let seconds = effect_deadline_secs(ctx.kind, ctx.params)?;
-    let end = std::time::Instant::now() + Duration::from_secs(seconds);
+    let start = std::time::Instant::now();
+    poll_pane_worker(
+        Duration::from_secs(seconds),
+        Duration::from_millis(100),
+        |remaining| crate::adapters::observe_pane_worker(&session, worktree, remaining, ctx.env),
+        || start.elapsed(),
+        std::thread::sleep,
+    )
+}
+
+/// The production loop, with explicit deadline, cadence and clock/wait seams.
+/// Tests advance a local clock; no environment override can shorten a real run.
+fn poll_pane_worker(
+    deadline: Duration,
+    interval: Duration,
+    mut observe: impl FnMut(Duration) -> Result<String, crate::adapters::ProcessFailure>,
+    elapsed: impl Fn() -> Duration,
+    mut sleep: impl FnMut(Duration),
+) -> Result<(), EffectOutcome> {
+    let seconds = deadline.as_secs();
     loop {
-        let remaining = end.saturating_duration_since(std::time::Instant::now());
+        let remaining = deadline.saturating_sub(elapsed());
         if remaining.is_zero() {
             return Err(EffectOutcome {
                 status: "ambiguous",
@@ -2865,7 +2884,7 @@ fn await_pane_worker(
                 result: object(vec![("deadline_secs", integer(seconds as i64))]),
             });
         }
-        match crate::adapters::observe_pane_worker(&session, worktree, remaining, ctx.env) {
+        match observe(remaining) {
             Ok(state) if matches!(state.as_str(), "idle" | "done" | "blocked") => return Ok(()),
             Ok(_) => {}
             Err(err) if err.code == crate::adapters::CODE_TIMEOUT => continue,
@@ -2878,10 +2897,7 @@ fn await_pane_worker(
                 });
             }
         }
-        std::thread::sleep(
-            Duration::from_millis(100)
-                .min(end.saturating_duration_since(std::time::Instant::now())),
-        );
+        sleep(interval.min(deadline.saturating_sub(elapsed())));
     }
 }
 
@@ -2897,10 +2913,30 @@ fn effect_collect_outcome(ctx: &EffectContext<'_>) -> EffectOutcome {
         Ok(path) => path,
         Err(err) => return refusal(err.code, err.message),
     };
+    let base_head = inputs.base_head;
+    // A missing/unrelated base or wrong checkout cannot become a valid
+    // collection by waiting for a worker. Refuse before observing that worker,
+    // using only the recorded object, never the runner's refs or remotes.
+    if run_git(
+        ctx,
+        &worktree,
+        &["merge-base", "--is-ancestor", &base_head, "HEAD"],
+    )
+    .is_err()
+    {
+        return refusal(
+            code::OUTPUT_LOCATION,
+            format!(
+                "collection base {base_head} is unavailable or is not an ancestor of the worktree HEAD"
+            ),
+        );
+    }
+    if let Err(outcome) = observed_worktree_branch(ctx, &worktree, inputs.branch.as_deref()) {
+        return outcome;
+    }
     if let Err(outcome) = await_pane_worker(ctx, &inputs.worktree, &worktree) {
         return outcome;
     }
-    let base_head = inputs.base_head;
     let head_out = match run_git(ctx, &worktree, &["rev-parse", "--verify", "HEAD"]) {
         Ok(out) => out,
         Err(outcome) => return outcome,
@@ -3744,6 +3780,54 @@ fn harness_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collection_polling_uses_injected_time_and_live_state() {
+        use std::cell::Cell;
+        let elapsed = Cell::new(Duration::ZERO);
+        let mut reads = Vec::new();
+        let mut states = ["working", "working", "done"].into_iter();
+        poll_pane_worker(
+            Duration::from_millis(3),
+            Duration::from_millis(1),
+            |remaining| {
+                reads.push(remaining.as_millis());
+                Ok(states.next().expect("bounded reads").to_string())
+            },
+            || elapsed.get(),
+            |wait| elapsed.set(elapsed.get() + wait),
+        )
+        .unwrap();
+        assert_eq!(
+            reads,
+            [3, 2, 1],
+            "consult live state until the worker stops"
+        );
+        assert_eq!(elapsed.get(), Duration::from_millis(2));
+
+        reads.clear();
+        elapsed.set(Duration::ZERO);
+        let outcome = poll_pane_worker(
+            Duration::from_millis(3),
+            Duration::from_millis(2),
+            |remaining| {
+                assert!(reads.len() < 3, "deadline must bound polling");
+                reads.push(remaining.as_millis());
+                Ok("working".to_string())
+            },
+            || elapsed.get(),
+            |wait| elapsed.set(elapsed.get() + wait),
+        )
+        .unwrap_err();
+        assert_eq!(reads, [3, 1]);
+        assert_eq!(
+            elapsed.get(),
+            Duration::from_millis(3),
+            "last wait is capped"
+        );
+        assert_eq!(outcome.status, "ambiguous");
+        assert_eq!(outcome.code.as_deref(), Some(code::WORKER_TIMEOUT));
+    }
 
     // Issue #92 F1: the documented per-effect deadline table, the reviewed
     // policy override and the hard ceiling.

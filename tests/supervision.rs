@@ -1080,34 +1080,52 @@ fn cli_supervision_status_reads_the_versioned_status_back_inert() {
     shutdown(daemon);
 }
 
+/// Use the same admitted submission and durable check path as the daemon,
+/// but inject the check time for policy-boundary tests. Real timer/wake/RPC
+/// wiring remains exercised by the daemon tests in this suite.
+fn submit_observation_run(state: &State, name: &str, policy: supervision::Authorization) -> String {
+    seed_grant(state, "gr_0000000000000095", 5);
+    let (bound, digest) = render_bound(state, &observation_request(vec![selected("#5", REV_A)]));
+    let plan = submission_plan_for(
+        state,
+        &idem_key(name),
+        &bound,
+        &digest,
+        "gr_0000000000000095",
+        Some(policy),
+    );
+    let (_, items) = state.submit_queue_run(&plan).unwrap();
+    item_row_of(&items, 5).instance_id.unwrap()
+}
+
+fn reconcile_at(state: &State, run: &str, now: i64) -> Val {
+    let row = state.supervision_by_id(run).unwrap().unwrap();
+    let evidence = state.supervision_evidence(run).unwrap().unwrap();
+    let plan = supervision::check_plan(&row, &evidence, None, row.checks == 0, now);
+    state.commit_supervision_check(&plan).unwrap();
+    let row = state.supervision_by_id(run).unwrap().unwrap();
+    let evidence = state.supervision_evidence(run).unwrap().unwrap();
+    let policy = supervision::Policy {
+        check_interval_secs: row.check_interval_secs,
+        progress_timeout_secs: row.progress_timeout_secs,
+    };
+    let verdict = supervision::classify(&evidence, &row.authorization_digest, &policy, now);
+    supervision::status_doc(&row, &evidence, None, &verdict, now)
+}
+
 #[test]
 fn freshly_armed_run_is_held_and_never_opens_a_continuation_window() {
     // AC3 (reviewer finding 95-R1): a freshly armed run has NO recorded
     // progress observation yet. The first reconciliations must classify it as
     // held (unknown) and must never advance the durable continuation counter,
     // and the read must report exactly what the driver committed.
-    let fixture = DaemonFixture::new("fresh-arm");
-    let (bound, digest) = {
-        let state = fixture.seed();
-        seed_grant(&state, "gr_0000000000000095", 5);
-        render_bound(&state, &observation_request(vec![selected("#5", REV_A)]))
-    };
-    let daemon = fixture.spawn();
-    wait_ready(&fixture);
-    let key = idem_key("fresh-arm");
-    let params = params_doc(
-        &key,
-        &bound,
-        &digest,
-        &role_revision(),
-        "gr_0000000000000095",
-        Some(armed(10, 60)),
-    );
-    let result = rpc_ok(&fixture.socket, &fresh_id(1), "queue.submit", Some(params));
-    let run = instance_of(&result, 5);
+    let fixture = Fixture::new("fresh-arm-clock");
+    let state = fixture.open();
+    let run = submit_observation_run(&state, "fresh-arm-clock", armed(10, 60));
+    let now = canter::time::unix_now();
 
     // The FIRST committed check: held, and no window opened.
-    let first = wait_for_checks(&fixture, &run, 1);
+    let first = reconcile_at(&state, &run, now);
     assert_eq!(class_of(&first), "unknown");
     assert_eq!(
         evaluation(&first).get("reason").and_then(Val::as_str),
@@ -1124,7 +1142,8 @@ fn freshly_armed_run_is_held_and_never_opens_a_continuation_window() {
     // counter stays at zero across several further reconciliations.
     let mut last = first;
     for want in 2..=4 {
-        let doc = wait_for_checks(&fixture, &run, want);
+        let doc = reconcile_at(&state, &run, now + (want - 1) * 10);
+        assert_eq!(checks_of(&doc), want);
         assert_eq!(reports_of(&doc), 0, "no check may open a window here");
         assert_eq!(window_state(&doc), "closed");
         assert_eq!(
@@ -1155,52 +1174,22 @@ fn freshly_armed_run_is_held_and_never_opens_a_continuation_window() {
         "healthy",
         "the run is observed and healthy"
     );
-    shutdown(daemon);
 }
 
 #[test]
 fn a_genuine_deadline_reports_exactly_one_continuation() {
-    // AC4 (the legitimate path): once an observation IS recorded and then
-    // genuinely ages past the explicit policy deadline, the reader reports
-    // continuation-eligible and the durable counter advances exactly once —
-    // with the status surface showing that committed state.
-    let fixture = DaemonFixture::new("deadline");
-    let (bound, digest) = {
-        let state = fixture.seed();
-        seed_grant(&state, "gr_0000000000000095", 5);
-        render_bound(&state, &observation_request(vec![selected("#5", REV_A)]))
-    };
-    let daemon = fixture.spawn();
-    wait_ready(&fixture);
-    let key = idem_key("deadline");
-    // The minimum legal window: a 5s check interval and a 60s deadline, so the
-    // bounded poll below observes the REAL timeout path (~65s), never a
-    // simulated one.
-    let params = params_doc(
-        &key,
-        &bound,
-        &digest,
-        &role_revision(),
-        "gr_0000000000000095",
-        Some(armed(5, 60)),
-    );
-    let result = rpc_ok(&fixture.socket, &fresh_id(1), "queue.submit", Some(params));
-    let run = instance_of(&result, 5);
-    let first = wait_for_checks(&fixture, &run, 1);
+    // Drive the production check planner, transaction and status renderer
+    // with explicit times, rather than spending 70 wall-clock seconds.
+    let fixture = Fixture::new("deadline-clock");
+    let state = fixture.open();
+    let run = submit_observation_run(&state, "deadline-clock", armed(5, 60));
+    let now = canter::time::unix_now();
+    let first = reconcile_at(&state, &run, now);
     assert_eq!(reports_of(&first), 0, "the first check is held");
-    let deadline = Instant::now() + Duration::from_secs(150);
-    let mut eligible = None;
-    let mut attempt = 0u64;
-    while Instant::now() < deadline {
-        attempt += 1;
-        let doc = status_doc(&fixture.socket, &fresh_id(700 + attempt), &run);
-        if class_of(&doc) == "continuation-eligible" {
-            eligible = Some(doc);
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    let doc = eligible.expect("a genuinely aged observation must report a continuation");
+    let before = reconcile_at(&state, &run, now + 59);
+    assert_eq!(class_of(&before), "healthy");
+    assert_eq!(reports_of(&before), 0, "the deadline has not elapsed");
+    let doc = reconcile_at(&state, &run, now + 60);
     assert_eq!(
         evaluation(&doc).get("reason").and_then(Val::as_str),
         Some(supervision::codes::PROGRESS_TIMEOUT)
@@ -1219,13 +1208,12 @@ fn a_genuine_deadline_reports_exactly_one_continuation() {
         "the read reports the committed class"
     );
     // A later check within the same window never reports again.
-    let after = wait_for_checks(&fixture, &run, checks_of(&doc) + 2);
+    let after = reconcile_at(&state, &run, now + 70);
     assert_eq!(
         reports_of(&after),
         1,
         "one report per window, never one per check"
     );
-    shutdown(daemon);
 }
 
 #[test]
@@ -2722,7 +2710,7 @@ fn cycle2_collect_missing_base_is_refused_before_retry_consumption() {
         ],
     );
     assert_eq!(exit, 4, "{out} {err}");
-    assert!(err.contains("refusal.unavailable"), "{err}");
+    assert!(err.contains("refusal.worker.output_location"), "{err}");
     let (exit, out, err) = run_cli(&fixture, &["retry", "--run", &run, "--step", "p2"]);
     assert_eq!(exit, 0, "{out} {err}");
     let before = attempts_for(&fixture, &run, "p2");
@@ -3310,7 +3298,7 @@ fn supervised_collection(mode: &str) {
                 ("requires_delta", Val::Bool(true)),
                 (
                     "deadline_secs",
-                    integer(if mode == "timeout" { 1 } else { 30 }),
+                    integer(if mode == "timeout" { 1 } else { 15 }),
                 ),
             ])),
         });
@@ -3485,6 +3473,136 @@ fn supervised_collection(mode: &str) {
     );
     assert!(fixture.seed().run_retries(&run).unwrap().is_empty());
     shutdown(daemon);
+}
+
+#[test]
+fn collection_invalid_base_refuses_before_any_worker_poll() {
+    use canter::mutation::{EffectContext, bind_plan, execute_step, run_session_handle};
+    let fixture = DaemonFixture::new("collect-base-refusal");
+    let root = fixture.dir.join("worktrees");
+    std::fs::create_dir_all(&root).unwrap();
+    let lane = root.join("issues-5");
+    init_repo(&lane);
+    git_output(&lane, &["remote", "remove", "origin"]);
+    let base = git_output(&lane, &["rev-parse", "HEAD"]).trim().to_string();
+    let session = run_session_handle("run-0000000000000005").unwrap();
+    let bin = write_fake_herdr(&fixture.dir);
+    let worker = fixture.dir.join("herdr-state");
+    std::fs::create_dir_all(&worker).unwrap();
+    for (name, value) in [
+        ("name", "impl-5".to_string()),
+        ("pane", "w1:p1".to_string()),
+        ("cwd", lane.to_string_lossy().to_string()),
+        ("lane", session.session_id.clone()),
+        ("generation", session.identity.generation.to_string()),
+        ("state", "working".to_string()),
+    ] {
+        std::fs::write(worker.join(name), value).unwrap();
+    }
+    let env = std::collections::BTreeMap::from([
+        (
+            "PATH".to_string(),
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        ),
+        (
+            "HOME".to_string(),
+            fixture.dir.to_string_lossy().to_string(),
+        ),
+    ]);
+    let steps = Val::Arr(vec![
+        object(vec![
+            ("id", string("prompt")),
+            ("kind", string("prompt")),
+            (
+                "params",
+                object(vec![
+                    ("harness_key", string(HARNESS)),
+                    ("kind", string("hermes")),
+                    ("worktree", string("issues-5")),
+                    ("payload", string("bounded work")),
+                ]),
+            ),
+        ]),
+        object(vec![
+            ("id", string("collect")),
+            ("kind", string("collect_outcome")),
+        ]),
+    ]);
+    let plan = bind_plan(&plan_doc_with_steps(steps, 5)).unwrap();
+    let collect = |base: Option<&str>| {
+        let mut params = object(vec![
+            ("worktree", string("issues-5")),
+            ("deadline_secs", integer(1)),
+        ]);
+        if let (Some(base), Val::Obj(fields)) = (base, &mut params) {
+            fields.insert("base_head".to_string(), string(base));
+        }
+        execute_step(&EffectContext {
+            plan: &plan,
+            step_id: "collect",
+            kind: "collect_outcome",
+            params: Some(&params),
+            repository: "example-org/widgets",
+            integration_branch: "staging",
+            production_branches: &[],
+            worktrees_root: &root,
+            integration_repo: &lane,
+            observed_feature_head: None,
+            observed_integration_base: None,
+            env: &env,
+            role: None,
+            session: Some(&session),
+            archive_root: None,
+        })
+    };
+    let log = fixture.dir.join("herdr-argv.txt");
+    let absent = "0".repeat(40);
+    // Same typed refusal on an attached no-origin checkout, a detached one,
+    // and a fresh repository without a HEAD. None may observe the live worker.
+    for layout in ["no-origin", "detached", "fresh"] {
+        if layout == "detached" {
+            git_output(&lane, &["checkout", "--detach", &base]);
+        } else if layout == "fresh" {
+            std::fs::remove_dir_all(lane.join(".git")).unwrap();
+            git_output(&lane, &["init", "-b", "staging"]);
+        }
+        for (head, code) in [
+            (None, "refusal.request.malformed"),
+            (Some("not-a-commit"), "refusal.request.malformed"),
+            (Some(absent.as_str()), "refusal.worker.output_location"),
+        ] {
+            let outcome = collect(head);
+            assert_eq!(outcome.status, "refused", "{layout}: {outcome:?}");
+            assert_eq!(outcome.code.as_deref(), Some(code), "{layout}: {outcome:?}");
+            assert!(
+                !log.exists(),
+                "invalid base must never poll a worker: {layout}"
+            );
+        }
+        if layout == "detached" {
+            let outcome = collect(Some(&base));
+            assert_eq!(
+                outcome.code.as_deref(),
+                Some("refusal.worker.output_location")
+            );
+            assert!(
+                !log.exists(),
+                "a detached checkout must refuse before polling"
+            );
+        }
+        if layout == "no-origin" {
+            // Positive control: identical binding, valid base -> the fake live
+            // worker IS read, and the injected one-second deadline parks it.
+            let outcome = collect(Some(&base));
+            assert_eq!(outcome.code.as_deref(), Some("effect.worker_timeout"));
+            assert!(
+                std::fs::read_to_string(&log)
+                    .unwrap()
+                    .contains("agent get impl-5")
+            );
+            std::fs::remove_file(&log).unwrap();
+        }
+    }
 }
 
 #[test]
