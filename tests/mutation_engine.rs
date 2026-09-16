@@ -1169,7 +1169,10 @@ fn plan_rpc_digest_binding_and_idempotent_replay() {
     // A racing duplicate (new request, same branch/worktree) cannot create
     // a second lane: the effect fails and nothing is duplicated (AC2).
     let (code2, _) = scenario.apply_err(4, "w1", None, None);
-    assert_eq!(code2, "adapter.exit", "git refuses the duplicate worktree");
+    assert_eq!(
+        code2, "refusal.worktree.exists",
+        "duplicate lane refuses typed"
+    );
     let lane = scenario.repos.worktrees_root.join("issues-123");
     let listing = Git::new(&scenario.repos.checkout)
         .run(&["worktree", "list"])
