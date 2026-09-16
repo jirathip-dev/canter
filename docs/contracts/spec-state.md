@@ -444,9 +444,10 @@ to journal fails closed — the mutation does not start.
   its LAST committed spine step (issue #152): a run whose committed spine
   still carries steps after the delivery stays live and keeps its counted
   slot until those steps are recorded as achieved, so its own authorized
-  merge and cleanup stay dispatchable and a `done` is never recorded over an
-  unexecuted plan; a spine that ends at its reviewed-evidence step completes
-  exactly as before.
+  merge and cleanup stay dispatchable — and the supervision driver drives
+  that committed tail itself, under its own typed conditions — and a `done`
+  is never recorded over an unexecuted plan; a spine that ends at its
+  reviewed-evidence step completes exactly as before.
 - **Dependency holds**: every declared requirement of the candidate must be
   delivered and verified — a requirement that is selected but not delivered
   is `queue.dependency_unsettled`, one outside the selected set is

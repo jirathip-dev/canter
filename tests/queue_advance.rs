@@ -1604,6 +1604,229 @@ fn attempt_status(doc: &Val, step: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// ONE recorded cursor sample of a supervised run, read on the product's own
+/// read-only surface: `(run status, next step, next step kind, attempts)`.
+fn cursor_sample(
+    socket: &Path,
+    run: &str,
+    id: u64,
+) -> (String, String, String, Vec<(String, String)>) {
+    let doc = rpc_ok(
+        socket,
+        &fresh_id(id),
+        "supervision.status",
+        Some(supervision::status_params(run)),
+    );
+    let attempts = doc
+        .get("cursor")
+        .and_then(|cursor| cursor.get("attempts"))
+        .and_then(Val::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|attempt| {
+            (
+                attempt
+                    .get("step")
+                    .and_then(Val::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                attempt
+                    .get("status")
+                    .and_then(Val::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            )
+        })
+        .collect();
+    (
+        doc.get("run")
+            .and_then(|run| run.get("status"))
+            .and_then(Val::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        doc.get("cursor")
+            .and_then(|cursor| cursor.get("next_step"))
+            .and_then(Val::as_str)
+            .unwrap_or("")
+            .to_string(),
+        doc.get("cursor")
+            .and_then(|cursor| cursor.get("next_step_kind"))
+            .and_then(Val::as_str)
+            .unwrap_or("")
+            .to_string(),
+        attempts,
+    )
+}
+
+fn achieved(attempts: &[(String, String)], step: &str) -> bool {
+    attempts
+        .iter()
+        .any(|(id, status)| id == step && status == "succeeded")
+}
+
+/// Issue #152, supervisor half: the DRIVER — not an operator `apply` — drives
+/// the delivering run's own committed merge and then its cleanup, and the run
+/// completes only after that last committed step. No operator dispatch of m1
+/// or c1 exists in this test.
+#[test]
+fn the_supervisor_itself_drives_the_committed_merge_and_cleanup_to_the_last_step() {
+    let fixture = DaemonFixture::new("drive");
+    let head = repos_with_lane_branch(&fixture);
+    let caps_for_tail = tail_boundary_caps();
+    let tail_caps: Vec<&str> = caps_for_tail.iter().map(|cap| cap.as_str()).collect();
+    let (bound, digest) = {
+        let state = fixture.seed();
+        seed_grant_with_caps(&state, "gr_0000000000000005", 5, &tail_caps);
+        seed_grant_with_caps(&state, "gr_0000000000000006", 6, &tail_caps);
+        let mut request = request_with(vec![selected("#5", &[]), selected("#6", &[])]);
+        request.steps = committed_tail_steps();
+        request.boundary.caps = tail_boundary_caps();
+        render_bound(&state, &request)
+    };
+    let daemon = fixture.spawn();
+    wait_ready(&fixture);
+    let caps = ConcurrencyCaps {
+        global: 4,
+        per_repository: 1,
+        per_harness: 2,
+    };
+    let submitted = rpc_ok(
+        &fixture.socket,
+        &fresh_id(1),
+        "queue.submit",
+        Some(submit_params_doc(
+            &idem_key("drive-submit"),
+            &bound,
+            &digest,
+            &[("#5", "gr_0000000000000005"), ("#6", "gr_0000000000000006")],
+            caps,
+            5,
+            60,
+        )),
+    );
+    let submission_id = submitted
+        .get("submission_id")
+        .and_then(Val::as_str)
+        .expect("submission id")
+        .to_string();
+    let run5 = live_item(&submitted, 5)
+        .get("instance_id")
+        .and_then(Val::as_str)
+        .expect("issue 5 admitted")
+        .to_string();
+
+    // The reviewed delivery is recorded through the daemon's own mutation
+    // path (the reviewer's own record — NOT a continuation dispatch).
+    let applied = rpc_ok(
+        &fixture.socket,
+        &fresh_id(2),
+        "apply",
+        Some(step_apply_params(
+            2,
+            &fixture,
+            &run5,
+            5,
+            "gr_0000000000000005",
+            "r1",
+            "review_evidence",
+            review_params(),
+            &head,
+            &head,
+        )),
+    );
+    assert!(
+        applied.get("evidence_id").and_then(Val::as_str).is_some(),
+        "the review evidence committed: {}",
+        canter::canonical::canonical_text(&applied)
+    );
+
+    // From here on NO client dispatch of m1/c1 happens: the driver owns the
+    // committed tail. Poll the product's own status surface (bounded, no
+    // fixed sleep) and record the observed frontier progression.
+    let mut timeline: Vec<String> = Vec::new();
+    let mut id = 700u64;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let (next_step, next_kind) = loop {
+        id += 1;
+        let (status, step, kind, attempts) = cursor_sample(&fixture.socket, &run5, id);
+        timeline.push(format!(
+            "t{} status={status} next={step}/{kind} attempts={attempts:?}",
+            id - 700
+        ));
+        if achieved(&attempts, "m1") {
+            break (step, kind);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the driver never dispatched the run's committed merge step; observed: {timeline:?}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    eprintln!("SUPERVISOR_TAIL_TIMELINE={timeline:?}");
+    assert_eq!(
+        next_step, "c1",
+        "the frontier must advance PAST the merge to the cleanup: {next_step}/{next_kind}"
+    );
+    assert_eq!(next_kind, "cleanup");
+    // The daemon's OWN log names the driver's dispatch of the merge step and
+    // never a refusal of it.
+    let log = std::fs::read_to_string(fixture.daemon_log()).unwrap_or_default();
+    assert!(
+        log.contains("dispatched step m1"),
+        "the driver's own dispatch record must name the merge step:\n{log}"
+    );
+    assert!(
+        !log.contains("step m1: refusal.") && !log.contains("supervision.dispatch_refused"),
+        "no refusal may stand between the driver and its committed tail:\n{log}"
+    );
+
+    // The driver then drives the LAST committed step too: the run completes
+    // only after it, and the freed slot admits the waiting issue.
+    let mut done_sample: Option<Vec<(String, String)>> = None;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while Instant::now() < deadline && done_sample.is_none() {
+        id += 1;
+        let (status, _, _, attempts) = cursor_sample(&fixture.socket, &run5, id);
+        if status == "done" {
+            done_sample = Some(attempts.clone());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let attempts = done_sample.expect("the driver completes the run after its last committed step");
+    assert!(
+        achieved(&attempts, "m1"),
+        "the merge must be recorded achieved: {attempts:?}"
+    );
+    assert!(
+        achieved(&attempts, "c1"),
+        "the cleanup must be recorded achieved BEFORE the run completes: {attempts:?}"
+    );
+    let queue = rpc_ok(
+        &fixture.socket,
+        &fresh_id(900),
+        "queue.status",
+        Some(object(vec![("submission_id", string(&submission_id))])),
+    );
+    assert_eq!(
+        live_item(&queue, 6).get("status").and_then(Val::as_str),
+        Some("admitted"),
+        "the completion after the last committed step frees the slot: {}",
+        canter::canonical::canonical_text(&queue)
+    );
+    assert!(
+        !fixture.dir.join("worktrees/issues-5").exists(),
+        "the driver's cleanup removed the run's own worktree"
+    );
+    assert_eq!(
+        git(&fixture.dir.join("repo"), &["rev-parse", "staging"]),
+        head,
+        "the rehearsal never lands in the integration checkout"
+    );
+    shutdown(daemon);
+}
+
 #[test]
 fn a_delivering_run_stays_live_for_its_committed_merge_and_cleanup_then_the_queue_continues() {
     let fixture = DaemonFixture::new("tail");
@@ -1878,6 +2101,240 @@ fn a_delivering_run_stays_live_for_its_committed_merge_and_cleanup_then_the_queu
         "no step ever landed in the integration checkout"
     );
     shutdown(daemon);
+}
+
+// ---------------------------------------------------------------------------
+// The supervised committed-tail dispatch capability (issue #152, supervisor
+// half): typed and closed, never a blanket allow-list entry
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_supervisor_dispatch_capability_for_the_committed_tail_is_typed_and_closed() {
+    use canter::state::{EvidenceRow, InstanceRow, QueueItemRef, SupervisionEvidence};
+
+    const RUN_ID: &str = "run-0123456789abcdef";
+    const TAIL_CAPS: &str = "[\"read\",\"worktree\",\"spawn\",\"review\",\"merge\",\"cleanup\"]";
+    const NO_CLEANUP_CAPS: &str = "[\"read\",\"worktree\",\"spawn\",\"review\",\"merge\"]";
+    const DIGEST: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const NOW: i64 = 1_800_000_000;
+    const AT: &str = "2026-09-13T00:00:10Z";
+
+    fn run_row(caps: &str, status: &str) -> InstanceRow {
+        InstanceRow {
+            instance_id: RUN_ID.to_string(),
+            repository: REPO.to_string(),
+            workflow_id: DOCTRINE_WORKFLOW_ID.to_string(),
+            workflow_hash: WORKFLOW_HASH.to_string(),
+            policy_hash: POLICY_HASH.to_string(),
+            grant_id: "gr_0000000000000005".to_string(),
+            issue_number: 5,
+            issue_revision: REV_A.to_string(),
+            phase: "review".to_string(),
+            scope: "worktrees/issues/5".to_string(),
+            caps: caps.to_string(),
+            current_node: String::new(),
+            normal_rounds: 0,
+            recovery_rounds: 0,
+            human_queue: false,
+            terminal_blockers: 0,
+            paused: false,
+            resume_digest: String::new(),
+            pause_requested: false,
+            pause_reason: String::new(),
+            pause_requested_at: String::new(),
+            state_epoch: 1,
+            status: status.to_string(),
+            created_at: "2026-09-13T00:00:00Z".to_string(),
+            updated_at: "2026-09-13T00:00:00Z".to_string(),
+        }
+    }
+
+    fn evidence_row() -> EvidenceRow {
+        EvidenceRow {
+            evidence_id: "ev_0123456789abcdef".to_string(),
+            instance_id: RUN_ID.to_string(),
+            repository: REPO.to_string(),
+            feature_head: HEAD_A.to_string(),
+            integration_base: BASE_A.to_string(),
+            workflow_hash: WORKFLOW_HASH.to_string(),
+            policy_hash: POLICY_HASH.to_string(),
+            verdict: "pass".to_string(),
+            reviewer: "reviewer-1".to_string(),
+            checks: r#"[{"name":"hosted-ci","status":"passed"}]"#.to_string(),
+            created_at: AT.to_string(),
+        }
+    }
+
+    fn item() -> QueueItemRef {
+        QueueItemRef {
+            submission_id: "qs_0123456789abcdef".to_string(),
+            ordinal: 0,
+            work_item: "wi_0123456789abcdef".to_string(),
+            issue_number: 5,
+            status: "admitted".to_string(),
+        }
+    }
+
+    fn snapshot(
+        steps: &[(&str, &str)],
+        caps: &str,
+        has_dispatch_context: bool,
+        membership: bool,
+        newest: bool,
+        status: &str,
+    ) -> SupervisionEvidence {
+        SupervisionEvidence {
+            run: run_row(caps, status),
+            has_dispatch_context,
+            ownership_instance: Some(RUN_ID.to_string()),
+            submission_id: Some("qs_0123456789abcdef".to_string()),
+            submission_digest: Some(DIGEST.to_string()),
+            steps: steps
+                .iter()
+                .map(|(id, kind)| (id.to_string(), kind.to_string()))
+                .collect(),
+            attempts: vec![
+                ("p1".to_string(), "succeeded".to_string(), String::new()),
+                ("r1".to_string(), "succeeded".to_string(), String::new()),
+            ],
+            retries: Vec::new(),
+            verdicts: Vec::new(),
+            in_flight: None,
+            progress_at: AT.to_string(),
+            item: if membership { Some(item()) } else { None },
+            newest_evidence: if newest { Some(evidence_row()) } else { None },
+            dispatch_refusal: None,
+        }
+    }
+
+    // The spine of the delivering run: the reviewed delivery, then the
+    // committed tail.
+    let tail_spine = [
+        ("p1", "checkout"),
+        ("r1", "review_evidence"),
+        ("m1", "merge"),
+        ("c1", "cleanup"),
+    ];
+    let delivering = snapshot(&tail_spine, TAIL_CAPS, true, true, true, "running");
+
+    // 1. The run's OWN committed merge and cleanup are dispatchable, and the
+    //    classification reports exactly that dispatchable frontier.
+    assert!(supervision::driver_dispatchable_kind(
+        &delivering,
+        "m1",
+        "merge"
+    ));
+    assert!(supervision::driver_dispatchable_kind(
+        &delivering,
+        "c1",
+        "cleanup"
+    ));
+    let policy = supervision::Policy {
+        check_interval_secs: 10,
+        progress_timeout_secs: 60,
+    };
+    let verdict = supervision::classify(&delivering, DIGEST, &policy, NOW);
+    assert_eq!(verdict.class, "healthy");
+    assert_eq!(verdict.reason, supervision::codes::DISPATCH);
+    assert!(
+        verdict.eligible,
+        "the committed tail is an eligible frontier"
+    );
+    assert_eq!(verdict.detail, "m1");
+
+    // 2. NOT for a run that is not an admitted member of a committed
+    //    submission: an ad-hoc run's merge is never driven.
+    let ad_hoc = snapshot(&tail_spine, TAIL_CAPS, true, false, true, "running");
+    assert!(!supervision::driver_dispatchable_kind(
+        &ad_hoc, "m1", "merge"
+    ));
+    // ... and the ordinary autonomous kinds are unaffected by that.
+    assert!(supervision::driver_dispatchable_kind(
+        &ad_hoc, "p1", "checkout"
+    ));
+
+    // 3. NOT without the run's own approved capability for the kind.
+    let no_cleanup = snapshot(&tail_spine, NO_CLEANUP_CAPS, true, true, true, "running");
+    assert!(!supervision::driver_dispatchable_kind(
+        &no_cleanup,
+        "c1",
+        "cleanup"
+    ));
+    assert!(supervision::driver_dispatchable_kind(
+        &no_cleanup,
+        "m1",
+        "merge"
+    ));
+
+    // 4. NOT without a fresh verified delivery: the tail exists only behind
+    //    the delivery it completes.
+    let undelivered = snapshot(&tail_spine, TAIL_CAPS, true, true, false, "running");
+    assert!(!supervision::driver_dispatchable_kind(
+        &undelivered,
+        "m1",
+        "merge"
+    ));
+    assert!(!supervision::driver_dispatchable_kind(
+        &undelivered,
+        "c1",
+        "cleanup"
+    ));
+
+    // 5. NOT for a step that does not come AFTER the reviewed delivery.
+    let merge_before = [
+        ("p1", "checkout"),
+        ("m1", "merge"),
+        ("r1", "review_evidence"),
+        ("c1", "cleanup"),
+    ];
+    let early = snapshot(&merge_before, TAIL_CAPS, true, true, true, "running");
+    assert!(!supervision::driver_dispatchable_kind(
+        &early, "m1", "merge"
+    ));
+    let early_verdict = supervision::classify(&early, DIGEST, &policy, NOW);
+    assert_ne!(early_verdict.reason, supervision::codes::DISPATCH);
+    assert_eq!(
+        early_verdict.reason,
+        supervision::codes::PROGRESS_TIMEOUT,
+        "a non-drivable frontier keeps the pre-existing report: {early_verdict:?}"
+    );
+
+    // 6. The driven set stays CLOSED: other risk-classed kinds that share the
+    //    merge/cleanup capability are not tail kinds.
+    assert!(!supervision::driver_dispatchable_kind(
+        &delivering,
+        "x1",
+        "branch_delete"
+    ));
+    assert!(!supervision::driver_dispatchable_kind(
+        &delivering,
+        "x1",
+        "publish"
+    ));
+    assert!(!supervision::driver_dispatchable_kind(
+        &delivering,
+        "x1",
+        "branch_push"
+    ));
+    assert!(!supervision::driver_dispatchable_kind(
+        &delivering,
+        "x1",
+        "approve"
+    ));
+
+    // 7. A TERMINAL run is never a dispatch frontier, however eligible the
+    //    kind is: the run-status fence is composed with this gate by the
+    //    dispatch producer, and the classification reports completion.
+    let mut done = snapshot(&tail_spine, TAIL_CAPS, true, true, true, "done");
+    done.verdicts = vec![(
+        "ev_0123456789abcdef".to_string(),
+        "pass".to_string(),
+        AT.to_string(),
+    )];
+    assert!(supervision::driver_dispatchable_kind(&done, "m1", "merge"));
+    let done_verdict = supervision::classify(&done, DIGEST, &policy, NOW);
+    assert_eq!(done_verdict.class, "completed");
+    assert!(!done_verdict.eligible);
 }
 
 // ---------------------------------------------------------------------------

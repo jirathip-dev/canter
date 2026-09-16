@@ -11717,16 +11717,12 @@ fn queue_advance_attempt_locked(
     })
 }
 
-/// The step kind whose committed effect records the reviewed evidence a
-/// verified delivery is read from (issue #152). The LAST committed step of
-/// this kind in a run's spine is the run's delivering step: every committed
-/// step after it is work the plan still owes.
-const DELIVERY_STEP_KIND: &str = "review_evidence";
-
 /// Whether ONE delivering run owes NOTHING after its own verified delivery
 /// (issue #152): the delivery may complete the run only when it is the run's
 /// LAST committed spine step, or when every committed step after it has been
-/// recorded as achieved.
+/// recorded as achieved. The delivering step is the last committed step of
+/// `crate::mutation::DELIVERY_STEP_KIND` — the same fact the supervised
+/// committed-tail dispatch anchors on.
 ///
 /// The spine is re-read from the SAME committed bound-input line the run's
 /// membership was admitted from and the achievements from the SAME attempt
@@ -11745,7 +11741,7 @@ fn delivery_completes_run(
     let steps = bound_steps_of(request_line);
     let Some(delivering) = steps
         .iter()
-        .rposition(|(_, kind)| kind == DELIVERY_STEP_KIND)
+        .rposition(|(_, kind)| kind == crate::mutation::DELIVERY_STEP_KIND)
     else {
         return Ok(true);
     };
