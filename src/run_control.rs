@@ -1,31 +1,36 @@
-//! Run-scoped controls (issue #86): safe-boundary pause, resume and
-//! bounded retry for ONE queue run.
+//! Run-scoped controls (issue #86): safe-boundary pause, resume, bounded
+//! retry and supported step dispatch for ONE queue run, plus (issue #146)
+//! the explicit release of a run that can never progress.
 //!
 //! A *run* is one durable `instances` row (`run-` + 16 hex) — the identity
 //! the merged queue executor (#85) commits for every admitted selected
 //! issue. This module is the typed control surface over those rows:
 //! parameter parsing, the closed refusal vocabulary, the deterministic
-//! projections (`hf-run-control/v1` / `hf-run-retry/v1`) and the pure
-//! diagnosis helpers. The daemon owns journaling and the state
-//! transactions (`State::request_run_pause`, `State::resume_run`,
-//! `State::record_run_retry`, `State::claim_run_retry`).
+//! projections (`hf-run-control/v1` / `hf-run-retry/v1` /
+//! `hf-run-release/v1`) and the pure diagnosis helpers. The daemon owns
+//! journaling and the state transactions (`State::request_run_pause`,
+//! `State::resume_run`, `State::record_run_retry`, `State::claim_run_retry`,
+//! `State::release_run`).
 //!
 //! ## Scope matrix (run vs fleet vs lane)
 //!
 //! | level | identity | control surface | effect of a run control |
 //! | --- | --- | --- | --- |
-//! | run | one `run-` instance id | `run.pause` / `run.resume` / `run.retry` / `run.dispatch` / `run.status` | exactly this run: stop admitting new steps (pause), lift this run's pause (resume), authorize one bounded re-dispatch of one diagnosed step (retry, authorization only), dispatch ONE committed-spine step with the operator's own step inputs (dispatch, derived from the run's committed submission), read the control state back (status) |
+//! | run | one `run-` instance id | `run.pause` / `run.resume` / `run.retry` / `run.release` / `run.dispatch` / `run.status` | exactly this run: stop admitting new steps (pause), lift this run's pause (resume), authorize one bounded re-dispatch of one diagnosed step (retry, authorization only), release ONE run that can never progress — its issue ownership and the occupancy it held are freed and the run goes terminal (release), dispatch ONE committed-spine step with the operator's own step inputs (dispatch, derived from the run's committed submission), read the control state back (status) |
 //! | fleet | the whole run population | NONE — no `fleet.*` method exists in the closed RPC set | a fleet-level hold is an operator policy expressed as the set of paused runs: every `run.resume` is fenced on the exact instance id, so it never lifts another run's pause and never re-enables anything fleet-wide |
 //! | lane | one handoff lane generation (replacement/checkpoint records) | `lane.*` only | run controls never touch lane records; a run control naming a non-run identity refuses typed |
 //!
 //! Nothing on this surface kills a process, cleans up work, mutates Git,
 //! clears a repository or fleet-level hold, or bypasses a gate: a pause
-//! stops admitting NEW work and preserves in-flight dirty work, and a
-//! retry authorizes exactly ONE bounded step re-dispatch.
+//! stops admitting NEW work and preserves in-flight dirty work, a retry
+//! authorizes exactly ONE bounded step re-dispatch, and a release refuses
+//! while work is in flight or a bounded authorization is unconsumed — it
+//! frees durable BOOKKEEPING (ownership, occupancy) of a run that cannot
+//! make progress, never a running effect.
 
 use crate::canonical::sha256_hex;
 use crate::formats;
-use crate::state::{InstanceRow, RUN_RETRY_MAX, RunRetryRow};
+use crate::state::{GrantRow, InstanceRow, RUN_RETRY_MAX, RunReleaseOutcome, RunRetryRow};
 use crate::value::{Val, bool_, integer, null, object, string};
 
 /// The run-control document schema id (module-local like the #84 preview
@@ -41,6 +46,10 @@ pub const RUN_DISPATCH_SCHEMA: &str = "hf-run-dispatch/v1";
 
 /// Evidence-based diagnosed-step resolution (module-local).
 pub const RUN_RESOLUTION_SCHEMA: &str = "hf-run-resolution/v1";
+
+/// The explicit release of a run that can never progress (issue #146;
+/// module-local).
+pub const RUN_RELEASE_SCHEMA: &str = "hf-run-release/v1";
 
 /// Bound on the operator pause reason (same bound as the lane hold).
 pub const REASON_MAX: usize = 300;
@@ -61,6 +70,12 @@ pub const DISPATCH_STATEMENT: &str = "step dispatch only: exactly ONE step of th
 /// The statement on evidence-based resolution: the diagnosed effect is never
 /// executed again and the record conveys no review or merge authority.
 pub const RESOLUTION_STATEMENT: &str = "diagnosed-step resolution only: recorder-attributed artifact evidence marks exactly ONE prompt step delivered without re-executing its ambiguous/failed effect; no process is started or prompted, no Git/forge write occurs, no review verdict or merge authority is created, and supervision's diagnosed-step no-redispatch fence remains in force";
+
+/// The statement every release document carries: what the release did and
+/// did NOT do. A release is a BOOKKEEPING operation — it frees the durable
+/// ownership and occupancy of ONE run that can never progress, and it
+/// refuses while anything of that run is still live.
+pub const RELEASE_STATEMENT: &str = "run release only: exactly ONE run is addressed — its durable ownership of its issue and the per-repository/per-harness occupancy it held are freed and the run becomes terminal (`invalidated`), so it is never resumed, retried, dispatched or reconciled again; a release refuses typed while a step of the run is in flight or while it still holds an unconsumed bounded retry authorization (that authorization is never burned by a release); nothing is killed, no in-flight work is cancelled or cleaned up, no other run's ownership or pause is touched, no worktree or Git state is mutated, no grant is rewritten and no gate is bypassed";
 
 /// The closed control-state vocabulary rendered by the documents.
 pub const CONTROL_STATES: [&str; 3] = ["active", "pause_requested", "paused"];
@@ -89,7 +104,8 @@ pub mod codes {
     /// The named step has no recorded terminal failed attempt: a retry is
     /// only for a DIAGNOSED failure, never for an attempt that never ran.
     pub const STEP_UNDIAGNOSED: &str = "refusal.run.step_undiagnosed";
-    /// One unconsumed retry authorization already exists for this step.
+    /// One unconsumed retry authorization already exists for this step; a
+    /// release refuses on it rather than burning it.
     pub const RETRY_PENDING: &str = "refusal.run.retry_pending";
     /// All bounded retries for this step are used.
     pub const RETRY_BOUND: &str = "refusal.run.retry_bound";
@@ -97,7 +113,8 @@ pub mod codes {
     pub const RESOLUTION_KIND: &str = "refusal.run.resolution_kind";
     /// Artifact evidence or recorder identity is malformed/incomplete.
     pub const RESOLUTION_EVIDENCE: &str = "refusal.run.resolution_evidence";
-    /// A claimed effect still exists; resolution cannot race it.
+    /// A claimed effect still exists; resolution cannot race it and a
+    /// release never abandons it.
     pub const IN_FLIGHT: &str = "refusal.run.in_flight";
     /// The run was superseded: live ownership of its issue belongs to
     /// another run.
@@ -192,6 +209,18 @@ pub struct DispatchParams {
     pub topology: Option<Val>,
     /// Explicit current admission attestation; never a synthesized measurement.
     pub admission: Option<Val>,
+}
+
+/// `run.release` params (issue #146), fully shape-validated: ONE run, an
+/// operator reason and nothing capable of dispatching work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReleaseParams {
+    /// The presented idempotency key.
+    pub idempotency_key: String,
+    /// The exact run identity (`run-` + 16 hex).
+    pub instance_id: String,
+    /// The bounded operator reason (recorded in the audit).
+    pub reason: String,
 }
 
 /// Validate one required key and return its closed key set check.
@@ -339,6 +368,46 @@ pub fn parse_retry_params(params: &Val) -> Result<RetryParams, ControlError> {
         idempotency_key,
         instance_id,
         step,
+    })
+}
+
+/// Parse and shape-validate `run.release` params (issue #146). A malformed,
+/// missing or foreign-target identity refuses before any state is read, and
+/// the closed key set keeps every dispatch-capable input out of this path.
+pub fn parse_release_params(params: &Val) -> Result<ReleaseParams, ControlError> {
+    only_keys(
+        params,
+        &["idempotency_key", "instance_id", "reason"],
+        "run.release",
+    )?;
+    let idempotency_key = required(params, "idempotency_key", "run.release")?;
+    if !formats::is_idempotency_key(&idempotency_key) {
+        return Err(ControlError::new(
+            "refusal.malformed",
+            "run.release params.idempotency_key must be `ik_` + 8-64 of [a-z0-9-]",
+        ));
+    }
+    let instance_id = required(params, "instance_id", "run.release")?;
+    if !formats::is_run_id(&instance_id) {
+        return Err(ControlError::new(
+            codes::TARGET,
+            format!(
+                "run.release addresses exactly ONE run (`run-` + 16 hex); {instance_id:?} is not a \
+                 run identity (a lane id, a submission id or free text never addresses a run)"
+            ),
+        ));
+    }
+    let reason = required(params, "reason", "run.release")?;
+    if reason.is_empty() || reason.len() > REASON_MAX || reason.chars().any(char::is_control) {
+        return Err(ControlError::new(
+            "refusal.malformed",
+            format!("run.release params.reason must be 1-{REASON_MAX} printable characters"),
+        ));
+    }
+    Ok(ReleaseParams {
+        idempotency_key,
+        instance_id,
+        reason,
     })
 }
 
@@ -571,6 +640,15 @@ pub fn retry_params(key: &str, instance_id: &str, step: &str) -> Val {
     ])
 }
 
+/// The canonical `run.release` params document (issue #146).
+pub fn release_params(key: &str, instance_id: &str, reason: &str) -> Val {
+    object(vec![
+        ("idempotency_key", string(key)),
+        ("instance_id", string(instance_id)),
+        ("reason", string(reason)),
+    ])
+}
+
 /// The canonical `run.resolve` params document. Evidence is data, never an
 /// effect request or a set of replacement step params.
 pub fn resolution_params(
@@ -762,6 +840,70 @@ pub fn control_doc(
     ])
 }
 
+/// The deterministic release id: `rl_` + first 16 hex of the sha256 over
+/// the domain-separated (run, claim key) pair — one release claim produces
+/// exactly one release record, so a replay and a restart can never invent a
+/// second id for one release.
+pub fn release_id(instance_id: &str, key: &str) -> String {
+    let preimage = format!("{RUN_RELEASE_SCHEMA}|{instance_id}|{key}");
+    format!("rl_{}", &sha256_hex(preimage.as_bytes())[..16])
+}
+
+/// Render the `hf-run-release/v1` projection of one committed release
+/// (issue #146): the released run (now terminal), the operator reason, what
+/// the release freed, and the authorization window the run held when it was
+/// released (`usable:false` when that window was missing, revoked or already
+/// expired — the record states the window, it never presents or reuses it).
+pub fn release_doc(outcome: &RunReleaseOutcome, reason: &str, released_at: &str, key: &str) -> Val {
+    let run = &outcome.run;
+    object(vec![
+        ("schema", string(RUN_RELEASE_SCHEMA)),
+        ("release_id", string(&release_id(&run.instance_id, key))),
+        ("run", run_block(run)),
+        (
+            "release",
+            object(vec![
+                ("reason", string(reason)),
+                ("released_at", string(released_at)),
+                ("status", string(&run.status)),
+                (
+                    "ownership",
+                    string(if outcome.ownership_freed {
+                        "freed"
+                    } else {
+                        "absent"
+                    }),
+                ),
+                (
+                    "authorization",
+                    match &outcome.grant {
+                        Some(grant) => grant_window_block(grant, outcome.grant_usable),
+                        None => object(vec![
+                            ("grant_id", string(&run.grant_id)),
+                            ("status", string("missing")),
+                            ("expires_at", null()),
+                            ("usable", bool_(false)),
+                        ]),
+                    },
+                ),
+            ]),
+        ),
+        ("scope", scope_block(&run.instance_id)),
+        ("statement", string(RELEASE_STATEMENT)),
+    ])
+}
+
+/// The authorization window block of one release document: the run's own
+/// grant row at release time and whether that window was still usable.
+fn grant_window_block(grant: &GrantRow, usable: bool) -> Val {
+    object(vec![
+        ("grant_id", string(&grant.grant_id)),
+        ("status", string(&grant.status)),
+        ("expires_at", string(&grant.expires_at)),
+        ("usable", bool_(usable)),
+    ])
+}
+
 /// Render the `hf-run-retry/v1` projection of one recorded bounded retry.
 pub fn retry_doc(
     run: &InstanceRow,
@@ -935,6 +1077,12 @@ pub fn render_human(document: &Val) -> String {
     };
     let number =
         |value: &Val, key: &str| -> i64 { value.get(key).and_then(Val::as_int).unwrap_or(0) };
+    let flag = |value: &Val, key: &str| -> String {
+        match value.get(key).and_then(Val::as_bool) {
+            Some(value) => value.to_string(),
+            None => "unknown".to_string(),
+        }
+    };
     let schema = text(document, "schema");
     if schema == RUN_DISPATCH_SCHEMA {
         let step = document.get("step").cloned().unwrap_or_else(null);
@@ -967,6 +1115,32 @@ pub fn render_human(document: &Val) -> String {
             crate::canonical::canonical_text(&step.get("params").cloned().unwrap_or_else(null)),
             outcome,
             authorization,
+            text(&run, "instance_id"),
+        );
+    }
+    if schema == RUN_RELEASE_SCHEMA {
+        let release = document.get("release").cloned().unwrap_or_else(null);
+        let authorization = release.get("authorization").cloned().unwrap_or_else(null);
+        let window = if authorization.is_null() {
+            "none recorded".to_string()
+        } else {
+            format!(
+                "{} ({}, expires {}, usable {})",
+                text(&authorization, "grant_id"),
+                text(&authorization, "status"),
+                text(&authorization, "expires_at"),
+                flag(&authorization, "usable")
+            )
+        };
+        return format!(
+            "run {} released: status {}, ownership {}, {} at {}\nreason: {}\nauthorization window at release: {}\nscope: run {} only; no fleet-level or lane effect\n",
+            text(&run, "instance_id"),
+            text(&release, "status"),
+            text(&release, "ownership"),
+            text(document, "release_id"),
+            text(&release, "released_at"),
+            text(&release, "reason"),
+            window,
             text(&run, "instance_id"),
         );
     }

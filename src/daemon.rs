@@ -611,6 +611,7 @@ fn dispatch(shared: &Arc<Shared>, request: &Request) -> String {
         "run.pause" => method_run_pause(shared, request),
         "run.resume" => method_run_resume(shared, request),
         "run.retry" => method_run_retry(shared, request),
+        "run.release" => method_run_release(shared, request),
         "run.resolve" => method_run_resolve(shared, request),
         "run.dispatch" => method_run_dispatch(shared, request),
         "run.status" => method_run_status(shared, request),
@@ -3871,6 +3872,66 @@ fn method_run_retry(shared: &Arc<Shared>, request: &Request) -> String {
             request,
             &key,
             "run.retry",
+            false,
+            null(),
+            Some((code, message)),
+        ),
+    }
+}
+
+/// `run.release` (issue #146): release exactly ONE run that can never
+/// progress. The release frees durable bookkeeping ONLY — the run's unique
+/// ownership row is removed and the run goes terminal (`invalidated`) so it
+/// stops counting against the occupancy, with the operator's reason, the
+/// exact run identity and the authorization window it held recorded in the
+/// audit. It refuses typed (`refusal.run.in_flight`) while a step of the run
+/// is still dispatched and (`refusal.run.retry_pending`) while the run still
+/// holds an unconsumed bounded retry authorization — nothing in flight is
+/// killed or abandoned and no authorization is burned. An expired, revoked or
+/// missing grant is NOT a fence: that run is exactly the case a release
+/// exists for, and the release never presents or reuses the old window (a
+/// continuation needs a freshly minted window).
+fn method_run_release(shared: &Arc<Shared>, request: &Request) -> String {
+    let Some(params) = request.params.as_ref() else {
+        return err_response(
+            &request.id,
+            "refusal.malformed",
+            "run.release requires params: idempotency_key, instance_id, reason",
+        );
+    };
+    let parsed = match crate::run_control::parse_release_params(params) {
+        Ok(parsed) => parsed,
+        Err(err) => return err_response(&request.id, err.code, err.message),
+    };
+    let target = format!("run:{}", parsed.instance_id);
+    let key = match journal_mutation(shared, request, "mutate.run.release", &target) {
+        Intent::Claimed { key } => key,
+        Intent::Replay { response } => return replay(shared, &response),
+        Intent::Refused { code, message } => return err_response(&request.id, code, &message),
+    };
+    crash_point("run.release.after-intent");
+    let outcome = (|| -> Result<Val, (&'static str, String)> {
+        let state = shared
+            .lock_state()
+            .map_err(|message| ("state.unavailable", message))?;
+        let at = time::rfc3339_now();
+        let released = state
+            .release_run(&parsed.instance_id, &parsed.reason, &key, &at)
+            .map_err(|err| (err.code, err.message))?;
+        Ok(crate::run_control::release_doc(
+            &released,
+            &parsed.reason,
+            &at,
+            &key,
+        ))
+    })();
+    match outcome {
+        Ok(doc) => finish_mutation(shared, request, &key, "run.release", true, doc, None),
+        Err((code, message)) => finish_mutation(
+            shared,
+            request,
+            &key,
+            "run.release",
             false,
             null(),
             Some((code, message)),
@@ -8990,6 +9051,13 @@ fn reconcile_run_control(
             .run_retries(&instance_id)
             .map(|rows| !rows.is_empty())
             .unwrap_or(false),
+        // The release's own commit marker is the terminal status (the
+        // release transaction flips it together with the ownership removal
+        // and its `run.release` audit record). A revision rebind sets the
+        // same status, so the readback can over-report a release that never
+        // committed — it never under-reports, and no control is repeated
+        // either way.
+        "run.release" => run.status == "invalidated",
         _ => false,
     };
     log.write(

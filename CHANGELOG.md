@@ -758,6 +758,39 @@ release process activates (docs/RELEASING.md), then semver applies.
   `method_apply` effect path are unchanged; the substrate is a plan-bound step
   param, so it can never move at effect time.
 
+### Added (issue #146 — A run that can never progress is releasable)
+
+- `canter run release --run RUN_ID --reason TEXT` (daemon `run.release`,
+  closed RPC set 39 -> 40; module-local `hf-run-release/v1`) frees the
+  durable BOOKKEEPING of exactly ONE run that can never progress: the run's
+  unique `queue_ownership` row is removed, the run row goes terminal
+  (`invalidated`, pause state cleared, resume digest consumed) so it stops
+  occupying the global/per-repository/per-harness capacity, and a
+  hash-chained `run.release` audit record carries the operator reason, the
+  exact run identity, what was freed and the authorization window the run
+  held. After the release the freed issue is admitted by a fresh submission
+  on its own merits, and the freed slot admits the issue that was waiting
+  for capacity.
+- The release is fenced fail-closed on anything genuinely live: a step
+  dispatch still in flight refuses `refusal.run.in_flight` (nothing is
+  killed, cancelled or cleaned up), an unconsumed bounded retry
+  authorization refuses `refusal.run.retry_pending` (the authorization is
+  never burned), a terminal run refuses `refusal.run.terminal` (a second
+  release replays only under the same idempotency key) and an unknown run is
+  `state.not_found`. A missing, revoked or EXPIRED grant is deliberately NOT
+  a fence — an expired-grant run is exactly the case the release exists for:
+  the record states that window (`usable:false`) without presenting or
+  reusing it, so continuing that work needs a freshly minted window. A
+  released run stays inert everywhere else (`refusal.instance.state` on the
+  engine path, no supervision dispatch intent, no delivered-evidence
+  advance).
+- No schema, column, migration or dependency change: the release is a state
+  transition over the existing `instances`/`queue_ownership` rows, proven by
+  the `tests/run_control.rs` release battery (freed ownership and occupancy,
+  a paused predecessor, the expired-grant window, the unconsumed
+  authorization, the in-flight refusal and the idempotent replay) plus the
+  public-entry-point parity test in `tests/run_control_cli.rs`.
+
 ### Changed
 
 - Documentation polish (issue #12, PR #13): security recipe doc line fix

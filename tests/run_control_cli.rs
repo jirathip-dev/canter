@@ -580,6 +580,7 @@ fn cli_run_duplicate_key_refuses_a_reused_key_and_usage_errors_exit_two() {
         &["run", "resume", "--run", &run, "--digest", "short"][..],
         &["run", "status", "--run", &run, "--step", "p1"][..],
         &["run", "retry", "--run", &run, "--step", "not a slug"][..],
+        &["run", "release", "--run", &run][..],
         &[
             "run",
             "pause",
@@ -607,6 +608,7 @@ fn cli_run_duplicate_key_refuses_a_reused_key_and_usage_errors_exit_two() {
         "run pause",
         "run resume",
         "run retry",
+        "run release",
         "run dispatch",
         "run status",
     ] {
@@ -654,4 +656,99 @@ fn fixture_seed_yields_exactly_one_run() {
     let run = seed_run(&state);
     assert!(run.starts_with("run-"), "run id: {run}");
     assert_eq!(state.list_instances().expect("instances").len(), 1);
+}
+
+/// Issue #146: releasing one run that can never progress through the public
+/// entry point — two separate invocations against one daemon, raw exits, and
+/// the daemon's own readback.
+#[test]
+fn cli_run_release_frees_the_run_and_refuses_a_second_release_typed() {
+    let fixture = Fixture::new("release");
+    let run = {
+        let state = fixture.seed();
+        seed_run(&state)
+    };
+    let daemon = fixture.spawn();
+    wait_ready(&fixture);
+    let socket_arg = fixture.socket.display().to_string();
+    let config_arg = fixture.config_path.display().to_string();
+
+    // The release renders the documented facts in human mode.
+    let (exit, stdout, stderr) = fixture.cli(&[
+        "run",
+        "release",
+        "--run",
+        &run,
+        "--reason",
+        "predecessor is dead",
+        "--socket",
+        &socket_arg,
+        "--config",
+        &config_arg,
+    ]);
+    assert_eq!(exit, 0, "release exit; stderr: {stderr}");
+    assert!(
+        stdout.contains(&format!(
+            "run {run} released: status invalidated, ownership freed"
+        )),
+        "{stdout}"
+    );
+    assert!(stdout.contains("reason: predecessor is dead"), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "authorization window at release: {GRANT_5} (active, expires 2999-01-01T00:00:00Z, usable true)"
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "scope: run {run} only; no fleet-level or lane effect"
+        )),
+        "{stdout}"
+    );
+
+    // The daemon's own readback (its own invocation) agrees.
+    let (exit, stdout, stderr) = fixture.cli(&[
+        "run",
+        "status",
+        "--run",
+        &run,
+        "--socket",
+        &socket_arg,
+        "--config",
+        &config_arg,
+        "--json",
+    ]);
+    assert_eq!(exit, 0, "status exit; stderr: {stderr}");
+    let status = data_of(&envelope(&stdout));
+    assert_eq!(
+        status
+            .get("run")
+            .and_then(|run| run.get("status"))
+            .and_then(Val::as_str),
+        Some("invalidated")
+    );
+
+    // A SECOND release with a fresh key is a typed refusal (exit 4), never a
+    // second release.
+    let (exit, stdout, stderr) = fixture.cli(&[
+        "run",
+        "release",
+        "--run",
+        &run,
+        "--reason",
+        "again",
+        "--socket",
+        &socket_arg,
+        "--config",
+        &config_arg,
+        "--json",
+    ]);
+    assert_eq!(
+        exit, 4,
+        "a terminal run refuses the release: {stdout} {stderr}"
+    );
+    assert_eq!(error_code(&envelope(&stdout)), "refusal.run.terminal");
+
+    shutdown(daemon);
 }
