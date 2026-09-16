@@ -100,7 +100,7 @@ pub fn effect_deadline_secs(kind: &str, params: Option<&Val>) -> Result<u64, Eff
 /// documented rows (see the constants above).
 pub fn default_deadline_secs(kind: &str) -> u64 {
     match kind {
-        "prompt" => PROMPT_DEADLINE_DEFAULT_SECS,
+        "prompt" | "collect_outcome" => PROMPT_DEADLINE_DEFAULT_SECS,
         "harness_start" => HARNESS_START_DEADLINE_DEFAULT_SECS,
         _ => EFFECT_DEADLINE_DEFAULT_SECS,
     }
@@ -199,6 +199,10 @@ pub mod code {
     pub const MALFORMED_OUTPUT: &str = "refusal.malformed.output";
     /// A delta-required collection found no committed content change.
     pub const COLLECT_EMPTY_DELTA: &str = "refusal.collect.empty_delta";
+    /// The pane worker did not settle within the collection deadline.
+    pub const WORKER_TIMEOUT: &str = "effect.worker_timeout";
+    /// An existing lane cannot safely be created at the recorded base.
+    pub const WORKTREE_EXISTS: &str = "refusal.worktree.exists";
     /// The addressed worktree is not the worker output location the run bound.
     pub const OUTPUT_LOCATION: &str = "refusal.worker.output_location";
 }
@@ -1461,21 +1465,11 @@ pub fn bounded_effect_deadline(kind: &str, params: Option<&Val>) -> Option<u64> 
 /// `checkout`: read the exact current head of the integration branch on the
 /// integration checkout (the base every later read-back is compared to).
 fn effect_checkout(ctx: &EffectContext<'_>) -> EffectOutcome {
-    match run_git(
-        ctx,
-        ctx.integration_repo,
-        &["rev-parse", "--verify", ctx.integration_branch],
-    ) {
-        Ok(out) => {
-            let head = out.stdout.trim().to_string();
-            if !is_hex40(&head) {
-                return failed(code::MALFORMED_OUTPUT, "git head read-back is not 40-hex");
-            }
-            ok(object(vec![
-                ("integration_branch", string(ctx.integration_branch)),
-                ("integration_base", string(&head)),
-            ]))
-        }
+    match lane_integration_base(ctx) {
+        Ok(head) => ok(object(vec![
+            ("integration_branch", string(ctx.integration_branch)),
+            ("integration_base", string(&head)),
+        ])),
         Err(outcome) => outcome,
     }
 }
@@ -2413,8 +2407,27 @@ pub fn check_step_params(
         .map_err(typed)
 }
 
-/// `worktree_create`: create an isolated lane worktree + branch off the
-/// current integration head (path-contained under the lane root).
+/// Freeze the observed base, or read the published ref for the first checkout.
+/// Never substitute a local branch (including a stale remote-tracking ref).
+fn lane_integration_base(ctx: &EffectContext<'_>) -> Result<String, EffectOutcome> {
+    let base = match ctx.observed_integration_base {
+        Some(base) if is_hex40(base) => base.to_string(),
+        Some(_) => return Err(refusal(code::BAD_PARAMS, "integration base must be 40-hex")),
+        None => published_integration_head(ctx)?,
+    };
+    let commit = format!("{base}^{{commit}}");
+    if run_git(ctx, ctx.integration_repo, &["cat-file", "-e", &commit]).is_err() {
+        run_git(
+            ctx,
+            ctx.integration_repo,
+            &["fetch", "origin", ctx.integration_branch],
+        )?;
+        run_git(ctx, ctx.integration_repo, &["cat-file", "-e", &commit])?;
+    }
+    Ok(base)
+}
+
+/// Create a contained lane at the recorded/published integration base.
 fn effect_worktree_create(ctx: &EffectContext<'_>) -> EffectOutcome {
     let (branch, relative) = match worktree_create_inputs(ctx.params, &ctx.param_contract()) {
         Ok(inputs) => inputs,
@@ -2425,14 +2438,18 @@ fn effect_worktree_create(ctx: &EffectContext<'_>) -> EffectOutcome {
         Err(err) => return refusal(err.code, err.message),
     };
     if worktree.exists() {
-        return failed(
-            code::EXIT,
+        return refusal(
+            code::WORKTREE_EXISTS,
             format!(
                 "worktree {} already exists; a duplicate lane cannot be created",
                 worktree.display()
             ),
         );
     }
+    let base = match lane_integration_base(ctx) {
+        Ok(base) => base,
+        Err(outcome) => return outcome,
+    };
     if let Some(parent) = worktree.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -2445,7 +2462,7 @@ fn effect_worktree_create(ctx: &EffectContext<'_>) -> EffectOutcome {
             "-b",
             &branch,
             worktree.to_str().unwrap_or_default(),
-            ctx.integration_branch,
+            &base,
         ],
     ) {
         Ok(out) => {
@@ -2463,6 +2480,7 @@ fn effect_worktree_create(ctx: &EffectContext<'_>) -> EffectOutcome {
                 ("branch", string(&branch)),
                 ("worktree", string(&worktree.to_string_lossy())),
                 ("head", string(&head)),
+                ("base_head", string(&base)),
                 ("dirty", bool_(!status.trim().is_empty())),
                 (
                     "contained",
@@ -2806,6 +2824,83 @@ fn observed_worktree_branch(
     Ok(branch)
 }
 
+/// Wait for a pane turn to stop before inspecting its committed delivery.
+fn await_pane_worker(
+    ctx: &EffectContext<'_>,
+    relative: &str,
+    worktree: &Path,
+) -> Result<(), EffectOutcome> {
+    let prompt = ctx
+        .plan
+        .doc
+        .get("steps")
+        .and_then(Val::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .take_while(|step| step.get("id").and_then(Val::as_str) != Some(ctx.step_id))
+        .filter(|step| step.get("kind").and_then(Val::as_str) == Some("prompt"))
+        .filter_map(|step| step.get("params"))
+        .filter(|params| params.get("worktree").and_then(Val::as_str) == Some(relative))
+        .last();
+    let Some(prompt) = prompt else {
+        return Ok(());
+    };
+    if declared_execution(Some(prompt))? == crate::adapters::ExecutionMode::Headless {
+        return Ok(());
+    }
+    let inputs = prompt_inputs(Some(prompt), &ctx.param_contract())?;
+    let session = resolve_session(ctx, inputs.declared, "collect_outcome")?;
+    let seconds = effect_deadline_secs(ctx.kind, ctx.params)?;
+    let start = std::time::Instant::now();
+    poll_pane_worker(
+        Duration::from_secs(seconds),
+        Duration::from_millis(100),
+        |remaining| crate::adapters::observe_pane_worker(&session, worktree, remaining, ctx.env),
+        || start.elapsed(),
+        std::thread::sleep,
+    )
+}
+
+/// The production loop, with explicit deadline, cadence and clock/wait seams.
+/// Tests advance a local clock; no environment override can shorten a real run.
+fn poll_pane_worker(
+    deadline: Duration,
+    interval: Duration,
+    mut observe: impl FnMut(Duration) -> Result<String, crate::adapters::ProcessFailure>,
+    elapsed: impl Fn() -> Duration,
+    mut sleep: impl FnMut(Duration),
+) -> Result<(), EffectOutcome> {
+    let seconds = deadline.as_secs();
+    loop {
+        let remaining = deadline.saturating_sub(elapsed());
+        if remaining.is_zero() {
+            return Err(EffectOutcome {
+                status: "ambiguous",
+                code: Some(code::WORKER_TIMEOUT.to_string()),
+                message: Some(format!(
+                    "pane worker did not stop within {seconds}s; collection parked without redispatch"
+                )),
+                result: object(vec![("deadline_secs", integer(seconds as i64))]),
+            });
+        }
+        match observe(remaining) {
+            Ok(state) if matches!(state.as_str(), "idle" | "done" | "blocked") => return Ok(()),
+            Ok(_) => {}
+            Err(err) if err.code == crate::adapters::CODE_TIMEOUT => continue,
+            Err(err) => {
+                return Err(EffectOutcome {
+                    status: err.status(),
+                    code: Some(err.code.to_string()),
+                    message: Some(format!("{}: {}", err.message, err.detail)),
+                    result: null(),
+                });
+            }
+        }
+        sleep(interval.min(deadline.saturating_sub(elapsed())));
+    }
+}
+
 /// `collect_outcome`: collect the lane's commits/head since the integration
 /// base and read the harness terminal outcome through the workspace
 /// protocol (herdr workspace executable; fake-pinned in tests).
@@ -2819,6 +2914,29 @@ fn effect_collect_outcome(ctx: &EffectContext<'_>) -> EffectOutcome {
         Err(err) => return refusal(err.code, err.message),
     };
     let base_head = inputs.base_head;
+    // A missing/unrelated base or wrong checkout cannot become a valid
+    // collection by waiting for a worker. Refuse before observing that worker,
+    // using only the recorded object, never the runner's refs or remotes.
+    if run_git(
+        ctx,
+        &worktree,
+        &["merge-base", "--is-ancestor", &base_head, "HEAD"],
+    )
+    .is_err()
+    {
+        return refusal(
+            code::OUTPUT_LOCATION,
+            format!(
+                "collection base {base_head} is unavailable or is not an ancestor of the worktree HEAD"
+            ),
+        );
+    }
+    if let Err(outcome) = observed_worktree_branch(ctx, &worktree, inputs.branch.as_deref()) {
+        return outcome;
+    }
+    if let Err(outcome) = await_pane_worker(ctx, &inputs.worktree, &worktree) {
+        return outcome;
+    }
     let head_out = match run_git(ctx, &worktree, &["rev-parse", "--verify", "HEAD"]) {
         Ok(out) => out,
         Err(outcome) => return outcome,
@@ -3688,6 +3806,54 @@ fn harness_profile(
 mod tests {
     use super::*;
 
+    #[test]
+    fn collection_polling_uses_injected_time_and_live_state() {
+        use std::cell::Cell;
+        let elapsed = Cell::new(Duration::ZERO);
+        let mut reads = Vec::new();
+        let mut states = ["working", "working", "done"].into_iter();
+        poll_pane_worker(
+            Duration::from_millis(3),
+            Duration::from_millis(1),
+            |remaining| {
+                reads.push(remaining.as_millis());
+                Ok(states.next().expect("bounded reads").to_string())
+            },
+            || elapsed.get(),
+            |wait| elapsed.set(elapsed.get() + wait),
+        )
+        .unwrap();
+        assert_eq!(
+            reads,
+            [3, 2, 1],
+            "consult live state until the worker stops"
+        );
+        assert_eq!(elapsed.get(), Duration::from_millis(2));
+
+        reads.clear();
+        elapsed.set(Duration::ZERO);
+        let outcome = poll_pane_worker(
+            Duration::from_millis(3),
+            Duration::from_millis(2),
+            |remaining| {
+                assert!(reads.len() < 3, "deadline must bound polling");
+                reads.push(remaining.as_millis());
+                Ok("working".to_string())
+            },
+            || elapsed.get(),
+            |wait| elapsed.set(elapsed.get() + wait),
+        )
+        .unwrap_err();
+        assert_eq!(reads, [3, 1]);
+        assert_eq!(
+            elapsed.get(),
+            Duration::from_millis(3),
+            "last wait is capped"
+        );
+        assert_eq!(outcome.status, "ambiguous");
+        assert_eq!(outcome.code.as_deref(), Some(code::WORKER_TIMEOUT));
+    }
+
     // Issue #92 F1: the documented per-effect deadline table, the reviewed
     // policy override and the hard ceiling.
     #[test]
@@ -3708,6 +3874,7 @@ mod tests {
             effect_deadline_secs("prompt", None).expect("default"),
             PROMPT_DEADLINE_DEFAULT_SECS
         );
+        assert_eq!(effect_deadline_secs("collect_outcome", None).unwrap(), 1800);
         // A reviewed plan may declare its own bounded deadline...
         let declared = object(vec![("deadline_secs", integer(120))]);
         assert_eq!(

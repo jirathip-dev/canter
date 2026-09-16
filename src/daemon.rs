@@ -367,7 +367,8 @@ pub fn serve(paths: &DaemonPaths) -> Result<(), DaemonError> {
     // a dispatch always sees the same handle the request handlers use.
     let dispatch = Arc::new(DaemonDispatch {
         shared: std::sync::OnceLock::new(),
-        refusals: Mutex::new(std::collections::BTreeMap::new()),
+        refusals: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+        collecting: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
     });
     let supervisor = crate::supervision::start(
         Arc::clone(&state),
@@ -1149,7 +1150,10 @@ fn resolve_run_binding(
     kind: &str,
     presented: Option<&crate::config::ProfileBinding>,
 ) -> Result<RunBinding, (String, String)> {
-    if !matches!(kind, "harness_start" | "prompt" | "cleanup") {
+    if !matches!(
+        kind,
+        "harness_start" | "prompt" | "collect_outcome" | "cleanup"
+    ) {
         return Ok(RunBinding {
             role: None,
             session: None,
@@ -1159,7 +1163,7 @@ fn resolve_run_binding(
         Ok(state) => state,
         Err(message) => return Err(("state.unavailable".to_string(), message)),
     };
-    if kind == "cleanup" {
+    if matches!(kind, "cleanup" | "collect_outcome") {
         let bound = state
             .run_bound_start_step(instance_id)
             .map_err(|err| (err.code.to_string(), err.message))?;
@@ -1376,10 +1380,13 @@ fn admission_gate(
 /// driver is started before `Shared` exists; every dispatch runs through
 /// [`method_apply`], so capability, grant, admission, ownership, journal and
 /// idempotency gates all re-derive exactly as they do for a client request.
+#[derive(Clone)]
 struct DaemonDispatch {
     shared: std::sync::OnceLock<Arc<Shared>>,
     /// The refused-continuation ladder per run (item 4a of issue #144).
-    refusals: Mutex<std::collections::BTreeMap<String, RefusedDispatch>>,
+    refusals: Arc<Mutex<std::collections::BTreeMap<String, RefusedDispatch>>>,
+    /// Reserve before spawning; the durable claim then fences later ticks.
+    collecting: Arc<Mutex<std::collections::BTreeSet<String>>>,
 }
 
 /// One run's refused-continuation ladder (item 4a of issue #144): the step
@@ -1539,7 +1546,53 @@ impl crate::supervision::SupervisedDispatch for DaemonDispatch {
             );
             return Err(format!("{code}: {message}"));
         }
-        let response = method_apply(shared, &request);
+        if intent.kind == "collect_outcome" {
+            let mut collecting = self
+                .collecting
+                .lock()
+                .map_err(|_| "collection mutex poisoned")?;
+            if !collecting.insert(intent.instance_id.clone()) {
+                return Ok(format!("awaiting {}", intent.step_id));
+            }
+            let dispatcher = self.clone();
+            let shared = Arc::clone(shared);
+            let worker_intent = intent.clone();
+            let run = intent.instance_id.clone();
+            let spawn = std::thread::Builder::new()
+                .name("canter-collect".to_string())
+                .spawn(move || {
+                    let _ = dispatcher.apply_dispatch(
+                        &shared,
+                        &worker_intent,
+                        &request,
+                        &key,
+                        now_unix,
+                    );
+                    if let Ok(mut collecting) = dispatcher.collecting.lock() {
+                        collecting.remove(&run);
+                    }
+                    shared.wake_supervisor();
+                });
+            if let Err(err) = spawn {
+                collecting.remove(&intent.instance_id);
+                return Err(format!("cannot start bounded collection: {err}"));
+            }
+            return Ok("collection started".to_string());
+        }
+        self.apply_dispatch(shared, intent, &request, &key, now_unix)
+    }
+}
+
+impl DaemonDispatch {
+    fn apply_dispatch(
+        &self,
+        shared: &Arc<Shared>,
+        intent: &crate::supervision::DispatchIntent,
+        request: &Request,
+        key: &str,
+        now_unix: i64,
+    ) -> Result<String, String> {
+        let response = method_apply(shared, request);
         let doc = Val::parse_json(response.trim())
             .map_err(|message| format!("the dispatch response is unreadable ({message})"))?;
         if doc.get("ok").and_then(Val::as_bool) == Some(true) {
@@ -1569,7 +1622,7 @@ impl crate::supervision::SupervisedDispatch for DaemonDispatch {
         // against the run, so the run's own surfaces can classify it instead
         // of reporting the step eligible while nothing happens. A dispatch
         // that reached its claim already has a recorded attempt.
-        record_unclaimed_dispatch_refusal(shared, &intent.instance_id, &intent.step_id, code, &key);
+        record_unclaimed_dispatch_refusal(shared, &intent.instance_id, &intent.step_id, code, key);
         shared.log.write(
             "warn",
             "supervision.dispatch_refused",

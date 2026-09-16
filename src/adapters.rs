@@ -2591,6 +2591,25 @@ fn prompt_undelivered(
     )
 }
 
+/// Read this run's pane worker under the remaining collection budget.
+/// Reuse the prompt path's lane, generation and worktree verification.
+pub(crate) fn observe_pane_worker(
+    session: &SessionHandle,
+    worktree: &Path,
+    timeout: Duration,
+    env: &BTreeMap<String, String>,
+) -> Result<String, ProcessFailure> {
+    let end = std::time::Instant::now() + timeout;
+    let lane = herdr_lane::agent_name(session, timeout, env, Some(worktree))?;
+    let row = herdr_agent_get_row(
+        &lane,
+        end.saturating_duration_since(std::time::Instant::now()),
+        env,
+        Some(worktree),
+    )?;
+    Ok(verify_lane_binding(&row, session, Some(worktree))?.state)
+}
+
 /// Observe, interrupt or collect the terminal outcome of one lane through the
 /// Herdr agent surface (issue #139). Every one of them re-verifies the lane
 /// binding first, so interruption and the terminal outcome are collected
@@ -4536,10 +4555,10 @@ enum ProcessOutcome {
 }
 
 /// A classified failure of one typed invocation.
-struct ProcessFailure {
-    code: &'static str,
-    message: String,
-    detail: String,
+pub(crate) struct ProcessFailure {
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
+    pub(crate) detail: String,
 }
 
 impl ProcessFailure {
@@ -4547,7 +4566,7 @@ impl ProcessFailure {
     /// `refused`; interruption/timeout/process death are `ambiguous`
     /// (spec-plans.md §5: ambiguous = interrupted/restored work); ordinary
     /// exits are `failed`.
-    fn status(&self) -> &'static str {
+    pub(crate) fn status(&self) -> &'static str {
         if self.code.starts_with("refusal.") || self.code.starts_with("unknown.") {
             "refused"
         } else if matches!(self.code, CODE_TIMEOUT | CODE_PROCESS_DEATH) {

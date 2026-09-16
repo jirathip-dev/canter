@@ -434,6 +434,7 @@ fn init_repo(path: &Path) {
     std::fs::create_dir_all(path).expect("repo dir");
     for args in [
         vec!["init", "-q", "-b", "staging"],
+        vec!["remote", "add", "origin", "."],
         vec!["config", "user.email", "lane@example.invalid"],
         vec!["config", "user.name", "lane"],
         vec!["commit", "--allow-empty", "-q", "-m", "base"],
@@ -842,7 +843,7 @@ fn repaired_lane_scenario(
         .iter()
         .find(|(step, _)| step == "p2")
         .unwrap_or_else(|| panic!("the driver never dispatched p2: {attempts:?}"));
-    assert_eq!(p2.1, "failed", "the diagnosis is recorded: {attempts:?}");
+    assert_eq!(p2.1, "refused", "the diagnosis is recorded: {attempts:?}");
 
     // The operator repair, through the supported surfaces only.
     std::fs::remove_dir(fixture.dir.join("worktrees/lane-p2"))

@@ -170,7 +170,7 @@ runs control-plane effects:
 - **Per-effect deadlines (issue #92 F1)**: every effect that spawns has an
   explicit, documented, bounded deadline, resolved from a per-kind table —
   never a bare constant at the effect site:
-  - `prompt` 1800 s, `harness_start` 300 s, every other
+  - `prompt` and `collect_outcome` 1800 s, `harness_start` 300 s, every other
     kind 60 s (`EFFECT_DEADLINE_DEFAULT_SECS`), and the hard ceiling is
     3600 s (`EFFECT_DEADLINE_CEILING_SECS`);
   - a reviewed plan step may declare its own `deadline_secs` (policy, bound
