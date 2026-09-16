@@ -11,7 +11,7 @@
 //!
 //! Witnessed here:
 //! 1. the pane is created IN the run's lane worktree and the role starts in
-//!    it (`workspace create --cwd …`, `agent start … --pane`, pane read-back);
+//!    it (`worktree open --cwd … --path …`, `agent start … --pane`, read-back);
 //! 2. the prompt is delivered through `herdr agent prompt` and the pane
 //!    content shows it (the bare harness is never spawned);
 //! 3. Herdr unavailable is the typed `refusal.unavailable.herdr` — and never a
@@ -30,9 +30,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use canter::adapters::{
-    CODE_BAD_REQUEST, CODE_EXECUTION_UNSUPPORTED, CODE_PROMPT_UNDELIVERED, CODE_STALE_GENERATION,
-    CODE_UNAVAILABLE_HERDR, ExecutionMode, HarnessKind, Op, OpRequest, Profile, bind_identity,
-    execute_op_in_worktree, new_session,
+    CODE_BAD_REQUEST, CODE_EXECUTION_UNSUPPORTED, CODE_NAME_COLLISION, CODE_PROMPT_UNDELIVERED,
+    CODE_STALE_GENERATION, CODE_UNAVAILABLE_HERDR, ExecutionMode, HarnessKind, LaneNames, Op,
+    OpRequest, Profile, bind_identity, execute_op_in_worktree, new_session,
 };
 use canter::canonical::canonical_bytes;
 use canter::canonical::sha256_hex;
@@ -53,7 +53,9 @@ impl Dir {
             std::env::temp_dir().join(format!("hf-herdr-pane-{name}-{}-{n}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("create temp dir");
-        Dir { root }
+        Dir {
+            root: root.canonicalize().expect("canonical fixture root"),
+        }
     }
 
     fn path(&self, relative: &str) -> PathBuf {
@@ -123,36 +125,46 @@ report_lane() { printf '%s' "${HF_FAKE_HERDR_REPORT_LANE:-$(read_state lane '')}
 report_generation() { printf '%s' "${HF_FAKE_HERDR_REPORT_GENERATION:-$(read_state generation '')}"; }
 agent_doc() {
   printf '{"name":"%s","pane_id":"%s","cwd":"%s","agent_status":"%s","state_change_seq":%s,"tokens":{"canter_lane":"%s","canter_generation":"%s"}%s}' \
-    "$(read_state lane '')" "$(read_state pane 'w1:p1')" "$(read_state cwd '')" "$(read_state state 'idle')" \
+    "$(read_state name '')" "$(read_state pane 'w1:p1')" "$(read_state cwd '')" "$(read_state state 'idle')" \
     "$(read_state seq '0')" \
     "$(report_lane)" "$(report_generation)" "${1:-}"
 }
+workspace_doc() {
+  printf '{"workspace_id":"w1","label":"%s","cwd":"%s","worktree":{"repo_root":"%s","checkout_path":"%s","is_linked_worktree":true,"repo_name":"widgets"}}' \
+    "$(read_state label '')" "$(read_state cwd '')" "$(read_state root '')" "$(read_state cwd '')"
+}
 case "$1 $2" in
+  "workspace close")
+    log "$*"
+    rm -f "$STATE/pane" "$STATE/name" "$STATE/workspace"
+    printf '{"result":{}}\n'
+    ;;
   "workspace list")
     log "$*"
     if [ -f "$STATE/pane" ]; then
-      printf '{"id":"cli:workspace:list","result":{"workspaces":[{"workspace_id":"%s","label":"%s","cwd":"%s"}],"type":"workspace_list"}}\n' \
-        "$(read_state workspace 'w1')" "$(read_state label '')" "$(read_state cwd '')"
+      printf '{"id":"cli:workspace:list","result":{"workspaces":[%s],"type":"workspace_list"}}\n' "$(workspace_doc)"
     else
       printf '{"id":"cli:workspace:list","result":{"workspaces":[],"type":"workspace_list"}}\n'
     fi
     ;;
-  "workspace create")
+  "worktree open")
     log "$*"
-    cwd=""; label=""
+    cwd=""; label=""; root=""
     shift 2
     while [ $# -gt 0 ]; do
       case "$1" in
-        --cwd) cwd="$2"; shift 2 ;;
+        --cwd) root="$2"; shift 2 ;;
+        --path) cwd="$2"; shift 2 ;;
         --label) label="$2"; shift 2 ;;
         *) shift ;;
       esac
     done
+    printf '%s' "$root" > "$STATE/root"
     printf '%s' "$cwd" > "$STATE/cwd"
     printf '%s' "$label" > "$STATE/label"
     printf 'w1' > "$STATE/workspace"
     printf 'w1:p1' > "$STATE/pane"
-    printf '{"id":"cli:workspace:create","result":{"workspace":{"workspace_id":"w1"},"root_pane":{"pane_id":"w1:p1","cwd":"%s"},"type":"workspace_create"}}\n' "$cwd"
+    printf '{"id":"cli:worktree:open","result":{"workspace":%s,"root_pane":{"pane_id":"w1:p1","cwd":"%s"},"already_open":false,"type":"worktree_opened"}}\n' "$(workspace_doc)" "$cwd"
     ;;
   "pane list")
     log "$*"
@@ -190,7 +202,7 @@ case "$1 $2" in
     ;;
   "agent list")
     log "$*"
-    if [ -f "$STATE/pane" ] && [ ! -f "$STATE/no_agent" ]; then
+    if [ -f "$STATE/name" ] && [ ! -f "$STATE/no_agent" ]; then
       printf '{"id":"cli:agent:list","result":{"agents":[%s],"type":"agent_list"}}\n' "$(agent_doc)"
     else
       printf '{"id":"cli:agent:list","result":{"agents":[],"type":"agent_list"}}\n'
@@ -198,8 +210,11 @@ case "$1 $2" in
     ;;
   "agent start")
     log "$*"
-    lane="$3"
-    printf '%s' "$lane" > "$STATE/lane"
+    if [ -n "${HF_FAKE_HERDR_START_FAIL:-}" ]; then
+      printf '{"error":{"code":"agent_name_taken","message":"fixture name collision"}}\n' >&2
+      exit 1
+    fi
+    printf '%s' "$3" > "$STATE/name"
     # Measured herdr 0.9.0: the started agent rides under `result.agent`.
     printf '{"id":"cli:agent:start","result":{"agent":%s,"argv":["hermes"],"type":"agent_started"}}\n' "$(agent_doc)"
     ;;
@@ -330,7 +345,45 @@ impl Fixture {
         let bin = dir.path("fakebin");
         fs::create_dir_all(&bin).expect("bin dir");
         let worktree = dir.path("worktrees/issues-5");
-        fs::create_dir_all(&worktree).expect("lane worktree");
+        let integration = dir.path("integration");
+        for args in [
+            vec!["init", "-b", "staging", integration.to_str().unwrap()],
+            vec![
+                "-C",
+                integration.to_str().unwrap(),
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "seed",
+            ],
+            vec![
+                "-C",
+                integration.to_str().unwrap(),
+                "worktree",
+                "add",
+                "-b",
+                "issue-5",
+                worktree.to_str().unwrap(),
+                "staging",
+            ],
+        ] {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .output()
+                .expect("git fixture");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let worktree = worktree.canonicalize().expect("canonical lane");
         let log = dir.path("herdr.log");
         let state = dir.path("herdr-state");
         let marker = dir.path("hermes-marker");
@@ -416,11 +469,13 @@ impl Fixture {
 
 /// The profile of one lane role on the given substrate.
 fn lane_profile(execution: ExecutionMode) -> Profile {
-    Profile::official(HarnessKind::Hermes, "lane-role")
+    let mut profile = Profile::official(HarnessKind::Hermes, "lane-role")
         .expect("profile")
         .with_binding("example-provider", "example-model")
         .expect("binding")
-        .with_execution(execution)
+        .with_execution(execution);
+    profile.lane_names = Some(LaneNames::new(5, "implementer", 1).unwrap());
+    profile
 }
 
 /// The bound session of one lane run (generation is the lane generation).
@@ -468,10 +523,7 @@ fn the_role_starts_in_a_herdr_pane_created_in_the_lane_worktree() {
     let payload = result.payload.clone().expect("payload");
     // The recorded binding names the pane/agent identity and the worktree.
     assert_eq!(payload.get("pane").and_then(Val::as_str), Some("w1:p1"));
-    assert_eq!(
-        payload.get("agent").and_then(Val::as_str),
-        Some("lane-abc123")
-    );
+    assert_eq!(payload.get("agent").and_then(Val::as_str), Some("impl-5"));
     assert_eq!(
         payload.get("worktree").and_then(Val::as_str),
         Some(fixture.worktree.to_string_lossy().as_ref())
@@ -487,7 +539,13 @@ fn the_role_starts_in_a_herdr_pane_created_in_the_lane_worktree() {
     assert!(
         rows.iter().any(|row| {
             row == &format!(
-                "workspace create --cwd {} --label lane-abc123 --no-focus",
+                "worktree open --cwd {} --path {} --label 5-impl --no-focus",
+                fixture
+                    .dir
+                    .path("integration")
+                    .canonicalize()
+                    .unwrap()
+                    .display(),
                 fixture.worktree.display()
             )
         }),
@@ -495,13 +553,13 @@ fn the_role_starts_in_a_herdr_pane_created_in_the_lane_worktree() {
     );
     assert!(
         rows.iter().any(|row| row
-            == "agent start lane-abc123 --kind hermes --pane w1:p1 -- -p lane-role \
+            == "agent start impl-5 --kind hermes --pane w1:p1 -- -p lane-role \
                 --provider example-provider -m example-model"),
         "the role starts in that pane with the bound binding: {rows:?}"
     );
     assert!(
         rows.iter().any(|row| row
-            == "pane report-metadata w1:p1 --source custom:canter-lane --agent lane-abc123 \
+            == "pane report-metadata w1:p1 --source custom:canter-lane --agent canter \
                 --token canter_lane=lane-abc123 --token canter_generation=1"),
         "the lane↔pane/agent binding is recorded: {rows:?}"
     );
@@ -532,7 +590,7 @@ fn a_second_start_reuses_the_bound_pane_and_agent() {
     let creates_after_first = fixture
         .rows()
         .iter()
-        .filter(|row| row.starts_with("workspace create"))
+        .filter(|row| row.starts_with("worktree open"))
         .count();
     assert_eq!(creates_after_first, 1);
 
@@ -545,7 +603,7 @@ fn a_second_start_reuses_the_bound_pane_and_agent() {
         fixture
             .rows()
             .iter()
-            .filter(|row| row.starts_with("workspace create"))
+            .filter(|row| row.starts_with("worktree open"))
             .count(),
         1,
         "the reuse path creates no second pane: {:?}",
@@ -560,6 +618,280 @@ fn a_second_start_reuses_the_bound_pane_and_agent() {
         1,
         "the reuse path starts no second agent: {:?}",
         fixture.rows()
+    );
+}
+
+#[test]
+fn lane_names_derive_only_from_issue_role_and_round() {
+    for (issue, role, round, agent, workspace) in [
+        (154, "implementer", 1, "impl-154", "154-impl"),
+        (152, "reviewer", 1, "rev-152-r1", "152-rev1"),
+        (152, "reviewer", 2, "rev-152-r2", "152-rev2"),
+        (154, "implementer", 2, "impl-154-r2", "154-impl2"),
+    ] {
+        let names = LaneNames::new(issue, role, round).unwrap();
+        assert_eq!(names.agent, agent);
+        assert_eq!(names.workspace, workspace);
+    }
+    for (issue, role, round) in [(0, "implementer", 1), (1, "other", 1), (1, "reviewer", 0)] {
+        assert!(LaneNames::new(issue, role, round).is_err());
+    }
+}
+
+#[test]
+fn worktree_identity_is_required_and_returned_with_the_workspace() {
+    let fixture = Fixture::new("identity");
+    fixture.install(FAKE_HERDR);
+    let session = lane_session(1);
+    let mut profile = lane_profile(ExecutionMode::HerdrPane);
+    profile.lane_names = None;
+    let unnamed = execute_op_in_worktree(
+        &profile,
+        &start_request(&session),
+        &fixture.env(&[]),
+        &fixture.worktree,
+    );
+    assert_eq!(unnamed.code, Some(CODE_BAD_REQUEST));
+    assert!(fixture.rows().is_empty());
+    profile.lane_names = Some(LaneNames::new(5, "implementer", 1).unwrap());
+    let result = execute_op_in_worktree(
+        &profile,
+        &start_request(&session),
+        &fixture.env(&[]),
+        &fixture.worktree,
+    );
+    assert_eq!(result.status, "succeeded", "{:?}", result.message);
+    let payload = result.payload.unwrap();
+    assert_eq!(payload.get("workspace").and_then(Val::as_str), Some("w1"));
+    assert_eq!(
+        payload.get("workspace_label").and_then(Val::as_str),
+        Some("5-impl")
+    );
+    let identity = payload.get("worktree_identity").unwrap();
+    assert_eq!(
+        identity.get("repo_root").and_then(Val::as_str),
+        fixture
+            .dir
+            .path("integration")
+            .canonicalize()
+            .unwrap()
+            .to_str()
+    );
+    assert_eq!(
+        identity.get("checkout_path").and_then(Val::as_str),
+        fixture.worktree.to_str()
+    );
+    assert_eq!(
+        identity.get("is_linked_worktree").and_then(Val::as_bool),
+        Some(true)
+    );
+    assert!(
+        !fixture
+            .rows()
+            .iter()
+            .any(|row| row.starts_with("workspace create"))
+    );
+}
+
+#[test]
+fn a_duplicate_agent_name_is_refused_without_adoption_or_new_workspace() {
+    let fixture = Fixture::new("duplicate-name");
+    fixture.install(FAKE_HERDR);
+    let env = fixture.env(&[]);
+    let session = lane_session(1);
+    let profile = lane_profile(ExecutionMode::HerdrPane);
+    let first = execute_op_in_worktree(&profile, &start_request(&session), &env, &fixture.worktree);
+    assert_eq!(first.status, "succeeded");
+    let foreign = new_session(
+        "lane-other",
+        bind_identity("lane-other", "lane-other", 1).unwrap(),
+    )
+    .unwrap();
+    let refused =
+        execute_op_in_worktree(&profile, &start_request(&foreign), &env, &fixture.worktree);
+    assert_eq!(refused.status, "refused");
+    assert_eq!(refused.code, Some(CODE_NAME_COLLISION));
+    assert!(refused.message.unwrap().contains("impl-5"));
+    assert_eq!(
+        fixture
+            .rows()
+            .iter()
+            .filter(|row| row.starts_with("worktree open"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        fixture
+            .rows()
+            .iter()
+            .filter(|row| row.starts_with("agent start"))
+            .count(),
+        1
+    );
+    assert!(
+        !fixture
+            .rows()
+            .iter()
+            .any(|row| row.starts_with("workspace close"))
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.state.join("lane")).unwrap(),
+        session.session_id
+    );
+}
+
+#[test]
+fn same_lane_fix_round_reuses_original_names_and_workspace() {
+    let fixture = Fixture::new("fix-round");
+    fixture.install(FAKE_HERDR);
+    let session = lane_session(1);
+    let mut profile = lane_profile(ExecutionMode::HerdrPane);
+    let first = execute_op_in_worktree(
+        &profile,
+        &start_request(&session),
+        &fixture.env(&[]),
+        &fixture.worktree,
+    );
+    assert_eq!(first.status, "succeeded");
+    profile.lane_names = Some(LaneNames::new(5, "implementer", 2).unwrap());
+    let retry = execute_op_in_worktree(
+        &profile,
+        &start_request(&session),
+        &fixture.env(&[]),
+        &fixture.worktree,
+    );
+    assert_eq!(retry.status, "succeeded", "{:?}", retry.message);
+    let payload = retry.payload.unwrap();
+    assert_eq!(
+        payload.get("agent"),
+        first.payload.as_ref().unwrap().get("agent")
+    );
+    assert_eq!(
+        payload.get("workspace"),
+        first.payload.as_ref().unwrap().get("workspace")
+    );
+    assert_eq!(payload.get("reused").and_then(Val::as_bool), Some(true));
+    assert_eq!(
+        fixture
+            .rows()
+            .iter()
+            .filter(|row| row.starts_with("worktree open"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn failed_start_rolls_back_only_its_new_workspace_and_retry_starts_cleanly() {
+    let fixture = Fixture::new("failed-start");
+    fixture.install(FAKE_HERDR);
+    let session = lane_session(1);
+    let profile = lane_profile(ExecutionMode::HerdrPane);
+    let failed = execute_op_in_worktree(
+        &profile,
+        &start_request(&session),
+        &fixture.env(&[("HF_FAKE_HERDR_START_FAIL", "1".to_string())]),
+        &fixture.worktree,
+    );
+    assert_eq!(failed.code, Some(CODE_NAME_COLLISION), "{:?}", failed);
+    assert!(
+        !fixture.state.join("pane").exists(),
+        "failed attempt leaves no orphan"
+    );
+    assert!(fixture.rows().iter().any(|row| row == "workspace close w1"));
+    let retry = execute_op_in_worktree(
+        &profile,
+        &start_request(&session),
+        &fixture.env(&[]),
+        &fixture.worktree,
+    );
+    assert_eq!(retry.status, "succeeded", "{:?}", retry.message);
+}
+
+#[test]
+fn p8_preserves_dirty_live_and_stale_lanes_then_closes_the_owned_workspace() {
+    let fixture = Fixture::new("cleanup");
+    fixture.install(FAKE_HERDR);
+    let env = fixture.env(&[]);
+    let session = lane_session(1);
+    let profile = lane_profile(ExecutionMode::HerdrPane);
+    assert_eq!(
+        execute_op_in_worktree(&profile, &start_request(&session), &env, &fixture.worktree).status,
+        "succeeded"
+    );
+    let params = object(vec![
+        ("worktree", string("issues-5")),
+        ("branch", string("issue-5")),
+    ]);
+    let start_params = object(vec![
+        ("harness_key", string("lane-role")),
+        ("kind", string("hermes")),
+    ]);
+    let plan = bound_plan(vec![
+        plan_step("p3", "harness_start", start_params),
+        plan_step("p8-5", "cleanup", params.clone()),
+    ]);
+    let root = fixture.dir.path("worktrees");
+    let integration = fixture.dir.path("integration");
+    let ctx = EffectContext {
+        plan: &plan,
+        step_id: "p8-5",
+        kind: "cleanup",
+        params: Some(&params),
+        repository: "example-org/widgets",
+        integration_branch: "staging",
+        production_branches: &[],
+        worktrees_root: &root,
+        integration_repo: &integration,
+        observed_feature_head: None,
+        observed_integration_base: None,
+        env: &env,
+        role: None,
+        session: Some(&session),
+        archive_root: None,
+    };
+    let dirty = fixture.worktree.join("keep.txt");
+    fs::write(&dirty, "unfinished work").unwrap();
+    let refused = execute_step(&ctx);
+    assert_eq!(refused.code.as_deref(), Some("refusal.cleanup.dirty"));
+    assert!(dirty.exists());
+    assert!(
+        !fixture
+            .rows()
+            .iter()
+            .any(|row| row.starts_with("workspace close"))
+    );
+    fs::remove_file(dirty).unwrap();
+    fixture.seed("state", "working");
+    assert_eq!(
+        execute_step(&ctx).code.as_deref(),
+        Some(CODE_STALE_GENERATION)
+    );
+    fixture.seed("state", "idle");
+    fixture.seed("generation", "2");
+    assert_eq!(
+        execute_step(&ctx).code.as_deref(),
+        Some(CODE_STALE_GENERATION)
+    );
+    assert!(fixture.worktree.exists());
+    assert!(
+        !fixture
+            .rows()
+            .iter()
+            .any(|row| row.starts_with("workspace close"))
+    );
+    fixture.seed("generation", "1");
+    let cleaned = execute_step(&ctx);
+    assert_eq!(cleaned.status, "succeeded", "{:?}", cleaned.message);
+    assert!(!fixture.worktree.exists());
+    assert!(!fixture.state.join("pane").exists());
+    assert_eq!(
+        fixture
+            .rows()
+            .iter()
+            .filter(|row| row.starts_with("workspace close"))
+            .count(),
+        1
     );
 }
 
@@ -612,7 +944,7 @@ fn the_prompt_is_delivered_through_herdr_and_the_pane_shows_it() {
     assert_eq!(fixture.pane_content(), payload);
     assert!(
         fixture.rows().iter().any(|row| row.starts_with(&format!(
-            "agent prompt lane-abc123 {payload} --wait --timeout "
+            "agent prompt impl-5 {payload} --wait --timeout "
         ))),
         "the prompt is delivered through the Herdr row: {:?}",
         fixture.rows()
@@ -781,7 +1113,7 @@ fn an_undelivered_prompt_refuses_typed_with_argv_raw_output_exit_and_identity() 
         "the CLI's own error code is named: {message}"
     );
     assert!(
-        message.contains("lane-abc123") && message.contains("w1:p1"),
+        message.contains("impl-5") && message.contains("w1:p1"),
         "the refusal names the resolved agent and pane: {message}"
     );
     let detail = result.detail.clone().unwrap_or_default();
@@ -791,7 +1123,7 @@ fn an_undelivered_prompt_refuses_typed_with_argv_raw_output_exit_and_identity() 
         "the recorded evidence stays ONE diagnosable line: {detail}"
     );
     assert!(
-        detail.contains("argv: herdr agent prompt lane-abc123"),
+        detail.contains("argv: herdr agent prompt impl-5"),
         "the exact argv is recorded: {detail}"
     );
     assert!(
@@ -807,7 +1139,7 @@ fn an_undelivered_prompt_refuses_typed_with_argv_raw_output_exit_and_identity() 
         "the raw stderr is recorded: {detail}"
     );
     assert!(
-        detail.contains("agent: lane-abc123") && detail.contains("pane: w1:p1"),
+        detail.contains("agent: impl-5") && detail.contains("pane: w1:p1"),
         "the resolved identity is recorded: {detail}"
     );
     assert!(
@@ -889,7 +1221,7 @@ fn a_prompt_row_that_exited_zero_without_delivering_is_still_undelivered() {
         "the raw stdout document is recorded: {detail}"
     );
     assert!(
-        detail.contains("agent: lane-abc123") && detail.contains("pane: w1:p1"),
+        detail.contains("agent: impl-5") && detail.contains("pane: w1:p1"),
         "the resolved identity is recorded: {detail}"
     );
     assert!(
@@ -955,7 +1287,7 @@ fn a_launch_echo_of_the_task_text_is_not_a_delivery() {
     );
     let message = result.message.clone().unwrap_or_default();
     assert!(
-        message.contains("lifecycle") && message.contains("lane-abc123"),
+        message.contains("lifecycle") && message.contains("impl-5"),
         "the refusal names what it judged and the agent: {message}"
     );
     assert!(!fixture.bare_spawned());
@@ -1063,6 +1395,7 @@ fn a_superseded_lane_generation_is_refused_before_any_prompt_is_delivered() {
     // The pane read-back belongs to generation 7 while this run bound 2.
     fixture.seed("lane", "lane-abc123");
     fixture.seed("generation", "7");
+    fixture.seed("name", "impl-5");
     fixture.seed("cwd", &fixture.worktree.to_string_lossy());
     fixture.seed("pane", "w1:p1");
     let session = lane_session(2);
@@ -1135,7 +1468,7 @@ fn a_labelled_workspace_bound_to_another_worktree_is_refused_not_duplicated() {
     let profile = lane_profile(ExecutionMode::HerdrPane);
     // The lane's label already exists, hosted at another path, and no agent
     // of this lane is registered.
-    fixture.seed("label", "lane-abc123");
+    fixture.seed("label", "5-impl");
     fixture.seed("workspace", "w9");
     fixture.seed("pane", "w9:p1");
     fixture.seed("cwd", &elsewhere.to_string_lossy());
@@ -1145,12 +1478,12 @@ fn a_labelled_workspace_bound_to_another_worktree_is_refused_not_duplicated() {
         execute_op_in_worktree(&profile, &start_request(&session), &env, &fixture.worktree);
 
     assert_eq!(result.status, "refused", "{:?}", result.message);
-    assert_eq!(result.code, Some(CODE_STALE_GENERATION));
+    assert_eq!(result.code, Some(CODE_NAME_COLLISION));
     assert!(
         !fixture
             .rows()
             .iter()
-            .any(|row| row.starts_with("workspace create")),
+            .any(|row| row.starts_with("worktree open")),
         "no duplicate workspace/pane is created: {:?}",
         fixture.rows()
     );
@@ -1223,7 +1556,7 @@ fn interruption_and_the_terminal_outcome_are_collected_through_herdr() {
         fixture
             .rows()
             .iter()
-            .any(|row| row == "agent send-keys lane-abc123 ctrl+c"),
+            .any(|row| row == "agent send-keys impl-5 ctrl+c"),
         "the interruption is delivered through the Herdr key row: {:?}",
         fixture.rows()
     );
@@ -1444,15 +1777,18 @@ fn the_harness_start_step_starts_the_worker_in_the_lane_worktrees_pane() {
         Some("w1:p1"),
         "the recorded bind names the pane the worker runs in"
     );
-    assert_eq!(
-        fields.get("agent").and_then(Val::as_str),
-        Some("lane-abc123")
-    );
+    assert_eq!(fields.get("agent").and_then(Val::as_str), Some("impl-5"));
     assert_eq!(fields.get("execution").and_then(Val::as_str), Some("herdr"));
     assert!(
         fixture.rows().iter().any(|row| row
             == &format!(
-                "workspace create --cwd {} --label lane-abc123 --no-focus",
+                "worktree open --cwd {} --path {} --label 5-impl --no-focus",
+                fixture
+                    .dir
+                    .path("integration")
+                    .canonicalize()
+                    .unwrap()
+                    .display(),
                 fixture.worktree.display()
             )),
         "the pane is created in the run's lane worktree: {:?}",
@@ -1513,7 +1849,7 @@ fn a_plan_without_one_lane_worktree_refuses_typed_on_the_pane_substrate() {
         !fixture
             .rows()
             .iter()
-            .any(|row| row.starts_with("workspace create")),
+            .any(|row| row.starts_with("worktree open")),
         "no pane is created at a bare cwd: {:?}",
         fixture.rows()
     );
@@ -1598,7 +1934,7 @@ fn a_non_json_row_refuses_with_its_exact_argv_and_raw_stdout() {
     assert_eq!(result.code, Some("refusal.malformed.output"));
     let message = result.message.clone().unwrap_or_default();
     assert!(
-        message.contains("herdr agent get lane-abc123"),
+        message.contains("herdr agent get impl-5"),
         "the refusal names the exact row: {message}"
     );
     assert!(
@@ -1607,7 +1943,7 @@ fn a_non_json_row_refuses_with_its_exact_argv_and_raw_stdout() {
     );
     let detail = result.detail.clone().unwrap_or_default();
     assert!(
-        detail.contains("argv: herdr agent get lane-abc123"),
+        detail.contains("argv: herdr agent get impl-5"),
         "the exact argv is carried: {detail}"
     );
     assert!(detail.contains(raw), "the raw stdout is carried: {detail}");
@@ -1630,7 +1966,7 @@ fn a_pane_row_without_an_identity_refuses_with_the_raw_row() {
     fixture.seed("generation", "1");
     fixture.seed("cwd", &fixture.worktree.to_string_lossy());
     fixture.seed("pane", "w9:p1");
-    fixture.seed("label", "lane-abc123");
+    fixture.seed("label", "5-impl");
     fixture.seed("workspace", "w9");
     fixture.seed("no_agent", "1");
     let env = fixture.env(&[("HF_FAKE_HERDR_PANE_NO_ID", "1".to_string())]);
@@ -1659,7 +1995,7 @@ fn a_pane_row_without_an_identity_refuses_with_the_raw_row() {
     );
     let rows = fixture.rows();
     assert!(
-        !rows.iter().any(|row| row.starts_with("workspace create")),
+        !rows.iter().any(|row| row.starts_with("worktree open")),
         "a read-back without an identity creates no second pane: {rows:?}"
     );
     assert!(
