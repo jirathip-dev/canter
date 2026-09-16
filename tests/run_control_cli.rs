@@ -622,6 +622,47 @@ fn cli_run_duplicate_key_refuses_a_reused_key_and_usage_errors_exit_two() {
 }
 
 #[test]
+fn cli_run_help_documents_terminal_release_and_live_refusals() {
+    let output = Command::new(bin())
+        .args(["run", "--help"])
+        .output()
+        .expect("run help");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 help");
+    let release = stdout
+        .split_once("release frees")
+        .expect("release help")
+        .1
+        .split_once("status reads")
+        .expect("end of release help")
+        .0
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        !release.contains("refusal.run.terminal"),
+        "terminal status is not a release refusal: {release}"
+    );
+    for fact in [
+        "`done` stays `done`, otherwise `invalidated`",
+        "never resumed, retried or dispatched again",
+        "Terminal runs (`done` or `invalidated`) can release leftover ownership",
+        "a fresh --idempotency-key records an audited no-op (`ownership: absent`)",
+        "the SAME --idempotency-key replays the recorded response",
+        "No other run's ownership is touched",
+        "refusal.run.in_flight",
+        "refusal.run.retry_pending",
+        "the authorization is never burned",
+        "state.not_found",
+    ] {
+        assert!(
+            release.contains(fact),
+            "help must document {fact}: {release}"
+        );
+    }
+}
+
+#[test]
 fn cli_run_controls_refuse_a_stale_daemon_and_absent_daemon_typed() {
     // No daemon: the socket is absent and every control (including the
     // read-only status) reports the absent daemon typed — never a crash.
