@@ -1548,10 +1548,10 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// A disposable integration repo plus the run's own lane worktree. The lane
-/// branch sits AT the integration head, so the reviewed base is current and
-/// the branch is provably merged: the merge step is a read-only REHEARSAL
-/// (it never lands) and the cleanup may only delete a verified branch.
+/// A disposable integration repo, local bare origin and the run's lane
+/// worktree. The lane branch sits AT the published integration head, so the
+/// reviewed base is current and the branch is provably merged: the merge step
+/// is a read-only REHEARSAL and cleanup may only delete a verified branch.
 fn repos_with_lane_branch(fixture: &DaemonFixture) -> String {
     let repo = fixture.dir.join("repo");
     std::fs::create_dir_all(&repo).expect("repo dir");
@@ -1562,6 +1562,11 @@ fn repos_with_lane_branch(fixture: &DaemonFixture) -> String {
     git(&repo, &["add", "base.txt"]);
     git(&repo, &["commit", "-q", "-m", "fixture base"]);
     let head = git(&repo, &["rev-parse", "HEAD"]);
+    // The merge rehearsal certifies origin's published ref, not merely the
+    // checkout's local head. Keep that prerequisite real and network-free.
+    git(&fixture.dir, &["init", "-q", "--bare", "origin.git"]);
+    git(&repo, &["remote", "add", "origin", "../origin.git"]);
+    git(&repo, &["push", "-q", "origin", "staging"]);
     git(&repo, &["branch", "issue-5"]);
     std::fs::create_dir_all(fixture.dir.join("worktrees")).expect("worktrees root");
     git(
@@ -1817,6 +1822,11 @@ fn the_supervisor_itself_drives_the_committed_merge_and_cleanup_to_the_last_step
         head,
         "the rehearsal never lands in the integration checkout"
     );
+    assert_eq!(
+        git(&fixture.dir.join("origin.git"), &["rev-parse", "staging"]),
+        head,
+        "the rehearsal never changes the published integration head"
+    );
     shutdown(daemon);
 }
 
@@ -1958,6 +1968,58 @@ fn the_supervisor_dispatch_capability_for_the_committed_tail_is_typed_and_closed
         "the committed tail is an eligible frontier"
     );
     assert_eq!(verdict.detail, "m1");
+
+    // An eligible kind is not permission to replay an attempted tail step,
+    // even with a pending operator retry. Pin the dispatch producer itself.
+    let fixture = Fixture::new("tail-dispatch-fence");
+    let state = fixture.open();
+    let row = state
+        .arm_supervision(
+            RUN_ID,
+            &canter::state::SupervisionAuthorizationPlan {
+                desired: "armed".to_string(),
+                check_interval_secs: policy.check_interval_secs,
+                progress_timeout_secs: policy.progress_timeout_secs,
+            },
+            DIGEST,
+            "review",
+            1,
+            AT,
+        )
+        .expect("arm");
+    for (step, kind) in [("m1", "merge"), ("c1", "cleanup")] {
+        let mut evidence = snapshot(&tail_spine, TAIL_CAPS, true, true, true, "running");
+        if step == "c1" {
+            evidence
+                .attempts
+                .push(("m1".to_string(), "succeeded".to_string(), String::new()));
+        }
+        let intent = supervision::dispatch_intent(&row, &evidence).expect("unattempted tail");
+        assert_eq!(
+            (intent.step_id.as_str(), intent.kind.as_str()),
+            (step, kind)
+        );
+        evidence.retries.push(canter::state::RunRetryRow {
+            retry_id: "retry-tail".to_string(),
+            instance_id: RUN_ID.to_string(),
+            step_id: step.to_string(),
+            attempt: 1,
+            authorized_at: AT.to_string(),
+            consumed_at: String::new(),
+            consumed_key: String::new(),
+        });
+        for status in ["failed", "refused", "ambiguous"] {
+            evidence
+                .attempts
+                .push((step.to_string(), status.to_string(), String::new()));
+            assert_eq!(
+                supervision::dispatch_intent(&row, &evidence),
+                None,
+                "an attempted {kind} ({status}) belongs to the operator, never the driver"
+            );
+            evidence.attempts.pop();
+        }
+    }
 
     // 2. NOT for a run that is not an admitted member of a committed
     //    submission: an ad-hoc run's merge is never driven.
