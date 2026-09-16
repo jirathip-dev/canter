@@ -248,6 +248,13 @@ pub const EFFECT_KINDS: [&str; 16] = [
     "approve",
 ];
 
+/// The step kind whose committed effect records the reviewed evidence a
+/// verified delivery is read from (issue #152). One fact, two readers: the
+/// completion timing (`state::delivery_completes_run`) and the supervised
+/// committed-tail dispatch (`supervision::driver_dispatchable_kind`) both
+/// anchor on this kind.
+pub const DELIVERY_STEP_KIND: &str = "review_evidence";
+
 /// The closed capability required for each effect kind (grant caps, AC3).
 pub const KIND_CAPABILITY: [(&str, &str); 16] = [
     ("checkout", "read"),

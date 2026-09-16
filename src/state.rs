@@ -11906,6 +11906,50 @@ fn queue_advance_attempt_locked(
     })
 }
 
+/// Whether ONE delivering run owes NOTHING after its own verified delivery
+/// (issue #152): the delivery may complete the run only when it is the run's
+/// LAST committed spine step, or when every committed step after it has been
+/// recorded as achieved. The delivering step is the last committed step of
+/// `crate::mutation::DELIVERY_STEP_KIND` — the same fact the supervised
+/// committed-tail dispatch anchors on.
+///
+/// The spine is re-read from the SAME committed bound-input line the run's
+/// membership was admitted from and the achievements from the SAME attempt
+/// ledger `frontier_of` reads, so the completion timing and the frontier
+/// agree by construction: a recorded refusal or failure is never an
+/// achievement, and a run with a step still owed stays live instead of being
+/// foreclosed by its own delivery. A spine with no reviewed-evidence step
+/// binds no successor to a delivery, so the completion keeps its #96
+/// behaviour there.
+fn delivery_completes_run(
+    state: &State,
+    conn: &Connection,
+    request_line: &str,
+    instance_id: &str,
+) -> Result<bool, StateError> {
+    let steps = bound_steps_of(request_line);
+    let Some(delivering) = steps
+        .iter()
+        .rposition(|(_, kind)| kind == crate::mutation::DELIVERY_STEP_KIND)
+    else {
+        return Ok(true);
+    };
+    let owed: Vec<&str> = steps[delivering + 1..]
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .collect();
+    if owed.is_empty() {
+        return Ok(true);
+    }
+    let attempts = state.run_step_attempts_with_codes(conn, instance_id)?;
+    Ok(owed.iter().all(|step| {
+        attempts
+            .iter()
+            .rfind(|(id, _, _)| id == step)
+            .is_some_and(|(_, status, _)| status == "succeeded")
+    }))
+}
+
 /// Commit the queue-cursor advance of ONE fresh verified delivery (issue
 /// #96) inside the caller's transaction, atomically with the reconciliation
 /// that recognized it.
@@ -12013,6 +12057,25 @@ fn advance_queue_in_tx(
         items.push(row.map_err(|err| StateError::from_sqlite("queue_advance: items row", err))?);
     }
     drop(statement);
+    // Issue #152: the verified delivery COMPLETES the delivering run — but
+    // only when the delivery is the run's LAST committed spine step. A run
+    // whose committed spine still owes steps after the delivery (the merge
+    // and the cleanup of the queue spine) stays LIVE, so the plan it was
+    // authorized for can still be driven to its end instead of being
+    // foreclosed by the very delivery it verified; the completion then lands
+    // on a later reconciliation of the same run, once those steps are
+    // recorded as achieved. Completion is what frees the counted slot for
+    // the next approved issue, so it is written HERE, ahead of the cursor
+    // fence, and it is idempotent by construction (a done run stays done)
+    // and atomic with the cursor move.
+    if delivery_completes_run(state, tx, &submission.request_line, delivering_instance)? {
+        tx.execute(
+            "UPDATE instances SET status = 'done', updated_at = ?2
+              WHERE instance_id = ?1 AND status NOT IN ('done', 'invalidated')",
+            params![delivering_instance, at],
+        )
+        .map_err(|err| StateError::from_sqlite("queue_advance: complete", err))?;
+    }
     // 4. The idempotency fence + the candidate: a consumed delivery with a
     //    dispatch (or an exhausted queue) is final; a recorded HOLD is
     //    re-evaluated, because its reason is observed state that can settle.
@@ -12033,16 +12096,6 @@ fn advance_queue_in_tx(
             return Ok(());
         }
     }
-    // The verified delivery COMPLETES the delivering run: the queue's
-    // continuation is completion-to-next-work, and the freed slot is what
-    // lets the next approved issue be admitted at all. Idempotent by
-    // construction (a done run stays done) and atomic with the cursor move.
-    tx.execute(
-        "UPDATE instances SET status = 'done', updated_at = ?2
-          WHERE instance_id = ?1 AND status NOT IN ('done', 'invalidated')",
-        params![delivering_instance, at],
-    )
-    .map_err(|err| StateError::from_sqlite("queue_advance: complete", err))?;
     let (next_ordinal, next_work_item, next_instance_id, reason, message) = match &attempt.candidate
     {
         None => (None, None, None, None, None),
