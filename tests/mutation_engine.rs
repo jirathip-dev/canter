@@ -1304,6 +1304,61 @@ fn cycle2_ff_refusal_names_policy_divergence_not_an_inferred_base_move() {
 }
 
 #[test]
+fn cycle2_rehearsal_refuses_when_the_published_integration_ref_moved() {
+    let (scenario, feature, base) = cycle2_reviewed_merge("squash", false);
+    // Another lane lands on the published integration branch from a separate
+    // clone: the bare remote moves while this integration checkout stays at
+    // the reviewed base (no fetch). A bare-remote move is invisible to the
+    // checkout's own refs.
+    let root = scenario
+        .repos
+        .checkout
+        .parent()
+        .expect("sandbox root")
+        .to_path_buf();
+    let origin = root.join("origin.git");
+    let other = root.join("other-lane");
+    Git::new(&root).run(&[
+        "clone",
+        "-q",
+        "--branch",
+        "staging",
+        origin.to_str().expect("origin path"),
+        other.to_str().expect("other lane path"),
+    ]);
+    let other_git = Git::new(&other);
+    other_git.run(&["config", "user.name", "other lane"]);
+    other_git.run(&["config", "user.email", "lane@example.invalid"]);
+    std::fs::write(other.join("landed.txt"), "landed\n").expect("write");
+    other_git.run(&["add", "landed.txt"]);
+    other_git.run(&["commit", "-q", "-m", "another lane landed (synthetic)"]);
+    other_git.run(&["push", "-q", "origin", "staging"]);
+    let published = other_git.head("staging");
+    assert_ne!(published, base, "the published integration ref moved");
+    assert_eq!(
+        scenario.integration_base(),
+        base,
+        "the integration checkout was not fetched"
+    );
+
+    // The rehearsal may only certify the PUBLISHED integration ref: an
+    // unpublished local view must refuse instead of recording an integration
+    // head the next checkout step cannot trust.
+    let (code, message) = scenario.apply_err(15, "m1", Some(&feature), Some(&base));
+    assert_eq!(code, "effect.merge.not_fast_forward");
+    assert!(message.contains("published"), "{message}");
+    assert!(
+        !message.contains("base moved after"),
+        "the cause is the published ref, not an inferred base move: {message}"
+    );
+    assert_eq!(
+        scenario.integration_base(),
+        base,
+        "the rehearsal must not move integration"
+    );
+}
+
+#[test]
 fn moved_integration_base_invalidates_stale_evidence_and_refuses_merge() {
     let scenario = Scenario::new("stale-evidence", "2999-01-01T00:00:00Z", flow_steps());
     let integration_base = scenario.integration_base();
