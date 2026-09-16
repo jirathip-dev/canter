@@ -75,7 +75,7 @@ pub const RESOLUTION_STATEMENT: &str = "diagnosed-step resolution only: recorder
 /// did NOT do. A release is a BOOKKEEPING operation — it frees the durable
 /// ownership and occupancy of ONE run that can never progress, and it
 /// refuses while anything of that run is still live.
-pub const RELEASE_STATEMENT: &str = "run release only: exactly ONE run is addressed — its durable ownership of its issue and the per-repository/per-harness occupancy it held are freed and the run becomes terminal (`invalidated`), so it is never resumed, retried, dispatched or reconciled again; a release refuses typed while a step of the run is in flight or while it still holds an unconsumed bounded retry authorization (that authorization is never burned by a release); nothing is killed, no in-flight work is cancelled or cleaned up, no other run's ownership or pause is touched, no worktree or Git state is mutated, no grant is rewritten and no gate is bypassed";
+pub const RELEASE_STATEMENT: &str = "run release only: exactly ONE run is addressed — its durable ownership of its issue and the per-repository/per-harness occupancy it held are freed and the run stays terminal (`done`) or becomes `invalidated`, so it is never resumed, retried or dispatched again; a release refuses typed while a step of the run is in flight or while it still holds an unconsumed bounded retry authorization (that authorization is never burned by a release); nothing is killed, no in-flight work is cancelled or cleaned up, no other run's ownership or pause is touched, no worktree or Git state is mutated, no grant is rewritten and no gate is bypassed";
 
 /// The closed control-state vocabulary rendered by the documents.
 pub const CONTROL_STATES: [&str; 3] = ["active", "pause_requested", "paused"];
@@ -84,7 +84,7 @@ pub const CONTROL_STATES: [&str; 3] = ["active", "pause_requested", "paused"];
 pub mod codes {
     /// The target is not a run identity (or not the requested one).
     pub const TARGET: &str = "refusal.run.target";
-    /// The run is terminal (`done` / `invalidated`): no control applies.
+    /// The run is terminal (`done` / `invalidated`): pause/resume/retry refuse.
     pub const TERMINAL: &str = "refusal.run.terminal";
     /// The run already carries a pause (or none to resume): a duplicate
     /// control never creates a second effect.
