@@ -15,6 +15,16 @@
 //!   engine. That preserves the committed grant, capability, admission,
 //!   ownership, topology, journal and idempotency gates; diagnosed steps still
 //!   require the operator's explicit corrected retry dispatch.
+//! - It also drives the risk-classed TAIL of a run whose own committed queue
+//!   submission declares it (issue #152: the merge of its reviewed head, then
+//!   the cleanup of its lane worktree), so the spine that produced a verified
+//!   delivery reaches its own last committed step instead of being foreclosed
+//!   by the delivery. That capability is NOT a blanket allow-list entry: it is
+//!   the typed [`driver_dispatchable_kind`] decision — an admitted membership
+//!   of a committed submission, the run's own approved caps carrying the
+//!   kind's capability, and a step that follows that run's verified delivery.
+//!   The dispatch still presents the step's OWN committed params, and the
+//!   engine's unchanged contract/authority gates decide.
 //! - A continuation the apply engine REFUSES before its claim (a fan-out
 //!   admission refusal, a derived request the pre-screen rejects) leaves no
 //!   attempt of its own, so the driver records it against the run (issue
@@ -124,7 +134,7 @@ pub const TRIGGERS: [&str; 7] = [
 
 /// The statement every supervision document carries: what this surface does
 /// and provably does NOT do.
-pub const STATEMENT: &str = "an explicitly armed run is classified from recorded evidence and each unattempted autonomous next step is dispatched through the existing apply engine with the committed grant, capability, admission, ownership, topology, journal and idempotency gates; a continuation the engine refuses before any effect is reported with the engine's own code and is never presented as an eligible next step; a fresh verified reviewed-and-CI-green delivery advances its authorized queue cursor exactly once under the same admission and ownership checks; supervision never resumes a pause, authorizes or consumes a retry, retries a diagnosed step, invents missing inputs or clears a hold";
+pub const STATEMENT: &str = "an explicitly armed run is classified from recorded evidence and each unattempted autonomous next step — plus the risk-classed merge then cleanup tail of a run whose own committed queue submission declares it after that run's verified delivery — is dispatched through the existing apply engine with the committed grant, capability, admission, ownership, topology, journal and idempotency gates; a continuation the engine refuses before any effect is reported with the engine's own code and is never presented as an eligible next step; a fresh verified reviewed-and-CI-green delivery advances its authorized queue cursor exactly once under the same admission and ownership checks; supervision never resumes a pause, authorizes or consumes a retry, retries a diagnosed step, invents missing inputs or clears a hold";
 
 /// Default bounded timer fallback cadence (seconds).
 pub const DEFAULT_CHECK_INTERVAL_SECS: i64 = 60;
@@ -168,6 +178,94 @@ const AUTONOMOUS_STEP_KINDS: [&str; 6] = [
     "collect_outcome",
     "hosted_check",
 ];
+
+/// The risk-classed TAIL kinds a supervised run may drive on its OWN
+/// committed spine (issue #152): the merge of its reviewed head (a read-only
+/// policy rehearsal) and the cleanup of its lane worktree (destructive: it
+/// removes a worktree whose branch is provably merged).
+///
+/// They are deliberately NOT members of [`AUTONOMOUS_STEP_KINDS`]: an armed
+/// run's ordinary work is dispatched unconditionally, while these two are
+/// driven only under the typed conditions in [`driver_dispatchable_kind`] —
+/// the run's own committed, digest-bound queue submission declares the step,
+/// the run's own approved caps carry its capability, and the step is the tail
+/// that follows that run's verified delivery. No blanket allow-list entry,
+/// no widened cap and no bypass is involved.
+const COMMITTED_TAIL_STEP_KINDS: [&str; 2] = ["merge", "cleanup"];
+
+/// The run's own committed capability set (the instance row's caps array).
+fn run_caps(evidence: &SupervisionEvidence) -> Vec<String> {
+    crate::value::Val::parse_json(&evidence.run.caps)
+        .ok()
+        .and_then(|caps| caps.as_array().cloned())
+        .map(|caps| {
+            caps.iter()
+                .filter_map(|cap| cap.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether ONE committed spine step comes AFTER the run's reviewed-evidence
+/// step: the delivery whose tail the step completes (issue #152).
+fn after_delivery_step(evidence: &SupervisionEvidence, step: &str) -> bool {
+    let Some(delivering) = evidence
+        .steps
+        .iter()
+        .rposition(|(_, kind)| kind == crate::mutation::DELIVERY_STEP_KIND)
+    else {
+        return false;
+    };
+    match evidence.steps.iter().position(|(id, _)| id == step) {
+        Some(index) => index > delivering,
+        None => false,
+    }
+}
+
+/// Whether the driver may dispatch ONE kind of ONE step for this run
+/// (issue #152).
+///
+/// The unattended continuation set ([`AUTONOMOUS_STEP_KINDS`]) is
+/// unconditional: those steps are the run's ordinary committed work. The
+/// risk-classed TAIL kinds ([`COMMITTED_TAIL_STEP_KINDS`]) are authorized by
+/// the run's OWN committed submission instead, and only when every one of
+/// these holds:
+///
+/// - the run is an ADMITTED member of a committed, digest-bound queue
+///   submission (`evidence.item`): the spine is an approved plan, never an
+///   ad-hoc run;
+/// - the run's own committed caps carry the kind's required capability
+///   (`merge` / `cleanup`) — the very capability `revalidate_effect` demands
+///   at effect time, so the driver never attempts what the run was not
+///   granted and no cap is widened here;
+/// - the step comes AFTER the run's reviewed-evidence step in the committed
+///   spine and that run carries a fresh VERIFIED delivery
+///   ([`verified_delivery`]): the tail is driven only behind the delivery it
+///   completes, so a destructive cleanup can never be driven for a run that
+///   never delivered.
+///
+/// The step's parameters are never invented here: the dispatch presents the
+/// committed step's OWN declared params verbatim (branch + `merge_policy` for
+/// the merge, branch + worktree for the cleanup), which the engine's own
+/// `check_step_params`/`revalidate_effect` then validates — the same
+/// production-branch, policy, cleanup-ancestry and dirty-worktree gates as an
+/// operator dispatch. A step already ATTEMPTED stays the operator's: the
+/// caller re-checks the attempt ledger, so a diagnosed tail is never retried.
+pub fn driver_dispatchable_kind(evidence: &SupervisionEvidence, step: &str, kind: &str) -> bool {
+    if AUTONOMOUS_STEP_KINDS.contains(&kind) {
+        return true;
+    }
+    if !COMMITTED_TAIL_STEP_KINDS.contains(&kind) || evidence.item.is_none() {
+        return false;
+    }
+    let Some(capability) = crate::mutation::required_capability(kind) else {
+        return false;
+    };
+    if !run_caps(evidence).iter().any(|cap| cap == capability) {
+        return false;
+    }
+    verified_delivery(evidence).is_some() && after_delivery_step(evidence, step)
+}
 
 /// Stable supervision codes: `usage.supervision.*` for presented shape
 /// errors, `supervision.*` for recorded-evidence classifications.
@@ -565,8 +663,12 @@ pub trait SupervisedDispatch: Send + Sync {
 /// - the run is live: not paused, no pause request, no human queue, no
 ///   terminal blocker, not blocked/invalidated/done;
 /// - no step dispatch is in flight (a run mid-effect is never advanced);
-/// - the run still has a next unachieved step, and that step has NEVER been
-///   dispatched.
+/// - the run still has a next unachieved step, that step has NEVER been
+///   dispatched, and its kind is one the driver may dispatch for THIS run
+///   ([`driver_dispatchable_kind`]): the ordinary autonomous kinds, or the
+///   risk-classed merge/cleanup TAIL of a run whose own committed submission
+///   declares it — so the delivering run's own merge and cleanup are driven
+///   to the end of its committed spine (issue #152).
 ///
 /// A DIAGNOSED step (failed/refused/ambiguous) is never re-dispatched here,
 /// with or without a pending bounded retry authorization: re-dispatching it
@@ -602,7 +704,7 @@ pub fn dispatch_intent(
         return None;
     }
     let (step_id, kind) = next_unachieved_step(evidence)?;
-    if !AUTONOMOUS_STEP_KINDS.contains(&kind.as_str()) {
+    if !driver_dispatchable_kind(evidence, &step_id, &kind) {
         return None;
     }
     match latest_attempt_for(evidence, &step_id) {
@@ -780,7 +882,7 @@ pub fn classify(
     if evidence.in_flight.is_some() {
         return Verdict::new("healthy", codes::IN_FLIGHT, false, &next_step);
     }
-    if AUTONOMOUS_STEP_KINDS.contains(&next_kind.as_str())
+    if driver_dispatchable_kind(evidence, &next_step, &next_kind)
         && latest_attempt_for(evidence, &next_step).is_none()
         && !evidence.has_dispatch_context
     {
@@ -816,9 +918,11 @@ pub fn classify(
         );
     }
     // A never-attempted, fully authored executor step is eligible NOW. The
-    // driver dispatches it through the apply engine on this same check.
+    // driver dispatches it through the apply engine on this same check. The
+    // eligible set is the SAME predicate the dispatch producer uses, so a
+    // reported-eligible frontier is exactly a dispatchable one (issue #152).
     if evidence.has_dispatch_context
-        && AUTONOMOUS_STEP_KINDS.contains(&next_kind.as_str())
+        && driver_dispatchable_kind(evidence, &next_step, &next_kind)
         && latest_attempt_for(evidence, &next_step).is_none()
     {
         return Verdict::new("healthy", codes::DISPATCH, true, &next_step);

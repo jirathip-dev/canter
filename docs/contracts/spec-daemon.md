@@ -546,6 +546,27 @@ clears a repository/fleet-level hold or bypasses a gate.
   `supervision.waiting_approval` frontier until independent evidence is
   presented. Non-armed/unknown supervision keeps its classification-only,
   zero-effect guarantee verbatim: without a row the run is never even read.
+- **Committed-tail dispatch (issue #152)**: the frontier is also dispatched
+  when it is the risk-classed TAIL of that run's OWN committed queue spine —
+  `merge` (the closed-policy rehearsal of the reviewed head) and `cleanup`
+  (destructive: the removal of a lane worktree whose branch is provably
+  merged) — so the run that produced a verified delivery reaches its own last
+  committed step instead of being foreclosed by it. This is NOT a blanket
+  addition to the autonomous set and it widens NO gate: the step is dispatched
+  only when the run is an ADMITTED member of a committed, digest-bound
+  submission, the run's own committed caps carry the kind's required
+  capability (`merge`/`cleanup` — the same capability `revalidate_effect`
+  demands), and the step follows that run's reviewed-delivery step while the
+  run carries a fresh verified delivery. The dispatch presents the committed
+  step's OWN params (branch + `merge_policy`; branch + worktree) and the
+  unchanged engine gates decide: production branches, the scheduled
+  production/destructive refusal, the evidence-bound merge gate, the cleanup
+  ancestry and dirty-worktree refusals and the capability check are all still
+  in force; a DIAGNOSED tail is still never re-dispatched (the operator's
+  corrected `run dispatch` owns it); and every refusal is reported with the
+  engine's own code exactly like any other continuation refusal. The
+  classification reads the SAME predicate, so a frontier reported eligible
+  with `supervision.dispatch.next_step` is exactly a dispatchable one.
 - **Diagnosed frontier (issue #148)**: the classification half of the same
   honesty. The frontier step's own LATEST recorded attempt is read from the
   run's claim/outcome material, and when it is not `succeeded` the run is
@@ -585,11 +606,20 @@ clears a repository/fleet-level hold or bypasses a gate.
 - **Completion-to-next-work (issue #96)**: a fresh VERIFIED delivery of an
   armed run — reviewed `pass` with every named check `passed` at one exact
   head, bound to the run's own workflow/policy pins, no durable hold and no
-  in-flight step claim — completes that run (`done`) and advances its
+  in-flight step claim — advances its
   already-authorized queue cursor EXACTLY ONCE, admitting the next eligible
   approved item of the SAME committed submission through the same
   guard-verifying admission path (the same approved caps and occupancy
   attestation), armed with the delivering run's supervision authorization.
+  The DELIVERING run is completed (`done`) by that same transaction only once
+  the delivery is its LAST committed spine step (issue #152): a run whose
+  committed spine still carries steps after the delivery (the merge, then the
+  cleanup) stays live and keeps its counted slot until those steps are
+  recorded as achieved — and the driver DRIVES that tail itself (the
+  committed-tail dispatch above), so the run's own authorized merge and
+  cleanup run without an operator request and the completion is never a bare
+  `done` over an unexecuted plan. A spine that ends at its reviewed-evidence
+  step completes exactly as before.
   The consumption is keyed to the delivered membership item
   (`queue_advances`, m0012) and is durable across restarts: a duplicate
   delivery event, a replayed reconciliation or a crash can only observe the

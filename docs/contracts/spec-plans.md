@@ -51,8 +51,15 @@ Normative rules:
 - The built-in `merge` step declares `merge_policy:"squash"`. `merge_policy`
   is a closed `squash | ff` input and the effect is a read-only rehearsal: it
   verifies the reviewed integration ref and policy-compatible result tree but
-  never moves the integration checkout or a ref. The orchestrator/forge owns
-  the actual policy merge; `post_merge_verify` proves its landed head.
+  never moves the integration checkout or a ref. It certifies only the
+  PUBLISHED integration ref: that head is read from the checkout's `origin`
+  remote (`git ls-remote` — a bare-remote move is visible without a fetch,
+  never from the checkout's own refs) and a checkout that disagrees with it
+  refuses `effect.merge.not_fast_forward`, naming the published head and the
+  local head; an unreadable or absent published ref refuses
+  `effect.merge.failed` rather than certifying an unprovable base. The
+  orchestrator/forge owns the actual policy merge; `post_merge_verify` proves
+  its landed head.
 
 ### Canonical serialization and digest
 

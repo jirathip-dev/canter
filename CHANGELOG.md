@@ -791,6 +791,18 @@ release process activates (docs/RELEASING.md), then semver applies.
   authorization, the in-flight refusal and the idempotent replay) plus the
   public-entry-point parity test in `tests/run_control_cli.rs`.
 
+### Added (issue #132 — the merge rehearsal certifies the published integration ref)
+
+- The read-only `merge` rehearsal now proves the integration checkout is not
+  diverged from the PUBLISHED integration ref before it certifies a
+  policy-compatible merge: the ref is read from the checkout's `origin` remote
+  (`git ls-remote`, so a bare-remote move is visible without a fetch) and a
+  checkout behind it (someone landed without a fetch) or ahead of it (an
+  unpublished local move) refuses `effect.merge.not_fast_forward`, naming the
+  published head and the local head. An unreadable or absent published ref
+  refuses `effect.merge.failed`: an unprovable base is never certified. No new
+  step params, no schema change, and still no ref/checkout/remote mutation.
+
 ### Changed
 
 - Documentation polish (issue #12, PR #13): security recipe doc line fix

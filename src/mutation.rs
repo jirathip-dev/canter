@@ -248,6 +248,13 @@ pub const EFFECT_KINDS: [&str; 16] = [
     "approve",
 ];
 
+/// The step kind whose committed effect records the reviewed evidence a
+/// verified delivery is read from (issue #152). One fact, two readers: the
+/// completion timing (`state::delivery_completes_run`) and the supervised
+/// committed-tail dispatch (`supervision::driver_dispatchable_kind`) both
+/// anchor on this kind.
+pub const DELIVERY_STEP_KIND: &str = "review_evidence";
+
 /// The closed capability required for each effect kind (grant caps, AC3).
 pub const KIND_CAPABILITY: [(&str, &str); 16] = [
     ("checkout", "read"),
@@ -2908,6 +2915,34 @@ fn effect_review_evidence(ctx: &EffectContext<'_>) -> EffectOutcome {
     ]))
 }
 
+/// The head of the integration branch **as published** on the integration
+/// checkout's `origin` remote (`git ls-remote`) — never from the checkout's
+/// own refs, which cannot see a bare-remote move (issue #132). An unreadable
+/// or absent published ref refuses fail-closed: a rehearsal that cannot prove
+/// the published base must not certify a merge.
+fn published_integration_head(ctx: &EffectContext<'_>) -> Result<String, EffectOutcome> {
+    let out = run_git(
+        ctx,
+        ctx.integration_repo,
+        &[
+            "ls-remote",
+            "origin",
+            &format!("refs/heads/{}", ctx.integration_branch),
+        ],
+    )?;
+    let head = out.stdout.split_whitespace().next().unwrap_or_default();
+    if !is_hex40(head) {
+        return Err(failed(
+            code::MERGE_FAILED,
+            format!(
+                "the published integration ref {:?} is not readable from origin: the integration checkout cannot prove the merge base",
+                ctx.integration_branch
+            ),
+        ));
+    }
+    Ok(head.to_string())
+}
+
 /// `merge`: rehearse the explicit integration policy without changing the
 /// integration checkout, any ref, or the remote. The evidence gate runs
 /// daemon-side before this effect; the orchestrator owns the real forge merge.
@@ -2937,6 +2972,23 @@ fn effect_merge(ctx: &EffectContext<'_>) -> EffectOutcome {
         Ok(out) => out.stdout.trim().to_string(),
         Err(outcome) => return outcome,
     };
+    // Certify only the PUBLISHED integration ref (issue #132): a checkout that
+    // disagrees with the remote's head — behind it (a bare-remote move without
+    // a fetch) or ahead of it (an unpublished local move) — would record an
+    // integration head the plan's next `checkout` step cannot trust.
+    let published_head = match published_integration_head(ctx) {
+        Ok(head) => head,
+        Err(outcome) => return outcome,
+    };
+    if published_head != integration_head {
+        return failed(
+            code::MERGE_NOT_FF,
+            format!(
+                "{} policy rehearsal refused: the published integration ref {:?} is at {published_head}, but the integration checkout is at {integration_head}: fetch and re-review before merging",
+                inputs.policy, ctx.integration_branch
+            ),
+        );
+    }
     let reviewed_base = ctx.observed_integration_base.unwrap_or_default();
     let feature_tree = match run_git(
         ctx,
