@@ -2167,7 +2167,7 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
 
 // Origin is an internal capability, never a caller-controlled RPC field/key.
 fn method_apply_from(shared: &Arc<Shared>, request: &Request, supervised: bool) -> String {
-    let parsed = match apply_params(request) {
+    let mut parsed = match apply_params(request) {
         Ok(parsed) => parsed,
         Err((code, message)) => return err_response(&request.id, &code, message),
     };
@@ -2301,10 +2301,13 @@ fn method_apply_from(shared: &Arc<Shared>, request: &Request, supervised: bool) 
                 let Some(evidence) = state.supervision_evidence(&parsed.instance_id)? else {
                     return Ok(false);
                 };
-                automatic_retry = evidence
-                    .attempts
-                    .iter()
-                    .any(|(step, _, _)| step == &parsed.step);
+                // Issue #184: only a DIAGNOSED step attempt reserves and
+                // consumes supervision's own bounded retry. A recorded
+                // refusal of the run's OWN lapsed window is not a step
+                // diagnosis (the step never ran), so a lapse burns nothing.
+                automatic_retry = evidence.attempts.iter().any(|(step, status, code)| {
+                    step == &parsed.step && crate::state::step_attempt_diagnosed(status, code)
+                });
                 Ok(crate::supervision::dispatch_intent(&row, &evidence)
                     .is_some_and(|intent| intent.step_id == parsed.step))
             })();
@@ -2365,6 +2368,50 @@ fn method_apply_from(shared: &Arc<Shared>, request: &Request, supervised: bool) 
     };
     // No publish here: every post-journal terminal path below publishes
     // once after its state change (hub-lock ordering rule).
+
+    // Issue #184: a live run whose OWN authorization window lapsed mid-spine
+    // renews it HERE — an audited `grant.rotation`-class successor sized from
+    // the run's remaining committed spine — before any effect gate reads the
+    // window, so a lapse can never strand the frontier behind
+    // `refusal.run.retry_required` or burn a bounded retry the step never
+    // spent. The renewal is the RUN's own act, gated on its own live binding
+    // (own grant, same revision, live epoch, still owning its issue) and it
+    // never widens caps, phase or scope; every foreign, revoked, stale-epoch,
+    // released, paused, held or exhausted continuation is left to refuse
+    // downstream exactly as before.
+    let renewal = {
+        let state = match shared.lock_state() {
+            Ok(state) => state,
+            Err(message) => {
+                return resolve_apply_refusal(shared, request, &key, "state.unavailable", message);
+            }
+        };
+        match state.renew_lapsed_run_grant(&parsed.instance_id, &grant_id, &time::rfc3339_now()) {
+            Ok(renewal) => renewal,
+            Err(err) => {
+                drop(state);
+                return resolve_apply_refusal(shared, request, &key, err.code, err.message);
+            }
+        }
+    };
+    if let Some(renewal) = &renewal {
+        // The successor window is the run's own authorization from here on:
+        // this dispatch, and the effect below it, read the renewed grant.
+        parsed.grant_id = renewal.successor.grant_id.clone();
+        shared.log.write(
+            "info",
+            "run.grant.renewed",
+            &format!(
+                "run {} renewed its own lapsed window: grant {} superseded by {} ({}s derived \
+                 from the committed spine), expires {}",
+                parsed.instance_id,
+                renewal.superseded.grant_id,
+                renewal.successor.grant_id,
+                renewal.window_secs,
+                renewal.successor.expires_at
+            ),
+        );
+    }
 
     // Revalidate plan/grant/instance/epoch against FRESH state, then run
     // kind-specific gates that need durable state (evidence, closure).
@@ -9260,6 +9307,10 @@ pub(crate) fn crash_point(point: &str) {
 #[cfg(test)]
 #[path = "daemon_retry_tests.rs"]
 mod retry_tests;
+
+#[cfg(test)]
+#[path = "daemon_renewal_tests.rs"]
+mod renewal_tests;
 
 #[cfg(test)]
 mod tests {

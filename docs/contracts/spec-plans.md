@@ -177,7 +177,9 @@ runs control-plane effects:
   journaled intent.
 - Immediately before the effect the daemon revalidates, under the state
   lock: live epoch vs plan/grant/instance, grant status and expiry (an
-  expired grant refuses with `refusal.grant.expired`), the observed issue
+  expired grant refuses with `refusal.grant.expired` — after the run's OWN
+  lapsed window has had its chance to renew itself, see
+  [spec-daemon.md](spec-daemon.md) and issue #184), the observed issue
   revision vs the grant binding, workflow/policy hashes vs the grant and
   the pinned instance, and the step's required capability (`caps`, AC3).
 - Kind-specific gates run before the effect: an integration merge requires

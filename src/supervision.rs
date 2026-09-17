@@ -710,6 +710,17 @@ pub fn dispatch_intent(
     match latest_attempt_for(evidence, &step_id) {
         // Never dispatched: the plain continuation of an armed run.
         None => {}
+        // Issue #184: a recorded refusal of the run's OWN lapsed window is
+        // not a step diagnosis — the step never ran — so it is the same
+        // plain continuation and never a bounded retry. A recorded review
+        // failure still holds the frontier exactly as before.
+        Some((_, status, code))
+            if status != "succeeded" && !crate::state::step_attempt_diagnosed(status, code) =>
+        {
+            if newest_verdict(evidence) == "fail" {
+                return None;
+            }
+        }
         Some((_, status, code))
             if matches!(status.as_str(), "failed" | "refused" | "ambiguous")
                 && code != crate::mutation::code::WORKER_TIMEOUT

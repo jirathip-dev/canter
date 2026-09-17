@@ -558,11 +558,12 @@ fn f5_fresh_issuance_opens_live_and_expired_binding_windows() {
 }
 
 #[test]
-fn cycle2_expired_grant_rotation_continues_the_same_run_explicitly() {
+fn cycle2_a_lapsed_window_renews_itself_for_the_same_run_without_an_operator_key() {
     let mut fixture = Fixture::new();
     let digest = fixture.preview(REV);
     let old = fixture.grant("4");
-    let submitted = fixture.submit(&digest, text(&old, &["grant_id"]));
+    let old_id = text(&old, &["grant_id"]).to_string();
+    let submitted = fixture.submit(&digest, &old_id);
     let run = text(
         &field(&submitted, &["items"]).as_array().unwrap()[0],
         &["instance_id"],
@@ -580,53 +581,74 @@ fn cycle2_expired_grant_rotation_continues_the_same_run_explicitly() {
         expiry,
         &canter::time::rfc3339_now()
     ));
-    let (exit, refused) = fixture.cli(&["run", "dispatch", "--run", &run, "--step", "p2-5"]);
-    assert_eq!(exit, 4, "{refused:?}");
-    assert!(canonical_text(&refused).contains("refusal.grant.expired"));
-    let new = fixture.grant("3600");
-    assert_ne!(text(&old, &["grant_id"]), text(&new, &["grant_id"]));
-    let rotated = fixture.submit(&digest, text(&new, &["grant_id"]));
-    let item = &field(&rotated, &["items"]).as_array().unwrap()[0];
-    assert_eq!(
-        text(item, &["status"]),
-        "admitted",
-        "fresh issuance must unblock the same binding: {item:?}"
-    );
-    assert_eq!(text(item, &["instance_id"]), run);
-    // A rotation is durable and explicit, not a replacement of either grant row.
+    // Issue #184: the lapsed frontier is dispatched by the RUN's own renewal
+    // — no operator issuance and no operator retry key — and the SAME run
+    // continues along its committed spine.
+    succeeded(&fixture.ok(&["run", "dispatch", "--run", &run, "--step", "p2-5"]));
     fixture.restart();
     let journal =
         std::fs::read_to_string(fixture.path("state/canter/journal/audit.jsonl")).unwrap();
-    let rotation = journal
+    let rotations: Vec<&str> = journal
         .lines()
-        .find(|line| line.contains("grant.rotation"))
-        .expect("recorded rotation");
-    eprintln!("ROTATION_RECORD={rotation}");
-    assert!(rotation.contains(text(&old, &["grant_id"])));
-    assert!(rotation.contains(text(&new, &["grant_id"])));
-    assert!(rotation.contains(text(&new, &["grant", "expires_at"])));
+        .filter(|line| line.contains("\"action\":\"grant.rotation\""))
+        .collect();
+    assert_eq!(
+        rotations.len(),
+        1,
+        "exactly one renewal record: {rotations:?}"
+    );
+    eprintln!("RENEWAL_RECORD={}", rotations[0]);
+    let record = Val::parse_json(rotations[0]).expect("renewal record");
+    let target = text(&record, &["target"]).to_string();
+    let rest = target
+        .strip_prefix(&format!("run:{run}:superseded:{old_id}:replacement:"))
+        .unwrap_or_else(|| panic!("both grants are named in the record: {target}"));
+    let (replacement, rest) = rest
+        .split_once(":expires:")
+        .unwrap_or_else(|| panic!("the recorded expiry is named: {target}"));
+    let (replacement_expiry, rest) = rest
+        .split_once(":window_secs:")
+        .unwrap_or_else(|| panic!("the derived window is named: {target}"));
+    // The renewed window is SIZED FROM THE REMAINING COMMITTED SPINE, so it
+    // covers the worker round trip the run still owes — and it is honest
+    // about its instant.
+    let window: i64 = rest.parse().expect("window seconds");
+    assert!(
+        window >= 1800,
+        "the window covers the owed round trip: {window}"
+    );
+    assert_ne!(window, 7200, "never the fixed 2 h default");
+    assert!(
+        !canter::mutation::is_expired(replacement_expiry, &canter::time::rfc3339_now()),
+        "the recorded expiry is live: {replacement_expiry}"
+    );
+    assert!(
+        !journal.contains("mutate.run.retry"),
+        "zero operator retry keys"
+    );
     let status = fixture.ok(&["run", "status", "--run", &run]);
-    assert!(canonical_text(&status).contains(text(&new, &["grant_id"])));
-    // The expired dispatch is a diagnosed attempt; after rotating the grant,
-    // the supported bounded retry explicitly authorizes its continuation.
-    fixture.ok(&["run", "retry", "--run", &run, "--step", "p2-5"]);
-    succeeded(&fixture.ok(&["run", "dispatch", "--run", &run, "--step", "p2-5"]));
+    let status_text = canonical_text(&status);
+    assert!(
+        status_text.contains(replacement),
+        "the same run holds the replacement window: {status_text}"
+    );
+    assert!(
+        !status_text.contains(&old_id),
+        "the lapsed window is superseded: {status_text}"
+    );
+    // A fresh issuance for the same binding is refused: the run is live and
+    // its own window is live too — the renewal restored real authorization,
+    // it did not open a bypass.
+    let new = fixture.grant("3600");
+    assert_ne!(text(&new, &["grant_id"]), old_id);
     let replay = fixture.submit(&digest, text(&new, &["grant_id"]));
     assert_eq!(
         text(
             &field(&replay, &["items"]).as_array().unwrap()[0],
             &["status"]
         ),
-        "refused"
-    );
-    let journal =
-        std::fs::read_to_string(fixture.path("state/canter/journal/audit.jsonl")).unwrap();
-    assert_eq!(
-        journal
-            .lines()
-            .filter(|line| line.contains("\"action\":\"grant.rotation\""))
-            .count(),
-        1
+        "refused",
+        "an owned run with a live window is never re-bound: {replay:?}"
     );
 }
 

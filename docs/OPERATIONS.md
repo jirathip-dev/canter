@@ -462,7 +462,10 @@ with a fresh interactive TTY for production-branch effects.
    under the state lock: live epoch vs plan/grant/instance, grant status
    and expiry (expired → `refusal.grant.expired`), the observed issue
    revision vs the grant binding, workflow/policy hashes, and the step's
-   required capability. The intent is journaled (`mutate.*`) before the
+   required capability. A LIVE run whose own window lapsed mid-spine
+   renews it first, as one audited `grant.rotation` seeded from its
+   remaining committed spine (issue #184) — no operator key and no bounded
+   retry is involved. The intent is journaled (`mutate.*`) before the
    effect; the effect runs outside the lock through allowlisted
    subprocesses; the response is a typed `hf-outcome/v1`.
 4. **Verify.** Read the exact result back: the recorded outcome for a
@@ -486,7 +489,7 @@ Failure → remedy:
 | Symptom | Detail | Remedy |
 | --- | --- | --- |
 | Apply refused | `refusal.plan.identity` | The carried plan bytes were tampered; re-render and re-grant. |
-| Apply refused | `refusal.grant.expired` / epoch mismatch | Re-issue a grant against the live epoch; material edits or restore rotated the epoch and invalidated prior grants. |
+| Apply refused | `refusal.grant.expired` / epoch mismatch | A LIVE run renews its OWN lapsed window (audited `grant.rotation`, sized from its committed spine) — nothing to do; for a HELD or released run, re-issue a grant against the live epoch and rotate it explicitly. Material edits or restore rotated the epoch and invalidated prior grants. |
 | Merge refused | `refusal.evidence.stale` | Re-review at the moved head; evidence must bind the current head/base/workflow/policy. |
 | Outcome `ambiguous` | interrupted/restored work | External reconciliation required before a new idempotency key — never blindly retry. |
 | Mutation request rejected | missing/`ik_`-malformed idempotency key | Every mutating apply requires a well-formed `params.idempotency_key`. |

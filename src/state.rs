@@ -220,6 +220,25 @@ pub enum RunRetryClaim {
 /// The number of bounded retries one (run, step) may ever authorize.
 pub const RUN_RETRY_MAX: i64 = 3;
 
+/// Whether one RECORDED step attempt is a step diagnosis: an outcome of an
+/// attempt that actually ran (or whose work was refused for a reason of the
+/// step's own), and therefore one the bounded-retry fence bounds.
+///
+/// Issue #184: a pre-effect refusal for the run's OWN lapsed authorization
+/// window is NOT a step diagnosis. The step never ran, no effect was
+/// attempted and nothing was consumed — the run's window lapsed, which is an
+/// authorization event, not a step failure. Such a record neither demands
+/// nor consumes a bounded retry authorization, so a lapse can never strand a
+/// frontier behind `refusal.run.retry_required`. One fact, three readers:
+/// the retry fence ([`State::claim_run_retry`]), the daemon's supervised
+/// dispatch decision and the supervision driver's own eligibility.
+pub fn step_attempt_diagnosed(status: &str, code: &str) -> bool {
+    if !matches!(status, "failed" | "refused" | "ambiguous") {
+        return false;
+    }
+    code != crate::mutation::code::GRANT_EXPIRED
+}
+
 /// The recorded outcome of ONE explicit run release (issue #146): the run
 /// row as it stands AFTER the release commit, whether the release removed the
 /// unique ownership row that named this run, and the authorization window the
@@ -237,6 +256,67 @@ pub struct RunReleaseOutcome {
     /// Whether that window was still usable when the run was released: the
     /// row exists, is `active` and has not expired.
     pub grant_usable: bool,
+}
+
+/// The recorded outcome of ONE engine-owned renewal of a live run's own
+/// lapsed authorization window (issue #184): the successor grant row the run
+/// is bound to from here on, the lapsed grant row it supersedes, and the
+/// window length (seconds) derived from the run's remaining committed spine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LapsedGrantRenewal {
+    /// The successor grant (same bindings, new id, new recorded expiry).
+    pub successor: GrantRow,
+    /// The lapsed grant it supersedes (the run's own presented window).
+    pub superseded: GrantRow,
+    /// The window length recorded on the successor, in seconds.
+    pub window_secs: i64,
+}
+
+/// The window (seconds) one renewal must cover for one run (issue #184):
+/// the sum of the DOCUMENTED effect deadlines of the run's remaining
+/// committed-spine steps — the worker and independent-review round trips the
+/// run still owes — never a fixed default. `None` when the achieved ledger
+/// says the run owes nothing (its frontier is exhausted) or a spine step
+/// document is unreadable; the derived sum is clamped to the documented
+/// window ceiling.
+fn renewal_window_secs(
+    spine: &[String],
+    steps: &[Val],
+    attempts: &[(String, String)],
+    current_node: &str,
+) -> Option<i64> {
+    let frontier = crate::run_control::frontier_of(spine, attempts, current_node)?;
+    let start = crate::run_control::step_index_of(spine, &frontier)?;
+    let mut total: i64 = 0;
+    for id in spine.iter().skip(start) {
+        let step = steps
+            .iter()
+            .find(|step| step.get("id").and_then(Val::as_str) == Some(id.as_str()))?;
+        let kind = crate::mutation::step_kind(step).ok()?;
+        let params = match step.get("params") {
+            Some(value @ Val::Obj(_)) => Some(value),
+            _ => None,
+        };
+        // A declared `deadline_secs` that is outside the documented bounds
+        // can never dispatch its own step, so it contributes the per-kind
+        // default this table documents instead of refusing the renewal.
+        let secs = crate::mutation::effect_deadline_secs(&kind, params)
+            .unwrap_or_else(|_| crate::mutation::default_deadline_secs(&kind));
+        total = total.saturating_add(secs as i64);
+    }
+    Some(total.clamp(1, crate::mutation::GRANT_WINDOW_MAX_SECS))
+}
+
+/// The content-derived successor grant id of one renewal (issue #184):
+/// deterministic in the run, the superseded grant and the recorded expiry,
+/// so a replayed renewal of the SAME lapsed window mints the same identity
+/// and can never fork two live successors.
+fn renewal_grant_id(instance_id: &str, superseded: &str, expires_at: &str) -> String {
+    let derived = format!("canter/grant-renewal/v1|{instance_id}|{superseded}|{expires_at}");
+    format!(
+        "gr_{}",
+        &crate::canonical::sha256_hex(derived.as_bytes())[..16]
+    )
 }
 
 /// A workflow engine instance row (m0002: workflow pin, phase, node, review
@@ -3435,7 +3515,9 @@ impl State {
     /// a first dispatch of a step is never fenced; a re-dispatch of a step
     /// whose recorded outcomes include a terminal non-success consumes one
     /// unconsumed authorization, and refuses (`RunRetryClaim::Missing`)
-    /// when none exists.
+    /// when none exists. A recorded refusal of the run's OWN lapsed window
+    /// is not a step diagnosis ([`step_attempt_diagnosed`], issue #184), so
+    /// a lapse never demands a retry.
     pub fn claim_run_retry(
         &self,
         instance_id: &str,
@@ -3444,14 +3526,14 @@ impl State {
         at: &str,
     ) -> Result<RunRetryClaim, StateError> {
         self.ensure_writable()?;
-        let attempts = self.run_step_attempts(instance_id)?;
-        let diagnosed = attempts.iter().any(|(step, status)| {
-            step == step_id && matches!(status.as_str(), "failed" | "refused" | "ambiguous")
-        });
+        let conn = self.lock("claim_run_retry")?;
+        let attempts = self.run_step_attempts_with_codes(&conn, instance_id)?;
+        let diagnosed = attempts
+            .iter()
+            .any(|(step, status, code)| step == step_id && step_attempt_diagnosed(status, code));
         if !diagnosed {
             return Ok(RunRetryClaim::NotRequired);
         }
-        let conn = self.lock("claim_run_retry")?;
         // Supervision reserved and consumed its own slot with the intent.
         let consumed: Option<String> = conn
             .query_row(
@@ -3490,6 +3572,179 @@ impl State {
             return Ok(RunRetryClaim::Missing);
         }
         Ok(RunRetryClaim::Consumed(retry_id))
+    }
+
+    /// Renew the OWN lapsed authorization window of one live run (issue
+    /// #184) as an audited `grant.rotation`-class mutation.
+    ///
+    /// `Some(renewal)` exactly when the run's own presented grant row is
+    /// `active`, bound to this run and to the live epoch, its window has
+    /// actually lapsed, the run is live (unpaused, unheld, under the live
+    /// epoch, still owning its issue) and its committed spine still owes
+    /// steps. ONE transaction then inserts the successor grant derived from
+    /// the lapsed one — same repository/issue/revision/workflow/policy/phase/
+    /// scope/caps/epoch, NEW grant id and a new expiry SIZED FROM THE
+    /// REMAINING SPINE — re-points the run to it, and appends one
+    /// `grant.rotation` record naming the superseded grant, the replacement
+    /// grant and the recorded expiry.
+    ///
+    /// `None` invents nothing and changes nothing: every continuation the
+    /// engine does not own — a foreign, revoked, stale-epoch, released,
+    /// paused, held or exhausted run, a run whose window is still live, or a
+    /// run without a committed spine — keeps refusing exactly as before, so
+    /// the renewal never becomes a blanket authorization.
+    pub fn renew_lapsed_run_grant(
+        &self,
+        instance_id: &str,
+        presented_grant_id: &str,
+        at: &str,
+    ) -> Result<Option<LapsedGrantRenewal>, StateError> {
+        self.ensure_writable()?;
+        let Some(run) = self.instance_by_id(instance_id)? else {
+            return Ok(None);
+        };
+        // The committed spine is immutable once submitted: read it (with the
+        // achieved ledger) OUTSIDE the transaction, so the derived window can
+        // only ever come from durable rows.
+        let (Some(spine), Some(steps)) = (
+            self.run_step_spine(instance_id)?,
+            self.run_step_documents(instance_id)?,
+        ) else {
+            return Ok(None);
+        };
+        let attempts = self.run_step_attempts(instance_id)?;
+        let Some(window_secs) = renewal_window_secs(&spine, &steps, &attempts, &run.current_node)
+        else {
+            return Ok(None);
+        };
+        let Some(expires_unix) = time::unix_from_rfc3339(at) else {
+            return Err(state_error(
+                "state.corrupt",
+                format!("the renewal instant {at:?} is not an RFC3339 UTC second"),
+            ));
+        };
+        let expires_at = time::rfc3339_from_unix(expires_unix.saturating_add(window_secs));
+        let successor_id = renewal_grant_id(instance_id, presented_grant_id, &expires_at);
+        let mut conn = self.lock("renew_lapsed_run_grant")?;
+        let tx = conn
+            .transaction()
+            .map_err(|err| StateError::from_sqlite("renew_lapsed_run_grant: begin", err))?;
+        // Re-derive every guard under the transaction: the run as it is now,
+        // the live epoch, its issue ownership and its own grant row.
+        let sql = format!("{} WHERE instance_id = ?1", instance_select_sql());
+        let run: Option<InstanceRow> = tx
+            .query_row(sql.as_str(), params![instance_id], instance_row_from)
+            .optional()
+            .map_err(|err| StateError::from_sqlite("renew_lapsed_run_grant: run", err))?;
+        let Some(run) = run else {
+            return Ok(None);
+        };
+        let epoch = current_epoch_locked(&tx)?;
+        let owner: Option<String> = tx
+            .query_row(
+                "SELECT instance_id FROM queue_ownership
+                  WHERE repository = ?1 AND issue_number = ?2",
+                params![run.repository, run.issue_number],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("renew_lapsed_run_grant: ownership", err))?;
+        if run.grant_id != presented_grant_id
+            || run.state_epoch != epoch
+            || !matches!(run.status.as_str(), "new" | "running")
+            || run.paused
+            || run.pause_requested
+            || run.human_queue
+            || run.terminal_blockers > 0
+            || owner.as_deref() != Some(instance_id)
+        {
+            return Ok(None);
+        }
+        let grant: Option<GrantRow> = tx
+            .query_row(
+                "SELECT grant_id, repository, issue_number, issue_revision, workflow_hash,
+                        policy_hash, phase, scope, caps, expires_at, state_epoch, status, created_at
+                   FROM grants WHERE grant_id = ?1",
+                params![presented_grant_id],
+                grant_row_from,
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("renew_lapsed_run_grant: grant", err))?;
+        let Some(grant) = grant else {
+            return Ok(None);
+        };
+        if grant.status != "active"
+            || grant.state_epoch != epoch
+            || grant.repository != run.repository
+            || grant.issue_number != run.issue_number
+            || grant.issue_revision != run.issue_revision
+            || !crate::mutation::is_expired(&grant.expires_at, at)
+        {
+            return Ok(None);
+        }
+        tx.execute(
+            "INSERT INTO grants (grant_id, repository, issue_number, issue_revision,
+                                 workflow_hash, policy_hash, phase, scope, caps,
+                                 expires_at, state_epoch, status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'active', ?12)",
+            params![
+                successor_id,
+                grant.repository,
+                grant.issue_number,
+                grant.issue_revision,
+                grant.workflow_hash,
+                grant.policy_hash,
+                grant.phase,
+                grant.scope,
+                grant.caps,
+                expires_at,
+                epoch,
+                at
+            ],
+        )
+        .map_err(|err| StateError::from_sqlite("renew_lapsed_run_grant: successor", err))?;
+        let affected = tx
+            .execute(
+                "UPDATE instances SET grant_id = ?2, updated_at = ?3
+                  WHERE instance_id = ?1 AND grant_id = ?4
+                    AND status IN ('new', 'running') AND paused = 0 AND pause_requested = 0",
+                params![instance_id, successor_id, at, presented_grant_id],
+            )
+            .map_err(|err| StateError::from_sqlite("renew_lapsed_run_grant: rebind", err))?;
+        if affected != 1 {
+            return Err(state_error(
+                "state.ownership_conflict",
+                format!("run {instance_id} changed before its lapsed window renewed"),
+            ));
+        }
+        let mut key = format!("ik_renew-{instance_id}-{successor_id}");
+        key.truncate(64);
+        self.append_audit_locked(
+            &tx,
+            "grant.rotation",
+            &format!(
+                "run:{instance_id}:superseded:{presented_grant_id}:replacement:{successor_id}:expires:{expires_at}:window_secs:{window_secs}"
+            ),
+            &key,
+            None,
+            Some(&successor_id),
+        )?;
+        tx.commit()
+            .map_err(|err| StateError::from_sqlite("renew_lapsed_run_grant: commit", err))?;
+        Ok(Some(LapsedGrantRenewal {
+            // The successor differs from the lapsed row in exactly three
+            // fields: identity, recorded expiry and creation instant.
+            successor: GrantRow {
+                grant_id: successor_id,
+                expires_at,
+                state_epoch: epoch,
+                status: "active".to_string(),
+                created_at: at.to_string(),
+                ..grant.clone()
+            },
+            superseded: grant,
+            window_secs,
+        }))
     }
 
     /// Advance a running instance: record the current node and review-round

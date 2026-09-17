@@ -67,6 +67,14 @@ pub const PROMPT_DEADLINE_DEFAULT_SECS: u64 = 1800;
 /// it is bounded above the plain I/O default and far below the ceiling.
 pub const HARNESS_START_DEADLINE_DEFAULT_SECS: u64 = 300;
 
+/// Upper bound (seconds) on any authorization window the engine mints or
+/// renews for a run: 30 days. A grant is the bounded authorization of ONE
+/// run's own committed work, so no derived window may exceed the documented
+/// window class the operator surface already caps at (`grant issue
+/// --expires-in`). One fact, two readers: the CLI's `--expires-in` bound and
+/// the engine's own renewal (issue #184).
+pub const GRANT_WINDOW_MAX_SECS: i64 = 30 * 24 * 60 * 60;
+
 /// The effective, bounded deadline (seconds) of one effect step (issue #92
 /// F1). Policy surface: a reviewed plan step may carry `deadline_secs` for
 /// its own effect, bounded by [`EFFECT_DEADLINE_CEILING_SECS`]; a value
