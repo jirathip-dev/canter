@@ -100,7 +100,7 @@ To try the read-only path yourself in five minutes, the
 [Quickstart](#quickstart) below is copy-paste, with what you should see after
 every command.
 
-**Renamed from `canter` (issue #106).** The old binary name, state and
+**Renamed from `herdr-fleet` (issue #106).** The old binary name, state and
 config paths, and the debug crash-point env var all keep working — nothing is
 migrated destructively — and the pre-rename Herdr integration ids are
 retained. The single normative list is the
@@ -108,7 +108,7 @@ retained. The single normative list is the
 
 ## What it looks like inside
 
-[![canter (v0.1.0 render set; the shipped artifact predates the rename) as shipped: operator -> CLI -> daemon -> workflow engine -> adapters -> git/github/harnesses, with plans/grants state below](docs/architecture/canter.as-shipped.architecture.preview.light.png)](docs/architecture/canter.as-shipped.architecture.html)
+[![canter (v0.1.0 render set; the shipped artifact predates the rename) as shipped: operator -> CLI -> daemon -> workflow engine -> adapters -> git/github/harnesses, with plans/grants state below](docs/architecture/herdr-fleet.as-shipped.architecture.preview.light.png)](docs/architecture/herdr-fleet.as-shipped.architecture.html)
 
 That picture is the **as-shipped** architecture of the v0.1.0 release — not the
 long-term target; the mutation path it shows is the implemented primitive
@@ -124,9 +124,9 @@ plans/grants/state store before it runs. Herdr itself is **observed, never
 controlled**: `doctor` and `status` probe it, and nothing in canter starts,
 stops, or upgrades Herdr.
 
-The [interactive HTML](docs/architecture/canter.as-shipped.architecture.html)
-version is zoomable; the [dark preview](docs/architecture/canter.as-shipped.architecture.preview.dark.png),
-the [JSON source](docs/architecture/canter.as-shipped.architecture.json),
+The [interactive HTML](docs/architecture/herdr-fleet.as-shipped.architecture.html)
+version is zoomable; the [dark preview](docs/architecture/herdr-fleet.as-shipped.architecture.preview.dark.png),
+the [JSON source](docs/architecture/herdr-fleet.as-shipped.architecture.json),
 and the renderer provenance note live in
 [docs/architecture/README.md](docs/architecture/README.md). These are
 **frozen v0.1.0 render artifacts** (filenames, rendered titles, and SHA-256
@@ -541,14 +541,14 @@ module-level architecture is described in
 - Architecture artifacts (committed, with static previews):
   - [docs/architecture/README.md](docs/architecture/README.md) — index of both
     artifact sets and the renderer provenance notes.
-  - As shipped (v0.1.0): [JSON source](docs/architecture/canter.as-shipped.architecture.json) ·
-    [interactive HTML](docs/architecture/canter.as-shipped.architecture.html) ·
-    [preview (light)](docs/architecture/canter.as-shipped.architecture.preview.light.png) ·
-    [preview (dark)](docs/architecture/canter.as-shipped.architecture.preview.dark.png)
-  - Locked target (issue #1): [JSON source](docs/architecture/canter.locked-target.architecture.json) ·
-    [interactive HTML](docs/architecture/canter.locked-target.architecture.html) ·
-    [preview (light)](docs/architecture/canter.locked-target.architecture.preview.light.png) ·
-    [preview (dark)](docs/architecture/canter.locked-target.architecture.preview.dark.png)
+  - As shipped (v0.1.0): [JSON source](docs/architecture/herdr-fleet.as-shipped.architecture.json) ·
+    [interactive HTML](docs/architecture/herdr-fleet.as-shipped.architecture.html) ·
+    [preview (light)](docs/architecture/herdr-fleet.as-shipped.architecture.preview.light.png) ·
+    [preview (dark)](docs/architecture/herdr-fleet.as-shipped.architecture.preview.dark.png)
+  - Locked target (issue #1): [JSON source](docs/architecture/herdr-fleet.locked-target.architecture.json) ·
+    [interactive HTML](docs/architecture/herdr-fleet.locked-target.architecture.html) ·
+    [preview (light)](docs/architecture/herdr-fleet.locked-target.architecture.preview.light.png) ·
+    [preview (dark)](docs/architecture/herdr-fleet.locked-target.architecture.preview.dark.png)
 - [CONTRIBUTING.md](CONTRIBUTING.md) — how to contribute.
 - [SECURITY.md](SECURITY.md) — supported versions and private vulnerability
   reporting.
