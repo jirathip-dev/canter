@@ -167,6 +167,24 @@ can run with **no harness credentials** (AC7).
     A retry/fix round of the same lane retains its original workspace and
     agent names. Another lane holding the name or checkout refuses
     `refusal.lane.name_collision`; no suffix, rename or adoption is allowed.
+    **A retired generation's residue is reclaimed (issue #190)**: a run the
+    ledger records as terminal (`invalidated` / `done`) no longer holds its
+    issue's ownership, so its lane generation is residue — and the worktree
+    and the branch are not the whole of it. Before a bind step creates (or
+    reuses) its lane, the daemon resolves the terminal runs of the run's
+    repository issue from durable state (never from the substrate) and the
+    bind effect RETIRES each one's own lane workspace: the single-pane linked
+    registration at the run's own lane worktree whose pane carries exactly
+    that generation's `canter_lane` / `canter_generation` binding. The retire
+    is ownership-verified — several panes, a pane bound to another lane or a
+    newer generation, a registration that is not the run's own linked
+    worktree, or an unverifiable read-back is refused and left untouched (a
+    reclaim never becomes adoption, #157) — and every retire outcome
+    (`retired`, with the agent states the substrate still reported, or the
+    typed refusal) is recorded on the step outcome and in the journal. A LIVE
+    lane is never retired: a run that is not terminal still holds its issue's
+    unique ownership, so it is never in the retired set, and a live foreign
+    lane still refuses `refusal.lane.name_collision`.
     Git resolves the actual repository root, including an isolated clone's
     own named repo group; no checkout is moved or sandbox boundary changed.
     Herdr can create a repository-root workspace for a new group as well as

@@ -1260,6 +1260,16 @@ pub struct EffectContext<'a> {
     /// Daemon-owned archive/salvage root (issue #9 AC7; archive cleanup
     /// steps require it).
     pub archive_root: Option<&'a Path>,
+    /// Lane generations the run ledger RETIRED for this run's repository
+    /// issue (issue #190), resolved by the caller from durable state and
+    /// never from the substrate: the `harness_start` bind step retires their
+    /// lane workspaces BEFORE it binds the new generation's, so a retired
+    /// generation's residue (its pane/agent/workspace) can never keep the
+    /// deterministic lane name and refuse the successor with
+    /// `refusal.lane.name_collision`. A live lane is never in this set — a
+    /// run that is not terminal still holds its issue's unique ownership —
+    /// so the retire can never close a live current generation.
+    pub retired_run_ids: &'a [String],
 }
 
 /// Outcome for a refused effect (preconditions are checked by the daemon
@@ -2569,12 +2579,54 @@ fn effect_harness_start(ctx: &EffectContext<'_>) -> EffectOutcome {
             }
         }
     };
+    // Issue #190: the lane workspace is part of a generation's residue. The
+    // generations the run ledger RETIRED (resolved by the caller, never from
+    // the substrate) are retired HERE, before the new generation binds: the
+    // deterministic name/label belongs to ONE lane identity, so a retired
+    // generation's still-open workspace would otherwise refuse this bind with
+    // `refusal.lane.name_collision` and leave the issue with no product path
+    // out (#173). Every retire outcome — retired or refused — is recorded in
+    // this step's outcome below (and on a failed bind, in its message): the
+    // retire happened, so it is audited either way.
+    let mut retired_generations: Vec<Val> = Vec::new();
+    if profile.execution == crate::adapters::ExecutionMode::HerdrPane {
+        for run in ctx.retired_run_ids {
+            let doc = match run_session_handle(run) {
+                Ok(retired) => match crate::adapters::retire_lane_workspace(
+                    &retired,
+                    &cwd,
+                    ctx.env,
+                    crate::adapters::ADAPTER_TIMEOUT,
+                ) {
+                    Ok(Some(doc)) => doc,
+                    Ok(None) => continue,
+                    Err(err) => retire_refusal_doc(&retired.session_id, err.code, &err.message),
+                },
+                Err(err) => retire_refusal_doc(
+                    run,
+                    err.code
+                        .as_deref()
+                        .unwrap_or(crate::adapters::CODE_INCOMPLETE_IDENTITY),
+                    err.message.as_deref().unwrap_or_default(),
+                ),
+            };
+            retired_generations.push(doc);
+        }
+    }
     let result = crate::adapters::execute_op_in_worktree(&profile, &request, ctx.env, &cwd);
     if result.status != "succeeded" {
+        let mut message = result.message.clone().or_else(|| result.detail.clone());
+        if !retired_generations.is_empty() {
+            let note = retire_note(&retired_generations);
+            message = Some(match message {
+                Some(message) => format!("{message}; {note}"),
+                None => note,
+            });
+        }
         return EffectOutcome {
             status: result.status,
             code: result.code.map(str::to_string),
-            message: result.message.clone().or_else(|| result.detail.clone()),
+            message,
             result: null(),
         };
     }
@@ -2603,7 +2655,48 @@ fn effect_harness_start(ctx: &EffectContext<'_>) -> EffectOutcome {
                 .unwrap_or_else(null),
         );
     }
+    if !retired_generations.is_empty() {
+        fields.insert(
+            "retired_generations".to_string(),
+            Val::Arr(retired_generations),
+        );
+    }
     ok(Val::Obj(fields))
+}
+
+/// The recorded refusal of one pre-bind lane retire (issue #190): the
+/// generation that could not be retired, the typed refusal and the fact that
+/// nothing was closed by it.
+fn retire_refusal_doc(lane: &str, code: &str, message: &str) -> Val {
+    object(vec![
+        ("lane", string(lane)),
+        ("retired", bool_(false)),
+        ("code", string(code)),
+        ("message", string(message)),
+    ])
+}
+
+/// One bounded line naming what the pre-bind lane retire did (issue #190),
+/// recorded on a failed bind too: a retire that already happened must be
+/// recorded even when the bind that followed it did not succeed.
+fn retire_note(docs: &[Val]) -> String {
+    let retired = docs
+        .iter()
+        .filter(|doc| doc.get("retired").and_then(Val::as_bool) == Some(true))
+        .count();
+    let refused: Vec<String> = docs
+        .iter()
+        .filter_map(|doc| doc.get("code").and_then(Val::as_str))
+        .map(str::to_string)
+        .collect();
+    let mut note = format!(
+        "lane-retire: {retired} of {} terminal generation(s) retired before this bind",
+        docs.len()
+    );
+    if !refused.is_empty() {
+        note.push_str(&format!(" (refused: {})", refused.join(", ")));
+    }
+    note
 }
 
 /// The recorded binding of one session effect (issue #92 F2): the session

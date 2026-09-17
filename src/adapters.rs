@@ -75,7 +75,7 @@ use crate::schema::{Family, validate_doc};
 use crate::value::{Val, bool_, integer, null, object, string};
 
 mod herdr_lane;
-pub use herdr_lane::{LaneNames, close_lane_workspace};
+pub use herdr_lane::{LaneNames, close_lane_workspace, retire_lane_workspace};
 
 /// Closed `harness` axis capability set (`hf-capability/v1`, mirror of
 /// schema.rs and the fixture probe).
