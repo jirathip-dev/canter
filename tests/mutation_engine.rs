@@ -1297,7 +1297,9 @@ fn lane_flow_rehearses_then_verifies_landed_head_and_cleans_with_salvage() {
 // AC4 RED: moved base invalidates recorded evidence before the merge
 // ---------------------------------------------------------------------------
 
-fn cycle2_reviewed_merge(policy: &str, squash_first: bool) -> (Scenario, String, String) {
+/// The queue-spine steps (`flow_steps`) with the merge step bound to an
+/// explicit closed `merge_policy` (`squash` | `ff`).
+fn cycle2_merge_steps(policy: &str) -> Vec<Val> {
     let mut steps = flow_steps();
     steps[5] = step(
         "m1",
@@ -1307,6 +1309,11 @@ fn cycle2_reviewed_merge(policy: &str, squash_first: bool) -> (Scenario, String,
             ("merge_policy", string(policy)),
         ])),
     );
+    steps
+}
+
+fn cycle2_reviewed_merge(policy: &str, squash_first: bool) -> (Scenario, String, String) {
+    let steps = cycle2_merge_steps(policy);
     let scenario = Scenario::new(
         &format!("c2-{}{}", &policy[..1], u8::from(squash_first)),
         "2999-01-01T00:00:00Z",
@@ -1638,6 +1645,73 @@ fn cycle2_rehearsal_refuses_an_unprovable_published_base_on_both_routes() {
         scenario.integration_base(),
         base,
         "the refusal must not move integration"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The published-ref read's AMBIGUOUS route is its own typed outcome (#169)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cycle2_ambiguous_published_read_keeps_its_own_outcome_and_is_never_remapped() {
+    let scenario = Scenario::new(
+        "ambiguous-read",
+        "2999-01-01T00:00:00Z",
+        cycle2_merge_steps("squash"),
+    );
+    let base = scenario.integration_base();
+    scenario.apply_ok(20, "w1", None, None);
+    scenario.apply_ok(21, "h1", None, None);
+    scenario.apply_ok(22, "p1", None, None);
+    let collected = scenario.apply_ok(23, "o1", None, Some(&base));
+    let feature = collected
+        .get("head")
+        .and_then(Val::as_str)
+        .expect("lane head")
+        .to_string();
+    scenario.apply_ok(24, "r1", Some(&feature), Some(&base));
+
+    // An AMBIGUOUS read of the published ref: the shim `ls-remote` SIGKILLs
+    // itself, so the read never exits with a status. It is not "unreadable",
+    // so the step must keep the read's OWN ambiguous outcome — `process_death`
+    // when the shim wins, `adapter.timeout` if the effect deadline reaps it
+    // first under load — and never remap it onto the unprovable-base code
+    // (`effect.merge.failed`) the EXIT routes take. The shim passes every
+    // other git call through to the real git, so only the published-ref read
+    // is ambiguous.
+    let fakebin = scenario.sandbox.path("fakebin");
+    scenario.sandbox.write(
+        "fakebin/git",
+        &format!(
+            "#!/bin/sh\ncase \"$1\" in\n  ls-remote) kill -9 $$ ;;\n  *) exec {real_git} \"$@\" ;;\nesac\n",
+            real_git = std::env::var("PATH")
+                .unwrap_or_default()
+                .split(':')
+                .map(|dir| PathBuf::from(dir).join("git"))
+                .find(|candidate| candidate.is_file() && !candidate.starts_with(&fakebin))
+                .expect("a real git on PATH")
+                .display()
+        ),
+    );
+    scenario.sandbox.chmod_x("fakebin/git");
+    let (code, message) = scenario.apply_err(25, "m1", Some(&feature), Some(&base));
+    assert!(
+        code == "adapter.process_death" || code == "adapter.timeout",
+        "an ambiguous read keeps its own typed outcome, never the remapped one: {code}: {message}"
+    );
+    assert!(
+        message.contains("died without a terminal outcome")
+            || message.contains("exceeded its deadline"),
+        "the read's own diagnostics are preserved: {message}"
+    );
+    assert!(
+        !message.contains("not readable"),
+        "an ambiguous read is never remapped onto the unprovable-base code: {message}"
+    );
+    assert_eq!(
+        scenario.integration_base(),
+        base,
+        "an ambiguous read must not move integration"
     );
 }
 
