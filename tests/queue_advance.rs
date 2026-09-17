@@ -1027,6 +1027,81 @@ fn a_delivering_run_with_committed_steps_after_the_delivery_stays_live_until_its
     assert_eq!(advances[0].next_instance_id.as_deref(), Some(run6.as_str()));
     assert_eq!(advances[0].reason, None, "the hold settled");
     assert_eq!(state.list_instances().expect("instances").len(), 2);
+    reconcile(&state, &run5, false);
+    let completed = state.supervision_by_id(&run5).unwrap().unwrap();
+    assert_eq!(completed.last_check_class, "completed");
+    assert_eq!(completed.last_check_reason, supervision::codes::COMPLETED);
+    let evidence = state.supervision_evidence(&run5).unwrap().unwrap();
+    assert_eq!(supervision::next_unachieved_step(&evidence), None);
+    println!(
+        "FINISHED status={} reason={} attempts={:?}",
+        evidence.run.status, completed.last_check_reason, evidence.attempts
+    );
+}
+
+#[test]
+fn releasing_a_verified_delivery_with_an_unexecuted_tail_never_reports_completed() {
+    let fixture = Fixture::new("release-tail");
+    let state = fixture.open();
+    seed_grant(&state, "gr_0000000000000005", 5);
+    let mut request = request_with(vec![selected("#5", &[])]);
+    request.steps = committed_tail_steps();
+    request.boundary.caps = tail_boundary_caps();
+    let (bound, digest) = render_bound(&state, &request);
+    let plan = submission_plan(
+        &state,
+        "ik_152-release-tail",
+        &bound,
+        &digest,
+        &[("#5", "gr_0000000000000005")],
+        request.caps,
+    );
+    let (_, items) = state.submit_queue_run(&plan).expect("submit");
+    let run = items[0].instance_id.as_deref().expect("admitted run");
+    record_achieved_step(&state, run, "p1", "mutate.checkout", 11);
+    record_achieved_step(&state, run, "r1", "mutate.review_evidence", 12);
+    record_delivery(&state, run, HEAD_A);
+    reconcile(&state, run, true).expect("verified delivery");
+    assert_ne!(run_status(&state, run), "done", "the tail is still owed");
+
+    state
+        .release_run(
+            run,
+            "stop before committed merge and cleanup",
+            "ik_152-release-unfinished",
+            &canter::time::rfc3339_now(),
+        )
+        .expect("release unfinished run");
+    drop(state);
+    let state = fixture.open();
+    assert_eq!(reconcile(&state, run, true), None);
+    let row = state.supervision_by_id(run).unwrap().unwrap();
+    assert_eq!(row.last_check_class, "needs-attention");
+    assert_eq!(row.last_check_reason, supervision::codes::INVALIDATED);
+    let evidence = state.supervision_evidence(run).unwrap().unwrap();
+    assert_eq!(evidence.run.status, "invalidated");
+    assert_eq!(
+        supervision::next_unachieved_step(&evidence),
+        Some(("m1".to_string(), "merge".to_string()))
+    );
+    let unexecuted: Vec<_> = evidence
+        .steps
+        .iter()
+        .filter(|(id, _)| !evidence.attempts.iter().any(|(step, _, _)| step == id))
+        .cloned()
+        .collect();
+    assert_eq!(
+        unexecuted,
+        vec![
+            ("m1".to_string(), "merge".to_string()),
+            ("c1".to_string(), "cleanup".to_string()),
+        ]
+    );
+    assert!(supervision::dispatch_intent(&row, &evidence).is_none());
+    println!(
+        "RELEASED status={} reason={} unexecuted={unexecuted:?}",
+        evidence.run.status, row.last_check_reason
+    );
 }
 
 #[test]
