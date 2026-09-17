@@ -1,25 +1,104 @@
 # canter
 
-A control panel for fleets of AI coding agents: plan, review, and merge work
-across the repositories your Herdr agents operate in — without hand-driving
-every step yourself.
+Workflow coordination for coding agents running alongside Herdr.
 
-canter is for one operator running Herdr on their own Mac or Linux box. It
-removes the pain of keeping plan/review/merge discipline per repository by hand:
-you render a typed, deterministic plan for an issue, look it over, and then the
-work happens the same disciplined way every time. The safety story fits in one
-sentence — **nothing mutates without a reviewed plan plus an explicit grant; the
-CLI itself is read-only**, and the only mutation path is a grant-gated daemon
-`apply` that executes one digest-bound step per request and journals it before
-the effect.
 
-canter is an independent community companion compatible with Herdr — it is
-not an official or endorsed Herdr project. It is Herdr-first and harness-neutral,
-and it never stores credentials (GitHub reads use your shell's authenticated
-`gh`). It is also **not** Corral: Corral is a separate, optional read-only
-observability product, and neither tool depends on the other at runtime. To try
-it yourself in five minutes, the [Quickstart](#quickstart) below is copy-paste,
-with what you should see after every command.
+canter is for one operator managing coding agents across repositories from
+a Herdr box (macOS or Linux). The goal is a complete, disciplined delivery path
+— approved work carried through implementation, review, and verified
+integration — without hand-driving every step. That end-to-end path is the
+goal, not a shipped promise; [Readiness today](#readiness-today) states exactly
+what is usable today.
+
+
+It is **not a coding agent and does not replace Herdr's execution hosting**:
+Herdr runs the agents; canter is the companion that observes them and
+renders the coordination artifacts around the work. It is an independent
+community companion compatible with Herdr — not an official or endorsed Herdr
+project — and it never stores credentials (GitHub reads use your shell's
+authenticated `gh`). It is also **not** Corral: Corral is a separate, optional
+read-only observability product, and neither tool depends on the other at
+runtime.
+
+## Readiness today
+
+Three explicit categories, in plain order; each cites its sources.
+
+**1. Usable through the CLI now.** The read-only commands observe and render;
+`daemon run`/`daemon status` start and probe the local state daemon. Nothing
+in this category starts a workflow:
+
+- `config init` / `config validate` / `config show` — print the annotated
+  template, validate a config file and its policy overlay, inspect the
+  effective configuration. These three commands write nothing.
+- `doctor` — diagnose prerequisites (`git`, `herdr` >= 0.8.2, authenticated
+  `gh`); never installs or starts anything.
+- `status` — observe configured repositories from their local checkouts,
+  read-only and bounded.
+- `plan` — render a deterministic, typed `hf-plan/v1` **outline** for one
+  issue; the same inputs render the same bytes and the same digest. Rendering
+  authorizes nothing and executes nothing.
+- `capabilities` — report the CLI's declared forge read capabilities.
+- `service doctor` / `service install-plan|status-plan|uninstall-plan` — check
+  the daemon environment and render per-user launchd/systemd unit text and
+  steps; no host service manager is touched.
+- `daemon run` / `daemon status` — run and probe the local state daemon.
+  `daemon run` writes its per-user local runtime state (SQLite state,
+  audit/event journals, lock, log, socket) under XDG paths, but starting it
+  starts no workflow (category 3).
+
+Sources: [docs/OPERATIONS.md](docs/OPERATIONS.md) sections 2-5 and
+[docs/contracts/spec-cli.md](docs/contracts/spec-cli.md).
+
+**2. Implemented internal / daemon primitives — not yet a supported operator
+workflow.** Built, contract-tested against disposable local state, and
+documented:
+
+- The daemon is a single-writer local state server: per-user flock, migrated
+  SQLite state, audit/event journals, one Unix socket.
+- The only mutation path is the grant-gated daemon `apply` RPC: one
+  digest-bound plan step per request, freshly revalidated against live state,
+  journaled before the effect, answered with a typed `hf-outcome/v1`. It is
+  **RPC only — there is no CLI mutation command**, and `plan` never applies
+  anything.
+- The workflow engine, the bundled Doctrine default workflow, and typed
+  harness adapters (Hermes, Claude Code, Codex, Pi, Jcode, plus a generic
+  argv adapter) exist as modules verified with fake-executable contract tests.
+- Lifecycle machinery (recurring non-destructive schedules, cleanup
+  archive/salvage, cold-boot recovery, retention-bounded backups) and release
+  archive machinery (checksums, offline SBOM, provenance) are implemented
+  with human-gated execution.
+
+Sources: [docs/OPERATIONS.md](docs/OPERATIONS.md) section 6,
+[docs/contracts/spec-plans.md](docs/contracts/spec-plans.md),
+[docs/contracts/spec-daemon.md](docs/contracts/spec-daemon.md),
+[docs/contracts/spec-workflow.md](docs/contracts/spec-workflow.md),
+[docs/contracts/spec-lifecycle.md](docs/contracts/spec-lifecycle.md), and
+[docs/RELEASING.md](docs/RELEASING.md).
+
+**3. Not yet available as a supported end-to-end workflow.** No supported path
+carries an issue from plan to merge:
+
+- No CLI command grants, applies, or starts a workflow. Grants and workflow
+  instances are daemon-owned state; the RPC surface exposes `grants.list` and
+  `grants.revoke`, not grant creation, so the `apply` path cannot be driven
+  end-to-end by an operator today. The grant/apply sequence in
+  [docs/OPERATIONS.md](docs/OPERATIONS.md) section 6 is synthetic guidance
+  against the documented contract.
+- Starting the daemon does **not** start any fleet workflow; nothing runs
+  until an explicit request is made against it.
+- No live workflow execution or release execution exists yet, and no harness
+  session runs from public CI or fork PRs — real harness parity is a
+  human-gated clean-host exercise (issue #7 AC6).
+- Nothing in this repository mutates real repositories, fleets, or external
+  state.
+
+Sources: [docs/OPERATIONS.md](docs/OPERATIONS.md) section 6 and
+[docs/RELEASING.md](docs/RELEASING.md).
+
+To try the read-only path yourself in five minutes, the
+[Quickstart](#quickstart) below is copy-paste, with what you should see after
+every command.
 
 **Renamed from `herdr-fleet` (issue #106).** The old binary name, state and
 config paths, and the debug crash-point env var all keep working — nothing is
@@ -32,7 +111,9 @@ retained. The single normative list is the
 [![canter (v0.1.0 render set; the shipped artifact predates the rename) as shipped: operator -> CLI -> daemon -> workflow engine -> adapters -> git/github/harnesses, with plans/grants state below](docs/architecture/herdr-fleet.as-shipped.architecture.preview.light.png)](docs/architecture/herdr-fleet.as-shipped.architecture.html)
 
 That picture is the **as-shipped** architecture of the v0.1.0 release — not the
-long-term target. Reading left to right: you drive the read-only CLI
+long-term target; the mutation path it shows is the implemented primitive
+categorized in [Readiness today](#readiness-today), not a supported
+end-to-end workflow. Reading left to right: you drive the read-only CLI
 (`config`, `doctor`, `status`, `plan`, `capabilities`, `service *-plan`); the
 CLI probes the local checkout, `gh`, and Herdr directly, and talks to the local
 daemon only to run it or ask its status. Mutations are the guarded path at the
@@ -80,7 +161,13 @@ migration chain: m0001_initial_state_v1, m0002_workflow_engine_instances_v2, m00
 document schema families: hf-config/v1, hf-policy/v1, hf-output/v1, hf-error/v1, ...
 ```
 
-Configure — the template prints to stdout; the CLI never writes files:
+The second banner line is the current build's identity text; its "no daemon"
+wording predates the daemon work and is being corrected in
+[#55](https://github.com/jirathip-dev/canter/issues/55) — the daemon
+itself is implemented, as [Readiness today](#readiness-today) describes.
+
+Configure — `config init` prints the template to stdout and writes nothing
+(you redirect the output yourself):
 
 ```console
 $ ./target/release/canter config init > ~/.config/canter/config.toml
@@ -162,6 +249,11 @@ Outputs above are trimmed from real runs and host paths are redacted (`.../`,
 
 ## A day with canter
 
+**Target story, not a supported end-to-end workflow today** (see
+[Readiness today](#readiness-today)). Steps 1-3 are exercised read-only
+commands; steps 4-5 describe the daemon's grant/apply primitives and their
+journal read-back, which no supported operator path drives yet.
+
 You are the operator. It is Monday; `widgets` (issue #7) needs work from one of
 your agent fleets, and you want that work planned, reviewed, and merged without
 you babysitting the discipline.
@@ -231,10 +323,11 @@ That digest is the contract: a grant binds the plan's digest, repository,
 epoch, and capabilities; any tampering with the plan changes the digest and a
 later `apply` refuses it.
 
-**4. You run the daemon, grant the plan, and the work applies one step at a
+**4. Target path: you run the daemon, and it mediates one authorized step at a
 time.** The daemon is a single-writer local state server (per-user socket,
 SQLite state, audit journal). Start it in a terminal; read-only commands keep
-working even while it is down:
+working even while it is down. Starting the daemon does not start any
+workflow:
 
 ```console
 $ canter daemon run             # foreground; Ctrl-C stops the process
@@ -246,18 +339,17 @@ $ canter daemon status --json   # from another terminal: exit 0
  "exit_code":0,"kind":"ok","schema":"hf-output/v1"}
 ```
 
-Granting and applying: `canter grant issue` is the SUPPORTED production
-grant-issuance path (a thin CLI over the daemon's closed `grants.issue`
-method) — it mints ONE `hf-grant/v1` from a reviewed bound-input document,
-and the minted grant id is what `canter board --grant` / `canter queue
-submit --grant` present. Issuance is not authorization: the board remains
-the authorization point. `apply` stays a **daemon RPC operation, not a CLI
-subcommand**: each `apply` request executes exactly one plan step
-(checkout, then worktree, then harness start, prompt, outcome, review
-evidence, merge, cleanup — each gated on its own conditions) with an
-idempotency key, and writes the outcome to the journal before the effect.
-The full grant/apply workflow, its refusal codes, and its typed outcome
-statuses are documented — with synthetic examples only — in
+
+Granting and applying are **daemon RPC operations, not CLI subcommands**: a
+route grant binds the plan's digest, repository, epoch, and capabilities, and
+each `apply` request executes exactly one plan step (checkout, then worktree,
+then harness start, prompt, outcome, review evidence, merge, cleanup — each
+gated on its own conditions) with an idempotency key, and writes the outcome
+to the journal before the effect. This is an implemented primitive, not an
+end-to-end operator path: no CLI subcommand grants or applies, and grant
+issuance is not exposed over the daemon RPC today. The full grant/apply
+workflow, its refusal codes, and its typed outcome statuses are documented —
+with synthetic examples only — in
 [docs/OPERATIONS.md](docs/OPERATIONS.md) section 6.
 
 **5. You verify.** Every step was journaled and is read back exactly; replaying
@@ -268,8 +360,11 @@ is a human-gated clean-host exercise.
 
 ## Operating this
 
-Day 1 — try it read-only; Day 2 — let the daemon mediate work. Each step is one
-line here; the full runbook is [docs/OPERATIONS.md](docs/OPERATIONS.md).
+Day 1 — try it read-only; Day 2 — run the daemon and probe its state. Each
+step is one line here; the full runbook is
+[docs/OPERATIONS.md](docs/OPERATIONS.md). Authorized effects are daemon-RPC
+mediated; there is no supported end-to-end workflow yet (see
+[Readiness today](#readiness-today)).
 
 1. **Install** (Day 1): clone and build pinned.
    `git clone https://github.com/jirathip-dev/canter.git && cd canter && cargo build --release --locked`
