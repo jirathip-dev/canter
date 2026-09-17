@@ -1402,8 +1402,13 @@ fn cycle2_ff_refusal_names_policy_divergence_not_an_inferred_base_move() {
     assert_eq!(scenario.integration_base(), base);
 }
 
+/// Witness (a) (issue #178): a CERTIFIED delivery whose branch is behind the
+/// moved published integration ref is reconciled onto it, and this step's
+/// bounded retry re-certifies the reconciled head — so the delivery reaches a
+/// merged integration head and `post_merge_verify` passes. The published-ref
+/// verification is visible in the recorded outcome.
 #[test]
-fn cycle2_rehearsal_refuses_when_the_published_integration_ref_moved() {
+fn cycle2_rehearsal_reconciles_and_recertifies_a_delivery_behind_the_moved_published_ref() {
     let (scenario, feature, base) = cycle2_reviewed_merge("squash", false);
     // Another lane lands on the published integration branch from a separate
     // clone: the bare remote moves while this integration checkout stays at
@@ -1440,20 +1445,150 @@ fn cycle2_rehearsal_refuses_when_the_published_integration_ref_moved() {
         "the integration checkout was not fetched"
     );
 
-    // The rehearsal may only certify the PUBLISHED integration ref: an
-    // unpublished local view must refuse instead of recording an integration
-    // head the next checkout step cannot trust.
+    // Attempt 1 — the checkout is STRICTLY BEHIND the published ref: the
+    // certified delivery is reconciled onto the fetched published ref (the
+    // reviewed delta is replayed in the delivery's own worktree) and the step
+    // records the bounded retry that re-certifies the reconciled head. It is
+    // never a terminal failure.
+    let lane = scenario.repos.worktrees_root.join("issues-123");
     let (code, message) = scenario.apply_err(15, "m1", Some(&feature), Some(&base));
-    assert_eq!(code, "effect.merge.not_fast_forward");
-    assert!(message.contains("published"), "{message}");
+    assert_eq!(code, "refusal.run.retry_required", "{message}");
     assert!(
-        !message.contains("base moved after"),
-        "the cause is the published ref, not an inferred base move: {message}"
+        message.contains(&published),
+        "the reconciliation names the published head it reconciled onto: {message}"
     );
+    let lane_git = Git::new(&lane);
+    let reconciled = lane_git.head("HEAD");
+    assert_ne!(reconciled, feature, "the delivery was reconciled");
+    assert_eq!(
+        lane_git.run(&[
+            "merge-base",
+            "--is-ancestor",
+            &published,
+            reconciled.as_str()
+        ]),
+        "",
+        "the reconciled head descends from the published ref"
+    );
+    // The certification target is the PUBLISHED ref: the integration checkout
+    // itself is still not moved by a rehearsal.
     assert_eq!(
         scenario.integration_base(),
         base,
-        "the rehearsal must not move integration"
+        "a reconciliation never moves the integration checkout"
+    );
+
+    // Attempt 2 — the bounded retry certifies the reconciled head against the
+    // FETCHED published ref. The verification is visible in the outcome.
+    let certified = scenario.apply_ok(16, "m1", Some(&feature), Some(&base));
+    assert_eq!(
+        certified.get("mode").and_then(Val::as_str),
+        Some("rehearsal")
+    );
+    assert_eq!(certified.get("landed").and_then(Val::as_bool), Some(false));
+    assert_eq!(
+        certified.get("reconciled").and_then(Val::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        certified.get("published_head").and_then(Val::as_str),
+        Some(published.as_str())
+    );
+    assert_eq!(
+        certified.get("certified_head").and_then(Val::as_str),
+        Some(feature.as_str())
+    );
+    assert_eq!(
+        certified.get("reconciled_head").and_then(Val::as_str),
+        Some(reconciled.as_str())
+    );
+    assert_eq!(
+        certified.get("integration_head").and_then(Val::as_str),
+        Some(published.as_str()),
+        "the certified merge target is the published ref"
+    );
+
+    // The orchestrator/forge owns the landing. The fixture models the
+    // repository's SQUASH policy: fast-forward the checkout to the fetched
+    // published ref, squash the reconciled delivery onto it, publish.
+    let git = Git::new(&scenario.repos.checkout);
+    git.run(&["merge", "--ff-only", "refs/remotes/origin/staging"]);
+    git.run(&["merge", "--squash", "issue-123"]);
+    git.run(&[
+        "commit",
+        "-q",
+        "-m",
+        "squash the reconciled delivery (synthetic)",
+    ]);
+    git.run(&["push", "-q", "origin", "staging"]);
+    let merged = git.head("staging");
+    assert_ne!(merged, published, "the delivery reached a merged head");
+
+    // `post_merge_verify` passes on the squash landing through the content
+    // route: every path the review covered carries the reviewed head's exact
+    // content in the integration ref.
+    let verified = scenario.apply_ok(17, "v1", Some(&feature), Some(&base));
+    assert_eq!(
+        verified.get("contains_feature").and_then(Val::as_bool),
+        Some(true)
+    );
+    assert_eq!(verified.get("proof").and_then(Val::as_str), Some("content"));
+    assert_eq!(
+        verified.get("merged_head").and_then(Val::as_str),
+        Some(merged.as_str())
+    );
+
+    // The tail reaches its end: cleanup proves the squash landed by content
+    // and removes the lane.
+    let closed = scenario.apply_ok(18, "i1", Some(&feature), Some(&base));
+    assert_eq!(closed.get("action").and_then(Val::as_str), Some("close"));
+    let cleaned = scenario.apply_ok(19, "x1", Some(&feature), Some(&base));
+    assert_eq!(cleaned.get("removed").and_then(Val::as_bool), Some(true));
+    assert_eq!(
+        cleaned
+            .get("salvage")
+            .and_then(|salvage| salvage.get("landed_by"))
+            .and_then(Val::as_str),
+        Some("content"),
+        "the squash landing is proven by content, not ancestry"
+    );
+    assert!(!lane.exists());
+}
+
+/// Witness (b) (issue #178, #156): an UNPUBLISHED local move refuses. The
+/// checkout AHEAD of the published ref is a view nobody else can see; the
+/// published ref is the only certifiable merge target and never a
+/// reconciliation base. (The refusal is witnessed under the same effect the
+/// stale-evidence witness above already drives; this test pins the checkout
+/// AHEAD state directly.)
+#[test]
+fn cycle2_rehearsal_never_reconciles_an_unpublished_local_move() {
+    let (scenario, feature, base) = cycle2_reviewed_merge("squash", false);
+    let git = Git::new(&scenario.repos.checkout);
+    std::fs::write(scenario.repos.checkout.join("local.txt"), "local\n").expect("write");
+    git.run(&["add", "local.txt"]);
+    git.run(&["commit", "-q", "-m", "unpublished local move (synthetic)"]);
+    assert_eq!(
+        git.head("staging"),
+        scenario.integration_base(),
+        "the local move is unpublished"
+    );
+
+    let (code, message) = scenario.apply_err(15, "m1", Some(&feature), Some(&base));
+    assert_eq!(code, "effect.merge.not_fast_forward");
+    assert!(
+        message.contains("published"),
+        "the refusal names the published ref: {message}"
+    );
+    assert!(
+        message.contains("unpublished"),
+        "the refusal names the unpublished local view: {message}"
+    );
+    // Nothing was reconciled and nothing was merged.
+    assert_eq!(
+        Git::new(&scenario.repos.worktrees_root.join("issues-123")).head("HEAD"),
+        feature,
+        "an unpublished local move never rewrites the delivery"
     );
 }
 
@@ -1537,10 +1672,27 @@ fn moved_integration_base_invalidates_stale_evidence_and_refuses_merge() {
 
     // Even reporting the OLD base cannot merge: the recorded evidence still
     // matches the OLD base, so the gate passes and the merge effect itself
-    // fails closed on the moved ref (fast-forward impossible — AC2 race).
-    let (code2, _) = scenario.apply_err(36, "m1", Some(&feature_head), Some(&integration_base));
+    // fails closed on the moved ref (fast-forward impossible — AC2 race). An
+    // UNPUBLISHED local move — a view nobody else can see — is never
+    // reconciled (issue #178, #156): the published ref is the only certifiable
+    // merge target, so the delivery is not rewritten either.
+    let (code2, message2) =
+        scenario.apply_err(36, "m1", Some(&feature_head), Some(&integration_base));
     assert_eq!(code2, "effect.merge.not_fast_forward");
+    assert!(
+        message2.contains("published"),
+        "the refusal names the published ref: {message2}"
+    );
+    assert!(
+        message2.contains("unpublished"),
+        "the refusal names the unpublished local view: {message2}"
+    );
     assert_eq!(ck.head("staging"), moved_base, "no merge happened");
+    assert_eq!(
+        Git::new(&scenario.repos.worktrees_root.join("issues-123")).head("HEAD"),
+        feature_head,
+        "an unpublished local move never rewrites the delivery"
+    );
 }
 
 // ---------------------------------------------------------------------------

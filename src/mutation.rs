@@ -3122,9 +3122,395 @@ fn published_integration_head(ctx: &EffectContext<'_>) -> Result<String, EffectO
     Ok(head.to_string())
 }
 
+/// Whether `ancestor` is an ancestor of (or equal to) `descendant` in the
+/// integration repo. A git failure — an unresolvable object included — is
+/// `false`: an unprovable ancestry is never a proof (fail closed).
+fn is_commit_ancestor(ctx: &EffectContext<'_>, ancestor: &str, descendant: &str) -> bool {
+    run_git(
+        ctx,
+        ctx.integration_repo,
+        &["merge-base", "--is-ancestor", ancestor, descendant],
+    )
+    .is_ok()
+}
+
+/// The head of the published integration ref, FETCHED into the checkout's
+/// remote-tracking ref and verified against the `ls-remote` read (issue
+/// #178). A reconciliation may only merge against a view it has actually
+/// fetched (issue #156): a fetch that cannot run, or a fetched head that
+/// disagrees with the published read, refuses fail-closed.
+fn fetched_published_head(
+    ctx: &EffectContext<'_>,
+    published_head: &str,
+) -> Result<String, EffectOutcome> {
+    let branch = ctx.integration_branch;
+    let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+    if let Err(outcome) = run_git(
+        ctx,
+        ctx.integration_repo,
+        &["fetch", "--no-tags", "origin", &refspec],
+    ) {
+        if outcome.code.as_deref() != Some(code::EXIT) {
+            return Err(outcome);
+        }
+        let detail = outcome
+            .message
+            .as_deref()
+            .unwrap_or("the fetch failed without a message");
+        return Err(failed(
+            code::MERGE_FAILED,
+            format!(
+                "the published integration ref {branch:?} is not fetchable from origin: {detail}"
+            ),
+        ));
+    }
+    let fetched = run_git(
+        ctx,
+        ctx.integration_repo,
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("refs/remotes/origin/{branch}"),
+        ],
+    )?
+    .stdout
+    .trim()
+    .to_string();
+    if fetched != published_head {
+        return Err(failed(
+            code::MERGE_FAILED,
+            format!(
+                "the published integration ref {branch:?} is not readable from origin: the fetched head {fetched} disagrees with the published head {published_head}"
+            ),
+        ));
+    }
+    Ok(fetched)
+}
+
+/// The NUL-delimited paths that differ between two tree-ish in the
+/// integration repo. The cleanup content proof's lossless-adapter rules
+/// (issue #132) apply verbatim: a replacement character, a truncated NUL
+/// stream or an empty path refuses instead of ever becoming a proof.
+fn changed_paths_between(
+    ctx: &EffectContext<'_>,
+    from: &str,
+    to: &str,
+    refuse_code: &'static str,
+) -> Result<Vec<String>, EffectOutcome> {
+    let changed = run_git(
+        ctx,
+        ctx.integration_repo,
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "--ignore-submodules=none",
+            "-z",
+            from,
+            to,
+            "--",
+        ],
+    )?;
+    if changed.stdout.contains('\u{fffd}')
+        || (!changed.stdout.is_empty() && !changed.stdout.ends_with('\0'))
+    {
+        return Err(refusal(
+            refuse_code,
+            "cannot compare changed paths losslessly; refusing an unverified proof",
+        ));
+    }
+    let paths: Vec<String> = changed
+        .stdout
+        .split_terminator('\0')
+        .map(str::to_string)
+        .collect();
+    if paths.iter().any(|path| path.is_empty()) {
+        return Err(refusal(
+            refuse_code,
+            "the changed-path listing contains an empty path; refusing an unverified proof",
+        ));
+    }
+    Ok(paths)
+}
+
+/// The subset of `paths` whose content differs between `a` and `b` in the
+/// integration repo (`--literal-pathspecs`, so a path is never a pattern).
+/// Empty means every named path is byte-identical there. An EMPTY path list
+/// is independently confirmed against the whole diff, so a missing listing
+/// can never become a vacuous proof.
+fn differing_paths_between(
+    ctx: &EffectContext<'_>,
+    a: &str,
+    b: &str,
+    paths: &[String],
+    refuse_code: &'static str,
+) -> Result<Vec<String>, EffectOutcome> {
+    if paths.is_empty() {
+        run_git(
+            ctx,
+            ctx.integration_repo,
+            &[
+                "diff",
+                "--quiet",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--ignore-submodules=none",
+                a,
+                b,
+                "--",
+            ],
+        )?;
+        return Ok(Vec::new());
+    }
+    let mut args: Vec<&str> = vec![
+        "--literal-pathspecs",
+        "diff",
+        "--name-only",
+        "--no-renames",
+        "--ignore-submodules=none",
+        "-z",
+        a,
+        b,
+        "--",
+    ];
+    args.extend(paths.iter().map(String::as_str));
+    let differing = run_git(ctx, ctx.integration_repo, &args)?;
+    if differing.stdout.contains('\u{fffd}')
+        || (!differing.stdout.is_empty() && !differing.stdout.ends_with('\0'))
+    {
+        return Err(refusal(
+            refuse_code,
+            "cannot compare changed paths losslessly; refusing an unverified proof",
+        ));
+    }
+    Ok(differing
+        .stdout
+        .split_terminator('\0')
+        .map(str::to_string)
+        .collect())
+}
+
+/// Prove the certified content survives in `delivered` (issue #178): every
+/// path the review covered (`reviewed_base..certified`) must carry the
+/// certified head's exact content. A dropped path, partial content or any
+/// later divergence refuses — content is never merged that was not proven
+/// against the ref it lands on.
+fn prove_certified_content(
+    ctx: &EffectContext<'_>,
+    reviewed_base: &str,
+    certified: &str,
+    delivered: &str,
+) -> Result<(), EffectOutcome> {
+    let paths = changed_paths_between(ctx, reviewed_base, certified, code::MERGE_FAILED)?;
+    let differing = differing_paths_between(ctx, certified, delivered, &paths, code::MERGE_FAILED)?;
+    if !differing.is_empty() {
+        return Err(failed(
+            code::MERGE_FAILED,
+            format!(
+                "the delivered head {delivered} does not carry the certified content of {certified} on {} of the {} path(s) the review covered relative to {reviewed_base} (first {:?}); refusing to certify rewritten content",
+                differing.len(),
+                paths.len(),
+                differing.first()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The worktree of the integration repo that has `branch` checked out — the
+/// only place a reconciliation may run, and only when it is contained under
+/// the lane root.
+fn branch_worktree(ctx: &EffectContext<'_>, branch: &str) -> Result<PathBuf, EffectOutcome> {
+    let listing = run_git(
+        ctx,
+        ctx.integration_repo,
+        &["worktree", "list", "--porcelain"],
+    )?;
+    let wanted = format!("refs/heads/{branch}");
+    let mut current: Option<String> = None;
+    let mut found: Option<String> = None;
+    for line in listing.stdout.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current = Some(path.trim().to_string());
+        } else if let Some(head) = line.strip_prefix("branch ")
+            && head.trim() == wanted
+        {
+            found = current.clone();
+        }
+    }
+    let Some(path) = found else {
+        return Err(failed(
+            code::MERGE_FAILED,
+            format!(
+                "feature branch {branch:?} has no worktree in the integration checkout; a reconciliation refuses to rewrite a branch it cannot check out"
+            ),
+        ));
+    };
+    let worktree = PathBuf::from(path);
+    // The lane worktree must be strictly inside the presented lane root
+    // (canonicalized, so a symlinked temp root cannot hide an escape).
+    if !is_contained(ctx.worktrees_root, &worktree) {
+        return Err(failed(
+            code::MERGE_FAILED,
+            format!(
+                "the worktree of feature branch {branch:?} ({}) is outside the lane root; refusing to rewrite it",
+                worktree.display()
+            ),
+        ));
+    }
+    Ok(worktree)
+}
+
+/// Reconcile the certified delivery onto the fetched published head (issue
+/// #178): replay exactly the delivered commits (`upstream..delivered`) onto
+/// `target` in the branch's own worktree, then prove the certified content
+/// survived byte-identically. Fails closed: a conflict, a dirty worktree or a
+/// content divergence refuses and never leaves a partial rewrite behind.
+fn reconcile_onto_published(
+    ctx: &EffectContext<'_>,
+    branch: &str,
+    target: &str,
+    upstream: &str,
+) -> Result<String, EffectOutcome> {
+    let worktree = branch_worktree(ctx, branch)?;
+    if let Err(outcome) = run_git(ctx, &worktree, &["rebase", "--onto", target, upstream]) {
+        // Never leave a conflicted rebase behind: abort before refusing (the
+        // abort is best-effort; the refusal is not).
+        let _ = run_git(ctx, &worktree, &["rebase", "--abort"]);
+        if outcome.code.as_deref() != Some(code::EXIT) {
+            return Err(outcome);
+        }
+        let detail = outcome
+            .message
+            .as_deref()
+            .unwrap_or("the rebase failed without a message");
+        return Err(failed(
+            code::MERGE_FAILED,
+            format!(
+                "the certified content does not reconcile cleanly onto the published integration ref {target}: {detail}"
+            ),
+        ));
+    }
+    let reconciled = run_git(ctx, &worktree, &["rev-parse", "--verify", "HEAD"])?
+        .stdout
+        .trim()
+        .to_string();
+    if !is_hex40(&reconciled) || !is_commit_ancestor(ctx, target, &reconciled) {
+        return Err(failed(
+            code::MERGE_FAILED,
+            format!(
+                "the reconciled head {reconciled} does not descend from the published integration ref {target}; refusing an unverified reconciliation"
+            ),
+        ));
+    }
+    Ok(reconciled)
+}
+
+/// Certify a delivery against the FETCHED published ref once that ref moved
+/// beyond the reviewed base while the run was in flight (issue #178).
+///
+/// `Ok(())` when the delivery is already certifiable against `target`: it
+/// contains the published head, and — when the delivery is a reconciliation
+/// rather than the exact certified head — its certified content is proven
+/// present. A delivery still behind the published ref is reconciled in place
+/// and reported as the bounded `refusal.run.retry_required` this step's own
+/// next attempt re-certifies — never as a terminal failure. A published ref
+/// that moves again between those attempts is reconciled again (the same
+/// bounded loop), never merged unproven.
+fn reconcile_moved_published(
+    ctx: &EffectContext<'_>,
+    inputs: &MergeInputs,
+    target: &str,
+    reviewed_base: &str,
+) -> Result<(), EffectOutcome> {
+    let certified = ctx.observed_feature_head.unwrap_or_default();
+    if !is_hex40(certified) {
+        return Err(refusal(
+            code::BAD_PARAMS,
+            "merge requires observed.feature_head (the exact reviewed head) to reconcile a published ref that moved",
+        ));
+    }
+    if !is_hex40(reviewed_base) {
+        return Err(refusal(
+            code::BAD_PARAMS,
+            "merge requires observed.integration_base (the reviewed base) to reconcile a published ref that moved",
+        ));
+    }
+    if !is_commit_ancestor(ctx, reviewed_base, certified) {
+        return Err(failed(
+            code::MERGE_FAILED,
+            format!(
+                "the certified head {certified} does not descend from the reviewed base {reviewed_base}; refusing to reconcile content that was never reviewed against it"
+            ),
+        ));
+    }
+    let branch_head = run_git(
+        ctx,
+        ctx.integration_repo,
+        &["rev-parse", "--verify", &inputs.branch],
+    )?
+    .stdout
+    .trim()
+    .to_string();
+    if is_commit_ancestor(ctx, target, &branch_head) {
+        // The delivery already contains the published ref. The exact certified
+        // head certifies as-is; a reconciled (rewritten) delivery must prove
+        // its certified content survived.
+        if branch_head != certified {
+            return prove_certified_content(ctx, reviewed_base, certified, &branch_head);
+        }
+        return Ok(());
+    }
+    // Still behind the (possibly moved-again) published ref: replay the
+    // delivery's own commits onto the fetched published head.
+    let fork = match run_git(
+        ctx,
+        ctx.integration_repo,
+        &["merge-base", &branch_head, target],
+    ) {
+        Ok(out) => out.stdout.trim().to_string(),
+        Err(_) => {
+            return Err(failed(
+                code::MERGE_FAILED,
+                format!(
+                    "feature branch {:?} head {branch_head} shares no fork point with the published ref {target}; refusing to reconcile unrelated histories",
+                    inputs.branch
+                ),
+            ));
+        }
+    };
+    if !is_hex40(&fork) {
+        return Err(failed(
+            code::MERGE_FAILED,
+            format!(
+                "feature branch {:?} head {branch_head} shares no provable fork point with the published ref {target}",
+                inputs.branch
+            ),
+        ));
+    }
+    let reconciled = reconcile_onto_published(ctx, &inputs.branch, target, &fork)?;
+    prove_certified_content(ctx, reviewed_base, certified, &reconciled)?;
+    Err(refusal(
+        code::RETRY_REQUIRED,
+        format!(
+            "the certified delivery {:?} is behind the published integration ref {target}: head {branch_head} was reconciled onto it (new head {reconciled}); the reconciled head is re-certified by this step's bounded retry against the fetched published ref",
+            inputs.branch
+        ),
+    ))
+}
+
 /// `merge`: rehearse the explicit integration policy without changing the
 /// integration checkout, any ref, or the remote. The evidence gate runs
 /// daemon-side before this effect; the orchestrator owns the real forge merge.
+///
+/// A checkout strictly BEHIND the published integration ref is not a stale
+/// local view to refuse forever (issue #178): the published ref is fetched
+/// and verified, and a certified delivery that does not contain it is
+/// RECONCILED onto it — the reviewed delta is replayed in the delivery's own
+/// worktree — before this same step's bounded retry re-certifies the
+/// reconciled head. An UNPUBLISHED local move (the checkout ahead of, or
+/// diverged from, the published ref) is never reconciled: the published ref
+/// is the only certifiable merge target (issue #156).
 fn effect_merge(ctx: &EffectContext<'_>) -> EffectOutcome {
     let inputs = match merge_inputs(ctx.params, &ctx.param_contract()) {
         Ok(inputs) => inputs,
@@ -3151,23 +3537,38 @@ fn effect_merge(ctx: &EffectContext<'_>) -> EffectOutcome {
         Ok(out) => out.stdout.trim().to_string(),
         Err(outcome) => return outcome,
     };
-    // Certify only the PUBLISHED integration ref (issue #132): a checkout that
-    // disagrees with the remote's head — behind it (a bare-remote move without
-    // a fetch) or ahead of it (an unpublished local move) — would record an
-    // integration head the plan's next `checkout` step cannot trust.
+    // Certify only the PUBLISHED integration ref (issue #132): the checkout's
+    // own refs cannot see a bare-remote move, so the published head is always
+    // read from the checkout's `origin` remote, and an unreadable or absent
+    // published ref refuses fail-closed.
     let published_head = match published_integration_head(ctx) {
         Ok(head) => head,
         Err(outcome) => return outcome,
     };
-    if published_head != integration_head {
-        return failed(
-            code::MERGE_NOT_FF,
-            format!(
-                "{} policy rehearsal refused: the published integration ref {:?} is at {published_head}, but the integration checkout is at {integration_head}: fetch and re-review before merging",
-                inputs.policy, ctx.integration_branch
-            ),
-        );
-    }
+    // The certifiable merge target: the published head when the checkout
+    // disagrees with it, the checkout's own head when they agree.
+    let target = if published_head == integration_head {
+        integration_head.clone()
+    } else {
+        // Fetch the published ref and verify the fetched view before it can
+        // become a merge target (issue #178). A checkout AHEAD of, or
+        // diverged from, that view is an unpublished local move and is never
+        // reconciled (issue #156).
+        let fetched = match fetched_published_head(ctx, &published_head) {
+            Ok(head) => head,
+            Err(outcome) => return outcome,
+        };
+        if !is_commit_ancestor(ctx, &integration_head, &fetched) {
+            return failed(
+                code::MERGE_NOT_FF,
+                format!(
+                    "{} policy rehearsal refused: the published integration ref {:?} is at {fetched}, but the integration checkout is at {integration_head}: an unpublished or diverged local view is never reconciled",
+                    inputs.policy, ctx.integration_branch
+                ),
+            );
+        }
+        fetched
+    };
     let reviewed_base = ctx.observed_integration_base.unwrap_or_default();
     let feature_tree = match run_git(
         ctx,
@@ -3184,34 +3585,21 @@ fn effect_merge(ctx: &EffectContext<'_>) -> EffectOutcome {
     let integration_tree = match run_git(
         ctx,
         ctx.integration_repo,
-        &[
-            "rev-parse",
-            "--verify",
-            &format!("{}^{{tree}}", ctx.integration_branch),
-        ],
+        &["rev-parse", "--verify", &format!("{target}^{{tree}}")],
     ) {
         Ok(out) => out.stdout.trim().to_string(),
         Err(outcome) => return outcome,
     };
-    let feature_descends = run_git(
-        ctx,
-        ctx.integration_repo,
-        &[
-            "merge-base",
-            "--is-ancestor",
-            &integration_head,
-            &inputs.branch,
-        ],
-    )
-    .is_ok();
-    if integration_head != reviewed_base && feature_tree != integration_tree {
-        return failed(
-            code::MERGE_NOT_FF,
-            format!(
-                "{} policy rehearsal refused: integration ref {:?} is at {integration_head}, not reviewed base {reviewed_base}",
-                inputs.policy, ctx.integration_branch
-            ),
-        );
+    let feature_descends = is_commit_ancestor(ctx, &target, &inputs.branch);
+    // Issue #178: the published ref moved beyond the reviewed base while the
+    // run was in flight. Reconcile the certified delivery onto it, explicitly
+    // and within the existing bounded retry budget, instead of failing
+    // terminally (the old `not reviewed base` fence refused here and left a
+    // certified delivery stranded).
+    if target != reviewed_base
+        && let Err(outcome) = reconcile_moved_published(ctx, &inputs, &target, reviewed_base)
+    {
+        return outcome;
     }
     if inputs.policy == "ff" && !feature_descends {
         return failed(
@@ -3230,41 +3618,47 @@ fn effect_merge(ctx: &EffectContext<'_>) -> EffectOutcome {
             ),
         );
     }
+    let certified_head = ctx.observed_feature_head.unwrap_or_default().to_string();
+    let branch_head = match run_git(
+        ctx,
+        ctx.integration_repo,
+        &["rev-parse", "--verify", &inputs.branch],
+    ) {
+        Ok(out) => out.stdout.trim().to_string(),
+        Err(outcome) => return outcome,
+    };
     ok(object(vec![
         ("mode", string("rehearsal")),
         ("landed", bool_(false)),
         ("merge_policy", string(&inputs.policy)),
         ("integration_branch", string(ctx.integration_branch)),
-        ("integration_head", string(&integration_head)),
+        ("integration_head", string(&target)),
+        ("published_head", string(&published_head)),
+        ("checkout_head", string(&integration_head)),
+        ("certified_head", string(&certified_head)),
+        ("reconciled_head", string(&branch_head)),
+        (
+            "reconciled",
+            bool_(is_hex40(&certified_head) && branch_head != certified_head),
+        ),
         ("feature_branch", string(&inputs.branch)),
         ("result_tree", string(&feature_tree)),
     ]))
 }
 
 /// `post_merge_verify`: prove the merged integration head contains the
-/// reviewed feature head (exact git ancestry; AC7's verification step).
+/// reviewed feature head — by exact git ancestry (AC7's verification step),
+/// or, for the repository's SQUASH policy, whose landing rewrites the
+/// reviewed commits and can therefore never be an ancestor, by the same
+/// fail-closed content fact the merge rehearsal and the cleanup landed proof
+/// use: every path the review covered must carry the reviewed head's exact
+/// content in the integration ref (issue #178 — plan, merge and verifier
+/// agree on the squash landing).
 fn effect_post_merge_verify(ctx: &EffectContext<'_>) -> EffectOutcome {
     let feature_head = match post_merge_verify_inputs(&ctx.param_contract()) {
         Ok(head) => head,
         Err(outcome) => return outcome,
     };
-    let ancestor = run_git(
-        ctx,
-        ctx.integration_repo,
-        &[
-            "merge-base",
-            "--is-ancestor",
-            &feature_head,
-            ctx.integration_branch,
-        ],
-    )
-    .is_ok();
-    if !ancestor {
-        return failed(
-            code::EVIDENCE_STALE,
-            format!("feature head {feature_head:?} is not an ancestor of the integration branch"),
-        );
-    }
     let merged_head = match run_git(
         ctx,
         ctx.integration_repo,
@@ -3273,10 +3667,54 @@ fn effect_post_merge_verify(ctx: &EffectContext<'_>) -> EffectOutcome {
         Ok(out) => out.stdout.trim().to_string(),
         Err(outcome) => return outcome,
     };
+    if is_commit_ancestor(ctx, &feature_head, ctx.integration_branch) {
+        return ok(object(vec![
+            ("feature_head", string(&feature_head)),
+            ("merged_head", string(&merged_head)),
+            ("contains_feature", bool_(true)),
+            ("proof", string("ancestry")),
+        ]));
+    }
+    // The content route. Without the reviewed base there is nothing to
+    // compare against: the ancestry failure stands as the typed refusal.
+    let reviewed_base = ctx.observed_integration_base.unwrap_or_default();
+    if !is_hex40(reviewed_base) {
+        return failed(
+            code::EVIDENCE_STALE,
+            format!("feature head {feature_head:?} is not an ancestor of the integration branch"),
+        );
+    }
+    let paths = match changed_paths_between(ctx, reviewed_base, &feature_head, code::EVIDENCE_STALE)
+    {
+        Ok(paths) => paths,
+        Err(outcome) => return outcome,
+    };
+    let differing = match differing_paths_between(
+        ctx,
+        &feature_head,
+        ctx.integration_branch,
+        &paths,
+        code::EVIDENCE_STALE,
+    ) {
+        Ok(differing) => differing,
+        Err(outcome) => return outcome,
+    };
+    if !differing.is_empty() {
+        return failed(
+            code::EVIDENCE_STALE,
+            format!(
+                "feature head {feature_head:?} is not an ancestor of the integration branch and {} of the {} path(s) it changed relative to its reviewed base {reviewed_base} are not content-identical there (first {:?})",
+                differing.len(),
+                paths.len(),
+                differing.first()
+            ),
+        );
+    }
     ok(object(vec![
         ("feature_head", string(&feature_head)),
         ("merged_head", string(&merged_head)),
         ("contains_feature", bool_(true)),
+        ("proof", string("content")),
     ]))
 }
 

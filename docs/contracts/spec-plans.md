@@ -49,19 +49,38 @@ Normative rules:
   `requires_delta:false` for a legitimate no-op prompt; collection then
   succeeds with equal base/head while still enforcing the bound output branch.
 - The built-in `merge` step declares `merge_policy:"squash"`. `merge_policy`
-  is a closed `squash | ff` input and the effect is a read-only rehearsal: it
-  verifies the reviewed integration ref and policy-compatible result tree but
-  never moves the integration checkout or a ref. It certifies only the
+  is a closed `squash | ff` input and the effect is a rehearsal: it verifies
+  the reviewed integration ref and policy-compatible result tree but never
+  moves the integration checkout or a ref. It certifies only the
   PUBLISHED integration ref: that head is read from the checkout's `origin`
   remote (`git ls-remote` — a bare-remote move is visible without a fetch,
-  never from the checkout's own refs) and a checkout that disagrees with it
-  refuses `effect.merge.not_fast_forward`, naming the published head and the
-  local head; an unreadable or absent published ref refuses the same typed
-  `effect.merge.failed` on both routes — an absent ref, or an `origin` the
-  checkout cannot read at all (absent, unreachable, unauthenticated), which
-  keeps the read's git diagnostics in the message — rather than certifying an
-  unprovable base. The orchestrator/forge owns the actual policy merge;
-  `post_merge_verify` proves its landed head. Separately, the spine's
+  never from the checkout's own refs). An unreadable or absent published ref
+  refuses the typed `effect.merge.failed` on both routes — an absent ref, or
+  an `origin` the checkout cannot read at all (absent, unreachable,
+  unauthenticated), which keeps the read's git diagnostics in the message —
+  rather than certifying an unprovable base. A checkout AHEAD of, or diverged
+  from, the published ref is an unpublished local move and refuses
+  `effect.merge.not_fast_forward`, naming the published head and the local
+  head. A checkout strictly BEHIND the published ref (any concurrent landing
+  moves it while a run is in flight) is reconciled instead of refused forever
+  (issue #178): the published ref is FETCHED into the checkout's
+  remote-tracking ref and verified against the published read, a certified
+  delivery that does not contain it has exactly its reviewed delta
+  (`reviewed_base..certified_head`) replayed onto the fetched published head in
+  the delivery's own contained lane worktree, and the step then reports the
+  bounded `refusal.run.retry_required` naming the reconciled head; the retry
+  re-certifies the reconciled head against the fetched published ref, proving
+  every path the review covered carries the reviewed head's exact content
+  (the same fail-closed content fact as the cleanup landed proof — NUL-delimited
+  names, literal pathspecs, both rename endpoints; a conflict, a missing or
+  uncontained lane worktree, or any content divergence refuses with
+  diagnostics and never leaves a partial rewrite). The outcome records
+  `published_head`, `checkout_head`, `certified_head`, `reconciled_head` and
+  `reconciled`; `landed` stays `false`. The orchestrator/forge owns the actual
+  policy merge; `post_merge_verify` proves its landed head — by exact
+  ancestry, or, for a squash landing, which rewrites the reviewed commits and
+  can never be an ancestor, by the same content fact (issue #178).
+  Separately, the spine's
   `cleanup` step proves ancestry or content-equivalence against the local
   integration ref; it does not itself certify a published remote or forge
   merge. The content fallback covers every changed path, including both
@@ -70,7 +89,7 @@ Normative rules:
   without removing the lane or branch. The precise fail-closed cases and
   deletion flags are in [the lifecycle contract](spec-lifecycle.md#5-cleanup-archivesalvage-and-canonical-target-classification-ac7).
   This permits complete squash landings without weakening the ancestry-only
-  standalone `branch_delete` effect (Refs #132, #172).
+  standalone `branch_delete` effect (Refs #132, #172, #178).
 
 ### Canonical serialization and digest
 
