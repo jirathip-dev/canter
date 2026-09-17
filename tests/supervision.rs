@@ -3570,6 +3570,7 @@ fn collection_invalid_base_refuses_before_any_worker_poll() {
             role: None,
             session: Some(&session),
             archive_root: None,
+            retired_run_ids: &[],
         })
     };
     let log = fixture.dir.join("herdr-argv.txt");
@@ -3826,6 +3827,302 @@ fn the_supervised_run_starts_its_worker_in_a_herdr_pane_in_the_lane_worktree() {
             "journal lost {field}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #190: a retired generation's lane workspace is retired by the next
+// generation's bind — through the daemon's own apply path.
+// ---------------------------------------------------------------------------
+
+/// One caller-driven `apply` of a committed run step (the operator's dispatch
+/// shape), returning the recorded effect result.
+#[allow(clippy::too_many_arguments)]
+fn apply_step(
+    fixture: &DaemonFixture,
+    integration: &Path,
+    bound: &Val,
+    run: &str,
+    grant: &str,
+    seed: u64,
+    step: &str,
+    key: &str,
+) -> Val {
+    rpc_ok(
+        &fixture.socket,
+        &fresh_id(seed),
+        "apply",
+        Some({
+            let mut params = caller_apply_params(
+                fixture,
+                integration,
+                bound,
+                run,
+                grant,
+                (step, 5),
+                &idem_key(key),
+            );
+            if let Val::Obj(map) = &mut params {
+                map.insert("plan".to_string(), plan_doc_for_bound(bound, 5));
+                map.insert("profile".to_string(), harness_binding_doc());
+            }
+            params
+        }),
+    )
+}
+
+/// Issue #190 end-to-end witness: a run that was RELEASED leaves its lane
+/// Herdr workspace behind — a release is bookkeeping only, which is the
+/// measured live defect — and the documented residue repair removes only the
+/// worktree and the branch. The fresh same-issue submission's bind step then
+/// retires the dead generation's workspace itself (recorded on the step
+/// outcome and in the journal) and reaches `succeeded` with NO operator action
+/// and ZERO retry authorizations.
+#[test]
+fn a_released_generations_lane_residue_is_retired_by_the_next_submission() {
+    let fixture = DaemonFixture::new("lane-reclaim");
+    let integration = fixture.dir.join("integration");
+    init_repo(&integration);
+    // The harness fake records any spawn: on the pane substrate it must never
+    // run. The herdr fake IS the substrate here.
+    let fakebin_hermes = write_fake_hermes(&fixture.dir);
+    let fakebin_herdr = write_fake_herdr(&fixture.dir);
+    let host_path = std::env::var("PATH").unwrap_or_default();
+    let daemon = fixture.spawn_with_path(&format!(
+        "{}:{}:{host_path}",
+        fakebin_herdr.display(),
+        fakebin_hermes.display()
+    ));
+    wait_ready(&fixture);
+
+    // The FIRST generation: grant, submission, lane worktree, lane bind.
+    let (bound, digest) = {
+        let state = fixture.seed();
+        seed_grant(&state, "gr_0000000000000095", 5);
+        // The lane worktree and the bind only: this witness stops before the
+        // prompt, so the spine (and the boundary caps it needs) ends at p2.
+        let mut steps = harness_pane_steps(HARNESS);
+        steps.truncate(2);
+        let request = qp::QueueRequest {
+            steps,
+            role_config: harness_binding_doc(),
+            ..observation_request(vec![selected("#5", REV_A)])
+        };
+        render_bound(&state, &request)
+    };
+    let submitted = rpc_ok(
+        &fixture.socket,
+        &fresh_id(1),
+        "queue.submit",
+        Some(harness_submit_params(
+            &idem_key("reclaim-1"),
+            &bound,
+            &digest,
+            "gr_0000000000000095",
+        )),
+    );
+    let first = instance_of(&submitted, 5);
+    let first_session = canter::mutation::run_session_handle(&first)
+        .expect("the run session derives")
+        .session_id;
+    let lane = fixture.dir.join("worktrees/issues-5");
+    apply_step(
+        &fixture,
+        &integration,
+        &bound,
+        &first,
+        "gr_0000000000000095",
+        2,
+        "p1",
+        "reclaim-lane-0001",
+    );
+    assert!(lane.is_dir(), "the lane worktree exists");
+    let started = apply_step(
+        &fixture,
+        &integration,
+        &bound,
+        &first,
+        "gr_0000000000000095",
+        3,
+        "p2",
+        "reclaim-bind-0001",
+    );
+    assert_eq!(
+        started.get("session_id").and_then(Val::as_str),
+        Some(first_session.as_str()),
+        "the first generation's bind recorded its own session"
+    );
+    assert!(fixture.dir.join("herdr-state/pane").exists());
+
+    // The release retires the RUN, not its lane workspace (the measured
+    // defect): the residue survives and keeps the deterministic lane name.
+    rpc_ok(
+        &fixture.socket,
+        &fresh_id(4),
+        "run.release",
+        Some(canter::run_control::release_params(
+            &idem_key("reclaim-release-0001"),
+            &first,
+            "superseded generation",
+        )),
+    );
+    assert!(
+        fixture.dir.join("herdr-state/pane").exists(),
+        "a release is bookkeeping only"
+    );
+    assert!(
+        fixture
+            .seed()
+            .instance_by_id(&first)
+            .expect("read run")
+            .expect("the run exists")
+            .status
+            == "invalidated"
+    );
+
+    // The documented residue repair — the worktree and the branch only, as the
+    // operator did by hand — does NOT clear the Herdr-side workspace.
+    git_output(
+        &integration,
+        &["worktree", "remove", lane.to_str().unwrap()],
+    );
+    git_output(&integration, &["branch", "-D", "issue-5"]);
+    assert!(!lane.exists());
+    assert!(fixture.dir.join("herdr-state/pane").exists());
+
+    // The SECOND generation: a fresh grant and submission for the same issue.
+    let (bound2, digest2) = {
+        let state = fixture.seed();
+        seed_grant(&state, "gr_0000000000000096", 5);
+        // The lane worktree and the bind only: this witness stops before the
+        // prompt, so the spine (and the boundary caps it needs) ends at p2.
+        let mut steps = harness_pane_steps(HARNESS);
+        steps.truncate(2);
+        let request = qp::QueueRequest {
+            steps,
+            role_config: harness_binding_doc(),
+            ..observation_request(vec![selected("#5", REV_A)])
+        };
+        render_bound(&state, &request)
+    };
+    let submitted2 = rpc_ok(
+        &fixture.socket,
+        &fresh_id(5),
+        "queue.submit",
+        Some(harness_submit_params(
+            &idem_key("reclaim-2"),
+            &bound2,
+            &digest2,
+            "gr_0000000000000096",
+        )),
+    );
+    let second = instance_of(&submitted2, 5);
+    let second_session = canter::mutation::run_session_handle(&second)
+        .expect("the run session derives")
+        .session_id;
+    assert_ne!(first_session, second_session);
+    apply_step(
+        &fixture,
+        &integration,
+        &bound2,
+        &second,
+        "gr_0000000000000096",
+        6,
+        "p1",
+        "reclaim-lane-0002",
+    );
+    let rebound = apply_step(
+        &fixture,
+        &integration,
+        &bound2,
+        &second,
+        "gr_0000000000000096",
+        7,
+        "p2",
+        "reclaim-bind-0002",
+    );
+
+    // The bind SUCCEEDED (no operator action, no retry) and the retired
+    // generation's residue was retired first and recorded.
+    assert_eq!(
+        rebound.get("session_id").and_then(Val::as_str),
+        Some(second_session.as_str()),
+        "the recorded binding is the new generation's: {}",
+        canter::canonical::canonical_text(&rebound)
+    );
+    let retired_docs = match rebound.get("retired_generations") {
+        Some(Val::Arr(items)) => items.clone(),
+        other => panic!("the retire is recorded on the step outcome, got {other:?}"),
+    };
+    assert_eq!(retired_docs.len(), 1, "{retired_docs:?}");
+    assert_eq!(
+        retired_docs[0].get("retired").and_then(Val::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        retired_docs[0].get("lane").and_then(Val::as_str),
+        Some(first_session.as_str()),
+        "the retired generation's own lane token is named"
+    );
+    assert_eq!(
+        retired_docs[0].get("workspace_label").and_then(Val::as_str),
+        Some("5-impl")
+    );
+    let rows = std::fs::read_to_string(fixture.dir.join("herdr-argv.txt")).expect("herdr rows");
+    let lines: Vec<&str> = rows.lines().collect();
+    let opened_first = lines
+        .iter()
+        .position(|row| row.starts_with("worktree open"))
+        .unwrap_or_else(|| panic!("the first generation's pane is created: {rows}"));
+    let closed = lines
+        .iter()
+        .position(|row| *row == "workspace close w1")
+        .unwrap_or_else(|| panic!("the residue is closed: {rows}"));
+    let opened_last = lines
+        .iter()
+        .rposition(|row| row.starts_with("worktree open"))
+        .unwrap_or_else(|| panic!("the successor's pane is created: {rows}"));
+    assert!(
+        opened_first < closed && closed < opened_last,
+        "the retire sits between the two binds: {rows}"
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|row| row.starts_with("worktree open"))
+            .count(),
+        2,
+        "one pane per generation: {rows}"
+    );
+
+    shutdown(daemon);
+
+    // Reopen durable state after shutdown: the retire is in the JOURNAL, and
+    // the fresh run consumed no retry authorization at all.
+    let state = fixture.seed();
+    let claim = state
+        .claim(&idem_key("reclaim-bind-0002"))
+        .expect("claim")
+        .expect("the bind is journaled");
+    let outcome =
+        Val::parse_json(claim.outcome.as_deref().expect("journal outcome")).expect("outcome json");
+    let recorded = outcome.get("result").expect("journal start identity");
+    assert_eq!(
+        recorded.get("retired_generations"),
+        rebound.get("retired_generations"),
+        "the journal carries the retire record"
+    );
+    assert!(
+        state.run_retries(&second).expect("retries").is_empty(),
+        "no retry authorization was consumed by the fresh run"
+    );
+    assert_eq!(
+        state.run_step_attempts(&second).expect("attempts"),
+        vec![
+            ("p1".to_string(), "succeeded".to_string()),
+            ("p2".to_string(), "succeeded".to_string())
+        ],
+        "the fresh run reached the bind on its FIRST attempt"
+    );
 }
 
 // ---------------------------------------------------------------------------

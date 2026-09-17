@@ -2653,6 +2653,39 @@ impl State {
         })
     }
 
+    /// The lane generations this system RETIRED for one repository issue
+    /// (issue #190): the instance ids of the runs whose lane binding is
+    /// terminal in the ledger — `invalidated` (a release, a revision rebind
+    /// or an epoch rotation retired it) or `done` (its committed tail
+    /// completed). A run's lane session id is derivable from its instance id
+    /// ([`crate::mutation::run_session_handle`]), so a caller can retire the
+    /// residue of exactly these generations and can never address a live one:
+    /// a run that is not terminal still holds its issue's unique ownership.
+    /// Ordered by instance id, so the caller's retire order is deterministic.
+    pub fn retired_run_ids(
+        &self,
+        repository: &str,
+        issue_number: i64,
+    ) -> Result<Vec<String>, StateError> {
+        let conn = self.lock("retired_run_ids")?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT instance_id FROM instances
+                  WHERE repository = ?1 AND issue_number = ?2
+                    AND status IN ('invalidated', 'done')
+                  ORDER BY instance_id",
+            )
+            .map_err(|err| StateError::from_sqlite("retired_run_ids: prepare", err))?;
+        let rows = stmt
+            .query_map(params![repository, issue_number], |row| row.get(0))
+            .map_err(|err| StateError::from_sqlite("retired_run_ids: read", err))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|err| StateError::from_sqlite("retired_run_ids: row", err))?);
+        }
+        Ok(out)
+    }
+
     /// The step id of a step-dispatch claim (`method:"apply"`) still in
     /// flight for one run, or `None` when nothing is in flight. An
     /// unreadable claimed line is treated as unknown in-flight work
@@ -14391,6 +14424,98 @@ mod tests {
         let remaining = state.list_grants().expect("list after invalidation");
         assert!(remaining.is_empty(), "grants die with their epoch");
         assert_eq!(state.current_epoch().expect("epoch"), 2);
+    }
+
+    /// Issue #190: the RETIRED generations of one repository issue — the
+    /// terminal runs whose lane residue a successor may retire — are exactly
+    /// the ledger's `invalidated`/`done` rows for that repository+issue,
+    /// ordered by run identity. A live run is never in the set (it still holds
+    /// its issue's ownership), and another issue/repository is never in it.
+    #[test]
+    fn retired_run_ids_lists_only_terminal_generations_of_the_issue() {
+        let path = temp_db("retired-runs.db");
+        let state = State::open(&path, Retention::default()).expect("open");
+        for (grant_id, issue) in [("gr_0000000000000011", 190), ("gr_0000000000000012", 191)] {
+            let doc = Val::parse_json(&format!(
+                r#"{{"schema":"hf-grant/v1","grant_id":"{grant_id}","repository":"example-org/widgets",
+                    "issue":{{"number":{issue},"revision":"{}"}},
+                    "workflow_hash":"{}","policy_hash":"{}","phase":"merge",
+                    "scope":"worktrees/issues/{issue}","caps":["read","worktree","spawn","prompt"],
+                    "expires_at":"2999-01-01T00:00:00Z","state_epoch":1,
+                    "created_at":"2026-09-18T00:00:00Z"}}"#,
+                "a".repeat(40),
+                "b".repeat(64),
+                "c".repeat(64),
+            ))
+            .expect("grant doc");
+            state.issue_grant(&doc).expect("issue grant");
+        }
+        let at = "2026-09-18T00:00:00Z";
+        for (run, grant) in [
+            ("run-00000000000000a1", "gr_0000000000000011"),
+            ("run-00000000000000a2", "gr_0000000000000011"),
+            ("run-00000000000000b1", "gr_0000000000000012"),
+        ] {
+            state
+                .start_instance(run, grant, "fleet-doctrine-1", at)
+                .expect("start");
+        }
+        // One retired generation of issue 190; the other run stays live and
+        // the third belongs to another issue.
+        state
+            .release_run(
+                "run-00000000000000a1",
+                "superseded generation",
+                "ik_retired-0001",
+                at,
+            )
+            .expect("release");
+        assert_eq!(
+            state
+                .retired_run_ids("example-org/widgets", 190)
+                .expect("retired"),
+            vec!["run-00000000000000a1".to_string()]
+        );
+        assert!(
+            state
+                .retired_run_ids("example-org/widgets", 191)
+                .expect("retired")
+                .is_empty(),
+            "another issue's runs are never in the set"
+        );
+        assert!(
+            state
+                .retired_run_ids("example-org/other", 190)
+                .expect("retired")
+                .is_empty(),
+            "another repository's runs are never in the set"
+        );
+        // Every retired generation of the issue joins the set, ordered.
+        state
+            .release_run(
+                "run-00000000000000a2",
+                "superseded generation",
+                "ik_retired-0002",
+                at,
+            )
+            .expect("release");
+        state
+            .release_run(
+                "run-00000000000000b1",
+                "superseded generation",
+                "ik_retired-0003",
+                at,
+            )
+            .expect("release");
+        assert_eq!(
+            state
+                .retired_run_ids("example-org/widgets", 190)
+                .expect("retired"),
+            vec![
+                "run-00000000000000a1".to_string(),
+                "run-00000000000000a2".to_string()
+            ]
+        );
     }
 
     #[test]

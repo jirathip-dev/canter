@@ -443,3 +443,137 @@ pub fn close_lane_workspace(
     })();
     result.map_err(|err: ProcessFailure| AdapterError::refusal(err.code, err.message))
 }
+
+/// Retire the lane workspace of ONE **retired** generation (issue #190).
+///
+/// The caller supplies the session handle of a generation the run ledger
+/// records as terminal (an invalidated/released run, or a completed one) —
+/// never a live lane and never a name read back from the substrate. The
+/// deterministic lane name/label belongs to ONE lane identity, so a retired
+/// generation's still-open workspace would otherwise refuse its successor's
+/// bind with `refusal.lane.name_collision` and leave the issue with no
+/// product path out (#173). This closes that generation's own lane
+/// workspace: the single-pane linked-workspace registration AT the run's own
+/// lane worktree whose pane carries EXACTLY this generation's lane binding
+/// (`canter_lane` / `canter_generation`).
+///
+/// Anything else is refused and left untouched — several panes, a pane bound
+/// to another lane or a newer generation, a registration that is not the
+/// run's own linked worktree, or a read-back that cannot be verified: a
+/// reclaim never becomes adoption (#157). `None` means this generation has
+/// no workspace at the worktree (nothing to retire), which is not an error.
+///
+/// The generation is terminal in the ledger — a released run is never
+/// dispatched again — so its worker, whatever state the substrate reports
+/// for it, is residue; the observed agent states are recorded in the retire
+/// document instead of silently closing an agent. A live CURRENT generation
+/// is never passed here (its run is not terminal), so this never closes a
+/// live lane's workspace.
+pub fn retire_lane_workspace(
+    session: &SessionHandle,
+    worktree: &Path,
+    env: &BTreeMap<String, String>,
+    timeout: Duration,
+) -> Result<Option<Val>, AdapterError> {
+    let result = (|| {
+        // The registration must be THIS run's own linked lane worktree: a
+        // workspace of another checkout, another repository group or an
+        // unlinked directory is never this generation's residue.
+        let git_dir = git_path(worktree, "--git-dir", timeout, env)?;
+        let common = git_path(worktree, "--git-common-dir", timeout, env)?;
+        let root = common
+            .parent()
+            .filter(|_| common.file_name().is_some_and(|name| name == ".git"))
+            .ok_or_else(|| {
+                refusal(
+                    CODE_INCOMPLETE_IDENTITY,
+                    "lane must belong to a non-bare repository",
+                )
+            })?;
+        if same_worktree(&git_dir.to_string_lossy(), &common) {
+            return Err(refusal(
+                CODE_INCOMPLETE_IDENTITY,
+                "lane checkout is not a linked Git worktree",
+            ));
+        }
+        let list = herdr_call(&herdr_workspace_list_args(), timeout, env, Some(worktree))?;
+        for workspace in herdr_items(&list, "workspaces") {
+            if !workspace.get("worktree").is_some_and(|identity| {
+                same_worktree(&herdr_str(identity, "checkout_path"), worktree)
+            }) {
+                continue;
+            }
+            let id = workspace_id(workspace)?;
+            verify_workspace(workspace, root, worktree)?;
+            let rows = panes(&id, timeout, env, worktree)?;
+            if rows.len() != 1 {
+                return Err(refusal(
+                    CODE_STALE_GENERATION,
+                    format!(
+                        "lane workspace {id} has {} panes; a retired generation's residue is a \
+                         one-pane workspace and nothing else is ever closed",
+                        rows.len()
+                    ),
+                ));
+            }
+            let pane = verify_retired_pane(&rows[0], session, worktree)?;
+            // The agent evidence is recorded, never used as a reason to
+            // close or to keep: the generation is terminal in the ledger.
+            let agents = herdr_call(&herdr_agent_list_args(), timeout, env, Some(worktree))?;
+            let states: Vec<Val> = herdr_items(&agents, "agents")
+                .iter()
+                .filter(|row| herdr_str(row, "pane_id") == pane)
+                .map(|row| {
+                    let binding = LaneBinding::read(row);
+                    object(vec![
+                        ("agent", string(&binding.agent)),
+                        ("state", string(&binding.state)),
+                    ])
+                })
+                .collect();
+            close_workspace(&id, timeout, env, worktree)?;
+            return Ok(Some(object(vec![
+                ("workspace", string(&id)),
+                ("workspace_label", string(&herdr_str(workspace, "label"))),
+                ("pane", string(&pane)),
+                ("lane", string(&session.session_id)),
+                (
+                    "generation",
+                    integer(session.identity.generation.min(i64::MAX as u64) as i64),
+                ),
+                ("agent_states", Val::Arr(states)),
+                ("retired", bool_(true)),
+            ])));
+        }
+        Ok(None)
+    })();
+    result.map_err(|err: ProcessFailure| AdapterError::refusal(err.code, err.message))
+}
+
+/// Verify one pane read-back against a retired generation's binding during a
+/// retire: the lane token and generation must be EXACTLY this generation's,
+/// and the pane's own cwd — when the substrate still reports one — must be
+/// the run's lane worktree (a residue whose checkout was already removed may
+/// report none; any other cwd is refused).
+fn verify_retired_pane(
+    row: &Val,
+    session: &SessionHandle,
+    worktree: &Path,
+) -> Result<String, ProcessFailure> {
+    let mut row = row.clone();
+    if let Val::Obj(fields) = &mut row {
+        fields.insert("name".to_string(), string("pane-owner"));
+    }
+    let binding = verify_lane_binding(&row, session, None)?;
+    if !binding.cwd.is_empty() && !same_worktree(&binding.cwd, worktree) {
+        return Err(refusal(
+            CODE_STALE_GENERATION,
+            format!(
+                "the pane of lane {:?} reports cwd {:?}, not the run's lane worktree; refusing to \
+                 retire a workspace that is not this generation's own lane",
+                session.session_id, binding.cwd
+            ),
+        ));
+    }
+    Ok(binding.pane)
+}

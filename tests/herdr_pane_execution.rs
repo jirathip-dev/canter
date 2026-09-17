@@ -904,6 +904,7 @@ fn p8_preserves_dirty_live_and_stale_lanes_then_closes_the_owned_workspace() {
         role: None,
         session: Some(&session),
         archive_root: None,
+        retired_run_ids: &[],
     };
     let dirty = fixture.worktree.join("keep.txt");
     fs::write(&dirty, "unfinished work").unwrap();
@@ -947,6 +948,265 @@ fn p8_preserves_dirty_live_and_stale_lanes_then_closes_the_owned_workspace() {
             .filter(|row| row.starts_with("workspace close"))
             .count(),
         1
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #190: the lane workspace is part of a generation's residue. A retired
+// generation's still-open workspace must be retired before the successor
+// binds (the deterministic name/label belongs to ONE lane identity), while a
+// live or genuinely foreign holder is never retired and never adopted.
+// ---------------------------------------------------------------------------
+
+/// Run the `harness_start` bind effect for the fixture's lane with the given
+/// retired generations authorized (issue #190) — the effect the daemon's
+/// `apply` path runs for a run's bind step.
+fn run_harness_start_step(
+    fixture: &Fixture,
+    env: &BTreeMap<String, String>,
+    session: &canter::adapters::SessionHandle,
+    retired: &[String],
+) -> canter::mutation::EffectOutcome {
+    let worktrees_root = fixture.dir.path("worktrees");
+    let integration = fixture.dir.path("integration");
+    let params = object(vec![
+        ("harness_key", string("lane-role")),
+        ("kind", string("hermes")),
+    ]);
+    let plan = bound_plan(vec![
+        plan_step(
+            "p1",
+            "worktree_create",
+            object(vec![
+                ("branch", string("issue-5")),
+                ("worktree", string("issues-5")),
+            ]),
+        ),
+        plan_step("p2", "harness_start", params.clone()),
+    ]);
+    let ctx = EffectContext {
+        plan: &plan,
+        step_id: "p2",
+        kind: "harness_start",
+        params: Some(&params),
+        repository: "example-org/widgets",
+        integration_branch: "staging",
+        production_branches: &[],
+        worktrees_root: &worktrees_root,
+        integration_repo: &integration,
+        observed_feature_head: None,
+        observed_integration_base: None,
+        env,
+        role: None,
+        session: Some(session),
+        archive_root: None,
+        retired_run_ids: retired,
+    };
+    execute_step(&ctx)
+}
+
+/// Seed the fixture's fake substrate with the residue of one lane generation:
+/// the deterministic label at THIS lane's worktree, one pane carrying the
+/// generation's own lane token, and the agent the substrate still reports.
+fn seed_lane_residue(fixture: &Fixture, lane: &str) {
+    fixture.seed("pane", "w1:p1");
+    fixture.seed("cwd", &fixture.worktree.to_string_lossy());
+    fixture.seed(
+        "root",
+        &fixture
+            .dir
+            .path("integration")
+            .canonicalize()
+            .expect("integration repo")
+            .to_string_lossy(),
+    );
+    fixture.seed("label", "5-impl");
+    fixture.seed("name", "impl-5");
+    fixture.seed("state", "idle");
+    fixture.seed("lane", lane);
+    fixture.seed("generation", "1");
+}
+
+/// Issue #190 witness (the fix): the lane workspace of a RETIRED generation —
+/// its pane, agent and workspace — is retired before the new generation binds,
+/// so the deterministic lane name is free and the bind succeeds. The retire is
+/// ownership-verified (this lane worktree's own linked registration and
+/// exactly the retired generation's lane token) and recorded in the step
+/// outcome, together with the agent states the substrate still reported.
+#[test]
+fn a_retired_generations_lane_residue_is_retired_before_the_bind() {
+    let fixture = Fixture::new("retired-residue");
+    fixture.install(FAKE_HERDR);
+    let env = fixture.env(&[]);
+    let retired = canter::mutation::run_session_handle("run-00000000000000a1").expect("session");
+    seed_lane_residue(&fixture, &retired.session_id);
+
+    let session = lane_session(1);
+    let outcome = run_harness_start_step(
+        &fixture,
+        &env,
+        &session,
+        &["run-00000000000000a1".to_string()],
+    );
+
+    assert_eq!(outcome.status, "succeeded", "{:?}", outcome.message);
+    let fields = match &outcome.result {
+        Val::Obj(fields) => fields,
+        other => panic!("an object result, got {other:?}"),
+    };
+    assert_eq!(
+        fields.get("session_id").and_then(Val::as_str),
+        Some("lane-abc123"),
+        "the recorded binding is the NEW generation's"
+    );
+    let retired_docs = match fields.get("retired_generations") {
+        Some(Val::Arr(items)) => items.clone(),
+        other => panic!("the retire is recorded, got {other:?}"),
+    };
+    assert_eq!(retired_docs.len(), 1);
+    assert_eq!(
+        retired_docs[0].get("retired").and_then(Val::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        retired_docs[0].get("lane").and_then(Val::as_str),
+        Some(retired.session_id.as_str())
+    );
+    assert_eq!(
+        retired_docs[0].get("workspace").and_then(Val::as_str),
+        Some("w1")
+    );
+    assert_eq!(
+        retired_docs[0].get("workspace_label").and_then(Val::as_str),
+        Some("5-impl")
+    );
+    let states = retired_docs[0]
+        .get("agent_states")
+        .and_then(Val::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        states
+            .first()
+            .and_then(|row| row.get("state"))
+            .and_then(Val::as_str),
+        Some("idle"),
+        "the agent state the substrate still reported is recorded"
+    );
+    // The residue was closed BEFORE the successor's pane was created.
+    let rows = fixture.rows();
+    let closed = rows
+        .iter()
+        .position(|row| row == "workspace close w1")
+        .unwrap_or_else(|| panic!("the retired residue is closed: {rows:?}"));
+    let opened = rows
+        .iter()
+        .position(|row| row.starts_with("worktree open"))
+        .unwrap_or_else(|| panic!("the successor's pane is created: {rows:?}"));
+    assert!(closed < opened, "the retire precedes the bind: {rows:?}");
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.starts_with("worktree open"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.starts_with("agent start"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.state.join("lane")).unwrap(),
+        "lane-abc123",
+        "the pane now carries the new generation's token"
+    );
+    assert!(
+        !fixture.bare_spawned(),
+        "the retire never falls back to the bare harness"
+    );
+}
+
+/// Issue #190 negative witness: a GENUINELY FOREIGN holder at this lane's
+/// worktree (a pane bound to another lane's token) is never retired and never
+/// adopted — the bind still refuses typed, the foreign pane is untouched, and
+/// the refused retire is recorded on the failed bind.
+#[test]
+fn a_foreign_lane_holder_is_never_retired_and_the_bind_still_refuses() {
+    let fixture = Fixture::new("foreign-holder");
+    fixture.install(FAKE_HERDR);
+    let env = fixture.env(&[]);
+    seed_lane_residue(&fixture, "lane-foreign");
+
+    let session = lane_session(1);
+    let outcome = run_harness_start_step(
+        &fixture,
+        &env,
+        &session,
+        &["run-00000000000000a1".to_string()],
+    );
+
+    assert_eq!(outcome.status, "refused", "{:?}", outcome.message);
+    assert_eq!(outcome.code.as_deref(), Some(CODE_NAME_COLLISION));
+    assert!(
+        !fixture
+            .rows()
+            .iter()
+            .any(|row| row.starts_with("workspace close")),
+        "a foreign holder is never closed: {:?}",
+        fixture.rows()
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.state.join("lane")).unwrap(),
+        "lane-foreign",
+        "the foreign pane keeps its own binding"
+    );
+    let message = outcome.message.unwrap_or_default();
+    assert!(
+        message.contains("lane-retire: 0 of 1") && message.contains(CODE_STALE_GENERATION),
+        "the refused retire is recorded on the failed bind: {message}"
+    );
+}
+
+/// Issue #190 negative witness: a LIVE lane of another generation — the
+/// deterministic identity held by a live agent — is never retired and never
+/// adopted. The second generation still refuses, and the live lane's
+/// workspace, pane and binding are untouched.
+#[test]
+fn a_live_lane_is_never_retired_and_a_second_generation_still_refuses() {
+    let fixture = Fixture::new("live-lane");
+    fixture.install(FAKE_HERDR);
+    let env = fixture.env(&[]);
+    let first = lane_session(1);
+    let started = run_harness_start_step(&fixture, &env, &first, &[]);
+    assert_eq!(started.status, "succeeded", "{:?}", started.message);
+
+    let second = new_session(
+        "lane-def456",
+        bind_identity("lane-def456", "lane-def456", 1).unwrap(),
+    )
+    .unwrap();
+    let refused = run_harness_start_step(
+        &fixture,
+        &env,
+        &second,
+        &["run-00000000000000b2".to_string()],
+    );
+
+    assert_eq!(refused.status, "refused", "{:?}", refused.message);
+    assert_eq!(refused.code.as_deref(), Some(CODE_NAME_COLLISION));
+    assert!(
+        !fixture
+            .rows()
+            .iter()
+            .any(|row| row.starts_with("workspace close")),
+        "a live lane is never closed: {:?}",
+        fixture.rows()
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.state.join("lane")).unwrap(),
+        first.session_id,
+        "the live lane keeps its binding"
     );
 }
 
@@ -1818,6 +2078,7 @@ fn the_harness_start_step_starts_the_worker_in_the_lane_worktrees_pane() {
         role: None,
         session: Some(&session),
         archive_root: None,
+        retired_run_ids: &[],
     };
 
     let outcome = execute_step(&ctx);
@@ -1887,6 +2148,7 @@ fn a_plan_without_one_lane_worktree_refuses_typed_on_the_pane_substrate() {
         role: None,
         session: Some(&session),
         archive_root: None,
+        retired_run_ids: &[],
     };
     let outcome = execute_step(&ctx);
     assert_eq!(outcome.status, "refused", "{:?}", outcome.message);
@@ -1946,6 +2208,7 @@ fn a_plan_without_one_lane_worktree_refuses_typed_on_the_pane_substrate() {
         role: None,
         session: Some(&session),
         archive_root: None,
+        retired_run_ids: &[],
     };
     let outcome = execute_step(&ctx);
     assert_eq!(outcome.status, "refused", "{:?}", outcome.message);

@@ -2702,6 +2702,30 @@ fn method_apply_from(shared: &Arc<Shared>, request: &Request, supervised: bool) 
             return resolve_apply_refusal(shared, request, &key, &code, message);
         }
     };
+    // Issue #190: a lane workspace is part of a generation's residue, and the
+    // RETIRED generations of this repository issue — resolved from the run
+    // ledger here, never from the substrate — are what a bind step may
+    // retire before it binds the new generation. A live lane is never in this
+    // set (a run that is not terminal still holds its issue's ownership), so
+    // the retire can never close a live generation's workspace. Only a bind
+    // step can retire, so nothing else pays for the resolution.
+    let retired_run_ids: Vec<String> = if kind == "harness_start" {
+        let state = match shared.lock_state() {
+            Ok(state) => state,
+            Err(message) => {
+                return resolve_apply_refusal(shared, request, &key, "state.unavailable", message);
+            }
+        };
+        match state.retired_run_ids(&plan.repository, plan.issue_number) {
+            Ok(ids) => ids,
+            Err(err) => {
+                drop(state);
+                return resolve_apply_refusal(shared, request, &key, err.code, err.message);
+            }
+        }
+    } else {
+        Vec::new()
+    };
     let ctx = crate::mutation::EffectContext {
         plan: &plan,
         step_id: &parsed.step,
@@ -2718,6 +2742,7 @@ fn method_apply_from(shared: &Arc<Shared>, request: &Request, supervised: bool) 
         env: &effect_env,
         role: run_binding.role.as_ref(),
         session: run_binding.session.as_ref(),
+        retired_run_ids: &retired_run_ids,
     };
     let effect = crate::mutation::execute_step(&ctx);
     let mut result = effect.result;
