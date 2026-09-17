@@ -52,8 +52,10 @@ if sys.argv[2] == "hang":
 '''
 
 
-class WitnessOutputError(RuntimeError):
-    """A witness contract file was absent, empty, or not JSON."""
+class WitnessOutputError(AssertionError):
+    """A witness contract file was absent, empty, or not JSON. An AssertionError
+    so the failing test reports a typed assertion failure — never a bare
+    JSONDecodeError raised from inside the record helper."""
 
 
 def contract_record(path, command, exit_status):
