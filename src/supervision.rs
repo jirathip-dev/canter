@@ -666,21 +666,18 @@ pub trait SupervisedDispatch: Send + Sync {
 /// - the run is live: not paused, no pause request, no human queue, no
 ///   terminal blocker, not blocked/invalidated/done;
 /// - no step dispatch is in flight (a run mid-effect is never advanced);
-/// - the run still has a next unachieved step, that step has NEVER been
-///   dispatched, and its kind is one the driver may dispatch for THIS run
+/// - the run still has a next unachieved step, never dispatched or eligible
+///   for a bounded retry, and its kind is one the driver may dispatch for THIS run
 ///   ([`driver_dispatchable_kind`]): the ordinary autonomous kinds, or the
 ///   risk-classed merge/cleanup TAIL of a run whose own committed submission
 ///   declares it — so the delivering run's own merge and cleanup are driven
 ///   to the end of its committed spine (issue #152).
 ///
-/// A DIAGNOSED step (failed/refused/ambiguous) is never re-dispatched here,
-/// with or without a pending bounded retry authorization: re-dispatching it
-/// means carrying the operator's CORRECTED step params, which this driver
-/// does not hold — a dispatch built from the run's committed (stale) params
-/// would consume the operator's single-use authorization with the very
-/// request that was refused. `run.retry` therefore authorizes only, and the
-/// operator's own corrected dispatch consumes the authorization exactly once
-/// through the apply path.
+/// A diagnosed step may retry within the shared bounded budget. A pending
+/// operator authorization reserves the step for the operator's corrected
+/// dispatch: supervision never consumes it. The daemon backs off attempts
+/// and atomically records its own consumed authorization through the apply
+/// path, without bypassing any effect gate.
 ///
 /// Non-armed/unknown supervision keeps its zero-effect guarantee: this
 /// function returns `None` for every row that is not explicitly armed.
@@ -713,8 +710,20 @@ pub fn dispatch_intent(
     match latest_attempt_for(evidence, &step_id) {
         // Never dispatched: the plain continuation of an armed run.
         None => {}
-        // Diagnosed (or otherwise recorded): the operator's corrected
-        // dispatch owns it — never the driver.
+        Some((_, status, code))
+            if matches!(status.as_str(), "failed" | "refused" | "ambiguous")
+                && code != crate::mutation::code::WORKER_TIMEOUT
+                && newest_verdict(evidence) != "fail"
+                && evidence
+                    .retries
+                    .iter()
+                    .filter(|retry| retry.step_id == step_id)
+                    .count()
+                    < crate::state::RUN_RETRY_MAX as usize
+                && !evidence
+                    .retries
+                    .iter()
+                    .any(|retry| retry.step_id == step_id && retry.consumed_at.is_empty()) => {}
         Some(_) => return None,
     }
     Some(DispatchIntent {
@@ -938,8 +947,8 @@ pub fn classify(
     // ...but a wait is only honest while nothing has DIAGNOSED the step
     // (issue #148). A frontier step whose own latest attempt is recorded and
     // is not `succeeded` has already run and produced a concrete
-    // failure/refusal — and the driver never re-dispatches a diagnosed step —
-    // so reporting it `waiting-workers`/`waiting-CI`/`waiting-approval`
+    // failure/refusal. Bounded retries do not turn that diagnosis into live
+    // work, so reporting it `waiting-workers`/`waiting-CI`/`waiting-approval`
     // presents a stalled run as if work or CI were still in flight. The
     // recorded attempt's own code is the named blocker instead (the same
     // honesty #141/#144 apply to a refusal recorded before any attempt).
@@ -2269,12 +2278,10 @@ mod tests {
         assert!(verdict.eligible);
     }
 
-    /// Issue #141, the preserved rule: a refusal of a continuation dispatch is
-    /// NOT an attempt and never authorizes the driver to re-dispatch a
-    /// DIAGNOSED step. The diagnosed frontier keeps its own fence with or
-    /// without a recorded refusal elsewhere in the run.
+    /// A diagnosed frontier may retry within the budget, but an operator
+    /// reservation fences it even when a continuation refusal is also recorded.
     #[test]
-    fn a_diagnosed_frontier_stays_fenced_with_a_recorded_refusal() {
+    fn a_diagnosed_frontier_retries_unless_reserved_by_the_operator() {
         let state = temp_state("diagnosed-fence-refusal");
         let digest = "d".repeat(64);
         let run = "run-0123456789abcdef";
@@ -2301,7 +2308,7 @@ mod tests {
         };
         let now_unix = time::unix_from_rfc3339(at).expect("instant");
         for refusal in [None, Some(("p2", "refusal.admission.proof_stale", at))] {
-            let evidence = match refusal {
+            let mut evidence = match refusal {
                 Some(refusal) => evidence_with_refusal(
                     run_row(run),
                     Some(&digest),
@@ -2312,9 +2319,25 @@ mod tests {
                 ),
                 None => evidence_for(run_row(run), Some(&digest), &steps, &attempts, at),
             };
+            for status in ["ambiguous", "refused", "failed"] {
+                evidence.attempts.last_mut().unwrap().1 = status.to_string();
+                assert!(
+                    dispatch_intent(&row, &evidence).is_some(),
+                    "{status} is retry eligible"
+                );
+            }
+            evidence.retries.push(crate::state::RunRetryRow {
+                retry_id: "rt_0123456789abcdef".into(),
+                instance_id: run.into(),
+                step_id: "p2".into(),
+                attempt: 1,
+                authorized_at: at.into(),
+                consumed_at: String::new(),
+                consumed_key: String::new(),
+            });
             assert!(
                 dispatch_intent(&row, &evidence).is_none(),
-                "a diagnosed step is never re-dispatched: the operator's corrected dispatch owns it"
+                "operator reservation wins"
             );
             assert!(
                 !classify(&evidence, &digest, &policy, now_unix).eligible,
@@ -2328,9 +2351,8 @@ mod tests {
     /// Herdr pane; p4-147 (the prompt) was then recorded as a non-succeeded
     /// attempt (`adapter.exit`, nothing delivered) — and the run was reported
     /// `waiting-workers`, exactly as if a busy worker would eventually deliver
-    /// it. Nothing was running: the attempt is on record, the driver never
-    /// re-dispatches a diagnosed step, and the step's own failure code is what
-    /// an operator has to act on.
+    /// it. Nothing was running: the step's own failure code remains visible
+    /// while the driver backs off or the bounded retry budget is exhausted.
     #[test]
     fn a_diagnosed_prompt_frontier_is_never_reported_as_waiting_for_workers() {
         let policy = Policy {

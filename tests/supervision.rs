@@ -1552,7 +1552,7 @@ fn an_armed_run_is_dispatched_only_while_it_is_live_and_underway() {
 }
 
 #[test]
-fn f10_diagnosed_step_is_never_redispatched_by_supervision() {
+fn f10_diagnosed_step_without_dispatch_context_is_never_redispatched() {
     let fixture = Fixture::new("diagnosed-fence");
     let state = fixture.open();
     seed_grant(&state, "gr_0000000000000095", 5);
@@ -1581,7 +1581,7 @@ fn f10_diagnosed_step_is_never_redispatched_by_supervision() {
     );
     assert!(
         dispatch_intent_of(&state, &run).is_none(),
-        "the operator's evidence/retry path owns a diagnosed step"
+        "diagnosis alone cannot invent missing dispatch context"
     );
 }
 
@@ -1655,8 +1655,8 @@ fn an_undelivered_prompt_frontier_is_never_reported_as_waiting_for_workers() {
     );
     assert!(!verdict.eligible);
     assert!(
-        dispatch_intent_of(&state, &run).is_none(),
-        "the driver still never re-dispatches a diagnosed step"
+        dispatch_intent_of(&state, &run).is_some(),
+        "the driver may retry an undelivered prompt within its budget"
     );
 }
 
