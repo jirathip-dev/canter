@@ -84,6 +84,20 @@ remain usable without it; SQLite owns state; no network control API).
   `refusal.profile.binding`. The run's session identity is derived from the
   run itself; a `prompt` whose run recorded no succeeded `harness_start`
   refuses `refusal.session.unbound`.
+- A LIVE run whose OWN authorization window lapsed mid-spine renews it
+  before any effect gate reads the window (issue #184): ONE audited
+  `grant.rotation`-class transaction inserts a successor grant derived from
+  the lapsed one (same repository/issue/revision/workflow/policy/phase/
+  scope/caps/epoch, new `gr_` id), records an expiry SIZED FROM THE
+  REMAINING COMMITTED SPINE (the sum of the remaining steps' own documented
+  effect deadlines), re-points the run to it and names the superseded
+  grant, the replacement and the recorded expiry. No operator key and no
+  bounded retry (`run.retry`) is involved, and the renewal is never a
+  blanket authorization: a foreign, revoked, stale-epoch, released, paused,
+  held or exhausted run — or a run whose window is still live — refuses
+  exactly as before. A recorded refusal of the run's own lapsed window is
+  likewise not a STEP diagnosis: it neither demands nor consumes a bounded
+  retry.
 - Unknown methods are refused with a typed refusal (never guessed).
 
 ## Lifecycle methods (issue #9)

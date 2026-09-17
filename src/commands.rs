@@ -2045,7 +2045,9 @@ fn parse_grant(args: &[&String]) -> Result<Invocation, ParseError> {
 
 /// Upper bound on `grant issue --expires-in`: 30 days. A grant is the
 /// authorization window of one reviewed run, not a standing capability.
-const GRANT_EXPIRY_MAX_SECS: i64 = 30 * 24 * 60 * 60;
+/// The SAME documented bound caps an engine-side renewal (issue #184), so
+/// the value lives once, in the mutation engine's window table.
+const GRANT_EXPIRY_MAX_SECS: i64 = crate::mutation::GRANT_WINDOW_MAX_SECS;
 
 /// Parse `queue <submit|status|preview>` (issue #85; `preview` is the
 /// plan producer of the operator path, issue #91).
