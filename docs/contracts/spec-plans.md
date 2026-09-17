@@ -61,7 +61,16 @@ Normative rules:
   checkout cannot read at all (absent, unreachable, unauthenticated), which
   keeps the read's git diagnostics in the message — rather than certifying an
   unprovable base. The orchestrator/forge owns the actual policy merge;
-  `post_merge_verify` proves its landed head.
+  `post_merge_verify` proves its landed head. Separately, the spine's
+  `cleanup` step proves ancestry or content-equivalence against the local
+  integration ref; it does not itself certify a published remote or forge
+  merge. The content fallback covers every changed path, including both
+  rename endpoints, with NUL-delimited names and literal pathspecs. Partial
+  landings and paths that the text adapter cannot compare losslessly refuse
+  without removing the lane or branch. The precise fail-closed cases and
+  deletion flags are in [the lifecycle contract](spec-lifecycle.md#5-cleanup-archivesalvage-and-canonical-target-classification-ac7).
+  This permits complete squash landings without weakening the ancestry-only
+  standalone `branch_delete` effect (Refs #132, #172).
 
 ### Canonical serialization and digest
 
