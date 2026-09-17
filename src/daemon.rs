@@ -1469,10 +1469,19 @@ fn supervision_interval_secs(shared: &Arc<Shared>, instance_id: &str) -> i64 {
 
 impl crate::supervision::SupervisedDispatch for DaemonDispatch {
     fn dispatch(&self, intent: &crate::supervision::DispatchIntent) -> Result<String, String> {
+        self.dispatch_at(intent, time::unix_now())
+    }
+}
+
+impl DaemonDispatch {
+    fn dispatch_at(
+        &self,
+        intent: &crate::supervision::DispatchIntent,
+        now_unix: i64,
+    ) -> Result<String, String> {
         let Some(shared) = self.shared.get() else {
             return Err("the daemon dispatch hook is not wired yet".to_string());
         };
-        let now_unix = time::unix_now();
         // Issue #144 (4a): a continuation the engine keeps refusing is not
         // re-attempted on every check. `run-604cf9439372a5e5` re-attempted the
         // same refused `p3` dispatch every 60 s for over an hour; the ladder
@@ -1496,7 +1505,10 @@ impl crate::supervision::SupervisedDispatch for DaemonDispatch {
                 intent.instance_id, intent.step_id
             ));
         }
-        let key = dispatch_key(format!("{}-{}", intent.instance_id, intent.step_id));
+        let key = dispatch_key(
+            format!("{}-{}", intent.instance_id, intent.step_id),
+            now_unix,
+        );
         let request = match build_dispatch_request(
             shared,
             &intent.instance_id,
@@ -1592,7 +1604,7 @@ impl DaemonDispatch {
         key: &str,
         now_unix: i64,
     ) -> Result<String, String> {
-        let response = method_apply(shared, request);
+        let response = method_apply_from(shared, request, true);
         let doc = Val::parse_json(response.trim())
             .map_err(|message| format!("the dispatch response is unreadable ({message})"))?;
         if doc.get("ok").and_then(Val::as_bool) == Some(true) {
@@ -2020,12 +2032,12 @@ fn merged_step_params(committed: Option<&Val>, supplied: Option<&Val>) -> Option
 /// One dispatch idempotency key: `ik_` + the run-local step identity + the
 /// current second, so the driver's continuation dispatch of a step is a FRESH
 /// claim while a same-second duplicate can never double-dispatch.
-fn dispatch_key(target: String) -> String {
+fn dispatch_key(target: String, now_unix: i64) -> String {
     let sanitized: String = target
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    let tail = format!("{sanitized}-{}", crate::time::unix_now());
+    let tail = format!("{sanitized}-{now_unix}");
     format!("ik_{}", &tail[..tail.len().min(64)])
 }
 
@@ -2150,6 +2162,11 @@ impl Drop for ApplyClaim<'_> {
 }
 
 fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
+    method_apply_from(shared, request, false)
+}
+
+// Origin is an internal capability, never a caller-controlled RPC field/key.
+fn method_apply_from(shared: &Arc<Shared>, request: &Request, supervised: bool) -> String {
     let parsed = match apply_params(request) {
         Ok(parsed) => parsed,
         Err((code, message)) => return err_response(&request.id, &code, message),
@@ -2266,6 +2283,7 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
         }
     };
     let grant_id = parsed.grant_id.clone();
+    let mut automatic_retry = false;
     let journaled = {
         let state = match shared.lock_state() {
             Ok(state) => state,
@@ -2273,6 +2291,35 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
                 return err_response(&request.id, "state.unavailable", message);
             }
         };
+        // Recheck under the same guard as the claim: operator reservations,
+        // holds, authorization and the frontier may have moved since the tick.
+        if supervised {
+            let eligible = (|| -> Result<bool, StateError> {
+                let Some(row) = state.supervision_by_id(&parsed.instance_id)? else {
+                    return Ok(false);
+                };
+                let Some(evidence) = state.supervision_evidence(&parsed.instance_id)? else {
+                    return Ok(false);
+                };
+                automatic_retry = evidence
+                    .attempts
+                    .iter()
+                    .any(|(step, _, _)| step == &parsed.step);
+                Ok(crate::supervision::dispatch_intent(&row, &evidence)
+                    .is_some_and(|intent| intent.step_id == parsed.step))
+            })();
+            match eligible {
+                Ok(true) => {}
+                Ok(false) => {
+                    return err_response(
+                        &request.id,
+                        crate::mutation::code::RETRY_REQUIRED,
+                        "the supervised frontier is held, reserved or exhausted",
+                    );
+                }
+                Err(err) => return err_response(&request.id, err.code, err.message),
+            }
+        }
         match state.journal_intent(
             &action,
             &target,
@@ -2283,7 +2330,20 @@ fn method_apply(shared: &Arc<Shared>, request: &Request) -> String {
             Some(&grant_id),
             &request.line,
         ) {
-            Ok((ClaimAttempt::Claimed, _)) => true,
+            Ok((ClaimAttempt::Claimed, _)) => {
+                if automatic_retry
+                    && let Err(err) = state.consume_supervised_retry(
+                        &parsed.instance_id,
+                        &parsed.step,
+                        &time::rfc3339_now(),
+                        &key,
+                    )
+                {
+                    drop(state);
+                    return resolve_apply_refusal(shared, request, &key, err.code, err.message);
+                }
+                true
+            }
             Ok((ClaimAttempt::Replay { response }, _)) => return replay(shared, &response),
             Ok((ClaimAttempt::Reused { owner_request_id }, _)) => {
                 return err_response(
@@ -9196,6 +9256,10 @@ pub(crate) fn crash_point(point: &str) {
         std::process::abort();
     }
 }
+
+#[cfg(test)]
+#[path = "daemon_retry_tests.rs"]
+mod retry_tests;
 
 #[cfg(test)]
 mod tests {

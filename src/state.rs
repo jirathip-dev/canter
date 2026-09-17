@@ -3345,6 +3345,28 @@ impl State {
         step_id: &str,
         at: &str,
     ) -> Result<RunRetryRow, StateError> {
+        self.record_run_retry_inner(instance_id, step_id, at, "")
+    }
+
+    /// Reserve and consume supervision's own retry in one write. A pending
+    /// operator retry refuses here, never becoming the automatic claim.
+    pub(crate) fn consume_supervised_retry(
+        &self,
+        instance_id: &str,
+        step_id: &str,
+        at: &str,
+        claim_key: &str,
+    ) -> Result<RunRetryRow, StateError> {
+        self.record_run_retry_inner(instance_id, step_id, at, claim_key)
+    }
+
+    fn record_run_retry_inner(
+        &self,
+        instance_id: &str,
+        step_id: &str,
+        at: &str,
+        claim_key: &str,
+    ) -> Result<RunRetryRow, StateError> {
         self.ensure_writable()?;
         let conn = self.lock("record_run_retry")?;
         let existing: i64 = conn
@@ -3385,8 +3407,16 @@ impl State {
         conn.execute(
             "INSERT INTO run_retries (retry_id, instance_id, step_id, attempt, authorized_at,
                     consumed_at, consumed_key)
-             VALUES (?1, ?2, ?3, ?4, ?5, '', '')",
-            params![retry_id, instance_id, step_id, attempt, at],
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                retry_id,
+                instance_id,
+                step_id,
+                attempt,
+                at,
+                if claim_key.is_empty() { "" } else { at },
+                claim_key
+            ],
         )
         .map_err(|err| StateError::from_sqlite("record_run_retry: insert", err))?;
         Ok(RunRetryRow {
@@ -3395,8 +3425,8 @@ impl State {
             step_id: step_id.to_string(),
             attempt,
             authorized_at: at.to_string(),
-            consumed_at: String::new(),
-            consumed_key: String::new(),
+            consumed_at: if claim_key.is_empty() { "" } else { at }.to_string(),
+            consumed_key: claim_key.to_string(),
         })
     }
 
@@ -3422,6 +3452,20 @@ impl State {
             return Ok(RunRetryClaim::NotRequired);
         }
         let conn = self.lock("claim_run_retry")?;
+        // Supervision reserved and consumed its own slot with the intent.
+        let consumed: Option<String> = conn
+            .query_row(
+                "SELECT retry_id FROM run_retries
+              WHERE instance_id = ?1 AND step_id = ?2 AND consumed_key = ?3
+                AND consumed_at != ''",
+                params![instance_id, step_id, claim_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("claim_run_retry: consumed", err))?;
+        if let Some(retry_id) = consumed {
+            return Ok(RunRetryClaim::Consumed(retry_id));
+        }
         let pending: Option<(String, i64)> = conn
             .query_row(
                 "SELECT retry_id, attempt FROM run_retries
@@ -11319,7 +11363,7 @@ pub struct SupervisionEvidence {
     /// Recorded step attempts as `(step, status, error code)` in claim order.
     pub attempts: Vec<(String, String, String)>,
     /// Every durable retry authorization of the run (the retry cursor and
-    /// its timing; never edited by supervision).
+    /// its timing and the dispatch key that consumed each authorization).
     pub retries: Vec<RunRetryRow>,
     /// Recorded review evidence as `(evidence id, verdict, created_at)`,
     /// newest first.
