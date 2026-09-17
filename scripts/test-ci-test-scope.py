@@ -10,9 +10,10 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from ci_test_processes import MARKER, has_marker, signal_members
 
@@ -38,7 +39,10 @@ deadline = time.monotonic() + 3
 while b"innocent-worker" not in Path(f"/proc/{pid}/cmdline").read_bytes():
     if time.monotonic() >= deadline: raise RuntimeError("exec handshake timed out")
     time.sleep(0.01)
-Path(sys.argv[1]).write_text(json.dumps({"pid": pid, "tag": os.environ["CANTER_FIXTURE_TAG"], "start": Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]}))
+record = Path(sys.argv[1])
+temporary = record.with_name(record.name + ".tmp")
+temporary.write_text(json.dumps({"pid": pid, "tag": os.environ["CANTER_FIXTURE_TAG"], "start": Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]}))
+os.replace(temporary, record)
 print("test escaped_descendant_witness ... ", end="", flush=True)
 if sys.argv[2] == "kill-driver":
     os.kill(os.getppid(), signal.SIGKILL)
@@ -46,6 +50,44 @@ if sys.argv[2] == "hang":
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     time.sleep(120)
 '''
+
+
+class WitnessOutputError(AssertionError):
+    """A witness contract file was absent, empty, or not JSON. An AssertionError
+    so the failing test reports a typed assertion failure — never a bare
+    JSONDecodeError raised from inside the record helper."""
+
+
+def contract_record(path, command, exit_status):
+    """Parse a fixture's JSON contract file. Absent, empty, and non-JSON
+    content all fail typed, naming the command that produced nothing and its
+    raw exit status; a bare JSONDecodeError from an empty parse is never an
+    acceptable witness failure."""
+    try:
+        raw = path.read_text()
+    except (OSError, UnicodeDecodeError) as error:
+        detail = f"unreadable: {type(error).__name__}: {error}"
+    else:
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as error:
+            detail = f"{type(error).__name__}: {error} ({len(raw)} bytes)"
+    raise WitnessOutputError(
+        f"witness contract {path.name} produced no JSON: {detail}; "
+        f"command={' '.join(command)}; raw_exit={exit_status!r}"
+    ) from None
+
+
+def wait_for_contract(path, command, child, deadline):
+    """Existence is not readiness: a record is usable only once it parses, so
+    a publication observed mid-write is waited for instead of misread."""
+    while True:
+        try:
+            return contract_record(path, command, child.poll())
+        except WitnessOutputError:
+            if child.poll() is not None or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
 
 
 @unittest.skipUnless(sys.platform == "linux", "requires Linux /proc + setsid")
@@ -105,12 +147,7 @@ class LinuxScopeTests(unittest.TestCase):
             child = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             record = None
             try:
-                deadline = start + 5
-                while not pid_file.exists() and child.poll() is None:
-                    if time.monotonic() >= deadline:
-                        self.fail("witness never started")
-                    time.sleep(0.01)
-                record = json.loads(pid_file.read_text())
+                record = wait_for_contract(pid_file, argv, child, start + 5)
                 output, _ = child.communicate(timeout=30)
                 elapsed = time.monotonic() - start
                 print(f"WITNESS mode={mode} real_driver={real_driver} raw_exit={child.returncode} duration_s={elapsed:.2f}")
@@ -189,7 +226,10 @@ from pathlib import Path
 if sys.argv[2] == "hostile": signal.signal(signal.SIGTERM, signal.SIG_IGN)
 worker = subprocess.Popen(["/bin/sleep", "120"], start_new_session=True)
 rows = {str(pid): Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19] for pid in (os.getpid(), worker.pid)}
-Path(sys.argv[1]).write_text(json.dumps(rows))
+record = Path(sys.argv[1])
+temporary = record.with_name(record.name + ".tmp")
+temporary.write_text(json.dumps(rows))
+os.replace(temporary, record)
 sys.stdout.buffer.write(b"F" * (4 * 1024 * 1024) + b"FLOOD_COMPLETE\\n")
 sys.stdout.buffer.flush()
 time.sleep(120)
@@ -197,12 +237,7 @@ time.sleep(120)
                 argv = [sys.executable, "-u", str(WRAPPER), "--seconds", "1", "--log-dir", str(root / "logs"), "--", sys.executable, "-u", str(fixture), str(root / "pids.json"), "hostile" if hostile else "normal"]
                 started = time.monotonic()
                 child = subprocess.Popen(argv, stdout=write_fd, stderr=subprocess.STDOUT)
-                deadline = started + 3
-                while not (root / "pids.json").exists():
-                    if time.monotonic() >= deadline:
-                        self.fail("flood fixture never started")
-                    time.sleep(0.01)
-                records = {int(pid): ticks for pid, ticks in json.loads((root / "pids.json").read_text()).items()}
+                records = {int(pid): ticks for pid, ticks in wait_for_contract(root / "pids.json", argv, child, started + 3).items()}
                 before = subprocess.run(["ps", "-ww", "-p", ",".join(map(str, records)), "-o", "pid,ppid,pgid,sid,stat,args"], capture_output=True, text=True, timeout=3)
                 self.assertEqual(before.returncode, 0, before.stderr)
                 try:
@@ -297,6 +332,69 @@ time.sleep(120)
             if read_fd is not None:
                 os.close(read_fd)
             os.close(write_fd)
+
+
+class WitnessContractTests(unittest.TestCase):
+    """Platform-independent pin on the record handshake: a contract file is
+    readable only once it parses, and an absent, empty, or non-JSON record
+    fails typed with the command and its raw exit status."""
+
+    COMMAND = [
+        "python3", "-u", "scripts/ci-test-scope.py", "--seconds", "25", "--log-dir", "logs", "--",
+        "python3", "-u", "scripts/ci-test-driver.py", "--suite=--lib",
+    ]
+
+    def test_absent_empty_and_non_json_records_fail_typed(self):
+        with tempfile.TemporaryDirectory(prefix="canter-record-") as temp:
+            path = Path(temp) / "escape.json"
+            for label, content in (("absent", None), ("empty", ""), ("not-json", "<html>no record</html>")):
+                with self.subTest(label=label):
+                    if content is None:
+                        path.unlink(missing_ok=True)
+                    else:
+                        path.write_text(content)
+                    with self.assertRaises(WitnessOutputError) as raised:
+                        contract_record(path, self.COMMAND, 1)
+                    message = str(raised.exception)
+                    self.assertIn("witness contract escape.json produced no JSON", message)
+                    self.assertIn(" ".join(self.COMMAND), message)
+                    self.assertIn("raw_exit=1", message)
+
+    def test_a_late_publication_is_waited_for_not_misread(self):
+        with tempfile.TemporaryDirectory(prefix="canter-record-late-") as temp:
+            path = Path(temp) / "escape.json"
+            child = Mock()
+            child.poll.return_value = None
+            payload = {"pid": 4321, "start": "7"}
+
+            def publish():
+                time.sleep(0.05)
+                path.write_text(json.dumps(payload))
+
+            writer = threading.Thread(target=publish)
+            writer.start()
+            try:
+                self.assertEqual(wait_for_contract(path, self.COMMAND, child, time.monotonic() + 5), payload)
+            finally:
+                writer.join(timeout=5)
+
+    def test_a_record_without_a_live_command_fails_typed_with_its_exit(self):
+        with tempfile.TemporaryDirectory(prefix="canter-record-settled-") as temp:
+            child = Mock()
+            child.poll.return_value = 137
+            with self.assertRaises(WitnessOutputError) as raised:
+                wait_for_contract(Path(temp) / "escape.json", self.COMMAND, child, time.monotonic() + 5)
+            self.assertIn("raw_exit=137", str(raised.exception))
+
+    def test_a_record_that_never_arrives_fails_at_the_deadline(self):
+        with tempfile.TemporaryDirectory(prefix="canter-record-deadline-") as temp:
+            child = Mock()
+            child.poll.return_value = None
+            started = time.monotonic()
+            with self.assertRaises(WitnessOutputError) as raised:
+                wait_for_contract(Path(temp) / "escape.json", self.COMMAND, child, started + 0.05)
+            self.assertGreaterEqual(time.monotonic() - started, 0.05, "the wait is bounded by its deadline")
+            self.assertIn("raw_exit=None", str(raised.exception))
 
 
 if __name__ == "__main__":
