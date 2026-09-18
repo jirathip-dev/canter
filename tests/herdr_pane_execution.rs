@@ -904,6 +904,7 @@ fn p8_preserves_dirty_live_and_stale_lanes_then_closes_the_owned_workspace() {
         role: None,
         session: Some(&session),
         archive_root: None,
+        review_root: None,
         retired_run_ids: &[],
     };
     let dirty = fixture.worktree.join("keep.txt");
@@ -1000,6 +1001,7 @@ fn run_harness_start_step(
         role: None,
         session: Some(session),
         archive_root: None,
+        review_root: None,
         retired_run_ids: retired,
     };
     execute_step(&ctx)
@@ -2078,6 +2080,7 @@ fn the_harness_start_step_starts_the_worker_in_the_lane_worktrees_pane() {
         role: None,
         session: Some(&session),
         archive_root: None,
+        review_root: None,
         retired_run_ids: &[],
     };
 
@@ -2148,6 +2151,7 @@ fn a_plan_without_one_lane_worktree_refuses_typed_on_the_pane_substrate() {
         role: None,
         session: Some(&session),
         archive_root: None,
+        review_root: None,
         retired_run_ids: &[],
     };
     let outcome = execute_step(&ctx);
@@ -2208,6 +2212,7 @@ fn a_plan_without_one_lane_worktree_refuses_typed_on_the_pane_substrate() {
         role: None,
         session: Some(&session),
         archive_root: None,
+        review_root: None,
         retired_run_ids: &[],
     };
     let outcome = execute_step(&ctx);

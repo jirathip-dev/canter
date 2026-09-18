@@ -168,6 +168,26 @@ fn steps_value(steps: &[PlanStep]) -> Val {
     )
 }
 
+/// The reviewed reviewer role of one queue run (issue #193): the registry
+/// harness row (`key`/`kind`/`executable`) and the `hf-profile-binding/v1`
+/// document the FLEET REGISTRY resolved for it. `None` declares no reviewer
+/// leg: the spine's review step then stays the operator's own dispatch, and
+/// the run's supervision never self-dispatches a reviewer.
+///
+/// Nothing here is inferred: the caller resolves the row from the configured
+/// harnesses (never a code literal, never a model name in this repository).
+#[derive(Clone, Copy, Debug)]
+pub struct ReviewerRole<'a> {
+    /// Registry role-binding key of the reviewer row.
+    pub key: &'a str,
+    /// Harness kind of the reviewer row.
+    pub kind: &'a str,
+    /// Bare executable of the reviewer row.
+    pub executable: &'a str,
+    /// The registry-resolved binding document for that row.
+    pub binding: &'a Val,
+}
+
 /// The declared executable step spine of one queue run: the doctrine step
 /// spine with every step's binding parameters resolved from the reviewed
 /// run inputs.
@@ -188,6 +208,12 @@ fn steps_value(steps: &[PlanStep]) -> Val {
 /// the exact reviewed binding (the integration ref, the harness key, the
 /// per-issue work-item identity and worktree scope).
 ///
+/// `reviewer` (issue #193) is the reviewed reviewer role: when it is
+/// present every review step declares the reviewer LEG (the registry key,
+/// the harness kind/executable and the registry-resolved binding document
+/// the engine dispatches itself) — the run then reviews its own delivery
+/// instead of waiting for a lane an operator hand-dispatches.
+///
 /// `issues` is the reviewed selected set; callers pass it sorted and
 /// deduplicated. The caller also enforces the executable step bound
 /// (`queue_preview::STEPS_MAX`) — the spine grows by six steps per issue.
@@ -195,6 +221,7 @@ pub fn queue_run_steps(
     repository: &str,
     integration_branch: &str,
     harness_key: &str,
+    reviewer: Option<ReviewerRole<'_>>,
     issues: &[u64],
     execution: crate::adapters::ExecutionMode,
 ) -> Vec<PlanStep> {
@@ -260,10 +287,29 @@ pub fn queue_run_steps(
         // Review facts are supplied only after an independent review, but an
         // empty object keeps the reviewed spine resolved without fabricating
         // a reviewer, verdict, checks, or observed heads.
+        //
+        // Issue #193: when the reviewed run declares a reviewer role, the
+        // review step declares the reviewer LEG instead — the registry role
+        // key, the harness kind/executable and the registry-resolved
+        // `hf-profile-binding/v1` document (its provider/model are the
+        // registry's, never a literal in this repository) — so the run
+        // dispatches its OWN reviewer at the certified head and consumes the
+        // verdict that reviewer writes.
+        let review_params = match reviewer {
+            None => object(vec![]),
+            Some(reviewer) => object(vec![
+                ("execution", string(execution.name())),
+                ("harness_key", string(reviewer.key)),
+                ("kind", string(reviewer.kind)),
+                ("executable", string(reviewer.executable)),
+                ("reviewer_profile", reviewer.binding.clone()),
+                ("worktree", string(&worktree)),
+            ]),
+        };
         steps.push(PlanStep {
             id: format!("p6-{number}"),
             kind: "review_evidence".to_string(),
-            params: Some(object(vec![])),
+            params: Some(review_params),
         });
         steps.push(PlanStep {
             id: format!("p7-{number}"),
@@ -521,6 +567,7 @@ mod tests {
             "example-org/widgets",
             "staging",
             "lane-1",
+            None,
             &[5],
             crate::adapters::ExecutionMode::HerdrPane,
         );
@@ -597,6 +644,7 @@ mod tests {
             "example-org/widgets",
             "staging",
             "lane-1",
+            None,
             &[5],
             crate::adapters::ExecutionMode::HerdrPane,
         );
@@ -612,6 +660,7 @@ mod tests {
             "example-org/widgets",
             "staging",
             "lane-1",
+            None,
             &[5, 6],
             crate::adapters::ExecutionMode::HerdrPane,
         );
@@ -634,6 +683,7 @@ mod tests {
             "example-org/widgets",
             "staging",
             "lane-1",
+            None,
             &[5],
             crate::adapters::ExecutionMode::HerdrPane,
         );
@@ -650,6 +700,7 @@ mod tests {
                 "example-org/widgets",
                 "staging",
                 "lane-1",
+                None,
                 &[5],
                 crate::adapters::ExecutionMode::HerdrPane
             )),
@@ -661,6 +712,7 @@ mod tests {
                 "example-org/widgets",
                 "integration",
                 "lane-1",
+                None,
                 &[5],
                 crate::adapters::ExecutionMode::HerdrPane
             )),
@@ -672,10 +724,91 @@ mod tests {
                 "example-org/widgets",
                 "staging",
                 "lane-1",
+                None,
                 &[6],
                 crate::adapters::ExecutionMode::HerdrPane
             )),
             "a different declared spine derives a different hash"
         );
+    }
+
+    #[test]
+    fn a_reviewed_reviewer_role_authors_the_reviewer_leg_on_every_review_step() {
+        // Issue #193: the producer is where the run's reviewer role is bound.
+        // With `canter queue preview --reviewer-harness KEY` the review step
+        // declares the reviewer LEG — the registry role key, the harness
+        // kind/executable and the registry-resolved binding document — so the
+        // run dispatches its OWN reviewer. Without it the step keeps its
+        // empty params and stays the operator's own dispatch.
+        let binding = object(vec![
+            ("schema", string("hf-profile-binding/v1")),
+            ("key", string("lane-rev")),
+            ("kind", string("hermes")),
+            ("provider", string("provider-rev")),
+            ("model", string("model-rev")),
+            ("revision", string(&"0".repeat(64))),
+        ]);
+        let spine = queue_run_steps(
+            "example-org/widgets",
+            "staging",
+            "lane-1",
+            Some(ReviewerRole {
+                key: "lane-rev",
+                kind: "hermes",
+                executable: "hermes",
+                binding: &binding,
+            }),
+            &[5, 6],
+            crate::adapters::ExecutionMode::HerdrPane,
+        );
+        let review_steps: Vec<&PlanStep> = spine
+            .iter()
+            .filter(|step| step.kind == "review_evidence")
+            .collect();
+        assert_eq!(review_steps.len(), 2, "one review step per selected issue");
+        for step in review_steps {
+            let params = step.params.as_ref().expect("review params");
+            assert_eq!(
+                params.get("harness_key").and_then(Val::as_str),
+                Some("lane-rev"),
+                "the review step names the REGISTRY reviewer role key"
+            );
+            assert!(
+                matches!(
+                    params.get("worktree").and_then(Val::as_str),
+                    Some("issues-5" | "issues-6")
+                ),
+                "the reviewer runs in the run's own lane worktree"
+            );
+            let profile = params.get("reviewer_profile").expect("the binding");
+            assert_eq!(
+                profile.get("model").and_then(Val::as_str),
+                Some("model-rev")
+            );
+            assert_eq!(
+                profile.get("provider").and_then(Val::as_str),
+                Some("provider-rev")
+            );
+        }
+        // Without a reviewer role the spine declares no leg at all: the
+        // operator's own path, byte-identical to the pre-#193 spine.
+        let plain = queue_run_steps(
+            "example-org/widgets",
+            "staging",
+            "lane-1",
+            None,
+            &[5],
+            crate::adapters::ExecutionMode::HerdrPane,
+        );
+        let review = plain
+            .iter()
+            .find(|step| step.kind == "review_evidence")
+            .expect("review step");
+        match review.params.as_ref() {
+            Some(Val::Obj(map)) => {
+                assert!(map.is_empty(), "no reviewer leg is inferred: {map:?}")
+            }
+            other => panic!("the review step params must be an object, got {other:?}"),
+        }
     }
 }

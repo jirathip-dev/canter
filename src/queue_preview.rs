@@ -471,6 +471,36 @@ fn validate_request(request: &QueueRequest) -> Result<Validated, PreviewError> {
                 ),
             ));
         }
+        // Issue #193: a review step that declares the reviewer leg carries
+        // the registry-resolved reviewer binding, and the preview validates
+        // it here (the same closed `hf-profile-binding/v1` shape the daemon
+        // re-validates at the boundary) so an ill-formed reviewer role
+        // refuses before the plan is ever reviewed or submitted.
+        if let Some(Val::Obj(params)) = &step.params
+            && let Some(binding) = params.get("reviewer_profile")
+        {
+            if step.kind != "review_evidence" {
+                return Err(PreviewError::new(
+                    "usage.queue_steps",
+                    format!(
+                        "step {:?} declares params.reviewer_profile but its kind is {:?}; the \
+                         reviewer leg belongs to a review_evidence step",
+                        step.id, step.kind
+                    ),
+                ));
+            }
+            if let Err(err) = crate::config::ProfileBinding::from_doc(binding) {
+                return Err(PreviewError::new(
+                    "usage.queue_reviewer",
+                    format!(
+                        "step {:?} presents a reviewer binding that is not a valid \
+                         hf-profile-binding/v1 document: {}",
+                        step.id,
+                        err.message()
+                    ),
+                ));
+            }
+        }
     }
     if request.selected.is_empty() {
         return Err(PreviewError::new(

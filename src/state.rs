@@ -11648,6 +11648,12 @@ pub struct SupervisionEvidence {
     pub submission_digest: Option<String>,
     /// The bound step spine as `(step id, step kind)` in spine order.
     pub steps: Vec<(String, String)>,
+    /// The committed step ids whose own params declare the reviewer LEG
+    /// (issue #193): the review steps this run dispatches ITSELF instead of
+    /// waiting for an externally hand-dispatched reviewer lane. Read from the
+    /// committed bound-input document; an empty list means no step of this
+    /// spine self-dispatches its reviewer.
+    pub reviewer_leg_steps: Vec<String>,
     /// Recorded step attempts as `(step, status, error code)` in claim order.
     pub attempts: Vec<(String, String, String)>,
     /// Every durable retry authorization of the run (the retry cursor and
@@ -13067,7 +13073,7 @@ impl State {
             .optional()
             .map_err(|err| StateError::from_sqlite("supervision_evidence: submission row", err))?;
         drop(statement);
-        let (submission_id, submission_digest, steps, item) = match submission {
+        let (submission_id, submission_digest, steps, reviewer_leg_steps, item) = match submission {
             Some((
                 submission_id,
                 digest,
@@ -13080,6 +13086,7 @@ impl State {
                 Some(submission_id.clone()),
                 Some(digest),
                 bound_steps_of(&request_line),
+                bound_reviewer_leg_steps_of(&request_line),
                 Some(QueueItemRef {
                     submission_id,
                     ordinal,
@@ -13088,7 +13095,7 @@ impl State {
                     status,
                 }),
             ),
-            None => (None, None, Vec::new(), None),
+            None => (None, None, Vec::new(), Vec::new(), None),
         };
         let has_dispatch_context =
             self.has_dispatch_context_locked(&conn, instance_id, submission_id.as_deref())?;
@@ -13181,6 +13188,7 @@ impl State {
             submission_id,
             submission_digest,
             steps,
+            reviewer_leg_steps,
             attempts,
             retries,
             verdicts,
@@ -13672,6 +13680,27 @@ fn bound_steps_of(request_line: &str) -> Vec<(String, String)> {
                     let kind = step.get("kind").and_then(Val::as_str).unwrap_or("");
                     Some((id.to_string(), kind.to_string()))
                 })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The step ids of one committed bound-input line whose OWN params declare
+/// the reviewer leg (issue #193): the review steps the run dispatches itself.
+/// An unreadable line yields no ids, so a corrupted spine can never authorize
+/// a self-dispatch.
+fn bound_reviewer_leg_steps_of(request_line: &str) -> Vec<String> {
+    let Ok(doc) = Val::parse_json(request_line) else {
+        return Vec::new();
+    };
+    doc.get("steps")
+        .and_then(Val::as_array)
+        .map(|steps| {
+            steps
+                .iter()
+                .filter(|step| crate::mutation::declares_reviewer_leg(step.get("params")))
+                .filter_map(|step| step.get("id").and_then(Val::as_str))
+                .map(str::to_string)
                 .collect()
         })
         .unwrap_or_default()

@@ -67,7 +67,7 @@ USAGE:
     canter lane status (--replacement RP_ID | --lane ID --generation N) [--socket PATH] [--config PATH] [--json]
     canter queue submit --request FILE --confirm-digest HEX64 [--epoch N] [--grant REF=GRANT_ID]... [--resume INSTANCE=DIGEST]... [--host-available yes|no|unknown] [--harness-lanes N|unknown] [--supervise arm|off] [--topology FILE] [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter queue status --submission QS_ID [--socket PATH] [--config PATH] [--json]
-    canter queue preview --repository KEY --harness KEY --host HOST --issue N=HEX40... --caps G/R/H [--host-available yes|no|unknown] [--harness-lanes N|unknown] [--boundary-phase PHASE] [--integration-branch B] [--completion-branch B] [--execution herdr|headless] [--out FILE] [--socket PATH] [--config PATH] [--json]
+    canter queue preview --repository KEY --harness KEY [--reviewer-harness KEY] --host HOST --issue N=HEX40... --caps G/R/H [--host-available yes|no|unknown] [--harness-lanes N|unknown] [--boundary-phase PHASE] [--integration-branch B] [--completion-branch B] [--execution herdr|headless] [--out FILE] [--socket PATH] [--config PATH] [--json]
     canter run pause --run RUN_ID --reason TEXT [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run resume --run RUN_ID --digest HEX64 [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run retry --run RUN_ID --step STEP [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
@@ -410,6 +410,12 @@ pub struct QueuePreviewArgs {
     pub selected: Vec<(u64, String)>,
     /// Configured harness key whose reviewed role binding is re-observed.
     pub harness: String,
+    /// `--reviewer-harness KEY`: the configured harness key of the run's OWN
+    /// reviewer (issue #193). `None` declares no reviewer leg: the review
+    /// step then stays the operator's own dispatch. The key is resolved
+    /// against the configured harnesses, and the registry-resolved binding
+    /// rides into the reviewed review step — no model name is ever a literal.
+    pub reviewer_harness: Option<String>,
     /// Explicit target host identity token.
     pub host: String,
     /// Presented host availability; `None` = unknown (a hold).
@@ -2092,6 +2098,7 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
     let mut repository: Option<String> = None;
     let mut selected: Vec<(u64, String)> = Vec::new();
     let mut harness: Option<String> = None;
+    let mut reviewer_harness: Option<String> = None;
     let mut host: Option<String> = None;
     let mut boundary_phase: Option<String> = None;
     let mut integration_branch: Option<String> = None;
@@ -2229,6 +2236,16 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
                 }
                 harness = Some(raw);
             }
+            "--reviewer-harness" => {
+                let raw = flag_value(&rest, &mut index, "queue", "--reviewer-harness")?;
+                if !crate::formats::is_slug(&raw) {
+                    return Err(ParseError::Usage(format!(
+                        "queue preview: --reviewer-harness must be a configured harness key \
+                         (lowercase slug), got {raw:?}"
+                    )));
+                }
+                reviewer_harness = Some(raw);
+            }
             "--host" => {
                 let raw = flag_value(&rest, &mut index, "queue", "--host")?;
                 host = Some(raw);
@@ -2279,6 +2296,7 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
     let preview_only = repository.is_some()
         || !selected.is_empty()
         || harness.is_some()
+        || reviewer_harness.is_some()
         || host.is_some()
         || boundary_phase.is_some()
         || integration_branch.is_some()
@@ -2393,6 +2411,7 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
             repository,
             selected,
             harness,
+            reviewer_harness,
             host,
             host_available,
             harness_lanes,
@@ -5009,10 +5028,61 @@ fn execute_queue_preview(args: &QueuePreviewArgs, invocation: &Invocation) -> Cm
         .unwrap_or_else(|| "merge".to_string());
     // The declared executable spine: the doctrine spine bound to the
     // reviewed run, with every step resolved.
+    // Issue #193: the reviewed reviewer role. `--reviewer-harness KEY`
+    // resolves that registry row into the reviewed binding the review step
+    // declares, so the run dispatches its OWN reviewer at its certified head
+    // instead of waiting for a lane an operator hand-dispatches. The row's
+    // provider/model come from the configuration (never a literal here), and
+    // an unknown or unbound row refuses before any state is touched.
+    let reviewer_row = match args.reviewer_harness.as_deref() {
+        None => None,
+        Some(key) => {
+            let Some(row) = config.harnesses.iter().find(|harness| harness.key == key) else {
+                return error_result(
+                    5,
+                    "config.harness",
+                    format!(
+                        "no configured harness {key:?}; --reviewer-harness names a configured \
+                         harness key (see `canter config show --json`)"
+                    ),
+                    false,
+                );
+            };
+            let env = crate::config::credential_environment(row);
+            let Some(binding) = crate::config::ProfileBinding::from_config(&config, key, &env)
+            else {
+                return error_result(
+                    5,
+                    "config.harness",
+                    format!(
+                        "harness {key:?} declares no provider/model binding; the reviewer role \
+                         needs a reviewed binding the run's review step can declare"
+                    ),
+                    false,
+                );
+            };
+            Some((
+                row.key.clone(),
+                row.kind.clone(),
+                row.executable.clone(),
+                binding.to_doc(),
+            ))
+        }
+    };
+    let reviewer =
+        reviewer_row.as_ref().map(
+            |(key, kind, executable, binding)| crate::plan::ReviewerRole {
+                key: key.as_str(),
+                kind: kind.as_str(),
+                executable: executable.as_str(),
+                binding,
+            },
+        );
     let steps = queue_run_steps(
         &repository.identity(),
         &integration,
         &args.harness,
+        reviewer,
         &issues,
         args.execution,
     );
@@ -5812,7 +5882,8 @@ const QUEUE_USAGE: &str = "\
 canter queue <preview|submit|status> — the durable selected-run path
 
 USAGE:
-    canter queue preview --repository KEY --harness KEY --host HOST \
+    canter queue preview --repository KEY --harness KEY \
+[--reviewer-harness KEY] --host HOST \
 --issue N=HEX40... --caps G/R/H [--host-available yes|no|unknown] \
 [--harness-lanes N|unknown] [--boundary-phase PHASE] \
 [--integration-branch B] [--completion-branch B] \
@@ -6519,7 +6590,7 @@ fn per_command_usage(command: &str) -> &'static str {
             "usage: canter lane preview|request --lane ID --generation N --session S --process P --role R --worktree W --reason TEXT [--profile KEY]\n       canter lane status --replacement RP_ID | --lane ID --generation N"
         }
         "queue" => {
-            "usage: canter queue preview --repository KEY --harness KEY --host HOST --issue N=HEX40... --caps G/R/H [--out FILE]\n       canter queue submit --request FILE --confirm-digest HEX64 --caps G/R/H [--epoch N]\n       canter queue status --submission QS_ID"
+            "usage: canter queue preview --repository KEY --harness KEY [--reviewer-harness KEY] --host HOST --issue N=HEX40... --caps G/R/H [--out FILE]\n       canter queue submit --request FILE --confirm-digest HEX64 --caps G/R/H [--epoch N]\n       canter queue status --submission QS_ID"
         }
         "grant" => {
             "usage: canter grant issue --request FILE --issue N --expires-in SECS [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]"

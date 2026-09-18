@@ -223,40 +223,66 @@ fn after_delivery_step(evidence: &SupervisionEvidence, step: &str) -> bool {
     }
 }
 
+/// Whether ONE committed spine step declares the reviewer LEG (issue #193):
+/// the step's own reviewed params name the registry-resolved reviewer binding
+/// the engine dispatches itself. Read from the committed bound-input
+/// document, so an unapproved or drifted spine can never authorize it.
+fn declares_reviewer_leg(evidence: &SupervisionEvidence, step: &str) -> bool {
+    evidence
+        .reviewer_leg_steps
+        .iter()
+        .any(|declared| declared == step)
+}
+
 /// Whether the driver may dispatch ONE kind of ONE step for this run
-/// (issue #152).
+/// (issue #152, extended by issue #193).
 ///
 /// The unattended continuation set ([`AUTONOMOUS_STEP_KINDS`]) is
-/// unconditional: those steps are the run's ordinary committed work. The
-/// risk-classed TAIL kinds ([`COMMITTED_TAIL_STEP_KINDS`]) are authorized by
-/// the run's OWN committed submission instead, and only when every one of
-/// these holds:
+/// unconditional: those steps are the run's ordinary committed work. Two
+/// further groups are authorized by the run's OWN committed submission
+/// instead, and only when every one of these holds:
 ///
 /// - the run is an ADMITTED member of a committed, digest-bound queue
 ///   submission (`evidence.item`): the spine is an approved plan, never an
 ///   ad-hoc run;
 /// - the run's own committed caps carry the kind's required capability
-///   (`merge` / `cleanup`) — the very capability `revalidate_effect` demands
-///   at effect time, so the driver never attempts what the run was not
-///   granted and no cap is widened here;
-/// - the step comes AFTER the run's reviewed-evidence step in the committed
-///   spine and that run carries a fresh VERIFIED delivery
-///   ([`verified_delivery`]): the tail is driven only behind the delivery it
-///   completes, so a destructive cleanup can never be driven for a run that
-///   never delivered.
+///   (`review` / `merge` / `cleanup`) — the very capability
+///   `revalidate_effect` demands at effect time, so the driver never attempts
+///   what the run was not granted and no cap is widened here;
+/// - the review step's OWN committed params declare the reviewer leg (issue
+///   #193): the run dispatches its own reviewer instead of waiting for a lane
+///   an operator hand-dispatches. A review step that declares no reviewer leg
+///   is untouched by the driver — the operator's own path stays exactly as it
+///   was, and nothing is inferred;
+/// - the risk-classed TAIL kinds ([`COMMITTED_TAIL_STEP_KINDS`]) come AFTER
+///   the run's reviewed-evidence step in the committed spine and that run
+///   carries a fresh VERIFIED delivery ([`verified_delivery`]): the tail is
+///   driven only behind the delivery it completes, so a destructive cleanup
+///   can never be driven for a run that never delivered.
 ///
 /// The step's parameters are never invented here: the dispatch presents the
 /// committed step's OWN declared params verbatim (branch + `merge_policy` for
-/// the merge, branch + worktree for the cleanup), which the engine's own
-/// `check_step_params`/`revalidate_effect` then validates — the same
-/// production-branch, policy, cleanup-ancestry and dirty-worktree gates as an
-/// operator dispatch. A step already ATTEMPTED stays the operator's: the
-/// caller re-checks the attempt ledger, so a diagnosed tail is never retried.
+/// the merge, branch + worktree for the cleanup, the reviewer binding for the
+/// review), which the engine's own `check_step_params`/`revalidate_effect`
+/// then validates — the same production-branch, policy, cleanup-ancestry,
+/// dirty-worktree and reviewer-identity gates as an operator dispatch. A step
+/// already ATTEMPTED stays the operator's: the caller re-checks the attempt
+/// ledger, so a diagnosed tail is never retried.
 pub fn driver_dispatchable_kind(evidence: &SupervisionEvidence, step: &str, kind: &str) -> bool {
     if AUTONOMOUS_STEP_KINDS.contains(&kind) {
         return true;
     }
-    if !COMMITTED_TAIL_STEP_KINDS.contains(&kind) || evidence.item.is_none() {
+    if evidence.item.is_none() {
+        return false;
+    }
+    if kind == crate::mutation::DELIVERY_STEP_KIND {
+        let Some(capability) = crate::mutation::required_capability(kind) else {
+            return false;
+        };
+        return run_caps(evidence).iter().any(|cap| cap == capability)
+            && declares_reviewer_leg(evidence, step);
+    }
+    if !COMMITTED_TAIL_STEP_KINDS.contains(&kind) {
         return false;
     }
     let Some(capability) = crate::mutation::required_capability(kind) else {
@@ -1976,6 +2002,7 @@ mod tests {
                 .iter()
                 .map(|(id, kind)| (id.to_string(), kind.to_string()))
                 .collect(),
+            reviewer_leg_steps: Vec::new(),
             attempts: attempts
                 .iter()
                 .map(|(step, status, code)| {

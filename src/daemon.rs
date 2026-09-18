@@ -1152,7 +1152,7 @@ fn resolve_run_binding(
 ) -> Result<RunBinding, (String, String)> {
     if !matches!(
         kind,
-        "harness_start" | "prompt" | "collect_outcome" | "cleanup"
+        "harness_start" | "prompt" | "collect_outcome" | "cleanup" | "review_evidence"
     ) {
         return Ok(RunBinding {
             role: None,
@@ -1163,7 +1163,11 @@ fn resolve_run_binding(
         Ok(state) => state,
         Err(message) => return Err(("state.unavailable".to_string(), message)),
     };
-    if matches!(kind, "cleanup" | "collect_outcome") {
+    // Issue #193: a self-dispatching review step runs the run's own reviewer
+    // in the run's lane, so it needs the run's bound implementer session —
+    // and nothing else: the reviewer's role binding is the plan's own
+    // registry-resolved reviewer leg, never the run's implementer role.
+    if matches!(kind, "cleanup" | "collect_outcome" | "review_evidence") {
         let bound = state
             .run_bound_start_step(instance_id)
             .map_err(|err| (err.code.to_string(), err.message))?;
@@ -2230,11 +2234,12 @@ fn method_apply_from(shared: &Arc<Shared>, request: &Request, supervised: bool) 
         );
     }
     let _ = &risk;
-    // Issue #9 AC1 fan-out admission: harness_start/prompt spawn lane work.
-    // Refuse before any intent is journaled when an applicable cap or a
-    // fresh host-resource proof is missing/stale, or when the lane's
-    // declared scope overlaps a concurrent lane in the same repository.
-    if matches!(kind.as_str(), "harness_start" | "prompt")
+    // Issue #9 AC1 fan-out admission: harness_start/prompt spawn lane work,
+    // and so does a self-dispatching review step (issue #193: it starts the
+    // run's own reviewer lane) — the same caps, the same host-resource proof,
+    // the same overlap fence, never a bypass.
+    if (matches!(kind.as_str(), "harness_start" | "prompt")
+        || (kind == "review_evidence" && crate::mutation::declares_reviewer_leg(params)))
         && let Err(response) = admission_gate(shared, request, &plan, &parsed, params)
     {
         return response;
@@ -2726,6 +2731,10 @@ fn method_apply_from(shared: &Arc<Shared>, request: &Request, supervised: bool) 
     } else {
         Vec::new()
     };
+    // Issue #193: the reviewer's OWN written verdict is consumed from the
+    // daemon-owned review root (outside every lane worktree, so a reviewer's
+    // write never dirties the lane the cleanup step must remove).
+    let review_root = shared.paths.state_dir.join("reviews");
     let ctx = crate::mutation::EffectContext {
         plan: &plan,
         step_id: &parsed.step,
@@ -2737,6 +2746,7 @@ fn method_apply_from(shared: &Arc<Shared>, request: &Request, supervised: bool) 
         worktrees_root: &parsed.worktrees_root,
         integration_repo: &parsed.integration_repo,
         archive_root: parsed.archive_root.as_deref(),
+        review_root: Some(review_root.as_path()),
         observed_feature_head: parsed.feature_head.as_deref(),
         observed_integration_base: parsed.integration_base.as_deref(),
         env: &effect_env,
@@ -9562,6 +9572,7 @@ mod tests {
             "acme/widgets",
             "staging",
             "worker",
+            None,
             &[5],
             crate::adapters::ExecutionMode::HerdrPane,
         )
