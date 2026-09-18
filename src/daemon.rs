@@ -400,7 +400,17 @@ pub fn serve(paths: &DaemonPaths) -> Result<(), DaemonError> {
 
     let result = serve_loop(&shared, &listener);
     // Shutdown: cancel and JOIN the supervision driver before the lease is
-    // dropped, so no reconciliation can journal into a closing daemon.
+    // dropped, so no NEW reconciliation can journal into a closing daemon.
+    // Issue #170 N4: the invariant names exactly what is joined and what is
+    // not. The pane-collection worker (`canter-collect`, issue #147) is
+    // DELIBERATELY detached: it must outlive the reconciliation that spawned
+    // it while it waits for the pane worker's settled turn, bounded by the
+    // collection step's own deadline (1800 s default, 3600 s ceiling), and a
+    // join here would hold the daemon's shutdown for that whole window. It
+    // takes no lease (only this path takes and drops the daemon lease) and
+    // writes only transactionally under the state lock, so a process exit
+    // mid-collection leaves its claim in flight for the boot reconciliation
+    // (the modelled ambiguous-claim path) — never a half-written journal.
     shared.supervisor.signal_stop();
     let mut supervisor = supervisor;
     let joined = supervisor.join();
@@ -1390,7 +1400,9 @@ struct DaemonDispatch {
     /// The refused-continuation ladder per run (item 4a of issue #144).
     refusals: Arc<Mutex<std::collections::BTreeMap<String, RefusedDispatch>>>,
     /// Reserve before spawning; the durable claim then fences later ticks.
-    collecting: Arc<Mutex<std::collections::BTreeSet<String>>>,
+    /// Issue #170 N5: keyed by the exact `(run, step)` pair, so a collection
+    /// of one step never fences another step of the same run.
+    collecting: Arc<Mutex<std::collections::BTreeSet<(String, String)>>>,
 }
 
 /// One run's refused-continuation ladder (item 4a of issue #144): the step
@@ -1454,6 +1466,28 @@ impl DaemonDispatch {
     fn note_dispatched(&self, instance_id: &str) {
         if let Ok(mut ladders) = self.refusals.lock() {
             ladders.remove(instance_id);
+        }
+    }
+
+    /// Reserve the `(run, step)` collection slot before the worker thread is
+    /// spawned (issue #170 N5): `false` when that exact pair is already
+    /// collecting, so a second dispatch of the SAME step is answered
+    /// `awaiting <step>` while another step of the same run is never fenced
+    /// by it. The reservation is process-local by design — the durable claim
+    /// journaled by the spawned dispatch is what survives a restart.
+    fn reserve_collection(&self, instance_id: &str, step_id: &str) -> Result<bool, String> {
+        let mut collecting = self
+            .collecting
+            .lock()
+            .map_err(|_| "collection mutex poisoned".to_string())?;
+        Ok(collecting.insert((instance_id.to_string(), step_id.to_string())))
+    }
+
+    /// Release the `(run, step)` collection slot once the spawned collection
+    /// dispatch has resolved (either way: the outcome is durable).
+    fn release_collection(&self, instance_id: &str, step_id: &str) {
+        if let Ok(mut collecting) = self.collecting.lock() {
+            collecting.remove(&(instance_id.to_string(), step_id.to_string()));
         }
     }
 }
@@ -1563,17 +1597,14 @@ impl DaemonDispatch {
             return Err(format!("{code}: {message}"));
         }
         if intent.kind == "collect_outcome" {
-            let mut collecting = self
-                .collecting
-                .lock()
-                .map_err(|_| "collection mutex poisoned")?;
-            if !collecting.insert(intent.instance_id.clone()) {
+            if !self.reserve_collection(&intent.instance_id, &intent.step_id)? {
                 return Ok(format!("awaiting {}", intent.step_id));
             }
             let dispatcher = self.clone();
             let shared = Arc::clone(shared);
             let worker_intent = intent.clone();
             let run = intent.instance_id.clone();
+            let step = intent.step_id.clone();
             let spawn = std::thread::Builder::new()
                 .name("canter-collect".to_string())
                 .spawn(move || {
@@ -1584,13 +1615,11 @@ impl DaemonDispatch {
                         &key,
                         now_unix,
                     );
-                    if let Ok(mut collecting) = dispatcher.collecting.lock() {
-                        collecting.remove(&run);
-                    }
+                    dispatcher.release_collection(&run, &step);
                     shared.wake_supervisor();
                 });
             if let Err(err) = spawn {
-                collecting.remove(&intent.instance_id);
+                self.release_collection(&intent.instance_id, &intent.step_id);
                 return Err(format!("cannot start bounded collection: {err}"));
             }
             return Ok("collection started".to_string());
@@ -9944,6 +9973,45 @@ mod tests {
             dispatch_request_from(&material, "p6-5", Some(&complete_params), "ik_f10-complete")
                 .expect("complete request");
         preflight_apply_request(&complete).expect("contracts-complete continuation");
+    }
+
+    /// Issue #170 N5: the in-memory duplicate-dispatch reservation is keyed by
+    /// the exact `(run, step)` pair. A second dispatch of the SAME step while
+    /// its collection thread is in flight is answered `awaiting <step>`, but
+    /// another step of the SAME run is never fenced by it (the run-keyed
+    /// reservation did exactly that), and neither is another run's step.
+    #[test]
+    fn collection_reservation_is_keyed_by_run_and_step() {
+        let dispatch = DaemonDispatch {
+            shared: std::sync::OnceLock::new(),
+            refusals: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            collecting: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+        };
+        assert!(
+            dispatch.reserve_collection("run-1", "p5-7").unwrap(),
+            "the first dispatch of a (run, step) pair reserves it"
+        );
+        assert!(
+            !dispatch.reserve_collection("run-1", "p5-7").unwrap(),
+            "a second dispatch of the SAME (run, step) is fenced"
+        );
+        assert!(
+            dispatch.reserve_collection("run-1", "p5-8").unwrap(),
+            "another step of the same run is never fenced by it"
+        );
+        assert!(
+            dispatch.reserve_collection("run-2", "p5-7").unwrap(),
+            "another run's same-named step is never fenced by it"
+        );
+        dispatch.release_collection("run-1", "p5-7");
+        assert!(
+            dispatch.reserve_collection("run-1", "p5-7").unwrap(),
+            "a released (run, step) pair reserves again"
+        );
+        assert!(
+            !dispatch.reserve_collection("run-1", "p5-8").unwrap(),
+            "release is keyed too: the sibling step stays reserved"
+        );
     }
 
     #[test]

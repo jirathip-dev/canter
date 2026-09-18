@@ -48,6 +48,15 @@ Normative rules:
   the integration clone points at later. A plan may explicitly declare
   `requires_delta:false` for a legitimate no-op prompt; collection then
   succeeds with equal base/head while still enforcing the bound output branch.
+- A `checkout`/`worktree_create` step whose integration base cannot be
+  proven — an absent or unreadable published `origin` ref — fails with the
+  same typed `effect.merge.failed` the merge step's published-base proof
+  uses (issue #170 N2, accepted shared-code limitation; the message names
+  the lane-base read). A pane-substrate `collect_outcome` whose run never
+  recorded a succeeded `harness_start` bind refuses
+  `refusal.identity.incomplete` instead of evaluating the delta (issue #170
+  N6): the collector verifies the pane against the run's bound session and
+  never invents one — the fail-closed direction is deliberate.
 - The built-in `merge` step declares `merge_policy:"squash"`. `merge_policy`
   is a closed `squash | ff` input and the effect LANDS the certified delivery
   on the integration ref and PUBLISHES it to the integration remote — a

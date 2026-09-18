@@ -3104,6 +3104,18 @@ fn observed_worktree_branch(
     Ok(branch)
 }
 
+/// The collection wait's poll cadence (issue #170 N3): the prompt path's own
+/// 100 ms cadence at the start of the wait.
+const COLLECT_POLL_INTERVAL_MS: u64 = 100;
+/// The collection wait's poll cadence CEILING (issue #170 N3): the cadence
+/// doubles from `COLLECT_POLL_INTERVAL_MS` up to this ceiling, so a worker
+/// that runs for tens of minutes costs a BOUNDED number of Herdr reads (two
+/// subprocess rows each) instead of a continuous two-subprocess poll. With
+/// the default 1800 s collection deadline that is 365 reads (~730 rows),
+/// versus 18,000 reads (~36,000 rows) at the fixed cadence; the step
+/// deadline itself is unchanged.
+const COLLECT_POLL_MAX_INTERVAL_MS: u64 = 5_000;
+
 /// Collect a pane's delivery even while it is live. An empty result needs a
 /// confirmed stop, not a single transient idle/done/blocked read-back.
 fn await_pane_worker(
@@ -3138,7 +3150,8 @@ fn await_pane_worker(
     let start = std::time::Instant::now();
     poll_pane_worker(
         Duration::from_secs(seconds),
-        Duration::from_millis(100),
+        Duration::from_millis(COLLECT_POLL_INTERVAL_MS),
+        Duration::from_millis(COLLECT_POLL_MAX_INTERVAL_MS),
         |remaining| crate::adapters::observe_pane_worker(&session, worktree, remaining, ctx.env),
         || collect_worktree_outcome(ctx, inputs, worktree),
         || start.elapsed(),
@@ -3162,15 +3175,22 @@ fn await_pane_worker(
 /// `effect.worker_timeout`. A collection failure that is not emptiness (a
 /// refusal of the collection itself, e.g. a diverged or mis-branched lane)
 /// certifies no head and stays actionable without waiting for the stop.
+///
+/// Issue #170 N3: the poll cadence is BOUNDED — it starts at
+/// `initial_interval` and doubles towards `max_interval`, so a worker that
+/// runs for tens of minutes costs a bounded number of reads instead of a
+/// continuous two-subprocess poll. The step deadline is unchanged.
 fn poll_pane_worker(
     deadline: Duration,
-    interval: Duration,
+    initial_interval: Duration,
+    max_interval: Duration,
     mut observe: impl FnMut(Duration) -> Result<String, crate::adapters::ProcessFailure>,
     mut collect: impl FnMut() -> EffectOutcome,
     elapsed: impl Fn() -> Duration,
     mut sleep: impl FnMut(Duration),
 ) -> Result<EffectOutcome, EffectOutcome> {
     let seconds = deadline.as_secs();
+    let mut interval = initial_interval;
     let mut previous_stop = None;
     loop {
         let remaining = deadline.saturating_sub(elapsed());
@@ -3214,6 +3234,11 @@ fn poll_pane_worker(
         }
         previous_stop = stopped.then_some(state);
         sleep(interval.min(deadline.saturating_sub(elapsed())));
+        // Issue #170 N3: the cadence backs off towards its ceiling, so a
+        // worker that runs for tens of minutes costs a BOUNDED number of
+        // reads (two Herdr rows each), never a continuous poll. The cadence
+        // never falls below its initial value and the deadline is unchanged.
+        interval = (interval * 2).min(max_interval.max(interval));
     }
 }
 
@@ -5401,6 +5426,7 @@ mod tests {
         let outcome = poll_pane_worker(
             Duration::from_millis(7),
             Duration::from_millis(1),
+            Duration::from_millis(1),
             |_| Ok(states.next().expect("bounded reads").to_string()),
             || refusal(code::COLLECT_EMPTY_DELTA, "no committed delta"),
             || elapsed.get(),
@@ -5420,6 +5446,7 @@ mod tests {
         let mut states = ["working", "working", "done", "done"].into_iter();
         let stopped = poll_pane_worker(
             Duration::from_millis(4),
+            Duration::from_millis(1),
             Duration::from_millis(1),
             |remaining| {
                 reads.push(remaining.as_millis());
@@ -5442,6 +5469,7 @@ mod tests {
         elapsed.set(Duration::ZERO);
         let outcome = poll_pane_worker(
             Duration::from_millis(3),
+            Duration::from_millis(2),
             Duration::from_millis(2),
             |remaining| {
                 assert!(reads.len() < 3, "deadline must bound polling");
@@ -5475,6 +5503,7 @@ mod tests {
         let collections = Cell::new(0);
         let outcome = poll_pane_worker(
             Duration::from_millis(6),
+            Duration::from_millis(1),
             Duration::from_millis(1),
             |_| {
                 reads.set(reads.get() + 1);
@@ -5522,6 +5551,7 @@ mod tests {
         let outcome = poll_pane_worker(
             Duration::from_millis(8),
             Duration::from_millis(1),
+            Duration::from_millis(1),
             |_| {
                 reads.set(reads.get() + 1);
                 Ok(if reads.get() <= 3 { "working" } else { "done" }.to_string())
@@ -5563,6 +5593,7 @@ mod tests {
             let outcome = poll_pane_worker(
                 Duration::from_millis(3),
                 Duration::from_millis(1),
+                Duration::from_millis(1),
                 |_| {
                     reads.set(reads.get() + 1);
                     Ok(state.to_string())
@@ -5581,6 +5612,43 @@ mod tests {
             );
             assert_eq!(elapsed.get(), Duration::from_millis(1));
         }
+    }
+
+    /// Issue #170 N3: the collection wait's poll rate is BOUNDED — the
+    /// cadence doubles from the prompt path's own 100 ms up to a documented
+    /// ceiling — so a worker that runs for tens of minutes costs a bounded
+    /// number of Herdr reads (two subprocess rows each) instead of a
+    /// continuous two-subprocess poll. The step deadline is unchanged. This
+    /// test pins the EXACT poll count over the default 1800 s collection
+    /// deadline; an unbounded (fixed-cadence) poll would read 18,000 times
+    /// and fails it.
+    #[test]
+    fn collection_poll_count_over_the_full_deadline_is_bounded_and_pinned() {
+        use std::cell::Cell;
+        let elapsed = Cell::new(Duration::ZERO);
+        let reads = Cell::new(0u32);
+        let deadline = Duration::from_secs(1800);
+        let outcome = poll_pane_worker(
+            deadline,
+            Duration::from_millis(COLLECT_POLL_INTERVAL_MS),
+            Duration::from_millis(COLLECT_POLL_MAX_INTERVAL_MS),
+            |_| {
+                reads.set(reads.get() + 1);
+                Ok("working".to_string())
+            },
+            || refusal(code::COLLECT_EMPTY_DELTA, "no committed delta"),
+            || elapsed.get(),
+            |wait| elapsed.set(elapsed.get() + wait),
+        )
+        .expect_err("a live worker at the deadline parks as worker_timeout");
+        assert_eq!(outcome.status, "ambiguous");
+        assert_eq!(outcome.code.as_deref(), Some(code::WORKER_TIMEOUT));
+        assert_eq!(elapsed.get(), deadline, "the step deadline is unchanged");
+        assert_eq!(
+            reads.get(),
+            365,
+            "100 ms doubling to the 5 s ceiling over 1800 s: 365 reads, not 18,000"
+        );
     }
 
     // Issue #92 F1: the documented per-effect deadline table, the reviewed

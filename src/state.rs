@@ -11679,12 +11679,14 @@ pub struct SupervisionRow {
     pub progress_source: String,
     /// Reconciliations performed (the coalescing observable).
     pub checks: i64,
-    /// Continuation reports opened (one per absence window, never one per
-    /// check).
+    /// Continuation reports opened (one per eligible window, never one per
+    /// check; issue #170 N1: any eligible check class opens/holds the window,
+    /// not only the absence/progress-timeout one — see the canonical
+    /// contract).
     pub continuation_reports: i64,
-    /// Whether an absence window is currently open.
+    /// Whether an eligible window is currently open.
     pub continuation_open: bool,
-    /// When the open absence window started ('' when none).
+    /// When the open eligible window started ('' when none).
     pub continuation_since: String,
     /// Last check time (RFC3339 UTC; '' until the first check).
     pub last_check_at: String,
@@ -13528,7 +13530,10 @@ impl State {
                 row.progress_source.clone(),
             )
         };
-        // One continuation report per absence window.
+        // One continuation report per eligible window (issue #170 N1: any
+        // eligible check class opens/holds the window — an ordinary
+        // dispatchable frontier, an in-flight collection wait, or the
+        // progress-timeout case; see the canonical contract).
         let (reports, open, since) = if plan.eligible && !row.continuation_open {
             (row.continuation_reports + 1, true, plan.at.clone())
         } else if plan.eligible {

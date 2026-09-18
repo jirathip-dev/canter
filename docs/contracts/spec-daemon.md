@@ -547,6 +547,18 @@ clears a repository/fleet-level hold or bypasses a gate.
   (`state`/`since`/`reports`) — a read can therefore never launder a
   committed effect, and the surface never presents an observation as if it
   were the record.
+- **Continuation window scope (issue #170 N1, accepted limitation)**: the
+  durable window is keyed on the check's recorded ELIGIBILITY, not on the
+  absence/progress-timeout class alone. Any committed eligible check opens
+  or holds it — an in-flight collection wait (`waiting-workers`, issue #147),
+  an ordinary dispatchable frontier (`healthy` with
+  `supervision.dispatch.next_step`, issue #152) and the progress-timeout
+  `continuation-eligible` case — so `continuation.reports` counts
+  eligible-check episodes (one report per window, never one per check) and
+  the TUI's "continuation window: OPEN (N reports)" line renders that same
+  counter. It is a window/report dedup counter, not a stall counter. No
+  safety impact: a second dispatch is still fenced by the in-flight claim
+  (`dispatch_intent` gates on `evidence.in_flight`).
 - A run with NO recorded progress observation yet (a fresh arm: `progress_at`
   empty, or an unreadable instant) is **held** — class `unknown`, reason
   `supervision.progress_unobserved`, `eligible:false` — never eligible: an
@@ -624,7 +636,19 @@ clears a repository/fleet-level hold or bypasses a gate.
   without waiting for the stop. Exhausting the collection step's deadline
   records `effect.worker_timeout` as ambiguous and parks as `worker-timeout`
   / `supervision.worker_timeout`, ineligible. Neither a waiting claim nor a
-  timed-out attempt is re-dispatched by the supervisor.
+  timed-out attempt is re-dispatched by the supervisor. A pane-substrate
+  collection whose run never recorded a succeeded `harness_start` bind
+  refuses `refusal.identity.incomplete` instead of evaluating the delta
+  (issue #170 N6): the run's session identity is never invented, so there is
+  no lane binding to verify the pane against. The collection runs on its own
+  DETACHED thread: it must outlive the reconciliation that spawned it (up to
+  the collection step's deadline — 1800 s default, 3600 s ceiling), it takes
+  no daemon lease and it writes only transactionally under the state lock,
+  so a daemon exit mid-collection leaves its claim in flight for the boot
+  reconciliation (the modelled ambiguous-claim path) and never a
+  half-written journal. The shutdown JOIN invariant covers the supervision
+  driver itself — cancelled and joined before the daemon lease is dropped so
+  no NEW reconciliation can journal into a closing daemon (issue #170 N4).
 - **Moved certified head (issue #200)**: a review step whose recorded
   diagnosis is `refusal.evidence.verdict_stale` — the lane checkout is no
   longer the run's certified head — is an IMPOSSIBLE step, not a retryable
@@ -639,7 +663,13 @@ clears a repository/fleet-level hold or bypasses a gate.
   observed integration base, or resolve the published origin ref when no
   observation exists yet; never the local branch. Missing objects are fetched
   without moving that frozen base. Existing lane directories refuse typed
-  (`refusal.worktree.exists`); they are not reset or silently reused.
+  (`refusal.worktree.exists`); they are not reset or silently reused. An
+  unprovable published base — an absent or unreadable `origin` ref — fails
+  with the same typed `effect.merge.failed` the merge step's published-base
+  proof uses, and the message names the lane-base read (issue #170 N2,
+  accepted shared-code limitation: one fail-closed proof, and the code keeps
+  its merge-flavoured name on this route); no unprovable base is ever
+  certified.
 - **Diagnosed frontier (issue #148)**: the classification half of the same
   honesty. The frontier step's own LATEST recorded attempt is read from the
   run's claim/outcome material, and when it is not `succeeded` the run is
