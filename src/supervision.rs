@@ -782,7 +782,18 @@ pub fn dispatch_intent(
         }
         Some((_, status, code))
             if matches!(status.as_str(), "failed" | "refused" | "ambiguous")
+                // A worker timeout is a wait/park, never a retryable failure.
                 && code != crate::mutation::code::WORKER_TIMEOUT
+                // Issue #200: a review step whose recorded diagnosis is
+                // `refusal.evidence.verdict_stale` refuses because a head
+                // binding MOVED (the lane checkout is no longer the certified
+                // head). The certificate is a recorded fact and the checkout's
+                // movement is external, so a re-dispatch is guaranteed to
+                // refuse identically: the step is impossible, not retryable.
+                // It parks the frontier typed (the recorded code) with the
+                // bounded retries UNSPENT, instead of burning them on a step
+                // that can never succeed.
+                && code != crate::mutation::code::VERDICT_STALE
                 && newest_verdict(evidence) != "fail"
                 && evidence
                     .retries
@@ -2415,6 +2426,78 @@ mod tests {
                 "a diagnosed frontier is never reported eligible"
             );
         }
+    }
+
+    /// Issue #200 (AC2): a review frontier whose recorded diagnosis is
+    /// `refusal.evidence.verdict_stale` — the lane checkout moved past the
+    /// certified head — is an IMPOSSIBLE step, not a retryable one. The
+    /// certificate is a recorded fact and the checkout's movement is
+    /// external, so a re-dispatch refuses identically every time: the
+    /// frontier parks typed (needs-attention, the recorded code, the code as
+    /// the detail) with the bounded retries UNSPENT, instead of burning the
+    /// whole budget on it. The same frontier shape with a retryable diagnosis
+    /// still takes its bounded retry (#179/#180 unchanged).
+    #[test]
+    fn a_moved_head_diagnosis_parks_the_frontier_without_burning_a_bounded_retry() {
+        let state = temp_state("moved-head-park");
+        let digest = "d".repeat(64);
+        let run = "run-85a856d6b9e9e7d0";
+        let policy = Policy {
+            check_interval_secs: 10,
+            progress_timeout_secs: 60,
+        };
+        let at = "2026-09-18T13:04:41Z";
+        let now_unix = time::unix_from_rfc3339(at).expect("instant");
+        state
+            .arm_supervision_for_test(run, "armed", &digest, "merge", policy, at)
+            .expect("arm");
+        let row = state.supervision_by_id(run).expect("read").expect("row");
+        let steps = [("p5", "collect_outcome"), ("p6", "review_evidence")];
+        let scene = |code: &str| {
+            let mut evidence = evidence_for(
+                run_row(run),
+                Some(&digest),
+                &steps,
+                &[("p5", "succeeded", ""), ("p6", "refused", code)],
+                at,
+            );
+            // The frontier is the run's OWN committed review step: admitted
+            // member, `review` cap, declared reviewer leg.
+            evidence.run.caps = "[\"review\"]".to_string();
+            evidence.reviewer_leg_steps = vec!["p6".to_string()];
+            evidence.item = Some(crate::state::QueueItemRef {
+                submission_id: "qs_0123456789abcdef".to_string(),
+                ordinal: 0,
+                work_item: "wi_4aabf3ad5bea87b0".to_string(),
+                issue_number: 132,
+                status: "admitted".to_string(),
+            });
+            evidence
+        };
+        let moved = scene(crate::mutation::code::VERDICT_STALE);
+        assert!(
+            driver_dispatchable_kind(&moved, "p6", "review_evidence"),
+            "the fixture frontier is a genuinely dispatchable review step"
+        );
+        assert!(
+            dispatch_intent(&row, &moved).is_none(),
+            "an impossible step is never re-dispatched"
+        );
+        let verdict = classify(&moved, &digest, &policy, now_unix);
+        assert_eq!(verdict.class, "needs-attention");
+        assert_eq!(verdict.reason, codes::STEP_DIAGNOSED);
+        assert_eq!(verdict.detail, crate::mutation::code::VERDICT_STALE);
+        assert!(!verdict.eligible, "the parked frontier is never eligible");
+        assert!(
+            moved.retries.is_empty(),
+            "the bounded retries stay unspent on an impossible step"
+        );
+        let retryable = scene("refusal.worktree.exists");
+        assert_eq!(
+            dispatch_intent(&row, &retryable).map(|intent| intent.step_id),
+            Some("p6".to_string()),
+            "a retryable diagnosis of the same frontier still retries"
+        );
     }
 
     /// Issue #148 item 4: the classification half of the MEASURED #147 defect.

@@ -479,11 +479,26 @@ fn a_review_step_never_starts_a_reviewer_on_a_moved_head() {
     let params = reviewer_leg_params(&reviewer_binding_doc(), 5);
     let plan = plan_with_review_step(params.clone());
     let other = "d".repeat(40);
-    let outcome = run_review_step(&fixture, &plan, &params, &other, &fixture.base);
-    assert_eq!(outcome.status, "refused", "{outcome:?}");
-    assert_eq!(
-        outcome.code.as_deref(),
-        Some(canter::mutation::code::VERDICT_STALE)
+    // Issue #200: the refusal is DETERMINISTIC and typed — the certificate is
+    // a recorded fact and the checkout's movement is external, so the SAME
+    // moved head refuses identically on every dispatch. That determinism is
+    // what makes a re-dispatch of this step impossible (see supervision's
+    // parked-frontier rule) instead of a retryable failure.
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let outcome = run_review_step(&fixture, &plan, &params, &other, &fixture.base);
+        assert_eq!(outcome.status, "refused", "{outcome:?}");
+        assert_eq!(
+            outcome.code.as_deref(),
+            Some(canter::mutation::code::VERDICT_STALE)
+        );
+        seen.push((outcome.status, outcome.code, outcome.message.clone()));
+    }
+    assert_eq!(seen[0], seen[1], "the same moved head refuses identically");
+    let message = seen[0].2.clone().unwrap_or_default();
+    assert!(
+        message.contains(&fixture.head) && message.contains(&other),
+        "the refusal names the observed checkout head and the certified head: {message}"
     );
     assert!(
         !fixture.fake_argv().exists(),

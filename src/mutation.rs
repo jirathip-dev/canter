@@ -3149,6 +3149,19 @@ fn await_pane_worker(
 
 /// The production loop, with explicit deadline, cadence and clock/wait seams.
 /// Tests advance a local clock; no environment override can shorten a real run.
+///
+/// Issue #200: a delta head is certified only at a GENUINELY SETTLED pane
+/// turn — the stop state must be confirmed across two consecutive read-backs,
+/// exactly like the empty-delta path — because a head read while the worker is
+/// still mid-turn can still move. The measured p4→p5 boundary certified
+/// `38fb0929` while the same worker was still mid-turn and committed
+/// `0d5e851b` 26 s later, wedging the spine on `refusal.evidence.verdict_stale`
+/// forever. A delivery collected while the worker is still live, like an empty
+/// delta while the worker is still live, therefore stays a WAIT/re-check until
+/// the stop is confirmed or the step deadline parks the collection as
+/// `effect.worker_timeout`. A collection failure that is not emptiness (a
+/// refusal of the collection itself, e.g. a diverged or mis-branched lane)
+/// certifies no head and stays actionable without waiting for the stop.
 fn poll_pane_worker(
     deadline: Duration,
     interval: Duration,
@@ -3187,20 +3200,16 @@ fn poll_pane_worker(
             }
         };
         let outcome = collect();
-        let empty = outcome.code.as_deref() == Some(code::COLLECT_EMPTY_DELTA)
-            || (outcome.status == "succeeded"
-                && outcome
-                    .result
-                    .get("changed_files")
-                    .and_then(Val::as_array)
-                    .is_some_and(Vec::is_empty));
-        // A committed delivery (or a different collection failure) is actionable
-        // without waiting for the worker to exit. Only emptiness needs a stop.
-        if !empty {
-            return Ok(outcome);
-        }
+        // A stop report is a settled turn only once the SAME stop state is
+        // read back again: a worker may report idle/blocked between tool calls
+        // while its turn — and the head it commits — keeps moving.
         let stopped = matches!(state.as_str(), "idle" | "done" | "blocked");
         if stopped && previous_stop.as_deref() == Some(state.as_str()) {
+            return Ok(outcome);
+        }
+        if outcome.status != "succeeded"
+            && outcome.code.as_deref() != Some(code::COLLECT_EMPTY_DELTA)
+        {
             return Ok(outcome);
         }
         previous_stop = stopped.then_some(state);
@@ -5454,22 +5463,26 @@ mod tests {
         assert_eq!(outcome.code.as_deref(), Some(code::WORKER_TIMEOUT));
     }
 
+    /// Issue #200: a delivery read while the worker is still live is a
+    /// WAIT/re-check, never a certification — the unchanged #147 rule for an
+    /// empty delta now holds for a delivery too — and the delivery is still
+    /// collected once the SAME stop state settles across the read-back.
     #[test]
-    fn collection_delivery_while_live_is_collected() {
+    fn collection_delivery_while_live_waits_and_is_collected_once_settled() {
         use std::cell::Cell;
         let elapsed = Cell::new(Duration::ZERO);
         let reads = Cell::new(0);
-        let mut collections = 0;
+        let collections = Cell::new(0);
         let outcome = poll_pane_worker(
-            Duration::from_millis(3),
+            Duration::from_millis(6),
             Duration::from_millis(1),
             |_| {
                 reads.set(reads.get() + 1);
-                Ok("working".to_string())
+                Ok(if reads.get() <= 3 { "working" } else { "idle" }.to_string())
             },
             || {
-                collections += 1;
-                if collections < 3 {
+                collections.set(collections.get() + 1);
+                if collections.get() < 3 {
                     refusal(code::COLLECT_EMPTY_DELTA, "no committed delta")
                 } else {
                     ok(object(vec![(
@@ -5481,15 +5494,64 @@ mod tests {
             || elapsed.get(),
             |wait| elapsed.set(elapsed.get() + wait),
         )
-        .expect("delivery does not require a stopped worker");
+        .expect("a delivery is collected at the settled turn");
         assert_eq!(outcome.status, "succeeded");
         assert_eq!(
             outcome.result.get("changed_files"),
             Some(&Val::Arr(vec![string("delivery.txt")]))
         );
-        assert_eq!(reads.get(), 3);
-        assert_eq!(collections, 3);
-        assert_eq!(elapsed.get(), Duration::from_millis(2));
+        assert_eq!(
+            reads.get(),
+            5,
+            "the delivery read while working (read 3) never certifies"
+        );
+        assert_eq!(collections.get(), 5, "no deadline is consumed by waiting");
+        assert_eq!(elapsed.get(), Duration::from_millis(4));
+    }
+
+    /// Issue #200 (a): a worker that commits AFTER the outcome is read (the
+    /// measured p4→p5 boundary: the head `38fb0929` was certified and the SAME
+    /// worker committed `0d5e851b` 26 s later) must yield the FINAL settled
+    /// head, never the head read first.
+    #[test]
+    fn collection_certifies_the_final_settled_head_never_an_earlier_read() {
+        use std::cell::Cell;
+        let elapsed = Cell::new(Duration::ZERO);
+        let reads = Cell::new(0);
+        let mut heads: Vec<String> = Vec::new();
+        let outcome = poll_pane_worker(
+            Duration::from_millis(8),
+            Duration::from_millis(1),
+            |_| {
+                reads.set(reads.get() + 1);
+                Ok(if reads.get() <= 3 { "working" } else { "done" }.to_string())
+            },
+            || {
+                // Head A is read while the worker is still mid-turn; the
+                // worker's later commit is head B at its settled turn.
+                let head = if reads.get() <= 3 { "a" } else { "b" }.repeat(40);
+                heads.push(head.clone());
+                ok(object(vec![
+                    ("head", string(&head)),
+                    ("changed_files", Val::Arr(vec![string("delivery.txt")])),
+                ]))
+            },
+            || elapsed.get(),
+            |wait| elapsed.set(elapsed.get() + wait),
+        )
+        .expect("the settled turn certifies the delivery");
+        assert_eq!(outcome.status, "succeeded");
+        assert_eq!(
+            outcome.result.get("head"),
+            Some(&string(&"b".repeat(40))),
+            "the certified head is the final settled head"
+        );
+        assert!(
+            heads.contains(&"a".repeat(40)),
+            "the earlier head was genuinely read while the worker was still live"
+        );
+        assert_eq!(reads.get(), 5, "a live read is never a certification");
+        assert_eq!(elapsed.get(), Duration::from_millis(4));
     }
 
     #[test]

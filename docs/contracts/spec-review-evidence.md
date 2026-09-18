@@ -92,7 +92,10 @@ The leg runs, in order:
 2. the lane worktree the reviewed plan binds must be AT the run's certified
    `observed.feature_head`: a moved checkout refuses
    (`refusal.evidence.verdict_stale`) rather than reviewing a head nobody
-   certified;
+   certified. That refusal is deterministic — the certificate is a recorded
+   fact and the checkout's movement is external — so a re-dispatch can never
+   repair it: the frontier parks typed with the run's bounded retries unspent
+   (issue #200) instead of retrying an impossible step;
 3. the reviewer is started through the SAME role-bound adapter the rest of the
    spine uses (`Start`, then the bounded review brief as `Prompt`), in the
    run's lane, under the registry-resolved binding, with the reviewer lane
