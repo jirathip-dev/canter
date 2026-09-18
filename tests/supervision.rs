@@ -3570,6 +3570,7 @@ fn collection_invalid_base_refuses_before_any_worker_poll() {
             role: None,
             session: Some(&session),
             archive_root: None,
+            review_root: None,
             retired_run_ids: &[],
         })
     };
@@ -4463,4 +4464,271 @@ fn the_prompt_runs_the_runs_declared_role_binding_and_continues_its_session() {
     );
 
     shutdown(daemon);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #193: a committed review step that declares the reviewer LEG is the
+// run's OWN dispatch — the driver reaches it with no operator or orchestrator
+// lane dispatch — and a review step that declares none is untouched.
+// ---------------------------------------------------------------------------
+
+/// The registry-resolved reviewer binding of the reviewer-leg spine (issue
+/// #193): the key/provider/model come from the fleet registry row, never from
+/// a literal in the engine.
+fn reviewer_leg_binding_doc() -> Val {
+    let mut binding = ProfileBinding {
+        key: "lane-rev".to_string(),
+        kind: "hermes".to_string(),
+        provider: "provider-rev".to_string(),
+        model: "model-rev".to_string(),
+        fallbacks: Vec::new(),
+        configured_limits: Vec::new(),
+        introspection: false,
+        secrets: Vec::new(),
+        revision: String::new(),
+    };
+    binding.revision = binding.revision_of();
+    binding.to_doc()
+}
+
+/// The committed review step of the reviewer-leg spine: the registry role key
+/// and the binding document the reviewed plan binds.
+fn reviewer_leg_step() -> qp::PlannedStep {
+    qp::PlannedStep {
+        id: "r1".to_string(),
+        kind: "review_evidence".to_string(),
+        params: Some(object(vec![
+            ("execution", string("herdr")),
+            ("harness_key", string("lane-rev")),
+            ("kind", string("hermes")),
+            ("reviewer_profile", reviewer_leg_binding_doc()),
+            ("worktree", string("issues-5")),
+        ])),
+    }
+}
+
+/// The reviewed request with the review step under test (`r1`) and the
+/// `review` capability its own approved boundary carries.
+fn request_with_review_step(review: qp::PlannedStep) -> qp::QueueRequest {
+    let mut request = request_with(vec![selected("#5", REV_A)]);
+    request.boundary.caps.push("review".to_string());
+    request.boundary.caps.push("cleanup".to_string());
+    request.steps.push(review);
+    // The committed tail the delivering run must still reach: its own merge,
+    // then the cleanup of its lane worktree.
+    request.steps.push(qp::PlannedStep {
+        id: "m1".to_string(),
+        kind: "merge".to_string(),
+        params: Some(object(vec![
+            ("branch", string("issue-5")),
+            ("merge_policy", string("squash")),
+        ])),
+    });
+    request.steps.push(qp::PlannedStep {
+        id: "c1".to_string(),
+        kind: "cleanup".to_string(),
+        params: Some(object(vec![
+            ("branch", string("issue-5")),
+            ("worktree", string("issues-5")),
+        ])),
+    });
+    request
+}
+
+/// Seed the issue grant WITH the `review` capability: the run's own approved
+/// caps are what the engine revalidates, so the reviewer leg never widens one.
+fn seed_review_grant(state: &State, grant_id: &str, number: i64) {
+    let epoch = state.current_epoch().expect("epoch");
+    let mut grant = grant_doc_at(grant_id, number, REV_A, epoch);
+    match &mut grant {
+        Val::Obj(fields) => match fields.get_mut("caps") {
+            Some(Val::Arr(caps)) => {
+                caps.push(string("review"));
+                caps.push(string("cleanup"));
+            }
+            _ => unreachable!("the grant document carries a caps array"),
+        },
+        _ => unreachable!("the grant document is an object"),
+    }
+    state.issue_grant(&grant).expect("issue grant");
+}
+
+/// Submit one review-step request and return its admitted run.
+fn submit_review_step_run(state: &State, key: &str, review: qp::PlannedStep) -> String {
+    let (bound, digest) = render_bound(state, &request_with_review_step(review));
+    let plan = submission_plan_for(
+        state,
+        &idem_key(key),
+        &bound,
+        &digest,
+        "gr_0000000000000095",
+        Some(supervision::Authorization {
+            desired: "armed".to_string(),
+            policy: supervision::Policy {
+                check_interval_secs: 10,
+                progress_timeout_secs: 60,
+            },
+        }),
+    );
+    let (_, items) = state.submit_queue_run(&plan).expect("submit");
+    items
+        .iter()
+        .find(|item| item.issue_number == 5)
+        .and_then(|item| item.instance_id.clone())
+        .expect("issue 5 admitted")
+}
+
+#[test]
+fn a_committed_review_step_that_declares_the_reviewer_leg_is_the_runs_own_dispatch() {
+    let fixture = Fixture::new("reviewer-leg");
+    let state = fixture.open();
+    seed_review_grant(&state, "gr_0000000000000095", 5);
+    let run = submit_review_step_run(&state, "reviewer-leg", reviewer_leg_step());
+    // The first dispatch is the caller's (it holds the topology); everything
+    // after it is the driver's own. Recording p1 with the run's real
+    // dispatch topology is exactly the state a live run reaches the review
+    // frontier in.
+    seed_attempt_full(&state, &run, "p1", "ik_193-p1", "succeeded", "", true);
+
+    let row = state
+        .supervision_by_id(&run)
+        .expect("query row")
+        .expect("supervision row");
+    let evidence = state
+        .supervision_evidence(&run)
+        .expect("query evidence")
+        .expect("evidence");
+    assert_eq!(
+        evidence.reviewer_leg_steps,
+        vec!["r1".to_string()],
+        "the committed spine declares the reviewer leg"
+    );
+    // The DRIVER's own producer names the review step: the run dispatches its
+    // own reviewer, with no operator and no orchestrator lane dispatch.
+    let intent = dispatch_intent_of(&state, &run).expect("the driver dispatches the review step");
+    assert_eq!(
+        (intent.step_id.as_str(), intent.kind.as_str()),
+        ("r1", "review_evidence")
+    );
+    let policy = supervision::Policy {
+        check_interval_secs: row.check_interval_secs,
+        progress_timeout_secs: row.progress_timeout_secs,
+    };
+    let verdict = supervision::classify(
+        &evidence,
+        &row.authorization_digest,
+        &policy,
+        canter::time::unix_now(),
+    );
+    assert_eq!(
+        verdict.class, "healthy",
+        "the review frontier is the run's own work, not a wait: {verdict:?}"
+    );
+    assert_eq!(verdict.reason, supervision::codes::DISPATCH);
+    assert_eq!(verdict.detail, "r1");
+    assert!(verdict.eligible);
+    assert_ne!(verdict.reason, supervision::codes::WAITING_APPROVAL);
+
+    // The run then PROCEEDS on its own committed spine: with the review
+    // evidence the reviewer wrote recorded at the certified head, the driver's
+    // frontier is the committed merge, and after it the committed cleanup —
+    // still with no operator and no orchestrator lane dispatch. (The merge and
+    // cleanup EFFECTS are the unchanged #152 tail path; what is witnessed here
+    // is that the run reaches them by itself.)
+    let head = "a".repeat(40);
+    let base = "b".repeat(40);
+    state
+        .record_evidence(
+            &run,
+            REPO,
+            &head,
+            &base,
+            WORKFLOW_HASH,
+            POLICY_HASH,
+            "pass",
+            "rev-5-r1",
+            &Val::parse_json(r#"[{"name":"exact-head-review","status":"passed"}]"#)
+                .expect("checks"),
+        )
+        .expect("the reviewer's verdict is recorded as the run's evidence");
+    seed_attempt_full(&state, &run, "r1", "ik_193-r1", "succeeded", "", true);
+    let merge =
+        dispatch_intent_of(&state, &run).expect("the committed merge is the run's own next step");
+    assert_eq!(
+        (merge.step_id.as_str(), merge.kind.as_str()),
+        ("m1", "merge")
+    );
+    seed_attempt_full(&state, &run, "m1", "ik_193-m1", "succeeded", "", true);
+    let cleanup =
+        dispatch_intent_of(&state, &run).expect("the committed cleanup is the run's own last step");
+    assert_eq!(
+        (cleanup.step_id.as_str(), cleanup.kind.as_str()),
+        ("c1", "cleanup")
+    );
+
+    // NOT without the run's own approved capability for the kind: no cap is
+    // widened by the reviewer leg.
+    let mut without_review_cap = state
+        .supervision_evidence(&run)
+        .expect("query evidence")
+        .expect("evidence");
+    without_review_cap.run.caps =
+        "[\"read\",\"worktree\",\"spawn\",\"prompt\",\"merge\"]".to_string();
+    assert!(!supervision::driver_dispatchable_kind(
+        &without_review_cap,
+        "r1",
+        "review_evidence"
+    ));
+    assert!(!supervision::driver_dispatchable_kind(
+        &evidence,
+        "p9",
+        "review_evidence"
+    ));
+}
+
+#[test]
+fn a_review_step_that_declares_no_reviewer_leg_stays_the_operators_own_path() {
+    let fixture = Fixture::new("reviewer-leg-absent");
+    let state = fixture.open();
+    seed_review_grant(&state, "gr_0000000000000095", 5);
+    // The operator's own shape: the review step presents its facts (or none).
+    let run = submit_review_step_run(
+        &state,
+        "reviewer-leg-absent",
+        qp::PlannedStep {
+            id: "r1".to_string(),
+            kind: "review_evidence".to_string(),
+            params: Some(object(vec![])),
+        },
+    );
+    seed_attempt_full(&state, &run, "p1", "ik_193-p1-off", "succeeded", "", true);
+    let row = state
+        .supervision_by_id(&run)
+        .expect("query row")
+        .expect("supervision row");
+    let evidence = state
+        .supervision_evidence(&run)
+        .expect("query evidence")
+        .expect("evidence");
+    assert!(
+        evidence.reviewer_leg_steps.is_empty(),
+        "no step of this spine self-dispatches a reviewer"
+    );
+    assert_eq!(dispatch_intent_of(&state, &run), None);
+    let policy = supervision::Policy {
+        check_interval_secs: row.check_interval_secs,
+        progress_timeout_secs: row.progress_timeout_secs,
+    };
+    let verdict = supervision::classify(
+        &evidence,
+        &row.authorization_digest,
+        &policy,
+        canter::time::unix_now(),
+    );
+    assert_eq!(
+        verdict.class, "waiting-approval",
+        "a review step with no reviewer leg is exactly as it was: {verdict:?}"
+    );
+    assert_eq!(verdict.reason, supervision::codes::WAITING_APPROVAL);
+    assert!(!verdict.eligible);
 }

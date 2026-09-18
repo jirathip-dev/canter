@@ -63,3 +63,68 @@ Normative rules:
 
 Accept: `evidence.valid.json` (all four bindings + two passed checks).
 Refuse: unknown check status, unknown version.
+
+## Self-dispatching review step (issue #193)
+
+A `review_evidence` step (p6) has two shapes, and its OWN committed params
+declare which one:
+
+- **presented facts** (`reviewer`, `implementer`, `verdict`, `checks`): the
+  operator's own dispatch path, unchanged — the engine records exactly what
+  the step presents and runs nothing;
+- **the reviewer leg** (`harness_key` + `reviewer_profile` + `worktree`, with
+  the optional `lane_round` and `deadline_secs`): the run dispatches its OWN
+  reviewer. `params.reviewer_profile` is the `hf-profile-binding/v1` document
+  the **fleet registry** resolved for that role key (`canter queue preview
+  --reviewer-harness KEY` resolves the configured `harness.<key>` row), so the
+  reviewer's kind, provider and model are configuration — never a literal in
+  the engine, and never a step-param default. A step that declares both shapes
+  refuses (`refusal.request.malformed`), and a step that declares neither is
+  refused exactly as before: the engine never invents a reviewer.
+
+The leg runs, in order:
+
+1. the run's own bound implementer session is resolved from durable state
+   (a run that bound none refuses `refusal.session.unbound`); the reviewer's
+   session identity is DERIVED from it (domain-separated, one per
+   `lane_round`), so it is never caller-supplied and can never be the
+   implementer's own session (`refusal.evidence.reviewer_not_distinct`);
+2. the lane worktree the reviewed plan binds must be AT the run's certified
+   `observed.feature_head`: a moved checkout refuses
+   (`refusal.evidence.verdict_stale`) rather than reviewing a head nobody
+   certified;
+3. the reviewer is started through the SAME role-bound adapter the rest of the
+   spine uses (`Start`, then the bounded review brief as `Prompt`), in the
+   run's lane, under the registry-resolved binding, with the reviewer lane
+   identity (`rev-<issue>-r<round>`) the adapter verifies back;
+4. the engine then consumes the verdict the REVIEWER writes — as one
+   `hf-evidence/v1` object at the daemon-owned verdict path named in the brief
+   (`<state>/reviews/<lane session>-<step id>.json`), outside every lane
+   worktree. Nothing is synthesised: a missing artifact at the deadline is
+   `effect.review_timeout` (ambiguous, parked), and the engine only ever READS
+   that path.
+
+The written verdict must name the exact reviewed sha (`feature_head`), the
+observed `integration_base` when it names one, a closed `verdict`
+(`pass`|`fail`) and a non-empty `checks` list whose statuses are explicit
+`passed`/`failed`. A `pending` check refuses
+(`refusal.evidence.verdict_pending`): a recorded pending check permanently
+strands the tail (`refusal.run.step_done` blocks amendment and
+`evidence_checks_passed()` requires every check `passed`), so it is refused at
+the frontier instead of being recorded. An ill-formed document refuses
+(`refusal.evidence.verdict_malformed`); a document naming another sha refuses
+(`refusal.evidence.verdict_stale`). The other live bindings
+(`workflow_hash`/`policy_hash`) are recorded by the engine from its own live
+state, so a reviewer can neither move them nor strand the tail with a stale
+value.
+
+Supervision (issue #152's rule, extended): the driver dispatches a
+`review_evidence` step only when the run is an admitted member of a committed,
+digest-bound submission, the run's own approved caps carry `review`, and the
+step's OWN committed params declare the reviewer leg. A review step that
+declares no leg is untouched — it stays the operator's own dispatch and is
+classified `waiting-approval` exactly as before, and no cap is widened for
+either shape. The step still requires the `review` capability and phase at
+effect time, the reviewer's identity is still checked distinct, and the
+reviewer's dispatch passes the same fan-out admission gate (`harness_start` /
+`prompt` carry it) — the same caps, host-resource proof and overlap fence.

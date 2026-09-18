@@ -2133,6 +2133,7 @@ fn the_supervisor_dispatch_capability_for_the_committed_tail_is_typed_and_closed
                 .iter()
                 .map(|(id, kind)| (id.to_string(), kind.to_string()))
                 .collect(),
+            reviewer_leg_steps: Vec::new(),
             attempts: vec![
                 ("p1".to_string(), "succeeded".to_string(), String::new()),
                 ("r1".to_string(), "succeeded".to_string(), String::new()),
@@ -2390,6 +2391,7 @@ fn only_a_reviewed_pass_with_green_checks_at_the_run_pins_is_a_delivery() {
             submission_id: Some("qs_0123456789abcdef".to_string()),
             submission_digest: Some("d".repeat(64)),
             steps: vec![("p1".to_string(), "checkout".to_string())],
+            reviewer_leg_steps: Vec::new(),
             attempts: Vec::new(),
             retries: Vec::new(),
             verdicts: Vec::new(),

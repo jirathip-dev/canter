@@ -37,7 +37,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::canonical::{canonical_bytes, sha256_hex};
 use crate::config::adapter_environment;
@@ -174,6 +174,25 @@ pub mod code {
     pub const EVIDENCE_FAILED: &str = "refusal.evidence.failed";
     /// The reviewer is not distinct from the implementer.
     pub const REVIEWER_NOT_DISTINCT: &str = "refusal.evidence.reviewer_not_distinct";
+    /// The review step declares no reviewer role binding (issue #193): the
+    /// engine never invents a reviewer and never defaults a profile.
+    pub const REVIEWER_UNBOUND: &str = "refusal.evidence.reviewer_unbound";
+    /// The reviewer wrote no verdict artifact within the bounded wait
+    /// (issue #193). The frontier is parked; nothing is synthesised.
+    pub const VERDICT_MISSING: &str = "refusal.evidence.verdict_missing";
+    /// The reviewer's written verdict artifact is ill-formed: the engine
+    /// refuses it instead of filling anything in (issue #193).
+    pub const VERDICT_MALFORMED: &str = "refusal.evidence.verdict_malformed";
+    /// The reviewer's written verdict does not name the certified reviewed
+    /// head (or its other bindings moved): never consumed as evidence.
+    pub const VERDICT_STALE: &str = "refusal.evidence.verdict_stale";
+    /// The reviewer's written verdict carries a `pending` check (issue #193):
+    /// a pending check permanently strands the tail, so it is refused at the
+    /// frontier instead of being recorded.
+    pub const VERDICT_PENDING: &str = "refusal.evidence.verdict_pending";
+    /// The bounded wait for the reviewer's own written verdict expired
+    /// (issue #193): a typed outcome, never an unbounded poll.
+    pub const REVIEW_TIMEOUT: &str = "effect.review_timeout";
     /// Issue closure attempted before merge + post-merge verification.
     pub const CLOSURE_PREMATURE: &str = "refusal.closure.premature";
     /// Cleanup refused a dirty worktree.
@@ -1260,6 +1279,11 @@ pub struct EffectContext<'a> {
     /// Daemon-owned archive/salvage root (issue #9 AC7; archive cleanup
     /// steps require it).
     pub archive_root: Option<&'a Path>,
+    /// Daemon-owned review root (issue #193): the directory the reviewer's
+    /// OWN written verdict is consumed from. `None` for a presented plan
+    /// (no daemon owns the review): a self-dispatching `review_evidence`
+    /// step then refuses typed instead of inventing a verdict.
+    pub review_root: Option<&'a Path>,
     /// Lane generations the run ledger RETIRED for this run's repository
     /// issue (issue #190), resolved by the caller from durable state and
     /// never from the substrate: the `harness_start` bind step retires their
@@ -1895,9 +1919,11 @@ pub fn collect_outcome_inputs(
     })
 }
 
-/// The params-caused inputs of `review_evidence`.
+/// The review facts ONE `review_evidence` step presents itself (the operator
+/// dispatch shape: the reviewer's verdict is authored outside the engine and
+/// presented as the step's params).
 #[derive(Clone, Debug)]
-pub struct ReviewEvidenceInputs {
+pub struct PresentedReview {
     /// The reviewer identity.
     pub reviewer: String,
     /// The implementer identity.
@@ -1906,32 +1932,88 @@ pub struct ReviewEvidenceInputs {
     pub verdict: String,
     /// The non-empty named-check list.
     pub checks: Val,
+}
+
+/// The reviewer role ONE self-dispatching `review_evidence` step declares
+/// (issue #193): the role key the reviewed step names and the
+/// `hf-profile-binding/v1` document the FLEET REGISTRY resolved for it
+/// (harness kind + intended provider/model + fallback/limits + revision).
+///
+/// The engine never hardcodes a model, never defaults a profile and never
+/// infers a reviewer: the binding is the reviewed registry resolution the
+/// plan binds, and the step must agree with it.
+#[derive(Clone, Debug)]
+pub struct ReviewerLeg {
+    /// The registry role-binding key (`params.harness_key`).
+    pub key: String,
+    /// The declared bare executable (`''` when absent; `argv` only).
+    pub executable: String,
+    /// The declared closed harness kind.
+    pub kind: String,
+    /// The parsed closed-set kind.
+    pub parsed_kind: crate::adapters::HarnessKind,
+    /// The declared execution substrate.
+    pub execution: crate::adapters::ExecutionMode,
+    /// The registry-resolved binding document.
+    pub profile: crate::config::ProfileBinding,
+    /// The run's lane worktree the reviewer starts in.
+    pub worktree: String,
+    /// The reviewer lane round (positive; default 1).
+    pub round: u64,
+}
+
+/// Whether one step's params declare the self-dispatching reviewer LEG
+/// (issue #193): the registry-resolved reviewer binding the engine dispatches
+/// itself. Params-only and pure, so the daemon's fan-out admission gate and
+/// the supervision predicate read the same ONE fact.
+pub fn declares_reviewer_leg(params: Option<&Val>) -> bool {
+    params
+        .and_then(|params| params.get("reviewer_profile"))
+        .is_some()
+}
+
+/// The two accepted shapes of one `review_evidence` step (issue #193).
+#[derive(Clone, Debug)]
+pub enum ReviewEvidenceShape {
+    /// The step presents the review facts itself; the engine records them
+    /// and never dispatches anything (the operator's own path).
+    Presented(PresentedReview),
+    /// The step declares the reviewer's role binding; the engine dispatches
+    /// the run's own reviewer through the role-bound pane adapter and
+    /// consumes the verdict that reviewer writes. Boxed: the leg carries the
+    /// whole reviewed binding, and a step's shape must not inflate every
+    /// other value of this enum.
+    SelfDispatch(Box<ReviewerLeg>),
+}
+
+/// The params-caused inputs of `review_evidence`.
+#[derive(Clone, Debug)]
+pub struct ReviewEvidenceInputs {
     /// The exact reviewed feature head (request-level read-back).
     pub feature_head: String,
     /// The observed integration base (request-level read-back).
     pub integration_base: String,
+    /// Which of the two shapes this step declares.
+    pub shape: ReviewEvidenceShape,
 }
 
 /// Resolve the params-caused inputs of `review_evidence` (params required;
-/// reviewer/implementer/verdict/checks; the reviewer must differ from the
-/// implementer; both observed read-backs are required and 40-hex).
+/// both observed read-backs required and 40-hex).
+///
+/// The step declares ONE of two shapes:
+/// - `params.reviewer_profile` (with `params.harness_key`, `params.worktree`)
+///   declares the reviewer LEG: the registry-resolved reviewer binding the
+///   engine dispatches itself (issue #193). The presented review facts are
+///   refused alongside it — a step is one shape or the other;
+/// - otherwise the step presents the review facts itself
+///   (reviewer/implementer/verdict/checks; the reviewer must differ from the
+///   implementer).
 pub fn review_evidence_inputs(
     params: Option<&Val>,
     contract: &ParamContract<'_>,
 ) -> Result<ReviewEvidenceInputs, EffectOutcome> {
     let Some(params) = params else {
         return Err(refusal(code::BAD_PARAMS, "review_evidence requires params"));
-    };
-    let reviewer = param_str(Some(params), "reviewer")?.to_string();
-    let implementer = param_str(Some(params), "implementer")?.to_string();
-    let verdict = match param_str(Some(params), "verdict") {
-        Ok(value) if matches!(value, "pass" | "fail") => value.to_string(),
-        _ => {
-            return Err(refusal(
-                code::BAD_PARAMS,
-                "review_evidence verdict must be pass|fail",
-            ));
-        }
     };
     let feature_head = match contract.observed_feature_head {
         Some(value) if is_hex40(value) => value.to_string(),
@@ -1951,24 +2033,102 @@ pub fn review_evidence_inputs(
             ));
         }
     };
-    check_reviewer_distinct(&reviewer, &implementer)
-        .map_err(|err| refusal(err.code, err.message))?;
-    let checks = match params.get("checks") {
-        Some(Val::Arr(items)) if !items.is_empty() => Val::Arr(items.clone()),
-        _ => {
-            return Err(refusal(
-                code::BAD_PARAMS,
-                "review_evidence requires a non-empty checks list",
-            ));
+    let shape = match params.get("reviewer_profile") {
+        Some(doc) => {
+            for key in ["reviewer", "implementer", "verdict", "checks"] {
+                if params.get(key).is_some() {
+                    return Err(refusal(
+                        code::BAD_PARAMS,
+                        format!(
+                            "review_evidence declares both the reviewer leg \
+                             (params.reviewer_profile) and the presented review facts \
+                             (params.{key}); a step declares one shape or the other"
+                        ),
+                    ));
+                }
+            }
+            let profile = crate::config::ProfileBinding::from_doc(doc)
+                .map_err(|err| refusal(err.code(), err.message().to_string()))?;
+            let declared = harness_inputs(params)?;
+            if declared.key != profile.key {
+                return Err(refusal(
+                    crate::config::CODE_PROFILE_BINDING,
+                    format!(
+                        "the review step declares harness key {:?} and presents a reviewer \
+                         binding for {:?}; the reviewer's role key and its registry-resolved \
+                         binding must agree",
+                        declared.key, profile.key
+                    ),
+                ));
+            }
+            if declared.kind != profile.kind {
+                return Err(refusal(
+                    crate::config::CODE_PROFILE_BINDING,
+                    format!(
+                        "the review step declares harness kind {:?} and presents a reviewer \
+                         binding of kind {:?}",
+                        declared.kind, profile.kind
+                    ),
+                ));
+            }
+            let worktree = param_str(Some(params), "worktree")?.to_string();
+            screened_containment(contract, &worktree)?;
+            let round = match params.get("lane_round") {
+                None => 1,
+                Some(Val::Int(round)) if *round > 0 => *round as u64,
+                Some(_) => {
+                    return Err(refusal(
+                        code::BAD_PARAMS,
+                        "review_evidence lane_round must be a positive integer",
+                    ));
+                }
+            };
+            ReviewEvidenceShape::SelfDispatch(Box::new(ReviewerLeg {
+                key: declared.key,
+                executable: declared.executable,
+                kind: declared.kind,
+                parsed_kind: declared.parsed_kind,
+                execution: declared_execution(Some(params))?,
+                profile,
+                worktree,
+                round,
+            }))
+        }
+        None => {
+            let reviewer = param_str(Some(params), "reviewer")?.to_string();
+            let implementer = param_str(Some(params), "implementer")?.to_string();
+            let verdict = match param_str(Some(params), "verdict") {
+                Ok(value) if matches!(value, "pass" | "fail") => value.to_string(),
+                _ => {
+                    return Err(refusal(
+                        code::BAD_PARAMS,
+                        "review_evidence verdict must be pass|fail",
+                    ));
+                }
+            };
+            check_reviewer_distinct(&reviewer, &implementer)
+                .map_err(|err| refusal(err.code, err.message))?;
+            let checks = match params.get("checks") {
+                Some(Val::Arr(items)) if !items.is_empty() => Val::Arr(items.clone()),
+                _ => {
+                    return Err(refusal(
+                        code::BAD_PARAMS,
+                        "review_evidence requires a non-empty checks list",
+                    ));
+                }
+            };
+            ReviewEvidenceShape::Presented(PresentedReview {
+                reviewer,
+                implementer,
+                verdict,
+                checks,
+            })
         }
     };
     Ok(ReviewEvidenceInputs {
-        reviewer,
-        implementer,
-        verdict,
-        checks,
         feature_head,
         integration_base,
+        shape,
     })
 }
 
@@ -3151,23 +3311,488 @@ fn collect_worktree_outcome(
     ]))
 }
 
-/// `review_evidence`: validate a review-evidence step and return the typed
-/// record values the daemon stores durably (AC4 bindings; reviewer distinct
-/// from implementer). No subprocess runs.
+/// `review_evidence`: record review evidence for this run's certified head.
+///
+/// Two shapes (issue #193):
+/// - the step presents the review facts itself (the operator's own dispatch
+///   path): the typed record values are returned as-is, no subprocess runs;
+/// - the step declares the reviewer LEG: the run's own reviewer is started
+///   through the same role-bound pane adapter the rest of the spine uses, is
+///   handed the bounded review brief, and the verdict THAT reviewer writes is
+///   consumed as this step's evidence. The engine never synthesises a
+///   verdict: a missing, ill-formed, wrong-head or `pending`-carrying verdict
+///   leaves the frontier parked with a typed reason.
 fn effect_review_evidence(ctx: &EffectContext<'_>) -> EffectOutcome {
     let inputs = match review_evidence_inputs(ctx.params, &ctx.param_contract()) {
         Ok(inputs) => inputs,
         Err(outcome) => return outcome,
     };
+    match &inputs.shape {
+        ReviewEvidenceShape::Presented(facts) => ok(object(vec![
+            ("repository", string(ctx.repository)),
+            ("feature_head", string(&inputs.feature_head)),
+            ("integration_base", string(&inputs.integration_base)),
+            ("workflow_hash", string(&ctx.plan.workflow_hash)),
+            ("verdict", string(&facts.verdict)),
+            ("reviewer", string(&facts.reviewer)),
+            ("checks", facts.checks.clone()),
+        ])),
+        ReviewEvidenceShape::SelfDispatch(leg) => review_self_dispatch(ctx, &inputs, leg),
+    }
+}
+
+/// The reviewer's session identity for one lane round (issue #193): derived
+/// ONCE from the run's own bound implementer session and the round, so the
+/// reviewer identity is never caller-supplied, is stable across restarts and
+/// can never be the implementer's own session. The derivation is the first
+/// 16 hex of sha256 over the domain-separated pair.
+pub fn reviewer_session_handle(
+    implementer: &crate::adapters::SessionHandle,
+    round: u64,
+) -> Result<crate::adapters::SessionHandle, EffectOutcome> {
+    let digest = crate::canonical::sha256_hex(
+        format!("hf-review-session/v1|{}|{round}", implementer.session_id).as_bytes(),
+    );
+    let session_id = format!("lane-{}", &digest[..16]);
+    let identity = crate::adapters::bind_identity(&session_id, &session_id, 1)
+        .map_err(|err| refusal(err.code, err.message))?;
+    crate::adapters::new_session(&session_id, identity)
+        .map_err(|err| refusal(err.code, err.message))
+}
+
+/// The absolute path of the verdict artifact ONE run's review step consumes
+/// (issue #193): the daemon-owned review root, the run's own session identity
+/// and the step id — deterministic, outside every lane worktree (a reviewer's
+/// write never dirties the lane the cleanup step must be able to remove) and
+/// per-run, so a stale verdict of another run can never be consumed.
+pub fn review_verdict_path(
+    review_root: &Path,
+    implementer: &crate::adapters::SessionHandle,
+    step_id: &str,
+) -> PathBuf {
+    review_root.join(format!("{}-{step_id}.json", implementer.session_id))
+}
+
+/// The bounded review brief delivered to the run's own reviewer (issue #193):
+/// the certified head it must review, the observed base, the read-only fence,
+/// and the exact artifact path it must WRITE its verdict to. The engine states
+/// the live bindings it will record; it never states a verdict.
+fn review_brief(inputs: &ReviewEvidenceInputs, leg: &ReviewerLeg, verdict_path: &Path) -> String {
+    format!(
+        "Review the exact head {} of this run's lane worktree {:?} against the integration base \
+         {}, read-only: do not commit, push, or edit the checkout. Your verdict IS the evidence \
+         this run's review step consumes, so write it yourself as ONE JSON document to the exact \
+         path {:?}: {{\"schema\":\"hf-evidence/v1\",\"feature_head\":\"{}\",\
+         \"integration_base\":\"{}\",\"verdict\":\"pass|fail\",\"checks\":[{{\"name\":\"<check>\",\
+         \"status\":\"passed|failed\"}}]}} — every check must carry an explicit passed|failed \
+         status (a pending check can never be consumed), and a verdict that does not name \
+         feature_head {} is refused. Your role is {:?} (registry revision {}); the engine records \
+         your verdict verbatim and never fills one in.",
+        inputs.feature_head,
+        leg.worktree,
+        inputs.integration_base,
+        verdict_path.display(),
+        inputs.feature_head,
+        inputs.integration_base,
+        inputs.feature_head,
+        leg.key,
+        leg.profile.revision,
+    )
+}
+
+/// Start the run's own reviewer through the role-bound pane adapter and
+/// consume the verdict it writes (issue #193).
+fn review_self_dispatch(
+    ctx: &EffectContext<'_>,
+    inputs: &ReviewEvidenceInputs,
+    leg: &ReviewerLeg,
+) -> EffectOutcome {
+    // The run's own bound implementer session is the identity the reviewer
+    // must be distinct from, and the anchor the reviewer identity derives
+    // from. A run that bound none has no implementer to review: refused.
+    let Some(implementer) = ctx.session else {
+        return refusal(
+            code::SESSION_UNBOUND,
+            "review_evidence dispatches the run's own reviewer, and this run bound no \
+             implementer session (harness_start); the reviewer identity is never invented",
+        );
+    };
+    let worktree = match contained_path(ctx.worktrees_root, &leg.worktree) {
+        Ok(path) => path,
+        Err(err) => return refusal(err.code, err.message),
+    };
+    if !worktree.is_dir() {
+        return refusal(
+            code::OUTPUT_LOCATION,
+            format!(
+                "review_evidence binds the lane worktree {:?}, which is not a directory",
+                leg.worktree
+            ),
+        );
+    }
+    // The lane checkout must BE the certified head: a reviewer is never
+    // started on a moved checkout, so the reviewed sha cannot drift.
+    let head = match run_git(ctx, &worktree, &["rev-parse", "--verify", "HEAD"]) {
+        Ok(out) => out.stdout.trim().to_string(),
+        Err(outcome) => return outcome,
+    };
+    if head != inputs.feature_head {
+        return refusal(
+            code::VERDICT_STALE,
+            format!(
+                "the run's lane checkout is at {head}, not the certified reviewed head {}; a \
+                 reviewer is never started on a moved head",
+                inputs.feature_head
+            ),
+        );
+    }
+    let reviewer = match reviewer_session_handle(implementer, leg.round) {
+        Ok(session) => session,
+        Err(outcome) => return outcome,
+    };
+    if reviewer.session_id == implementer.session_id {
+        return refusal(
+            code::REVIEWER_NOT_DISTINCT,
+            "the derived reviewer session is the implementer's own session; refusing to \
+             dispatch a review to the identity under review",
+        );
+    }
+    let names = match crate::adapters::LaneNames::new(
+        ctx.plan.issue_number as u64,
+        "reviewer",
+        leg.round,
+    ) {
+        Ok(names) => names,
+        Err(err) => return refusal(err.code, err.message),
+    };
+    if let Err(err) = check_reviewer_distinct(&names.agent, &implementer.session_id) {
+        return refusal(err.code, err.message);
+    }
+    // The profile is the REGISTRY-resolved reviewer binding the reviewed plan
+    // bound (never a code literal, never a default): the kind/executable come
+    // from the step's declared role inputs, the intended provider/model from
+    // the binding document the fleet registry resolved.
+    let built = match crate::adapters::official_spec(leg.parsed_kind) {
+        Some(_) => crate::adapters::Profile::official(leg.parsed_kind, &leg.key),
+        None => crate::adapters::Profile::argv(
+            &leg.key,
+            &leg.executable,
+            &crate::adapters::HARNESS_CAPS,
+            BTreeMap::new(),
+        ),
+    };
+    let mut profile = match built {
+        Ok(profile) => profile,
+        Err(err) => return refusal(err.code, err.message),
+    };
+    profile = match profile.with_binding(&leg.profile.provider, &leg.profile.model) {
+        Ok(profile) => profile,
+        Err(err) => return refusal(err.code, err.message),
+    };
+    profile = profile.with_execution(leg.execution);
+    if leg.execution == crate::adapters::ExecutionMode::HerdrPane {
+        profile.lane_names = Some(names.clone());
+    }
+    let deadline = match effect_deadline_secs(ctx.kind, ctx.params) {
+        Ok(secs) => secs,
+        Err(outcome) => return outcome,
+    };
+    let cwd = match leg.execution {
+        crate::adapters::ExecutionMode::Headless => ctx.integration_repo.to_path_buf(),
+        crate::adapters::ExecutionMode::HerdrPane => worktree.clone(),
+    };
+    let request = crate::adapters::OpRequest {
+        op: crate::adapters::Op::Start,
+        session: &reviewer,
+        payload: None,
+        timeout: Duration::from_secs(deadline),
+    };
+    let started = crate::adapters::execute_op_in_worktree(&profile, &request, ctx.env, &cwd);
+    if started.status != "succeeded" {
+        return EffectOutcome {
+            status: started.status,
+            code: started.code.map(str::to_string),
+            message: started.message,
+            result: null(),
+        };
+    }
+    // The verdict artifact is written by the REVIEWER, never by the engine:
+    // any residue at the path is cleared first, so a stale verdict can never
+    // be consumed as this round's evidence.
+    let review_root = match ctx.review_root {
+        Some(root) => root,
+        None => {
+            return refusal(
+                code::REVIEWER_UNBOUND,
+                "review_evidence has no daemon-owned review root to consume the reviewer's \
+                 written verdict from; a presented plan declares its review facts itself",
+            );
+        }
+    };
+    let verdict_path = review_verdict_path(review_root, implementer, ctx.step_id);
+    if let Err(err) = std::fs::create_dir_all(review_root) {
+        return refusal(
+            code::REVIEWER_UNBOUND,
+            format!(
+                "the review root {:?} is not creatable: {err}",
+                review_root.display()
+            ),
+        );
+    }
+    match std::fs::remove_file(&verdict_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return refusal(
+                code::REVIEWER_UNBOUND,
+                format!(
+                    "the verdict path {:?} carries residue that cannot be cleared: {err}",
+                    verdict_path.display()
+                ),
+            );
+        }
+    }
+    let payload = review_brief(inputs, leg, &verdict_path);
+    let request = crate::adapters::OpRequest {
+        op: crate::adapters::Op::Prompt,
+        session: &reviewer,
+        payload: Some(&payload),
+        timeout: Duration::from_secs(deadline),
+    };
+    let delivered = crate::adapters::execute_op_in_worktree(&profile, &request, ctx.env, &cwd);
+    if delivered.status != "succeeded" {
+        return EffectOutcome {
+            status: delivered.status,
+            code: delivered.code.map(str::to_string),
+            message: delivered.message,
+            result: null(),
+        };
+    }
+    let written = match await_written_verdict(&verdict_path, Duration::from_secs(deadline)) {
+        Ok(text) => text,
+        Err(outcome) => return outcome,
+    };
+    let facts = match review_verdict_facts(&written, inputs) {
+        Ok(facts) => facts,
+        Err(outcome) => return outcome,
+    };
+    // The recorded reviewer identity is the adapter-verified lane identity
+    // this dispatch started (never a caller-supplied string), and the
+    // registry-resolved binding is recorded alongside it so the resolution is
+    // auditable: key, kind, provider, model and the revision the plan bound.
     ok(object(vec![
         ("repository", string(ctx.repository)),
         ("feature_head", string(&inputs.feature_head)),
         ("integration_base", string(&inputs.integration_base)),
         ("workflow_hash", string(&ctx.plan.workflow_hash)),
-        ("verdict", string(&inputs.verdict)),
-        ("reviewer", string(&inputs.reviewer)),
-        ("checks", inputs.checks),
+        ("verdict", string(&facts.verdict)),
+        ("reviewer", string(&names.agent)),
+        ("checks", facts.checks),
+        ("reviewer_profile", leg.profile.to_doc()),
+        ("reviewer_lane", string(&reviewer.session_id)),
+        ("verdict_path", string(&verdict_path.to_string_lossy())),
     ]))
+}
+
+/// The facts ONE reviewer's written verdict carries, or a typed refusal
+/// (issue #193). Nothing is defaulted, inferred or repaired here: the
+/// document must be an `hf-evidence/v1` object that names THIS run's
+/// certified head and every observed binding, with a closed verdict and a
+/// non-empty check list whose statuses are explicit `passed`/`failed` — a
+/// `pending` check is refused rather than recorded, because a pending check
+/// permanently strands the tail (`refusal.run.step_done` blocks amendment and
+/// `evidence_checks_passed()` requires every check `passed`).
+struct VerdictFacts {
+    verdict: String,
+    checks: Val,
+}
+
+fn review_verdict_facts(
+    text: &str,
+    inputs: &ReviewEvidenceInputs,
+) -> Result<VerdictFacts, EffectOutcome> {
+    let doc = Val::parse_json(text).map_err(|err| {
+        refusal(
+            code::VERDICT_MALFORMED,
+            format!("the reviewer's verdict is not JSON: {err}"),
+        )
+    })?;
+    if !matches!(&doc, Val::Obj(_)) {
+        return Err(refusal(
+            code::VERDICT_MALFORMED,
+            "the reviewer's verdict must be one JSON object",
+        ));
+    }
+    const KEYS: [&str; 10] = [
+        "schema",
+        "evidence_id",
+        "feature_head",
+        "integration_base",
+        "workflow_hash",
+        "policy_hash",
+        "verdict",
+        "checks",
+        "created_at",
+        "reviewer",
+    ];
+    let fields = match &doc {
+        Val::Obj(map) => map,
+        _ => unreachable!("the verdict object was just matched as an object"),
+    };
+    if let Some(unknown) = fields.keys().find(|key| !KEYS.contains(&key.as_str())) {
+        return Err(refusal(
+            code::VERDICT_MALFORMED,
+            format!("the reviewer's verdict carries unknown key {unknown:?} (closed surface)"),
+        ));
+    }
+    match doc.get("schema").and_then(Val::as_str) {
+        Some("hf-evidence/v1") => {}
+        _ => {
+            return Err(refusal(
+                code::VERDICT_MALFORMED,
+                "the reviewer's verdict schema must be \"hf-evidence/v1\"",
+            ));
+        }
+    }
+    // The reviewed head is the ONE binding the reviewer must name itself: a
+    // verdict for any other sha is never this run's evidence. The other live
+    // bindings (base/workflow/policy) are checked when the reviewer names
+    // them, and the engine records its OWN live read-backs for them either
+    // way — a reviewer can neither move them nor strand the tail with a
+    // stale value.
+    match doc.get("feature_head").and_then(Val::as_str) {
+        Some(value) if value == inputs.feature_head => {}
+        Some(value) => {
+            return Err(refusal(
+                code::VERDICT_STALE,
+                format!(
+                    "the reviewer's verdict names feature_head {value:?}, which is not this \
+                     run's certified reviewed head {:?}",
+                    inputs.feature_head
+                ),
+            ));
+        }
+        None => {
+            return Err(refusal(
+                code::VERDICT_MALFORMED,
+                "the reviewer's verdict must name feature_head (the exact reviewed 40-hex sha)",
+            ));
+        }
+    }
+    if let Some(value) = doc.get("integration_base").and_then(Val::as_str)
+        && value != inputs.integration_base
+    {
+        return Err(refusal(
+            code::VERDICT_STALE,
+            format!(
+                "the reviewer's verdict names integration_base {value:?}, which is not this \
+                 run's observed base {:?}",
+                inputs.integration_base
+            ),
+        ));
+    }
+    for key in ["workflow_hash", "policy_hash"] {
+        if let Some(value) = doc.get(key).and_then(Val::as_str)
+            && !is_hex64(value)
+        {
+            return Err(refusal(
+                code::VERDICT_MALFORMED,
+                format!("the reviewer's verdict {key} must be 64-hex"),
+            ));
+        }
+    }
+    let verdict = match doc.get("verdict").and_then(Val::as_str) {
+        Some(value @ ("pass" | "fail")) => value.to_string(),
+        _ => {
+            return Err(refusal(
+                code::VERDICT_MALFORMED,
+                "the reviewer's verdict must be pass|fail",
+            ));
+        }
+    };
+    let checks = match doc.get("checks") {
+        Some(Val::Arr(items)) if !items.is_empty() => Val::Arr(items.clone()),
+        _ => {
+            return Err(refusal(
+                code::VERDICT_MALFORMED,
+                "the reviewer's verdict requires a non-empty checks list",
+            ));
+        }
+    };
+    let items = match &checks {
+        Val::Arr(items) => items,
+        _ => unreachable!("the checks value was just matched as a non-empty array"),
+    };
+    for item in items {
+        match item.get("name").and_then(Val::as_str) {
+            Some(name) if !name.is_empty() => {}
+            _ => {
+                return Err(refusal(
+                    code::VERDICT_MALFORMED,
+                    "every check of the reviewer's verdict needs a non-empty name",
+                ));
+            }
+        }
+        match item.get("status").and_then(Val::as_str) {
+            Some("passed" | "failed") => {}
+            Some("pending") => {
+                return Err(refusal(
+                    code::VERDICT_PENDING,
+                    "the reviewer's verdict carries a `pending` check; a pending check can never \
+                     be consumed as evidence (it strands the tail), so the frontier stays parked",
+                ));
+            }
+            _ => {
+                return Err(refusal(
+                    code::VERDICT_MALFORMED,
+                    "every check status of the reviewer's verdict must be passed|failed",
+                ));
+            }
+        }
+    }
+    Ok(VerdictFacts { verdict, checks })
+}
+
+/// Wait, bounded, for the reviewer's OWN written verdict (issue #193). A
+/// missing artifact at the deadline is the typed `effect.review_timeout`; an
+/// artifact that is not yet PARSEABLE JSON is waited out rather than refused,
+/// because a partially written file is indistinguishable from a malformed one
+/// (the #186 lesson: publish-then-read must wait for parseable content).
+fn await_written_verdict(path: &Path, deadline: Duration) -> Result<String, EffectOutcome> {
+    let started = Instant::now();
+    let interval = Duration::from_millis(50);
+    loop {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                if Val::parse_json(&text).is_ok() {
+                    return Ok(text);
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(refusal(
+                    code::VERDICT_MALFORMED,
+                    format!(
+                        "the reviewer's verdict artifact {:?} is unreadable: {err}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        if started.elapsed() >= deadline {
+            return Err(EffectOutcome {
+                status: "ambiguous",
+                code: Some(code::REVIEW_TIMEOUT.to_string()),
+                message: Some(format!(
+                    "the reviewer wrote no verdict at {:?} within {deadline:?}; the review step \
+                     stays parked and nothing is synthesised",
+                    path.display()
+                )),
+                result: null(),
+            });
+        }
+        std::thread::sleep(interval.min(deadline.saturating_sub(started.elapsed())));
+    }
 }
 
 /// The head of the integration branch **as published** on the integration

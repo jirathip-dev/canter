@@ -588,6 +588,7 @@ fn queue_preview_derives_the_workflow_hash_when_no_pin_is_configured() {
         REPO,
         "staging",
         HARNESS,
+        None,
         &[5],
         canter::adapters::ExecutionMode::HerdrPane,
     ));
