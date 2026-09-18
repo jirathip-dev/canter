@@ -107,6 +107,21 @@ impl Git {
     fn head(&self, rev: &str) -> String {
         self.run(&["rev-parse", "--verify", rev]).trim().to_string()
     }
+
+    /// Whether `git <args>` succeeds — for probing that a fixture is really in
+    /// the shape under test (e.g. an object absent from this checkout).
+    fn succeeds(&self, args: &[&str]) -> bool {
+        Command::new("git")
+            .args(args)
+            .current_dir(&self.cwd)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", std::env::var("HOME").unwrap_or_default())
+            .output()
+            .expect("spawn git")
+            .status
+            .success()
+    }
 }
 
 /// Make every path under `root` read-only (directories stay traversable), so a
@@ -933,6 +948,105 @@ fn worktree_base_fetches_the_published_commit_missing_from_the_checkout() {
         Git::new(&scenario.repos.worktrees_root.join("issues-123")).head("HEAD"),
         published
     );
+}
+
+/// Issue #164 verification witness — the discriminating fixture (base leg).
+///
+/// Defect shape: the checkout's LOCAL `staging` is stale while the PUBLISHED
+/// ref has moved ahead, and the published commit is not present in the
+/// checkout at all (no fetch has run). The first `worktree_create` — no
+/// recorded observation — must derive the lane base from the published ref:
+/// the `ls-remote` read, then the fetch + `cat-file` fallback that makes the
+/// published head usable as a base. A stale local branch must never stand in.
+#[test]
+fn verify164_lane_base_is_the_published_head_not_the_stale_local_branch() {
+    let scenario = Scenario::new(
+        "v164a",
+        "2999-01-01T00:00:00Z",
+        vec![flow_steps()[0].clone()],
+    );
+    let checkout = Git::new(&scenario.repos.checkout);
+    let stale = checkout.head("staging");
+    // A sibling clone publishes a commit; the checkout's local branch stays
+    // behind and never fetches.
+    let publisher = scenario.sandbox.path("publisher");
+    Git::new(&scenario.sandbox.root).run(&[
+        "clone",
+        "-q",
+        "-b",
+        "staging",
+        "origin.git",
+        "publisher",
+    ]);
+    let publisher_git = Git::new(&publisher);
+    publisher_git.run(&["commit", "--allow-empty", "-qm", "published progress"]);
+    publisher_git.run(&["push", "origin", "staging"]);
+    let published = publisher_git.head("HEAD");
+    assert_ne!(stale, published, "the published ref must move ahead");
+    assert!(
+        !checkout.succeeds(&["cat-file", "-e", &format!("{published}^{{commit}}")]),
+        "the published commit must be absent from the checkout (fetch fallback is exercised)"
+    );
+    let created = scenario.apply_ok(164, "w1", None, None);
+    let derived = created
+        .get("base_head")
+        .and_then(Val::as_str)
+        .expect("base_head");
+    println!("stale local staging head = {stale}");
+    println!("published staging head   = {published}");
+    println!("derived lane base        = {derived}");
+    assert_eq!(
+        derived, published,
+        "the lane base must be the published head, never the stale local branch"
+    );
+    assert_eq!(
+        created.get("head").and_then(Val::as_str),
+        Some(published.as_str())
+    );
+    assert_eq!(
+        Git::new(&scenario.repos.worktrees_root.join("issues-123")).head("HEAD"),
+        published
+    );
+    // The effect moved no local branch: the stale branch is still stale.
+    assert_eq!(checkout.head("staging"), stale);
+}
+
+/// Issue #164 verification witness — the refusal leg.
+///
+/// With no recorded observation and a published ref that cannot be read from
+/// the checkout at all, `worktree_create` must refuse fail-closed
+/// (`effect.merge.failed`). It must never silently fall back to the stale
+/// local branch, and no lane may be created from an unprovable base.
+#[test]
+fn verify164_unresolvable_published_base_refuses_fail_closed() {
+    let scenario = Scenario::new(
+        "v164b",
+        "2999-01-01T00:00:00Z",
+        vec![flow_steps()[0].clone()],
+    );
+    let checkout = Git::new(&scenario.repos.checkout);
+    let stale = checkout.head("staging");
+    let missing = scenario.sandbox.path("missing-origin.git");
+    checkout.run(&[
+        "remote",
+        "set-url",
+        "origin",
+        missing.to_str().expect("sandbox path"),
+    ]);
+    let (code, message) = scenario.apply_err(164, "w1", None, None);
+    println!("refusal code    = {code}");
+    println!("refusal message = {message}");
+    assert_eq!(code, "effect.merge.failed");
+    assert!(
+        message.contains("not readable from origin"),
+        "the refusal must name the unreadable published ref: {message}"
+    );
+    let lane = scenario.repos.worktrees_root.join("issues-123");
+    assert!(
+        !lane.exists(),
+        "no lane may be created from an unprovable base"
+    );
+    assert_eq!(checkout.head("staging"), stale);
 }
 
 #[test]
