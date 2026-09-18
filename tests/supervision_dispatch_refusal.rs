@@ -762,9 +762,19 @@ fn dispatch_refusals(fixture: &DaemonFixture, run: &str) -> Vec<(String, String)
 /// the duplicate-lane guard diagnosed, and whose `p2` the operator then
 /// repaired through the supported surfaces (`run retry` + `run dispatch`).
 /// On return the frontier is the scenario's third step.
+///
+/// `measurable_host` controls the issue #198 half of the measured scenario:
+/// with `false` the fixture's lane root is not exposed to the daemon once the
+/// repair is done, so the supervisor cannot re-measure the host at its own
+/// dispatch and the lapsed proof it recorded stays the one the admission gate
+/// refuses — `refusal.admission.proof_stale`, an unmeasurable host is still a
+/// typed refusal and never a silent pass. With `true` the host IS measurable
+/// and the supervisor's renewal presents a dispatch-time measurement instead
+/// (issue #198).
 fn repaired_lane_scenario(
     name: &str,
     third: qp::PlannedStep,
+    measurable_host: bool,
 ) -> (DaemonFixture, GroupChild, String) {
     let fixture = DaemonFixture::new(name);
     let (bound, digest) = {
@@ -863,6 +873,12 @@ fn repaired_lane_scenario(
         ],
     );
     assert_eq!(exit, 0, "dispatch exit; stdout: {stdout}; stderr: {stderr}");
+    if !measurable_host {
+        // Issue #198: the host is not observable for the frontier that
+        // follows — the lane root the daemon measures is gone, so the
+        // supervisor's own dispatch cannot renew the lapsed proof.
+        std::fs::remove_dir_all(fixture.dir.join("worktrees")).expect("unexpose the lane root");
+    }
     (fixture, daemon, run)
 }
 
@@ -874,11 +890,18 @@ fn repaired_lane_scenario(
 /// The defect was that supervision kept reporting the frontier
 /// `eligible: true` with `supervision.dispatch.next_step` while its own
 /// dispatch was refused before any attempt existed: nothing named the refusal
-/// on any product surface. The repaired frontier must therefore either run (it
-/// cannot: the engine's admission gate refuses, unchanged) or be classified
-/// concretely — class `needs-attention`, reason `supervision.dispatch_refused`
-/// and the engine's own code as the named blocker, never eligible — and the
-/// refusal must be auditable in the run's own journal.
+/// on any product surface. The repaired frontier must therefore either run or
+/// be classified concretely — class `needs-attention`, reason
+/// `supervision.dispatch_refused` and the engine's own code as the named
+/// blocker, never eligible — and the refusal must be auditable in the run's
+/// own journal.
+///
+/// Issue #198 re-points the STALE half of this witness at the still-refusing
+/// case: the host is unmeasurable here (`measurable_host: false`), so the
+/// supervisor cannot renew the lapsed proof at its own dispatch and the
+/// engine's admission gate refuses exactly as before. The measurable half —
+/// the same shape, where the supervisor re-measures and the step IS reached —
+/// is witnessed in `tests/host_proof_renewal.rs`.
 #[test]
 fn a_repaired_frontier_refused_by_the_engine_is_named_and_never_reported_eligible() {
     let (fixture, daemon, run) = repaired_lane_scenario(
@@ -888,6 +911,7 @@ fn a_repaired_frontier_refused_by_the_engine_is_named_and_never_reported_eligibl
             kind: "harness_start".to_string(),
             params: Some(object(vec![("harness_key", string(HARNESS))])),
         },
+        false,
     );
 
     // The frontier is now p3. The supervisor dispatches it on its own — and
@@ -1041,6 +1065,7 @@ fn a_repaired_frontier_is_dispatched_by_the_driver_without_any_operator_dispatch
             kind: "checkout".to_string(),
             params: Some(resolved()),
         },
+        true,
     );
 
     // Nothing else dispatches p3: the driver's own continuation reaches the
@@ -1108,6 +1133,11 @@ fn checks_of(fixture: &DaemonFixture, run: &str) -> i64 {
 /// (doubling from the run's own check interval, capped), while the run's own
 /// surfaces still name the engine's refusal — the refusal itself is unchanged
 /// and nothing new is recorded for it.
+///
+/// Issue #198 keeps this witness on the still-refusing case: the host is
+/// unmeasurable (`measurable_host: false`), so the supervisor's own renewal
+/// cannot take a measurement and the engine's admission gate keeps refusing
+/// `refusal.admission.proof_stale` — the ladder's pacing contract is unchanged.
 #[test]
 fn a_repeatedly_refused_continuation_is_not_redispatched_every_tick() {
     let (fixture, daemon, run) = repaired_lane_scenario(
@@ -1117,6 +1147,7 @@ fn a_repeatedly_refused_continuation_is_not_redispatched_every_tick() {
             kind: "harness_start".to_string(),
             params: Some(object(vec![("harness_key", string(HARNESS))])),
         },
+        false,
     );
     let code = "refusal.admission.proof_stale";
 

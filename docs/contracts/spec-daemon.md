@@ -97,7 +97,11 @@ remain usable without it; SQLite owns state; no network control API).
   held or exhausted run — or a run whose window is still live — refuses
   exactly as before. A recorded refusal of the run's own lapsed window is
   likewise not a STEP diagnosis: it neither demands nor consumes a bounded
-  retry.
+  retry. The same shape holds for the fan-out host-resource proof (issue
+  #198): the supervisor's own continuation dispatch measures the host when
+  the run's recorded proof has lapsed (one audited `host.proof.renewal`
+  record; see [spec-lifecycle.md](spec-lifecycle.md) §4.1), and an
+  unmeasurable host keeps the typed `refusal.admission.proof_stale`.
 - Unknown methods are refused with a typed refusal (never guessed).
 
 ## Lifecycle methods (issue #9)
@@ -570,12 +574,17 @@ clears a repository/fleet-level hold or bypasses a gate.
   does not hold — the operator's own `run.dispatch` owns it. A fan-out step
   still needs the submission-presented
   admission inputs: supervision re-presents the run's committed caps and
-  occupancy but never fabricates a host-resource measurement, so the
-  admission gate refuses `refusal.admission.proof_missing` when no fresh
-  proof exists. `review_evidence` remains a concrete
-  `supervision.waiting_approval` frontier until independent evidence is
-  presented. Non-armed/unknown supervision keeps its classification-only,
-  zero-effect guarantee verbatim: without a row the run is never even read.
+  occupancy and, when the run's own recorded proof has LAPSED, presents a
+  host-resource proof measured at DISPATCH time (issue #198) — the free
+  bytes the host exposes at the run's lane root, audited as one
+  `host.proof.renewal` record before the renewed proof is presented. An
+  unmeasurable host renews nothing and the admission gate still refuses
+  `refusal.admission.proof_stale`; a run that presented no proof is never
+  given one (`refusal.admission.proof_missing` stands). `review_evidence`
+  remains a concrete `supervision.waiting_approval` frontier until
+  independent evidence is presented. Non-armed/unknown supervision keeps its
+  classification-only, zero-effect guarantee verbatim: without a row the run
+  is never even read.
 - **Committed-tail dispatch (issue #152)**: the frontier is also dispatched
   when it is the risk-classed TAIL of that run's OWN committed queue spine —
   `merge` (the closed-policy LANDING of the reviewed head: it lands it on the

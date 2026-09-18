@@ -97,6 +97,37 @@ when any applicable admission input is missing, stale, or exceeded:
   durable, state-owned half is the running-lane count. Default caps and
   freshness windows are design commitments (`src/lifecycle.rs` consts).
 
+### 4.1 The supervisor's own measurement (issue #198)
+
+The supervisor is a caller of this gate, so when it dispatches a fan-out
+step it presents a proof **measured at dispatch time** — never the
+submit-time attestation echoed back, and never a fabricated instant:
+
+- The measurement is a real host-resource observation of THIS dispatch: the
+  free bytes the host exposes at the run's lane root
+  (`topology.worktrees_root`, where the lane's own worktree lives). The
+  measurement instant is the instant of that observation.
+- The renewal is the RUN's own act (like its lapsed grant window, issue
+  #184) and is bounded: only a fan-out step (`harness_start`, `prompt`, or
+  the reviewer leg of a `review_evidence` step — issue #193) of a LIVE run
+  whose own recorded proof has actually lapsed renews. A missing proof is
+  never invented (`proof_missing` stands), a fresh proof is presented as
+  recorded, and a paused/held/blocked/queued/finished run never renews.
+- Every renewal is audited BEFORE the renewed proof is presented: one
+  `host.proof.renewal` journal record naming the superseded instant, the
+  replacement (the measurement) and the observed free bytes, plus one
+  `run.host_proof.renewed` daemon-log line. A renewal that cannot be
+  recorded is not presented (fail closed).
+- An UNMEASURABLE host renews nothing: the recorded proof is presented
+  unchanged and the gate still refuses `refusal.admission.proof_stale`
+  (`run.host_proof.unmeasurable` names why on the daemon log). Nothing here
+  weakens a gate — caps, occupancy, pacing, overlap and the freshness bound
+  itself stay the gate's own decisions; the presenter only ever supplies a
+  measurement.
+
+The operator's own `run dispatch` presents its explicit admission
+attestation (`run_control::DispatchParams::admission`), exactly as before.
+
 ## 5. Cleanup archive/salvage and canonical target classification (AC7)
 
 - Cleanup targets are canonicalized and must stay inside the worktrees

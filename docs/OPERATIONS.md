@@ -490,6 +490,7 @@ Failure → remedy:
 | --- | --- | --- |
 | Apply refused | `refusal.plan.identity` | The carried plan bytes were tampered; re-render and re-grant. |
 | Apply refused | `refusal.grant.expired` / epoch mismatch | A LIVE run renews its OWN lapsed window (audited `grant.rotation`, sized from its committed spine) — nothing to do; for a HELD or released run, re-issue a grant against the live epoch and rotate it explicitly. Material edits or restore rotated the epoch and invalidated prior grants. |
+| Apply refused | `refusal.admission.proof_stale` | The supervisor renews a run's OWN lapsed host-resource proof at dispatch time (audited `host.proof.renewal`, measured at the run's lane root) — nothing to do while the lane root is exposed. When the host cannot be measured (`run.host_proof.unmeasurable` on the daemon log) the refusal stands: restore the lane root the topology names, or dispatch the step yourself with a fresh `--admission`. |
 | Merge refused | `refusal.evidence.stale` | Re-review at the moved head; evidence must bind the current head/base/workflow/policy. |
 | Outcome `ambiguous` | interrupted/restored work | External reconciliation required before a new idempotency key — never blindly retry. |
 | Mutation request rejected | missing/`ik_`-malformed idempotency key | Every mutating apply requires a well-formed `params.idempotency_key`. |

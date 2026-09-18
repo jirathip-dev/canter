@@ -379,6 +379,88 @@ impl HostProof {
     }
 }
 
+/// One host-resource observation (issue #198): the daemon's own measurement
+/// at dispatch time, or the typed reason it could not be taken.
+///
+/// The proof a fan-out presents is a CALLER attestation; the supervisor is a
+/// caller too, so when it continues a run it must measure the host itself at
+/// DISPATCH time instead of echoing the submit-time attestation back. A host
+/// that cannot be observed is `Unmeasurable`: no measurement is ever
+/// fabricated for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostMeasurement {
+    /// The host was observed at this instant: the free bytes it exposed at
+    /// the lane root a fan-out writes into.
+    Measured {
+        /// Unix seconds of the observation itself.
+        measured_at_unix: i64,
+        /// Free bytes the host exposed at the lane root.
+        available_bytes: u64,
+    },
+    /// The host could not be observed; an unmeasurable host never renews a
+    /// proof (the admission gate keeps refusing the lapsed one).
+    Unmeasurable {
+        /// Human reason, recorded on the daemon log.
+        reason: String,
+    },
+}
+
+/// The recorded renewal of one run's lapsed host-resource proof (issue
+/// #198): the presented (lapsed) proof, the dispatch-time measurement that
+/// replaces it, and the observation behind it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostProofRenewal {
+    /// The presented proof this renewal supersedes.
+    pub superseded: HostProof,
+    /// The measurement the run presents from this dispatch on.
+    pub replacement: HostProof,
+    /// Free bytes the host exposed at the lane root.
+    pub available_bytes: u64,
+}
+
+/// Whether a run's OWN lapsed host-resource proof renews from a measurement
+/// taken at dispatch time (issue #198).
+///
+/// `Some(renewal)` only when ALL of these hold, so the renewal can never
+/// become a blanket authorization:
+/// - the run PRESENTED a proof (a missing one is never invented — the
+///   gate's own `proof_missing` stands);
+/// - that proof has actually lapsed (a fresh one is presented as recorded);
+/// - the run is live (`renewable` — the renewal is the run's own act, like
+///   its lapsed grant window, issue #184);
+/// - the host was MEASURED (`Unmeasurable` never renews: the gate then
+///   refuses `refusal.admission.proof_stale` exactly as before).
+///
+/// The freshness bound itself is untouched: the replacement is a measurement
+/// of THIS dispatch, and it goes stale on the same bound as any other proof.
+pub fn renew_lapsed_host_proof(
+    presented: Option<HostProof>,
+    measurement: &HostMeasurement,
+    renewable: bool,
+    now_unix: i64,
+) -> Option<HostProofRenewal> {
+    let presented = presented?;
+    if presented.fresh_at(now_unix) {
+        return None;
+    }
+    if !renewable {
+        return None;
+    }
+    match measurement {
+        HostMeasurement::Measured {
+            measured_at_unix,
+            available_bytes,
+        } => Some(HostProofRenewal {
+            superseded: presented,
+            replacement: HostProof {
+                measured_at_unix: *measured_at_unix,
+            },
+            available_bytes: *available_bytes,
+        }),
+        HostMeasurement::Unmeasurable { .. } => None,
+    }
+}
+
 /// Admission gate for one fan-out request (harness_start/prompt and other
 /// spawn-cap steps) before any effect runs.
 ///
@@ -1103,6 +1185,77 @@ mod tests {
             .unwrap_err()
             .code,
             code::CAP_HARNESS
+        );
+    }
+
+    #[test]
+    fn a_lapsed_proof_renews_only_from_a_dispatch_time_measurement_of_a_live_run() {
+        let now = anchor_secs();
+        let lapsed = HostProof {
+            measured_at_unix: now - HOST_PROOF_FRESHNESS_SECS - 1,
+        };
+        let measured = HostMeasurement::Measured {
+            measured_at_unix: now,
+            available_bytes: 4096,
+        };
+        // The lapsed proof of a live run renews from the measurement: the
+        // replacement is the MEASUREMENT's own instant, never `now` echoed.
+        let renewal = renew_lapsed_host_proof(Some(lapsed), &measured, true, now)
+            .expect("a lapsed proof of a live run renews");
+        assert_eq!(renewal.superseded, lapsed);
+        assert_eq!(
+            renewal.replacement,
+            HostProof {
+                measured_at_unix: now
+            }
+        );
+        assert_eq!(renewal.available_bytes, 4096);
+        // The replacement is fresh under the SAME unchanged bound.
+        assert!(renewal.replacement.fresh_at(now));
+        assert!(
+            !renewal
+                .replacement
+                .fresh_at(now + HOST_PROOF_FRESHNESS_SECS + 1)
+        );
+        // A FRESH presented proof is never re-measured.
+        assert_eq!(
+            renew_lapsed_host_proof(
+                Some(HostProof {
+                    measured_at_unix: now
+                }),
+                &measured,
+                true,
+                now
+            ),
+            None
+        );
+        // A missing proof is never invented (the gate's own proof_missing stands).
+        assert_eq!(renew_lapsed_host_proof(None, &measured, true, now), None);
+        // A run that is not live never renews: the renewal is its OWN act.
+        assert_eq!(
+            renew_lapsed_host_proof(Some(lapsed), &measured, false, now),
+            None
+        );
+        // An UNMEASURABLE host never renews: nothing is fabricated, and the
+        // lapsed proof stays the one the gate refuses.
+        let unmeasurable = HostMeasurement::Unmeasurable {
+            reason: "the host does not expose the lane root".to_string(),
+        };
+        assert_eq!(
+            renew_lapsed_host_proof(Some(lapsed), &unmeasurable, true, now),
+            None
+        );
+        // A measurement from the FUTURE is never a renewal either: the
+        // gate's own clock bound still decides.
+        let future = HostMeasurement::Measured {
+            measured_at_unix: now + HOST_PROOF_FRESHNESS_SECS + 60,
+            available_bytes: 4096,
+        };
+        let renewal = renew_lapsed_host_proof(Some(lapsed), &future, true, now)
+            .expect("the presenter passes the measurement through");
+        assert!(
+            !renewal.replacement.fresh_at(now),
+            "a future measurement is presented as measured and refused by the gate"
         );
     }
 
