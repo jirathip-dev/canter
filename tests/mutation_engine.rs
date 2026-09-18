@@ -109,6 +109,55 @@ impl Git {
     }
 }
 
+/// Make every path under `root` read-only (directories stay traversable), so a
+/// push into it is refused while reads still work.
+fn make_tree_read_only(root: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            let meta = std::fs::symlink_metadata(&path).expect("metadata");
+            if meta.is_dir() {
+                for entry in std::fs::read_dir(&path).expect("read dir") {
+                    stack.push(entry.expect("dir entry").path());
+                }
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o555))
+                    .expect("chmod dir");
+            } else {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))
+                    .expect("chmod file");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = root;
+}
+
+/// Restore the permissions [`make_tree_read_only`] changed.
+fn make_tree_writable(root: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            let meta = std::fs::symlink_metadata(&path).expect("metadata");
+            if meta.is_dir() {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod dir");
+                for entry in std::fs::read_dir(&path).expect("read dir") {
+                    stack.push(entry.expect("dir entry").path());
+                }
+            } else {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                    .expect("chmod file");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = root;
+}
+
 struct Repos {
     checkout: PathBuf,
     worktrees_root: PathBuf,
@@ -639,6 +688,16 @@ impl Scenario {
 
     fn integration_base(&self) -> String {
         Git::new(&self.repos.checkout).head("staging")
+    }
+
+    /// The disposable bare "remote" the integration checkout publishes to
+    /// (the published integration ref, read from the remote itself).
+    fn origin(&self) -> PathBuf {
+        self.repos
+            .checkout
+            .parent()
+            .expect("sandbox root")
+            .join("origin.git")
     }
 
     fn apply_ok(
@@ -1188,9 +1247,16 @@ fn plan_rpc_digest_binding_and_idempotent_replay() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn lane_flow_rehearses_then_verifies_landed_head_and_cleans_with_salvage() {
+fn lane_flow_lands_and_publishes_then_verifies_landed_head_and_cleans_with_salvage() {
     let scenario = Scenario::new("lane-flow", "2999-01-01T00:00:00Z", flow_steps());
     let integration_base = scenario.integration_base();
+    let origin = scenario
+        .repos
+        .checkout
+        .parent()
+        .expect("sandbox root")
+        .join("origin.git");
+    let origin_git = Git::new(&origin);
 
     let wt = scenario.apply_ok(10, "w1", None, None);
     assert_eq!(wt.get("contained").and_then(Val::as_bool), Some(true));
@@ -1231,19 +1297,33 @@ fn lane_flow_rehearses_then_verifies_landed_head_and_cleans_with_salvage() {
             .starts_with("ev_")
     );
 
-    // The merge step is a read-only ff-policy rehearsal. The fixture then
-    // models the orchestrator-owned landing before post-merge verification.
-    let rehearsed = scenario.apply_ok(15, "m1", Some(&feature_head), Some(&integration_base));
+    // The merge step LANDS and PUBLISHES the certified delivery under the
+    // plan's declared policy (`ff` in this spine): the published integration
+    // ref advances to the delivered head and the integration checkout carries
+    // the landed head the tail reads.
+    let landed = scenario.apply_ok(15, "m1", Some(&feature_head), Some(&integration_base));
+    assert_eq!(landed.get("mode").and_then(Val::as_str), Some("landed"));
+    assert_eq!(landed.get("landed").and_then(Val::as_bool), Some(true));
     assert_eq!(
-        rehearsed.get("mode").and_then(Val::as_str),
-        Some("rehearsal")
+        landed.get("landed_head").and_then(Val::as_str),
+        Some(feature_head.as_str()),
+        "an ff landing IS the delivered head"
     );
-    assert_eq!(scenario.integration_base(), integration_base);
-    Git::new(&scenario.repos.checkout).run(&["merge", "--ff-only", "issue-123"]);
+    assert_eq!(
+        landed.get("published_after").and_then(Val::as_str),
+        Some(feature_head.as_str())
+    );
+    assert_eq!(origin_git.head("staging"), feature_head);
+    assert_eq!(scenario.integration_base(), feature_head);
+
     let verified = scenario.apply_ok(16, "v1", Some(&feature_head), Some(&integration_base));
     assert_eq!(
         verified.get("contains_feature").and_then(Val::as_bool),
         Some(true)
+    );
+    assert_eq!(
+        verified.get("proof").and_then(Val::as_str),
+        Some("ancestry")
     );
 
     // Issue closure only after merge + post-merge verification (AC7).
@@ -1340,63 +1420,260 @@ fn cycle2_reviewed_merge(policy: &str, squash_first: bool) -> (Scenario, String,
     (scenario, feature, base)
 }
 
+/// Witness (a) (issue #176): with `merge_policy: "squash"`, the merge step
+/// PUBLISHES the certified delivery — the published integration ref (read from
+/// the bare remote itself) advances to a landing whose tree IS the delivered
+/// tree, so the lane's content is present on it byte-for-byte — and the
+/// integration checkout carries the landed head, which is what the run's own
+/// `post_merge_verify` and `cleanup` read. The previously-firing
+/// `refusal.cleanup.unmerged` no longer fires for that delivery.
 #[test]
-fn cycle2_merge_rehearsal_never_lands_in_the_integration_checkout() {
+fn cycle2_squash_merge_lands_and_publishes_the_certified_delivery() {
+    let (scenario, feature, base) = cycle2_reviewed_merge("squash", false);
+    let git = Git::new(&scenario.repos.checkout);
+    let origin_git = Git::new(&scenario.origin());
+    let published_before = origin_git.head("staging");
+    assert_eq!(published_before, base, "the fixture starts unpublished");
+    let delivered_tree = git.head("issue-123^{tree}");
+
+    let landed = scenario.apply_ok(15, "m1", Some(&feature), Some(&base));
+    assert_eq!(landed.get("mode").and_then(Val::as_str), Some("landed"));
+    assert_eq!(landed.get("landed").and_then(Val::as_bool), Some(true));
+    assert_eq!(
+        landed.get("merge_policy").and_then(Val::as_str),
+        Some("squash")
+    );
+    assert_eq!(
+        landed.get("published_head").and_then(Val::as_str),
+        Some(published_before.as_str())
+    );
+    let landed_head = landed
+        .get("landed_head")
+        .and_then(Val::as_str)
+        .expect("landed head")
+        .to_string();
+    assert_ne!(landed_head, published_before, "the published ref advanced");
+    assert_eq!(
+        landed.get("published_after").and_then(Val::as_str),
+        Some(landed_head.as_str())
+    );
+    assert_eq!(
+        landed.get("result_tree").and_then(Val::as_str),
+        Some(delivered_tree.as_str())
+    );
+
+    // The PUBLISHED integration ref carries the landing: read from the bare
+    // remote itself, its parent is the published head it landed on, its tree
+    // is the delivered tree, and the lane's file bytes are on it.
+    assert_eq!(origin_git.head("staging"), landed_head);
+    assert_eq!(
+        origin_git.head(&format!("{landed_head}^")),
+        published_before,
+        "the landing lands ON the published head"
+    );
+    assert_eq!(git.head(&format!("{landed_head}^{{tree}}")), delivered_tree);
+    assert_eq!(
+        git.run(&["show", &format!("{landed_head}:lane.txt")]),
+        "lane change\n"
+    );
+    assert_ne!(
+        landed_head, feature,
+        "a squash landing rewrites the delivered commits"
+    );
+
+    // The integration checkout carries the landed head (never a rewrite: the
+    // landing is a fast-forward from the published head) and the lane branch
+    // itself is untouched.
+    assert_eq!(git.head("staging"), landed_head);
+    assert_eq!(git.run(&["status", "--porcelain"]), "");
+    assert_eq!(git.head("issue-123"), feature);
+
+    // The run's tail completes: `post_merge_verify` proves the squash landing
+    // by content and `cleanup` certifies the landed content by content.
+    let verified = scenario.apply_ok(16, "v1", Some(&feature), Some(&base));
+    assert_eq!(
+        verified.get("contains_feature").and_then(Val::as_bool),
+        Some(true)
+    );
+    assert_eq!(verified.get("proof").and_then(Val::as_str), Some("content"));
+    assert_eq!(
+        verified.get("merged_head").and_then(Val::as_str),
+        Some(landed_head.as_str())
+    );
+    let cleaned = scenario.apply_ok(17, "x1", Some(&feature), Some(&base));
+    assert_eq!(cleaned.get("removed").and_then(Val::as_bool), Some(true));
+    assert_eq!(
+        cleaned
+            .get("salvage")
+            .and_then(|salvage| salvage.get("landed_by"))
+            .and_then(Val::as_str),
+        Some("content"),
+        "the squash landing is proven by content, not ancestry"
+    );
+    assert!(!scenario.repos.worktrees_root.join("issues-123").exists());
+}
+
+/// The merge step LANDS and PUBLISHES under BOTH closed policies, and operator
+/// work in the integration checkout is never discarded: a dirty (even staged)
+/// file the landing does not touch survives the fast-forward, while the
+/// published integration ref advances to the landing and every other ref stays
+/// put.
+#[test]
+fn cycle2_merge_lands_under_both_policies_and_preserves_operator_work() {
     for policy in ["ff", "squash"] {
         let (scenario, feature, base) = cycle2_reviewed_merge(policy, false);
         let git = Git::new(&scenario.repos.checkout);
-        // Dirty operator files and the index are not a rehearsal workspace.
+        let origin_git = Git::new(&scenario.origin());
+        let delivered_tree = git.head("issue-123^{tree}");
+        let lane_branch = git.head("issue-123");
+        // Dirty operator files and the index are not the daemon's to discard.
         std::fs::write(scenario.repos.checkout.join("base.txt"), "operator edit\n").unwrap();
         git.run(&["add", "base.txt"]);
-        let index = git.run(&["write-tree"]);
-        let refs = git.run(&["show-ref"]);
-        let remote = git.run(&["ls-remote", "origin", "refs/heads/staging"]);
+
         let result = scenario.apply_ok(15, "m1", Some(&feature), Some(&base));
-        assert_eq!(
-            git.head("staging"),
-            base,
-            "rehearsal must not move integration"
-        );
-        assert_eq!(git.run(&["show-ref"]), refs);
-        assert_eq!(git.run(&["write-tree"]), index);
-        assert_eq!(
-            git.run(&["ls-remote", "origin", "refs/heads/staging"]),
-            remote
-        );
-        assert_eq!(
-            std::fs::read_to_string(scenario.repos.checkout.join("base.txt")).unwrap(),
-            "operator edit\n"
-        );
-        assert_eq!(result.get("mode").and_then(Val::as_str), Some("rehearsal"));
+        assert_eq!(result.get("mode").and_then(Val::as_str), Some("landed"));
         assert_eq!(
             result.get("merge_policy").and_then(Val::as_str),
             Some(policy)
         );
-        assert_eq!(result.get("landed").and_then(Val::as_bool), Some(false));
+        let landed_head = result
+            .get("landed_head")
+            .and_then(Val::as_str)
+            .expect("landed head")
+            .to_string();
+        assert_ne!(landed_head, base, "{policy}: the published ref advanced");
         assert_eq!(
-            result.get("result_tree").and_then(Val::as_str),
-            Some(git.head("issue-123^{tree}").as_str())
+            origin_git.head("staging"),
+            landed_head,
+            "{policy}: the published ref carries the landing"
         );
-        assert!(
-            result.get("merged_head").is_none(),
-            "no landing claim: {result:?}"
+        assert_eq!(git.head("staging"), landed_head);
+        assert_eq!(
+            git.head(&format!("{landed_head}^{{tree}}")),
+            delivered_tree,
+            "{policy}: the landing IS the delivered content"
         );
+        assert_eq!(
+            std::fs::read_to_string(scenario.repos.checkout.join("base.txt")).unwrap(),
+            "operator edit\n",
+            "{policy}: operator work survives the landing"
+        );
+        assert_eq!(git.head("issue-123"), lane_branch);
+        if policy == "ff" {
+            assert_eq!(landed_head, feature, "an ff landing IS the delivered head");
+        }
     }
 }
 
+/// A delivery whose content is ALREADY on the published integration ref (the
+/// fixture models a landing that happened outside this step) publishes
+/// nothing: the step reports `already-landed`, the published ref does not
+/// move, and no empty commit is written.
 #[test]
-fn cycle2_squash_rehearsal_succeeds_after_the_policy_squash() {
+fn cycle2_squash_merge_reports_already_landed_content_and_publishes_nothing() {
     let (scenario, feature, base) = cycle2_reviewed_merge("squash", true);
+    let git = Git::new(&scenario.repos.checkout);
+    let origin_git = Git::new(&scenario.origin());
+    let published_before = origin_git.head("staging");
+    assert_eq!(published_before, base);
     let result = scenario.apply_ok(15, "m1", Some(&feature), Some(&base));
-    assert_eq!(scenario.integration_base(), base);
+    assert_eq!(
+        result.get("mode").and_then(Val::as_str),
+        Some("already-landed")
+    );
+    assert_eq!(result.get("landed").and_then(Val::as_bool), Some(true));
+    assert_eq!(
+        result.get("landed_head").and_then(Val::as_str),
+        Some(published_before.as_str())
+    );
+    assert_eq!(scenario.integration_base(), published_before);
+    assert_eq!(
+        origin_git.head("staging"),
+        published_before,
+        "an already-landed delivery publishes nothing"
+    );
     assert_eq!(
         result.get("result_tree").and_then(Val::as_str),
-        Some(
-            Git::new(&scenario.repos.checkout)
-                .head("staging^{tree}")
-                .as_str()
-        )
+        Some(git.head("staging^{tree}").as_str())
     );
+}
+
+/// No false success (issue #176): a landing that cannot be PUBLISHED records a
+/// typed non-success — never `succeeded` — and the integration checkout is
+/// rolled back to the published head, so no local move the published ref does
+/// not carry is ever left behind (#156).
+#[test]
+fn cycle2_squash_merge_records_a_typed_non_success_when_the_publish_fails() {
+    let (scenario, feature, base) = cycle2_reviewed_merge("squash", false);
+    let git = Git::new(&scenario.repos.checkout);
+    let origin = scenario.origin();
+    let origin_git = Git::new(&origin);
+    let published_before = origin_git.head("staging");
+    // The bare remote refuses the publish: it is read-only. Reads (the
+    // published-ref `ls-remote`) still work, so the failure is the publish.
+    make_tree_read_only(&origin);
+
+    let (code, message) = scenario.apply_err(15, "m1", Some(&feature), Some(&base));
+    assert_eq!(code, "effect.merge.failed", "{message}");
+    assert!(
+        message.contains("was not published"),
+        "the refusal names the failed publish: {message}"
+    );
+    assert_eq!(
+        origin_git.head("staging"),
+        published_before,
+        "nothing was published"
+    );
+    assert_eq!(
+        git.head("staging"),
+        published_before,
+        "the checkout was rolled back to the published head"
+    );
+    assert_eq!(
+        git.run(&["status", "--porcelain"]),
+        "",
+        "the rollback left no residue"
+    );
+    assert_eq!(
+        git.head("issue-123"),
+        feature,
+        "the delivery was never rewritten"
+    );
+    make_tree_writable(&origin);
+}
+
+/// No false success (issue #176): a checkout that cannot take the landing
+/// (untracked operator work on a landed path) refuses BEFORE anything is
+/// published — the operator's file survives and the published ref does not
+/// move.
+#[test]
+fn cycle2_squash_merge_refuses_a_checkout_that_cannot_take_the_landing() {
+    let (scenario, feature, base) = cycle2_reviewed_merge("squash", false);
+    let git = Git::new(&scenario.repos.checkout);
+    let origin_git = Git::new(&scenario.origin());
+    let published_before = origin_git.head("staging");
+    // The landing adds `lane.txt`; an untracked file at that path makes the
+    // fast-forward impossible without discarding operator work.
+    std::fs::write(scenario.repos.checkout.join("lane.txt"), "operator\n").unwrap();
+
+    let (code, message) = scenario.apply_err(15, "m1", Some(&feature), Some(&base));
+    assert_eq!(code, "effect.merge.failed", "{message}");
+    assert!(
+        message.contains("cannot advance to the landing"),
+        "the refusal names the checkout that did not take the landing: {message}"
+    );
+    assert_eq!(
+        origin_git.head("staging"),
+        published_before,
+        "nothing was published"
+    );
+    assert_eq!(git.head("staging"), published_before, "nothing was landed");
+    assert_eq!(
+        std::fs::read_to_string(scenario.repos.checkout.join("lane.txt")).unwrap(),
+        "operator\n",
+        "the operator's untracked file is never discarded"
+    );
+    assert_eq!(git.head("issue-123"), feature);
 }
 
 #[test]
@@ -1409,13 +1686,14 @@ fn cycle2_ff_refusal_names_policy_divergence_not_an_inferred_base_move() {
     assert_eq!(scenario.integration_base(), base);
 }
 
-/// Witness (a) (issue #178): a CERTIFIED delivery whose branch is behind the
-/// moved published integration ref is reconciled onto it, and this step's
-/// bounded retry re-certifies the reconciled head — so the delivery reaches a
-/// merged integration head and `post_merge_verify` passes. The published-ref
+/// Witness (a) (issues #178, #176): a CERTIFIED delivery whose branch is behind
+/// the moved published integration ref is reconciled onto it, and this step's
+/// bounded retry re-certifies the reconciled head AND lands it — the published
+/// integration ref advances to the squash landing of the reconciled delivery —
+/// so `post_merge_verify` and `cleanup` complete the tail. The published-ref
 /// verification is visible in the recorded outcome.
 #[test]
-fn cycle2_rehearsal_reconciles_and_recertifies_a_delivery_behind_the_moved_published_ref() {
+fn cycle2_merge_reconciles_then_lands_a_delivery_behind_the_moved_published_ref() {
     let (scenario, feature, base) = cycle2_reviewed_merge("squash", false);
     // Another lane lands on the published integration branch from a separate
     // clone: the bare remote moves while this integration checkout stays at
@@ -1477,59 +1755,68 @@ fn cycle2_rehearsal_reconciles_and_recertifies_a_delivery_behind_the_moved_publi
         "",
         "the reconciled head descends from the published ref"
     );
-    // The certification target is the PUBLISHED ref: the integration checkout
-    // itself is still not moved by a rehearsal.
+    // The reconciliation rewrites only the delivery's own worktree: nothing is
+    // published or moved in the integration checkout by that attempt.
     assert_eq!(
         scenario.integration_base(),
         base,
         "a reconciliation never moves the integration checkout"
     );
+    assert_eq!(
+        Git::new(&origin).head("staging"),
+        published,
+        "a reconciliation never publishes"
+    );
 
-    // Attempt 2 — the bounded retry certifies the reconciled head against the
-    // FETCHED published ref. The verification is visible in the outcome.
-    let certified = scenario.apply_ok(16, "m1", Some(&feature), Some(&base));
+    // Attempt 2 — the bounded retry re-certifies the reconciled head against
+    // the FETCHED published ref and LANDS it: the published ref advances to
+    // the squash landing of the reconciled delivery, whose tree is the
+    // reconciled delivery's tree. The verification is visible in the outcome.
+    let landed = scenario.apply_ok(16, "m1", Some(&feature), Some(&base));
+    assert_eq!(landed.get("mode").and_then(Val::as_str), Some("landed"));
+    assert_eq!(landed.get("landed").and_then(Val::as_bool), Some(true));
+    assert_eq!(landed.get("reconciled").and_then(Val::as_bool), Some(true));
     assert_eq!(
-        certified.get("mode").and_then(Val::as_str),
-        Some("rehearsal")
-    );
-    assert_eq!(certified.get("landed").and_then(Val::as_bool), Some(false));
-    assert_eq!(
-        certified.get("reconciled").and_then(Val::as_bool),
-        Some(true)
-    );
-    assert_eq!(
-        certified.get("published_head").and_then(Val::as_str),
+        landed.get("published_head").and_then(Val::as_str),
         Some(published.as_str())
     );
     assert_eq!(
-        certified.get("certified_head").and_then(Val::as_str),
+        landed.get("certified_head").and_then(Val::as_str),
         Some(feature.as_str())
     );
     assert_eq!(
-        certified.get("reconciled_head").and_then(Val::as_str),
+        landed.get("reconciled_head").and_then(Val::as_str),
         Some(reconciled.as_str())
     );
     assert_eq!(
-        certified.get("integration_head").and_then(Val::as_str),
+        landed.get("integration_head").and_then(Val::as_str),
         Some(published.as_str()),
-        "the certified merge target is the published ref"
+        "the merge target is the published ref"
     );
-
-    // The orchestrator/forge owns the landing. The fixture models the
-    // repository's SQUASH policy: fast-forward the checkout to the fetched
-    // published ref, squash the reconciled delivery onto it, publish.
-    let git = Git::new(&scenario.repos.checkout);
-    git.run(&["merge", "--ff-only", "refs/remotes/origin/staging"]);
-    git.run(&["merge", "--squash", "issue-123"]);
-    git.run(&[
-        "commit",
-        "-q",
-        "-m",
-        "squash the reconciled delivery (synthetic)",
-    ]);
-    git.run(&["push", "-q", "origin", "staging"]);
-    let merged = git.head("staging");
+    let merged = landed
+        .get("landed_head")
+        .and_then(Val::as_str)
+        .expect("landed head")
+        .to_string();
     assert_ne!(merged, published, "the delivery reached a merged head");
+    let git = Git::new(&scenario.repos.checkout);
+    assert_eq!(Git::new(&origin).head("staging"), merged, "published");
+    assert_eq!(git.head("staging"), merged, "the checkout carries it");
+    assert_eq!(
+        git.head(&format!("{merged}^{{tree}}")),
+        lane_git.head("HEAD^{tree}"),
+        "the landing IS the reconciled delivery's content"
+    );
+    assert_eq!(
+        git.head(&format!("{merged}^")),
+        published,
+        "the landing lands ON the published head"
+    );
+    assert_eq!(
+        git.run(&["show", &format!("{merged}:landed.txt")]),
+        "landed\n",
+        "the other lane's landed work survives the squash landing"
+    );
 
     // `post_merge_verify` passes on the squash landing through the content
     // route: every path the review covered carries the reviewed head's exact
@@ -1562,14 +1849,13 @@ fn cycle2_rehearsal_reconciles_and_recertifies_a_delivery_behind_the_moved_publi
     assert!(!lane.exists());
 }
 
-/// Witness (b) (issue #178, #156): an UNPUBLISHED local move refuses. The
-/// checkout AHEAD of the published ref is a view nobody else can see; the
-/// published ref is the only certifiable merge target and never a
-/// reconciliation base. (The refusal is witnessed under the same effect the
-/// stale-evidence witness above already drives; this test pins the checkout
-/// AHEAD state directly.)
+/// Witness (c) (issues #178, #156): an UNPUBLISHED local move refuses — the
+/// stale local view nobody else can see is never a merge target and never a
+/// reconciliation base, so nothing is landed or published from it. (The
+/// refusal is witnessed under the same effect the stale-evidence witness above
+/// already drives; this test pins the checkout AHEAD state directly.)
 #[test]
-fn cycle2_rehearsal_never_reconciles_an_unpublished_local_move() {
+fn cycle2_merge_never_reconciles_an_unpublished_local_move() {
     let (scenario, feature, base) = cycle2_reviewed_merge("squash", false);
     let git = Git::new(&scenario.repos.checkout);
     std::fs::write(scenario.repos.checkout.join("local.txt"), "local\n").expect("write");
@@ -1599,8 +1885,11 @@ fn cycle2_rehearsal_never_reconciles_an_unpublished_local_move() {
     );
 }
 
+/// The published-ref read is fail-closed on BOTH unprovable-base routes: an
+/// ABSENT published ref and an `origin` the checkout cannot read at all. An
+/// unprovable base is never certified and nothing is landed or published.
 #[test]
-fn cycle2_rehearsal_refuses_an_unprovable_published_base_on_both_routes() {
+fn cycle2_merge_refuses_an_unprovable_published_base_on_both_routes() {
     let (scenario, feature, base) = cycle2_reviewed_merge("squash", false);
     let root = scenario
         .repos
@@ -1977,6 +2266,51 @@ fn cleanup_accepts_a_squash_landed_lane_and_still_refuses_unlanded_content() {
     assert_eq!(code, "refusal.cleanup.unmerged", "{message}");
     assert!(message.contains("not content-identical"), "{message}");
     assert!(unlanded.repos.worktrees_root.join("issues-123").exists());
+}
+
+/// Witness (b) (issue #176): the acceptance spine's own shape — without a
+/// landing the delivery's content is not on the published ref, so `p8` cleanup
+/// refuses `refusal.cleanup.unmerged`; with the merge STEP landing and
+/// publishing it, the very next step certifies the content and removes the
+/// lane.
+#[test]
+fn cleanup_certifies_a_merge_step_squash_landing_and_refuses_without_one() {
+    // The same delivery WITHOUT a landing: its content is not on the published
+    // ref and cleanup refuses the unverified deletion.
+    let (unlanded, _feature2, _base2) = cycle2_reviewed_merge("squash", false);
+    let (code, message) = unlanded.apply_err(15, "x1", None, None);
+    assert_eq!(code, "refusal.cleanup.unmerged", "{message}");
+    assert!(unlanded.repos.worktrees_root.join("issues-123").exists());
+
+    let (landed, feature, base) = cycle2_reviewed_merge("squash", false);
+    let merged = landed.apply_ok(15, "m1", Some(&feature), Some(&base));
+    // `p8` cleanup runs on the integration ref the merge step left behind: it
+    // certifies the landed content by content and removes the lane. This is
+    // exactly where the pre-fix rehearsal killed the tail — the step
+    // "succeeded" without publishing anything, so this very cleanup refused
+    // `refusal.cleanup.unmerged` (witness (d) runs this test under that
+    // mutation).
+    let cleaned = landed.apply_ok(16, "x1", Some(&feature), Some(&base));
+    assert_eq!(merged.get("mode").and_then(Val::as_str), Some("landed"));
+    assert_eq!(merged.get("landed").and_then(Val::as_bool), Some(true));
+    assert_eq!(cleaned.get("removed").and_then(Val::as_bool), Some(true));
+    assert_eq!(
+        cleaned
+            .get("salvage")
+            .and_then(|salvage| salvage.get("landed_by"))
+            .and_then(Val::as_str),
+        Some("content"),
+        "the merge step's squash landing is proven by content, not ancestry"
+    );
+    assert_eq!(
+        cleaned
+            .get("salvage")
+            .and_then(|salvage| salvage.get("merge_base"))
+            .and_then(Val::as_str),
+        Some(base.as_str()),
+        "the content proof names the fork point it compared from"
+    );
+    assert!(!landed.repos.worktrees_root.join("issues-123").exists());
 }
 
 // One daemon, real git trees, and no sleeps: each refusal is followed by a

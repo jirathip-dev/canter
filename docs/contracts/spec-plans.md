@@ -49,17 +49,17 @@ Normative rules:
   `requires_delta:false` for a legitimate no-op prompt; collection then
   succeeds with equal base/head while still enforcing the bound output branch.
 - The built-in `merge` step declares `merge_policy:"squash"`. `merge_policy`
-  is a closed `squash | ff` input and the effect is a rehearsal: it verifies
-  the reviewed integration ref and policy-compatible result tree but never
-  moves the integration checkout or a ref. It certifies only the
-  PUBLISHED integration ref: that head is read from the checkout's `origin`
-  remote (`git ls-remote` — a bare-remote move is visible without a fetch,
-  never from the checkout's own refs). An unreadable or absent published ref
-  refuses the typed `effect.merge.failed` on both routes — an absent ref, or
-  an `origin` the checkout cannot read at all (absent, unreachable,
-  unauthenticated), which keeps the read's git diagnostics in the message —
-  rather than certifying an unprovable base. A checkout AHEAD of, or diverged
-  from, the published ref is an unpublished local move and refuses
+  is a closed `squash | ff` input and the effect LANDS the certified delivery
+  on the integration ref and PUBLISHES it to the integration remote — a
+  control-plane mutation the daemon journals like every other effect. It
+  certifies only the PUBLISHED integration ref: that head is read from the
+  checkout's `origin` remote (`git ls-remote` — a bare-remote move is visible
+  without a fetch, never from the checkout's own refs). An unreadable or absent
+  published ref refuses the typed `effect.merge.failed` on both routes — an
+  absent ref, or an `origin` the checkout cannot read at all (absent,
+  unreachable, unauthenticated), which keeps the read's git diagnostics in the
+  message — rather than certifying an unprovable base. A checkout AHEAD of, or
+  diverged from, the published ref is an unpublished local move and refuses
   `effect.merge.not_fast_forward`, naming the published head and the local
   head. A checkout strictly BEHIND the published ref (any concurrent landing
   moves it while a run is in flight) is reconciled instead of refused forever
@@ -74,12 +74,27 @@ Normative rules:
   (the same fail-closed content fact as the cleanup landed proof — NUL-delimited
   names, literal pathspecs, both rename endpoints; a conflict, a missing or
   uncontained lane worktree, or any content divergence refuses with
-  diagnostics and never leaves a partial rewrite). The outcome records
-  `published_head`, `checkout_head`, `certified_head`, `reconciled_head` and
-  `reconciled`; `landed` stays `false`. The orchestrator/forge owns the actual
-  policy merge; `post_merge_verify` proves its landed head — by exact
-  ancestry, or, for a squash landing, which rewrites the reviewed commits and
-  can never be an ancestor, by the same content fact (issue #178).
+  diagnostics and never leaves a partial rewrite).
+  The LANDING honours the declared policy: `squash` writes ONE new integration
+  commit whose tree is the delivered tree and whose parent is the published
+  head (the delivered commits are rewritten, so a squash landing is never an
+  ancestor of the delivery), `ff` lands the delivered head itself. The landing
+  is fast-forwarded into the integration checkout — never a rewrite, never a
+  forced update; a checkout that cannot advance (uncommitted operator work on
+  the landed paths) refuses `effect.merge.failed` BEFORE anything is published
+  — and pushed to the same `origin` remote the published ref was read from.
+  The published ref is then read back: the step succeeds only when it carries
+  the landing (`mode:"landed"`), and a landing that cannot be published records
+  a typed non-success (never `succeeded`) with the integration checkout rolled
+  back to the published head, so no local move the published ref does not carry
+  is ever left behind. A delivery whose content is already on the merge target
+  — a prior landing of this very delivery, or a delivery with no content beyond
+  the base — reports `mode:"already-landed"` and publishes nothing. The outcome
+  records `published_head`, `published_after`, `landed_head`, `checkout_head`,
+  `certified_head`, `reconciled_head` and `reconciled`. `post_merge_verify`
+  proves the landed head — by exact ancestry, or, for a squash landing, which
+  rewrites the reviewed commits and can never be an ancestor, by the same
+  content fact (issue #176, #178).
   Separately, the spine's
   `cleanup` step proves ancestry or content-equivalence against the local
   integration ref; it does not itself certify a published remote or forge
@@ -89,7 +104,7 @@ Normative rules:
   without removing the lane or branch. The precise fail-closed cases and
   deletion flags are in [the lifecycle contract](spec-lifecycle.md#5-cleanup-archivesalvage-and-canonical-target-classification-ac7).
   This permits complete squash landings without weakening the ancestry-only
-  standalone `branch_delete` effect (Refs #132, #172, #178).
+  standalone `branch_delete` effect (Refs #132, #172, #176, #178).
 
 ### Canonical serialization and digest
 

@@ -563,15 +563,17 @@ clears a repository/fleet-level hold or bypasses a gate.
   zero-effect guarantee verbatim: without a row the run is never even read.
 - **Committed-tail dispatch (issue #152)**: the frontier is also dispatched
   when it is the risk-classed TAIL of that run's OWN committed queue spine —
-  `merge` (the closed-policy rehearsal of the reviewed head) and `cleanup`
-  (destructive: the removal of a lane worktree whose branch is provably
-  merged) — so the run that produced a verified delivery reaches its own last
-  committed step instead of being foreclosed by it. This is NOT a blanket
-  addition to the autonomous set and it widens NO gate: the step is dispatched
-  only when the run is an ADMITTED member of a committed, digest-bound
-  submission, the run's own committed caps carry the kind's required
-  capability (`merge`/`cleanup` — the same capability `revalidate_effect`
-  demands), and the step follows that run's reviewed-delivery step while the
+  `merge` (the closed-policy LANDING of the reviewed head: it lands it on the
+  integration ref and publishes it, a journaled control-plane mutation) and
+  `cleanup` (destructive: the removal of a lane worktree whose branch is
+  provably merged) — so the run that produced a verified delivery reaches its
+  own last committed step instead of being foreclosed by it. This is NOT a
+  blanket addition to the autonomous set and it widens NO gate: the step is
+  dispatched only when the run is an ADMITTED member of a committed,
+  digest-bound submission, the run's own committed caps carry the kind's
+  required capability (`merge`/`cleanup` — the same capability
+  `revalidate_effect` demands), and the step follows that run's
+  reviewed-delivery step while the
   run carries a fresh verified delivery. The dispatch presents the committed
   step's OWN params (branch + `merge_policy`; branch + worktree) and the
   unchanged engine gates decide: production branches, the scheduled

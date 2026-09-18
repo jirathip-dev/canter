@@ -181,9 +181,10 @@ const AUTONOMOUS_STEP_KINDS: [&str; 6] = [
 ];
 
 /// The risk-classed TAIL kinds a supervised run may drive on its OWN
-/// committed spine (issue #152): the merge of its reviewed head (a read-only
-/// policy rehearsal) and the cleanup of its lane worktree (destructive: it
-/// removes a worktree whose branch is provably merged).
+/// committed spine (issue #152): the merge of its reviewed head (the closed
+/// policy LANDING that publishes it — a control-plane mutation) and the
+/// cleanup of its lane worktree (destructive: it removes a worktree whose
+/// branch is provably merged).
 ///
 /// They are deliberately NOT members of [`AUTONOMOUS_STEP_KINDS`]: an armed
 /// run's ordinary work is dispatched unconditionally, while these two are

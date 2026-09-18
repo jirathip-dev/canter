@@ -841,6 +841,32 @@ release process activates (docs/RELEASING.md), then semver applies.
   `tests/mutation_engine.rs` check refusal plus surviving branches, complete
   landings with unrelated integration work, and the ancestor proof label.
 
+### Fixed (issue #176 — the merge step honours the plan's policy and publishes)
+
+- The built-in `merge` step (`p7`) declared `merge_policy:"squash"` while the
+  effect was a read-only rehearsal that never moved the integration ref: the
+  step recorded `succeeded` with `landed:false`, the published integration
+  branch never advanced, and the run's own `cleanup` (`p8`) could only refuse
+  `refusal.cleanup.unmerged` — the acceptance spine's last-mile blocker. The
+  effect now LANDS the certified delivery under the declared policy and
+  PUBLISHES it: `squash` writes one integration commit whose tree is the
+  delivered tree and whose parent is the published head, `ff` lands the
+  delivered head itself; the landing is fast-forwarded into the integration
+  checkout (never a rewrite, never a forced update; uncommitted operator work
+  the landing does not touch survives) and pushed to the same `origin` remote
+  the published ref is read from. The published ref is read back, so the step
+  succeeds only when it carries the landing; a landing that cannot be
+  published records a typed non-success (`effect.merge.failed`, or the bounded
+  `refusal.run.retry_required` when the published ref moved) and the checkout
+  is rolled back to the published head. A delivery whose content is already on
+  the merge target reports `mode:"already-landed"` and publishes nothing. The
+  outcome now records `published_head`, `published_after`, `landed_head` and
+  the pre-landing `checkout_head`. The #156 published-ref target, the #182
+  bounded reconciliation loop, the evidence gate and the closed
+  `squash | ff` policy are unchanged; `post_merge_verify` and `cleanup`
+  certify the landed head by ancestry or by the same fail-closed content fact
+  (`tests/mutation_engine.rs`).
+
 ### Changed
 
 - Documentation polish (issue #12, PR #13): security recipe doc line fix

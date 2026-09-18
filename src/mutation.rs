@@ -2132,7 +2132,7 @@ pub fn review_evidence_inputs(
     })
 }
 
-/// The explicit integration policy of a read-only merge rehearsal.
+/// The explicit integration policy of a merge landing.
 #[derive(Clone, Debug)]
 pub struct MergeInputs {
     /// The slug feature branch.
@@ -3798,8 +3798,8 @@ fn await_written_verdict(path: &Path, deadline: Duration) -> Result<String, Effe
 /// The head of the integration branch **as published** on the integration
 /// checkout's `origin` remote (`git ls-remote`) — never from the checkout's
 /// own refs, which cannot see a bare-remote move (issue #132). An unreadable
-/// or absent published ref refuses fail-closed: a rehearsal that cannot prove
-/// the published base must not certify a merge.
+/// or absent published ref refuses fail-closed: a merge that cannot prove the
+/// published base must not land on it.
 fn published_integration_head(ctx: &EffectContext<'_>) -> Result<String, EffectOutcome> {
     let out = match run_git(
         ctx,
@@ -4016,6 +4016,23 @@ fn differing_paths_between(
         .collect())
 }
 
+/// The reviewed paths (`reviewed_base..certified`) and the subset of them whose
+/// content is NOT identical between `certified` and `delivered` — the shared
+/// fail-closed content fact of the squash landing (`delivered` = the merge
+/// target), the reconciliation and the cleanup landed proof. An empty
+/// `differing` means every path the review covered carries the certified
+/// head's exact content in `delivered`.
+fn certified_content_differences(
+    ctx: &EffectContext<'_>,
+    reviewed_base: &str,
+    certified: &str,
+    delivered: &str,
+) -> Result<(Vec<String>, Vec<String>), EffectOutcome> {
+    let paths = changed_paths_between(ctx, reviewed_base, certified, code::MERGE_FAILED)?;
+    let differing = differing_paths_between(ctx, certified, delivered, &paths, code::MERGE_FAILED)?;
+    Ok((paths, differing))
+}
+
 /// Prove the certified content survives in `delivered` (issue #178): every
 /// path the review covered (`reviewed_base..certified`) must carry the
 /// certified head's exact content. A dropped path, partial content or any
@@ -4027,8 +4044,8 @@ fn prove_certified_content(
     certified: &str,
     delivered: &str,
 ) -> Result<(), EffectOutcome> {
-    let paths = changed_paths_between(ctx, reviewed_base, certified, code::MERGE_FAILED)?;
-    let differing = differing_paths_between(ctx, certified, delivered, &paths, code::MERGE_FAILED)?;
+    let (paths, differing) =
+        certified_content_differences(ctx, reviewed_base, certified, delivered)?;
     if !differing.is_empty() {
         return Err(failed(
             code::MERGE_FAILED,
@@ -4225,18 +4242,99 @@ fn reconcile_moved_published(
     ))
 }
 
-/// `merge`: rehearse the explicit integration policy without changing the
-/// integration checkout, any ref, or the remote. The evidence gate runs
-/// daemon-side before this effect; the orchestrator owns the real forge merge.
+/// Write the SQUASH landing commit of a certified delivery: ONE integration
+/// commit whose tree is the delivered tree — the delivery contains the merge
+/// target, so its tree is exactly the target's tree plus the delivered delta —
+/// and whose parent is the merge target. The delivered commits are rewritten,
+/// which is what the repository's squash policy states and why a squash
+/// landing is never an ancestor of the delivery. The commit uses the daemon's
+/// own deterministic identity: the landing is a control-plane mutation and
+/// never depends on the host's git configuration.
+fn squash_landing_commit(
+    ctx: &EffectContext<'_>,
+    inputs: &MergeInputs,
+    tree: &str,
+    target: &str,
+    certified: &str,
+) -> Result<String, EffectOutcome> {
+    let mut message = format!(
+        "squash the certified delivery {} onto {} (certified head {})",
+        inputs.branch, ctx.integration_branch, certified
+    );
+    if ctx.plan.issue_number > 0 {
+        message.push_str(&format!("\n\nRefs #{}", ctx.plan.issue_number));
+    }
+    let out = run_git(
+        ctx,
+        ctx.integration_repo,
+        &[
+            "-c",
+            "user.name=canter",
+            "-c",
+            "user.email=canter@localhost",
+            "commit-tree",
+            tree,
+            "-p",
+            target,
+            "-m",
+            &message,
+        ],
+    )?;
+    let head = out.stdout.trim().to_string();
+    if !is_hex40(&head) {
+        return Err(failed(
+            code::MERGE_FAILED,
+            format!("the squash landing commit could not be created (git reported {head:?})"),
+        ));
+    }
+    Ok(head)
+}
+
+/// Roll the integration checkout back to the published merge target after a
+/// landing the published ref does not carry. The local move must never be left
+/// behind: on the next attempt it would read as an unpublished local move
+/// (issue #156). The rollback is `reset --keep`, which aborts rather than
+/// discard operator work; by construction no operator change overlaps the
+/// landing delta (the fast-forward that preceded it succeeded).
+fn roll_back_landing(ctx: &EffectContext<'_>, target: &str) -> Result<(), String> {
+    match run_git(ctx, ctx.integration_repo, &["reset", "--keep", target]) {
+        Ok(_) => Ok(()),
+        Err(outcome) => Err(outcome.message.unwrap_or_else(|| {
+            format!("the checkout rollback to the published head {target} failed")
+        })),
+    }
+}
+
+/// `merge`: LAND the certified delivery on the integration ref under the
+/// plan's closed policy and PUBLISH it to the integration remote — a
+/// control-plane mutation the daemon journals like every other effect. The
+/// evidence gate runs daemon-side before this effect.
 ///
-/// A checkout strictly BEHIND the published integration ref is not a stale
-/// local view to refuse forever (issue #178): the published ref is fetched
-/// and verified, and a certified delivery that does not contain it is
-/// RECONCILED onto it — the reviewed delta is replayed in the delivery's own
-/// worktree — before this same step's bounded retry re-certifies the
-/// reconciled head. An UNPUBLISHED local move (the checkout ahead of, or
-/// diverged from, the published ref) is never reconciled: the published ref
-/// is the only certifiable merge target (issue #156).
+/// The merge target is always the PUBLISHED integration ref (issue #132): the
+/// checkout's own refs cannot see a bare-remote move, so the published head is
+/// read from the checkout's `origin` remote, and an unreadable or absent
+/// published ref refuses fail-closed. An UNPUBLISHED local move (the checkout
+/// ahead of, or diverged from, the published ref) is never reconciled: the
+/// published ref is the only merge target (issue #156). A checkout strictly
+/// BEHIND it is not a stale local view to refuse forever (issue #178): the
+/// published ref is fetched and verified, and a certified delivery that does
+/// not contain it is RECONCILED onto it — the reviewed delta is replayed in
+/// the delivery's own worktree — before this same step's bounded retry
+/// re-certifies the reconciled head.
+///
+/// The landing itself honours the declared policy: `squash` writes ONE new
+/// integration commit whose tree is the delivered tree and whose parent is the
+/// published head (the delivered commits are rewritten, exactly as the
+/// repository's squash policy states), `ff` lands the delivered head itself.
+/// The landing is fast-forwarded into the integration checkout — never a
+/// rewrite, never a forced update — and pushed to the same `origin` remote the
+/// published ref was read from; the published ref is then read back, and the
+/// step succeeds only when it carries the landing. A landing that cannot be
+/// published records a typed non-success and the checkout is rolled back to
+/// the published head (never a local move the published ref does not carry). A
+/// delivery whose content is already on the merge target — a prior landing of
+/// this very delivery, or a delivery with no content beyond the base — reports
+/// `already-landed` and publishes nothing.
 fn effect_merge(ctx: &EffectContext<'_>) -> EffectOutcome {
     let inputs = match merge_inputs(ctx.params, &ctx.param_contract()) {
         Ok(inputs) => inputs,
@@ -4288,7 +4386,7 @@ fn effect_merge(ctx: &EffectContext<'_>) -> EffectOutcome {
             return failed(
                 code::MERGE_NOT_FF,
                 format!(
-                    "{} policy rehearsal refused: the published integration ref {:?} is at {fetched}, but the integration checkout is at {integration_head}: an unpublished or diverged local view is never reconciled",
+                    "{} policy merge refused: the published integration ref {:?} is at {fetched}, but the integration checkout is at {integration_head}: an unpublished or diverged local view is never reconciled",
                     inputs.policy, ctx.integration_branch
                 ),
             );
@@ -4336,14 +4434,6 @@ fn effect_merge(ctx: &EffectContext<'_>) -> EffectOutcome {
             ),
         );
     }
-    if inputs.policy == "squash" && !feature_descends && feature_tree != integration_tree {
-        return failed(
-            code::MERGE_FAILED,
-            format!(
-                "squash policy rehearsal cannot prove feature tree {feature_tree} against integration tree {integration_tree}"
-            ),
-        );
-    }
     let certified_head = ctx.observed_feature_head.unwrap_or_default().to_string();
     let branch_head = match run_git(
         ctx,
@@ -4353,13 +4443,135 @@ fn effect_merge(ctx: &EffectContext<'_>) -> EffectOutcome {
         Ok(out) => out.stdout.trim().to_string(),
         Err(outcome) => return outcome,
     };
+    // The landing commit, or `None` when the delivered content is ALREADY on
+    // the merge target — a prior landing of this very delivery, or a delivery
+    // with no content beyond the base. Nothing is published then (a landing
+    // would only add an empty commit); the step reports the already-present
+    // content instead of a landing it did not perform.
+    let landing = if !feature_descends {
+        // Only the squash policy reaches here (the ff policy refused above):
+        // the delivery does not contain the merge target, so no landing can be
+        // built from it — a commit based on the target could only rewrite the
+        // target's own content. Its reviewed content must therefore already be
+        // there, proven by the same fail-closed content fact the cleanup
+        // landed proof and `post_merge_verify` use.
+        let (reviewed_paths, differing) =
+            match certified_content_differences(ctx, reviewed_base, &certified_head, &target) {
+                Ok(pair) => pair,
+                Err(outcome) => return outcome,
+            };
+        if !differing.is_empty() {
+            return failed(
+                code::MERGE_FAILED,
+                format!(
+                    "the certified delivery {:?} does not contain the published integration ref {target} and {} of the {} reviewed path(s) it changed are not content-identical there (first {:?}); nothing can be landed from it",
+                    inputs.branch,
+                    differing.len(),
+                    reviewed_paths.len(),
+                    differing.first()
+                ),
+            );
+        }
+        None
+    } else if feature_tree == integration_tree {
+        None
+    } else if inputs.policy == "squash" {
+        match squash_landing_commit(ctx, &inputs, &feature_tree, &target, &certified_head) {
+            Ok(head) => Some(head),
+            Err(outcome) => return outcome,
+        }
+    } else {
+        Some(branch_head.clone())
+    };
+    let mut published_after = published_head.clone();
+    if let Some(landed_head) = &landing {
+        // Advance the integration checkout to the landing — a fast-forward
+        // from the published head, never a rewrite, never a forced update. A
+        // checkout that cannot advance (uncommitted operator work on the
+        // landed paths) refuses BEFORE anything is published: no landing is
+        // ever claimed from a checkout that did not take it.
+        if let Err(outcome) = run_git(
+            ctx,
+            ctx.integration_repo,
+            &["merge", "--ff-only", landed_head],
+        ) {
+            if outcome.code.as_deref() != Some(code::EXIT) {
+                return outcome;
+            }
+            let detail = outcome
+                .message
+                .as_deref()
+                .unwrap_or("the fast-forward failed without a message");
+            return failed(
+                code::MERGE_FAILED,
+                format!(
+                    "the integration checkout {:?} cannot advance to the landing {landed_head}: {detail}",
+                    ctx.integration_branch
+                ),
+            );
+        }
+        // Publish to the same remote the merge target was read from, then read
+        // the published ref back: the landing is real only when the published
+        // ref carries it.
+        let push = run_git(
+            ctx,
+            ctx.integration_repo,
+            &[
+                "push",
+                "--porcelain",
+                "origin",
+                &format!("{landed_head}:refs/heads/{}", ctx.integration_branch),
+            ],
+        );
+        published_after = match published_integration_head(ctx) {
+            Ok(head) => head,
+            Err(outcome) => {
+                let _ = roll_back_landing(ctx, &target);
+                return outcome;
+            }
+        };
+        if published_after != *landed_head {
+            let rollback = roll_back_landing(ctx, &target);
+            let detail = match (&push, &rollback) {
+                (Err(outcome), _) => outcome.message.clone().unwrap_or_default(),
+                (Ok(_), Err(detail)) => format!("the checkout rollback also failed: {detail}"),
+                (Ok(_), Ok(())) => "the published ref did not carry the landing".to_string(),
+            };
+            if published_after != published_head {
+                return refusal(
+                    code::RETRY_REQUIRED,
+                    format!(
+                        "the published integration ref {:?} moved to {published_after} while this step landed {landed_head}: the landing was rolled back and this step's bounded retry re-certifies the delivery against the fetched published ref",
+                        ctx.integration_branch
+                    ),
+                );
+            }
+            return failed(
+                code::MERGE_FAILED,
+                format!(
+                    "the landing {landed_head} was not published to {:?}: {detail}",
+                    ctx.integration_branch
+                ),
+            );
+        }
+    }
+    let landed_head = landing.clone().unwrap_or_else(|| target.clone());
     ok(object(vec![
-        ("mode", string("rehearsal")),
-        ("landed", bool_(false)),
+        (
+            "mode",
+            string(if landing.is_some() {
+                "landed"
+            } else {
+                "already-landed"
+            }),
+        ),
+        ("landed", bool_(true)),
         ("merge_policy", string(&inputs.policy)),
         ("integration_branch", string(ctx.integration_branch)),
         ("integration_head", string(&target)),
         ("published_head", string(&published_head)),
+        ("published_after", string(&published_after)),
+        ("landed_head", string(&landed_head)),
         ("checkout_head", string(&integration_head)),
         ("certified_head", string(&certified_head)),
         ("reconciled_head", string(&branch_head)),
@@ -4376,7 +4588,7 @@ fn effect_merge(ctx: &EffectContext<'_>) -> EffectOutcome {
 /// reviewed feature head — by exact git ancestry (AC7's verification step),
 /// or, for the repository's SQUASH policy, whose landing rewrites the
 /// reviewed commits and can therefore never be an ancestor, by the same
-/// fail-closed content fact the merge rehearsal and the cleanup landed proof
+/// fail-closed content fact the merge landing and the cleanup landed proof
 /// use: every path the review covered must carry the reviewed head's exact
 /// content in the integration ref (issue #178 — plan, merge and verifier
 /// agree on the squash landing).
@@ -4673,7 +4885,7 @@ enum LandedProof {
     Ancestor,
     /// Every path the branch changed relative to its fork point already
     /// carries the branch's exact content in the integration ref — the same
-    /// content fact the merge rehearsal certifies for the `squash` policy.
+    /// content fact the merge landing certifies for the `squash` policy.
     Content {
         /// The fork point the content proof compared from.
         merge_base: String,
