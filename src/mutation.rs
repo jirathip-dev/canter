@@ -2175,6 +2175,25 @@ pub fn merge_inputs(
             ));
         }
     };
+    // The ref a landing PUBLISHES to is never a production branch (issue
+    // #176): the landing is the reviewed merge of one feature branch onto the
+    // integration branch, and promotion to production stays a separate,
+    // human-gated path — there is no direct push to integration/production
+    // refs anywhere in this engine.
+    if contract.integration_branch == "main"
+        || contract
+            .production_branches
+            .iter()
+            .any(|branch| branch == contract.integration_branch)
+    {
+        return Err(refusal(
+            code::PUSH_POLICY,
+            format!(
+                "the integration branch {:?} is a production branch; a merge never publishes to production",
+                contract.integration_branch
+            ),
+        ));
+    }
     Ok(MergeInputs { branch, policy })
 }
 
@@ -5991,6 +6010,56 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    /// Issue #176: a landing PUBLISHES to the integration ref, so a topology
+    /// whose integration branch is a production branch is refused before any
+    /// work — production promotion stays human-gated.
+    #[test]
+    fn merge_inputs_never_publishes_to_a_production_integration_branch() {
+        let main_only = vec!["main".to_string()];
+        let params = object(vec![
+            ("branch", string("issue-1")),
+            ("merge_policy", string("squash")),
+        ]);
+        // `main` is production even when it is not declared.
+        let contract = ParamContract {
+            integration_branch: "main",
+            production_branches: &main_only,
+            ..ParamContract::default()
+        };
+        let refused =
+            merge_inputs(Some(&params), &contract).expect_err("main is never a landing target");
+        assert_eq!(refused.code.as_deref(), Some(code::PUSH_POLICY));
+        assert!(
+            refused
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("production"),
+            "{refused:?}"
+        );
+        // A DECLARED production integration branch is refused too.
+        let declared = vec!["main".to_string(), "release".to_string()];
+        let contract = ParamContract {
+            integration_branch: "release",
+            production_branches: &declared,
+            ..ParamContract::default()
+        };
+        assert_eq!(
+            merge_inputs(Some(&params), &contract)
+                .expect_err("declared production refused")
+                .code
+                .as_deref(),
+            Some(code::PUSH_POLICY)
+        );
+        // The ordinary integration branch still resolves.
+        let contract = ParamContract {
+            integration_branch: "staging",
+            production_branches: &declared,
+            ..ParamContract::default()
+        };
+        assert!(merge_inputs(Some(&params), &contract).is_ok());
     }
 
     #[test]
