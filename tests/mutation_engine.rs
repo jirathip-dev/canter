@@ -664,14 +664,31 @@ struct Scenario {
 
 impl Scenario {
     fn new(name: &str, expires_at: &str, steps: Vec<Val>) -> Scenario {
+        Scenario::with_host_path(name, expires_at, steps, true)
+    }
+
+    /// The same fixture with the daemon's PATH narrowed to the sandbox's own
+    /// `fakebin` (no host PATH behind it): an executable missing there — a
+    /// `git` shim included — is a REAL spawn failure for the effect, because
+    /// no host candidate can serve it (a non-executable host-PATH candidate
+    /// is skipped by `execvp`, so shadowing needs the whole PATH).
+    fn without_host_path(name: &str, expires_at: &str, steps: Vec<Val>) -> Scenario {
+        Scenario::with_host_path(name, expires_at, steps, false)
+    }
+
+    fn with_host_path(name: &str, expires_at: &str, steps: Vec<Val>, host_path: bool) -> Scenario {
         let sandbox = Sandbox::new(name);
         let repos = make_repos(&sandbox);
         sandbox.write("fakebin/gh", FAKE_GH);
         sandbox.write("fakebin/hf-lane", FAKE_LANE);
         sandbox.chmod_x("fakebin/gh");
         sandbox.chmod_x("fakebin/hf-lane");
-        let host_path = std::env::var("PATH").unwrap_or_default();
-        let path = format!("{}:{host_path}", sandbox.path("fakebin").display());
+        let fakebin = sandbox.path("fakebin").display().to_string();
+        let path = if host_path {
+            format!("{fakebin}:{}", std::env::var("PATH").unwrap_or_default())
+        } else {
+            fakebin
+        };
         let fixture = Fixture::new(&sandbox, name);
         let db_path = fixture.paths().db_path;
         seed_state(&db_path, expires_at);
@@ -2002,6 +2019,166 @@ fn cycle2_ambiguous_published_read_keeps_its_own_outcome_and_is_never_remapped()
         base,
         "an ambiguous read must not move integration"
     );
+}
+
+/// An executable `git` shim inside the sandbox's `fakebin` that appends every
+/// invocation's argv (one line per call) to a per-leg log before running
+/// `body`. The fixture's PATH puts `fakebin` first, so the shim stands in for
+/// the real git in every effect subprocess while the log proves exactly which
+/// call was made.
+fn write_read_shim(sandbox: &Sandbox, leg: &str, body: &str) {
+    let log = sandbox.path(&format!("git-argv-{leg}.txt"));
+    sandbox.write(
+        "fakebin/git",
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n{body}",
+            log.display()
+        ),
+    );
+    sandbox.chmod_x("fakebin/git");
+}
+
+/// #169: the published-ref read's non-remap guard. EXACTLY ONE subprocess
+/// outcome class is remapped onto the read's own unprovable-base refusal —
+/// the ordinary non-zero exit, which becomes `effect.merge.failed` — and every
+/// other class keeps its own typed code: a mid-read death
+/// (`adapter.process_death`), a read that outlives the declared effect
+/// deadline (`adapter.timeout`), and a read whose executable cannot be spawned
+/// at all (`refusal.unavailable`). Each leg drives the real
+/// `published_integration_head` through the daemon's own `apply` route over a
+/// disposable local repository: step `w1` with no observed base makes the
+/// published read the FIRST git subprocess of the effect, and the shim's argv
+/// log proves the read — never a neighbouring call — was reached.
+#[test]
+fn cycle2_published_read_keeps_every_subprocess_outcome_that_is_not_a_non_zero_exit() {
+    let read = "ls-remote origin refs/heads/staging";
+    let mut observed: Vec<(&str, String, String)> = Vec::new();
+
+    // The timed-out and the unspawnable read need a PATH with no host
+    // fallback: `fakebin` is the daemon's WHOLE PATH there, so removing the
+    // `git` shim is a REAL spawn failure (`execvp` skips a non-executable
+    // host candidate, so a merely shadowed host git would still answer).
+    let narrowed = Scenario::without_host_path(
+        "v169a",
+        "2999-01-01T00:00:00Z",
+        vec![step(
+            "w1",
+            "worktree_create",
+            Some(object(vec![
+                ("branch", string("issue-123")),
+                ("worktree", string("issues-123")),
+                // The documented declared effect deadline (1..=ceiling); the
+                // shim's read outlives it by far while never exiting itself.
+                ("deadline_secs", integer(1)),
+            ])),
+        )],
+    );
+    let narrowed_base = narrowed.integration_base();
+    write_read_shim(&narrowed.sandbox, "deadline", "exec /bin/sleep 30\n");
+    let (code, message) = narrowed.apply_err(1691, "w1", None, None);
+    observed.push(("read-deadline", code, message));
+    std::fs::remove_file(narrowed.sandbox.path("fakebin/git")).expect("remove the git shim");
+    let (code, message) = narrowed.apply_err(1692, "w1", None, None);
+    observed.push(("read-unspawnable", code, message));
+
+    // The control and the mid-read death run against the stock fixture (the
+    // host PATH behind `fakebin`), where the real git is reachable for every
+    // call the read is not.
+    let stock = Scenario::new(
+        "v169b",
+        "2999-01-01T00:00:00Z",
+        vec![flow_steps()[0].clone()],
+    );
+    let stock_base = stock.integration_base();
+    write_read_shim(
+        &stock.sandbox,
+        "exit",
+        "echo 'fatal: could not read from remote repository' >&2\nexit 128\n",
+    );
+    let (code, message) = stock.apply_err(1693, "w1", None, None);
+    observed.push(("ordinary-exit", code, message));
+    write_read_shim(&stock.sandbox, "death", "kill -9 $$\n");
+    let (code, message) = stock.apply_err(1694, "w1", None, None);
+    observed.push(("mid-read-death", code, message));
+    for (leg, code, message) in &observed {
+        eprintln!("published-read leg {leg}: {code}: {message}");
+    }
+
+    // One aggregate verdict, so a mutated guard is reported for EVERY leg it
+    // would remap instead of hiding the rest behind the first panic.
+    let expect: [(&str, &str, &str); 4] = [
+        (
+            "ordinary-exit",
+            "effect.merge.failed",
+            "exited with code 128",
+        ),
+        (
+            "mid-read-death",
+            "adapter.process_death",
+            "died without a terminal outcome",
+        ),
+        ("read-deadline", "adapter.timeout", "exceeded its deadline"),
+        ("read-unspawnable", "refusal.unavailable", "could not spawn"),
+    ];
+    let mut mismatches = Vec::new();
+    for (leg, want_code, want_text) in expect {
+        let (_, code, message) = observed
+            .iter()
+            .find(|(name, _, _)| *name == leg)
+            .expect("every leg ran");
+        if code != want_code {
+            mismatches.push(format!(
+                "{leg}: expected the read's own code {want_code}, observed {code}: {message}"
+            ));
+        }
+        if !message.contains(want_text) {
+            mismatches.push(format!(
+                "{leg}: the read's own diagnostics must contain {want_text:?}: {message}"
+            ));
+        }
+        if leg != "ordinary-exit" && message.contains("not readable") {
+            mismatches.push(format!(
+                "{leg}: a non-exit outcome was remapped onto the unprovable-base code: {message}"
+            ));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "the published read's guard remaps ONLY an ordinary non-zero exit (#169):\n{}",
+        mismatches.join("\n")
+    );
+
+    // The shim's argv log pins the call site: the effect's first — and, until
+    // it fails, only — git subprocess is the published read itself.
+    for (scenario, base, legs) in [
+        (&narrowed, &narrowed_base, ["deadline"].as_slice()),
+        (&stock, &stock_base, ["exit", "death"].as_slice()),
+    ] {
+        for leg in legs {
+            let log =
+                std::fs::read_to_string(scenario.sandbox.path(&format!("git-argv-{leg}.txt")))
+                    .expect("the shim ran");
+            assert_eq!(
+                log.lines().collect::<Vec<_>>(),
+                vec![read],
+                "{leg}: the published read is the only git call before the outcome"
+            );
+        }
+        assert!(
+            !scenario.repos.worktrees_root.join("issues-123").exists(),
+            "a read that kept its own outcome never created a lane"
+        );
+        assert_eq!(
+            Git::new(&scenario.repos.checkout).head("staging"),
+            *base,
+            "a read that kept its own outcome never moved the checkout"
+        );
+        assert_eq!(
+            Git::new(&scenario.origin()).head("staging"),
+            *base,
+            "a read that kept its own outcome never moved the published ref"
+        );
+    }
 }
 
 #[test]
