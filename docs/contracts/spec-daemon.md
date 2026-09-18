@@ -326,6 +326,21 @@ outcome after the effect transaction commits.
   `submission.already_owned`; a later issuance may rotate an expired window on
   that same run, with `grant.rotation` naming both rows and the new expiry. The
   grant insertion order is the normative authorization-window order.
+- **Reviewed-evidence frontier (issue #192):** the rebind above never
+  supersedes a run whose recorded frontier has REACHED its own
+  `review_evidence` step — that step is the run's next unachieved step, or is
+  already achieved (read from the same committed bound-input spine plus the
+  same recorded apply-attempt ledger the driver's own frontier reads, with
+  `current_node` only as the pre-ledger fallback). Such a run's verified spine
+  (its recorded delivery included) is carried forward: the presented item is
+  refused `submission.frontier_preserved`, the run keeps its unique ownership
+  and its own authorization window, and it continues its own committed
+  merge/cleanup tail. The preview reports the same fact as
+  `preview.frontier_preserved` instead of presenting the rebind as
+  authorized. Replacing such a run is an explicit, audited act: the
+  `run.release` control frees its ownership and the run goes terminal, after
+  which a fresh submission admits a new run. A run that has not reached that
+  frontier keeps the rebind semantics above unchanged.
 - `queue.status` requires `params.submission_id` (`qs_` + 16 hex) and
   returns the same document the submit response carried (a pure
   projection of the committed rows; `state.not_found` for an unknown id).

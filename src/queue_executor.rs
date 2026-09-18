@@ -89,6 +89,11 @@ pub mod codes {
     pub const STEPS: &str = "submission.steps";
     /// A declared step requires a capability outside the reviewed boundary.
     pub const BOUNDARY: &str = "submission.boundary";
+    /// The live owner has reached its reviewed-evidence frontier: its
+    /// verified spine is carried forward and a fresh submission never
+    /// supersedes it (issue #192). A deliberate replacement is an explicit,
+    /// audited `run.release` followed by a fresh submission.
+    pub const FRONTIER_PRESERVED: &str = "submission.frontier_preserved";
 }
 
 /// A typed submission error/refusal (fail closed; stable codes).
@@ -969,7 +974,7 @@ fn holds_of(doc: &Val) -> Vec<HoldText> {
 /// preview holds are a closed set; an unknown code is dropped (the preview
 /// renderer is the only producer).
 fn code_static(code: &str) -> Option<&'static str> {
-    const CODES: [&str; 14] = [
+    const CODES: [&str; 15] = [
         preview_holds::WORKFLOW_UNSUPPORTED,
         preview_holds::HOST_UNAVAILABLE,
         preview_holds::OCCUPANCY_UNKNOWN,
@@ -978,6 +983,7 @@ fn code_static(code: &str) -> Option<&'static str> {
         preview_holds::STEP_UNRESOLVED,
         preview_holds::PROTECTED_BRANCH,
         preview_holds::REVISION_STALE,
+        preview_holds::FRONTIER_PRESERVED,
         preview_holds::DEPENDENCY_UNRESOLVED,
         preview_holds::DEPENDENCY_UNSETTLED,
         preview_holds::DEPENDENCY_CYCLE,

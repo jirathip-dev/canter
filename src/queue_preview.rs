@@ -101,6 +101,11 @@ pub mod holds {
     pub const PROTECTED_BRANCH: &str = "preview.protected_branch";
     /// The selected spec revision moved past the recorded run revision.
     pub const REVISION_STALE: &str = "preview.revision_stale";
+    /// The active owner has reached its reviewed-evidence frontier: its
+    /// verified spine is carried forward and a fresh submission never
+    /// supersedes it (issue #192); replacing it takes an explicit, audited
+    /// release.
+    pub const FRONTIER_PRESERVED: &str = "preview.frontier_preserved";
     /// A required dependency is not part of the selected set.
     pub const DEPENDENCY_UNRESOLVED: &str = "preview.dependency_unresolved";
     /// A required dependency is selected but not settled (blocked or owned).
@@ -1126,8 +1131,11 @@ pub fn preview_queue(state: &State, request: &QueueRequest) -> Result<QueuePrevi
 
     // Items: durable ownership first, then dependency readiness. A moved
     // revision is rebindable only when a later grant window explicitly binds
-    // that exact selection; opaque revision hashes are never ordered.
+    // that exact selection; opaque revision hashes are never ordered — and a
+    // run that has reached its reviewed-evidence frontier is carried forward
+    // instead (issue #192), never superseded by a candidate rebuild.
     let mut rebindable: BTreeSet<(IssueId, String)> = BTreeSet::new();
+    let mut preserved: BTreeSet<(IssueId, String)> = BTreeSet::new();
     for issue in &request.selected {
         if let Some(owner) = owned_rows.iter().copied().find(|row| {
             row.repository == issue.id.repository
@@ -1143,7 +1151,19 @@ pub fn preview_queue(state: &State, request: &QueueRequest) -> Result<QueuePrevi
                 )
                 .map_err(|err| PreviewError::new(err.code, err.message))?;
             if authorized {
-                rebindable.insert((issue.id.clone(), issue.revision.clone()));
+                // The later window authorizes the rebind, but a run at its
+                // reviewed-evidence frontier is preserved by the same durable
+                // frontier fact the submission transaction enforces: the
+                // preview never presents a supersession the admission would
+                // refuse.
+                if state
+                    .run_reached_review_frontier(&owner.instance_id)
+                    .map_err(|err| PreviewError::new(err.code, err.message))?
+                {
+                    preserved.insert((issue.id.clone(), issue.revision.clone()));
+                } else {
+                    rebindable.insert((issue.id.clone(), issue.revision.clone()));
+                }
             }
         }
     }
@@ -1175,14 +1195,32 @@ pub fn preview_queue(state: &State, request: &QueueRequest) -> Result<QueuePrevi
         if let Some(run) = &item.owned
             && item.stale_revision
         {
-            item_level.push(Hold {
-                code: holds::REVISION_STALE,
-                subject: item.id.display(),
-                message: format!(
-                    "the selected spec revision {} differs from active run {} at {}; no later grant window authorizes this exact revision, so only the older authorization remains",
-                    item.revision, run.instance_id, run.revision
-                ),
-            });
+            // Issue #192: a later window may authorize a rebind, but a run
+            // that has reached its reviewed-evidence frontier is carried
+            // forward — reported with its own code so the operator is told
+            // the exact deliberate path (an audited release), never a stale
+            // "no later window" claim.
+            item_level.push(
+                if preserved.contains(&(item.id.clone(), item.revision.clone())) {
+                    Hold {
+                        code: holds::FRONTIER_PRESERVED,
+                        subject: item.id.display(),
+                        message: format!(
+                            "run {} has reached its review_evidence frontier; the verified spine is carried forward and a fresh submission never supersedes it — release the run explicitly to replace it",
+                            run.instance_id
+                        ),
+                    }
+                } else {
+                    Hold {
+                        code: holds::REVISION_STALE,
+                        subject: item.id.display(),
+                        message: format!(
+                            "the selected spec revision {} differs from active run {} at {}; no later grant window authorizes this exact revision, so only the older authorization remains",
+                            item.revision, run.instance_id, run.revision
+                        ),
+                    }
+                },
+            );
         }
         // Declared dependency facts are reported on every item that declares
         // them (ownership included): an unresolved reference or a cycle is
