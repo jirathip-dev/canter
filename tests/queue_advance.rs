@@ -1775,7 +1775,7 @@ fn repos_with_lane_branch(fixture: &DaemonFixture) -> String {
     git(&repo, &["add", "base.txt"]);
     git(&repo, &["commit", "-q", "-m", "fixture base"]);
     let head = git(&repo, &["rev-parse", "HEAD"]);
-    // The merge rehearsal certifies origin's published ref, not merely the
+    // The merge step certifies origin's published ref, not merely the
     // checkout's local head. Keep that prerequisite real and network-free.
     git(&fixture.dir, &["init", "-q", "--bare", "origin.git"]);
     git(&repo, &["remote", "add", "origin", "../origin.git"]);
@@ -2033,12 +2033,12 @@ fn the_supervisor_itself_drives_the_committed_merge_and_cleanup_to_the_last_step
     assert_eq!(
         git(&fixture.dir.join("repo"), &["rev-parse", "staging"]),
         head,
-        "the rehearsal never lands in the integration checkout"
+        "a delivery with no content beyond the base publishes nothing"
     );
     assert_eq!(
         git(&fixture.dir.join("origin.git"), &["rev-parse", "staging"]),
         head,
-        "the rehearsal never changes the published integration head"
+        "the published integration head is unchanged (nothing to land)"
     );
     shutdown(daemon);
 }
