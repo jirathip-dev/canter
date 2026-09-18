@@ -1420,6 +1420,75 @@ fn cycle2_reviewed_merge(policy: &str, squash_first: bool) -> (Scenario, String,
     (scenario, feature, base)
 }
 
+/// Witness (issue #202 AC1): a commit that lands on the delivery branch AFTER
+/// the verdict named its head is never consumed. The published integration ref
+/// has not moved, so the delivery is frozen at the exact head the recorded
+/// verdict names: the merge refuses typed (`refusal.delivery.moved`) naming
+/// both heads and requiring the delivery to re-enter review, publishes
+/// nothing, and moves nothing. With the moved head restored to the certified
+/// head the SAME step lands the delivery, so the refusal is the freeze and not
+/// a blanket failure.
+#[test]
+fn a_post_verdict_commit_on_the_delivery_branch_is_never_consumed_by_the_merge() {
+    let (scenario, feature, base) = cycle2_reviewed_merge("squash", false);
+    let origin_git = Git::new(&scenario.origin());
+    let published_before = origin_git.head("staging");
+    assert_eq!(published_before, base, "the fixture starts unpublished");
+
+    // The lane's own worker commits on the delivery branch after the verdict.
+    let lane = scenario.repos.worktrees_root.join("issues-123");
+    std::fs::write(lane.join("post-verdict.txt"), "unreviewed\n").expect("write");
+    let lane_git = Git::new(&lane);
+    lane_git.run(&["add", "post-verdict.txt"]);
+    lane_git.run(&[
+        "-c",
+        "user.name=Worker",
+        "-c",
+        "user.email=worker@example.invalid",
+        "commit",
+        "-q",
+        "-m",
+        "post-verdict commit (synthetic)",
+    ]);
+    let moved = lane_git.head("HEAD");
+    assert_ne!(moved, feature, "the delivery moved past the verdict");
+
+    let (code, message) = scenario.apply_err(15, "m1", Some(&feature), Some(&base));
+    assert_eq!(code, "refusal.delivery.moved", "{message}");
+    assert!(
+        message.contains(&moved) && message.contains(&feature),
+        "the refusal names both the moved head and the head the verdict names: {message}"
+    );
+    // Nothing was consumed: the published ref and the integration checkout are
+    // exactly where they were.
+    assert_eq!(
+        Git::new(&scenario.origin()).head("staging"),
+        published_before,
+        "a frozen delivery publishes nothing"
+    );
+    assert_eq!(
+        scenario.integration_base(),
+        base,
+        "a frozen delivery moves no integration ref"
+    );
+    assert_eq!(
+        lane_git.head("HEAD"),
+        moved,
+        "the refusal never rewrites the delivery branch"
+    );
+
+    // Control: with the certified head restored, the SAME step lands it — the
+    // freeze is the verdict's head, never a blanket refusal.
+    lane_git.run(&["reset", "--hard", &feature]);
+    let landed = scenario.apply_ok(16, "m1", Some(&feature), Some(&base));
+    assert_eq!(landed.get("mode").and_then(Val::as_str), Some("landed"));
+    assert_ne!(
+        Git::new(&scenario.origin()).head("staging"),
+        published_before,
+        "the unmoved certified delivery still lands"
+    );
+}
+
 /// Witness (a) (issue #176): with `merge_policy: "squash"`, the merge step
 /// PUBLISHES the certified delivery — the published integration ref (read from
 /// the bare remote itself) advances to a landing whose tree IS the delivered

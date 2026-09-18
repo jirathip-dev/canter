@@ -226,6 +226,20 @@ pub mod code {
     pub const MALFORMED_OUTPUT: &str = "refusal.malformed.output";
     /// A delta-required collection found no committed content change.
     pub const COLLECT_EMPTY_DELTA: &str = "refusal.collect.empty_delta";
+    /// A collection step could not bind the delivery head it observed: the
+    /// observation is not a certified delivery binding, so the step is a
+    /// typed non-success rather than a `succeeded` outcome that bound nothing
+    /// (issue #202 AC2).
+    pub const COLLECT_UNBOUND: &str = "refusal.collect.unbound";
+    /// A step was asked to consume a delivery head the run's own collection
+    /// never certified (issue #202 AC2): no head is ever consumed that was
+    /// not observed by the run's own collector.
+    pub const DELIVERY_UNBOUND: &str = "refusal.delivery.unbound";
+    /// The delivery branch moved past the head its recorded verdict names
+    /// (issue #202 AC1): a commit landed on the reviewed delivery after the
+    /// verdict, so no step may consume it — the delivery must re-enter review
+    /// and a new verdict must name the moved head.
+    pub const DELIVERY_MOVED: &str = "refusal.delivery.moved";
     /// The pane worker did not settle within the collection deadline.
     pub const WORKER_TIMEOUT: &str = "effect.worker_timeout";
     /// An existing lane cannot safely be created at the recorded base.
@@ -3328,6 +3342,14 @@ fn collect_worktree_outcome(
             ),
         );
     }
+    // Issue #202 (AC2): the collection binds the certified delivery head it
+    // OBSERVED, or it is a typed non-success. A `succeeded` collection that
+    // bound no head is the defect the review frontier parked on forever: the
+    // head below IS this run's certified delivery binding (branch + head +
+    // base), and `certify_delivery_binding` refuses when it cannot be named.
+    if let Err(outcome) = certify_delivery_binding(&head, &branch) {
+        return outcome;
+    }
     ok(object(vec![
         ("head", string(&head)),
         ("commits", Val::Arr(commits)),
@@ -3337,6 +3359,32 @@ fn collect_worktree_outcome(
         ("requires_delta", bool_(inputs.requires_delta)),
         ("changed_files", Val::Arr(changed)),
     ]))
+}
+
+/// Whether one collection's observation IS a certified delivery binding
+/// (issue #202 AC2): the observed head is a 40-hex commit sha and the branch
+/// it was collected from is a slug. A collection that cannot name what it
+/// observed is a typed non-success ([`code::COLLECT_UNBOUND`]), never a
+/// `succeeded` outcome that bound nothing — the run's later steps may only
+/// ever consume the head the run's own collector certified.
+pub fn certify_delivery_binding(head: &str, branch: &str) -> Result<(), EffectOutcome> {
+    if !is_hex40(head) {
+        return Err(refusal(
+            code::COLLECT_UNBOUND,
+            format!(
+                "collect_outcome observed no bindable delivery head ({head:?} is not a 40-hex sha); a collection that cannot bind the head it observed is a typed non-success, never a `succeeded` outcome that bound nothing"
+            ),
+        ));
+    }
+    if !is_slug(branch) {
+        return Err(refusal(
+            code::COLLECT_UNBOUND,
+            format!(
+                "collect_outcome observed no bindable delivery branch ({branch:?} is not a slug); a collection that cannot bind the delivery it observed is a typed non-success, never a `succeeded` outcome that bound nothing"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// `review_evidence`: record review evidence for this run's certified head.
@@ -4471,6 +4519,26 @@ fn effect_merge(ctx: &EffectContext<'_>) -> EffectOutcome {
         Ok(out) => out.stdout.trim().to_string(),
         Err(outcome) => return outcome,
     };
+    // Issue #202 (AC1): a recorded verdict FREEZES the delivery at the exact
+    // head it names. `ctx.observed_feature_head` IS that head here — the
+    // daemon's own evidence gate has already proven the newest `pass` verdict
+    // names it — so when the published integration ref has not moved, the
+    // delivery branch may only be consumed AT that head. A commit that
+    // landed on the delivery after the verdict is a move no verdict names:
+    // the step refuses typed (never a silent consumption of the moved
+    // content) and the delivery must re-enter review. The published-ref
+    // reconciliation above stays the ONE documented engine refresh (issue
+    // #178: it is a history rewrite onto the *published* ref whose certified
+    // content is proven byte-for-byte), so it is not this rule's subject.
+    if target == reviewed_base && branch_head != certified_head {
+        return refusal(
+            code::DELIVERY_MOVED,
+            format!(
+                "the delivery branch {:?} is at {branch_head}, not the head {certified_head} its recorded verdict names: a commit landed on the reviewed delivery after the verdict, so no step may consume it; the delivery must re-enter review and a new verdict must name {branch_head} before any step consumes it",
+                inputs.branch
+            ),
+        );
+    }
     // The landing commit, or `None` when the delivered content is ALREADY on
     // the merge target — a prior landing of this very delivery, or a delivery
     // with no content beyond the base. Nothing is published then (a landing
@@ -5461,6 +5529,37 @@ mod tests {
         );
         assert_eq!(outcome.status, "ambiguous");
         assert_eq!(outcome.code.as_deref(), Some(code::WORKER_TIMEOUT));
+    }
+
+    /// Issue #202 (AC2): a collection's observation binds only when it names a
+    /// 40-hex head AND the slug branch it was collected from — the certified
+    /// delivery binding this run's later steps consume. Anything else is a
+    /// typed non-success (`refusal.collect.unbound`), never a `succeeded`
+    /// outcome that bound nothing.
+    #[test]
+    fn a_collection_that_cannot_bind_its_observed_head_is_a_typed_non_success() {
+        let head = "1".repeat(40);
+        let short = "1".repeat(39);
+        assert!(
+            certify_delivery_binding(&head, "issue-5").is_ok(),
+            "a named head and its branch are the binding"
+        );
+        for (observed, branch) in [
+            (String::new(), "issue-5".to_string()),
+            ("not-a-sha".to_string(), "issue-5".to_string()),
+            (short, "issue-5".to_string()),
+            (head.clone(), String::new()),
+            (head.clone(), "issue 5".to_string()),
+        ] {
+            let outcome = certify_delivery_binding(&observed, &branch)
+                .expect_err("an un-bindable observation is never a success");
+            assert_eq!(outcome.status, "refused", "{observed:?}/{branch:?}");
+            assert_eq!(
+                outcome.code.as_deref(),
+                Some(code::COLLECT_UNBOUND),
+                "{observed:?}/{branch:?}"
+            );
+        }
     }
 
     /// Issue #200: a delivery read while the worker is still live is a

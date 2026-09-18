@@ -121,6 +121,22 @@ the frontier instead of being recorded. An ill-formed document refuses
 state, so a reviewer can neither move them nor strand the tail with a stale
 value.
 
+The certified delivery (issue #202): a step may only ever consume the head the
+run's OWN `collect_outcome` step certified. That binding is recorded and
+attributed (`run_delivery_certificate`: the newest successful collection's step
+id, idempotency key, branch, head and base) and is the ONLY source of the run's
+`feature_head` — a `head` echoed by another effect's response (the base a
+`worktree_create`/`checkout` response carries) is never a certified feature
+head. A run whose collection never observed a delivery therefore binds
+nothing, and a `review_evidence`/`merge` step of such a run refuses typed
+(`refusal.delivery.unbound`) BEFORE a reviewer is started or a landing is
+built: a head no collection of the run observed is never reviewed and never
+landed. A collection that cannot name the 40-hex head (and the slug branch) it
+observed is itself a typed non-success (`refusal.collect.unbound`), never a
+`succeeded` outcome that bound nothing. Once a verdict IS recorded, the
+delivery is frozen at the head that verdict names: see the freeze rule in
+[spec-daemon.md](spec-daemon.md).
+
 Supervision (issue #152's rule, extended): the driver dispatches a
 `review_evidence` step only when the run is an admitted member of a committed,
 digest-bound submission, the run's own approved caps carry `review`, and the

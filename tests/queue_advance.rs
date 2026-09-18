@@ -363,6 +363,419 @@ fn record_delivery(state: &State, run: &str, head: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #202 AC2: the run's certified delivery head is the head its OWN
+// collection observed — never a neighbouring effect's echo
+// ---------------------------------------------------------------------------
+
+/// Record ONE `apply` step claim with an explicit committed plan document, its
+/// success outcome and its RPC response through the SAME durable ledger the
+/// daemon writes (pre-effect claim -> recorded outcome + response). No effect
+/// runs here: the witnesses below read the recorded rows exactly as the
+/// product's own dispatch-context and certificate reads do.
+fn record_step_response(
+    state: &State,
+    run: &str,
+    step: &str,
+    kind: &str,
+    seed: u64,
+    result: Val,
+) -> String {
+    let key = idem_key(&format!("recorded-{step}-{seed}"));
+    let request_line = canter::canonical::canonical_text(&object(vec![
+        ("method", string("apply")),
+        (
+            "params",
+            object(vec![
+                ("instance_id", string(run)),
+                ("step", string(step)),
+                (
+                    "plan",
+                    object(vec![(
+                        "steps",
+                        Val::Arr(vec![object(vec![
+                            ("id", string(step)),
+                            ("kind", string(kind)),
+                        ])]),
+                    )]),
+                ),
+                (
+                    "topology",
+                    object(vec![("integration_branch", string("staging"))]),
+                ),
+            ]),
+        ),
+    ]));
+    let (claim, _) = state
+        .journal_intent(
+            &format!("apply.{step}"),
+            &format!("{REPO}:{run}:{step}"),
+            &key,
+            &format!("request-{seed:016x}"),
+            "apply",
+            None,
+            None,
+            &request_line,
+        )
+        .expect("step intent");
+    assert!(
+        matches!(claim, canter::state::ClaimAttempt::Claimed),
+        "the step claim must be fresh: {claim:?}"
+    );
+    let outcome = canter::canonical::canonical_text(&object(vec![("status", string("succeeded"))]));
+    let response = canter::canonical::canonical_text(&object(vec![
+        ("ok", canter::value::bool_(true)),
+        ("result", result),
+    ]));
+    state
+        .resolve_run_step_claim(
+            &key,
+            "apply",
+            &outcome,
+            &response,
+            run,
+            step,
+            &canter::time::rfc3339_now(),
+        )
+        .expect("step outcome");
+    key
+}
+
+/// One admitted run of its own fresh state directory, ready to have recorded
+/// step rows seeded against it.
+fn admitted_run(fixture: &Fixture, key: &str) -> String {
+    let state = fixture.open();
+    seed_grant(&state, "gr_0000000000000005", 5);
+    let (bound, digest) = render_bound(&state, &request_with(vec![selected("#5", &[])]));
+    let caps = ConcurrencyCaps {
+        global: 4,
+        per_repository: 2,
+        per_harness: 2,
+    };
+    let plan = submission_plan(
+        &state,
+        key,
+        &bound,
+        &digest,
+        &[("#5", "gr_0000000000000005")],
+        caps,
+    );
+    let (_, items) = state.submit_queue_run(&plan).expect("submit");
+    item_of(&items, 5)
+        .instance_id
+        .clone()
+        .expect("issue 5 admitted")
+}
+
+/// Issue #202 (AC2). The run's certified delivery binding is the head its OWN
+/// `collect_outcome` step observed — recorded, attributed and readable
+/// (`run_delivery_certificate`) — and it is the ONLY source of that run's
+/// `feature_head`; a `head` echoed by another effect (the base a
+/// `worktree_create` response carries) is never a certified delivery head, so
+/// a run whose collection never observed a delivery binds NOTHING.
+#[test]
+fn a_run_binds_only_the_delivery_head_its_own_collection_certified() {
+    // The delivering run: an echo row followed by the run's own collection.
+    let delivering = Fixture::new("certified-delivery");
+    let run = admitted_run(&delivering, "ik_202-certified");
+    let state = delivering.open();
+    record_step_response(
+        &state,
+        &run,
+        "w1",
+        "worktree_create",
+        1,
+        object(vec![
+            ("head", string(BASE_A)),
+            ("branch", string("issue-5")),
+        ]),
+    );
+    let key = record_step_response(
+        &state,
+        &run,
+        "o1",
+        "collect_outcome",
+        2,
+        object(vec![
+            ("head", string(HEAD_A)),
+            ("base_head", string(BASE_A)),
+            ("branch", string("issue-5")),
+            ("commits", Val::Arr(vec![string(HEAD_A)])),
+            ("changed_files", Val::Arr(vec![string("src/lib.rs")])),
+        ]),
+    );
+    let certificate = state
+        .run_delivery_certificate(&run)
+        .expect("certificate read")
+        .expect("the run's own collection certified a delivery");
+    assert_eq!(certificate.step_id, "o1", "{certificate:?}");
+    assert_eq!(certificate.key, key, "{certificate:?}");
+    assert_eq!(certificate.branch, "issue-5", "{certificate:?}");
+    assert_eq!(certificate.head, HEAD_A, "{certificate:?}");
+    assert_eq!(certificate.base_head, BASE_A, "{certificate:?}");
+    let context = state
+        .run_dispatch_context(&run)
+        .expect("context read")
+        .expect("a recorded dispatch context");
+    assert_eq!(
+        context.feature_head.as_deref(),
+        Some(HEAD_A),
+        "the run's feature head IS the head its own collection observed: {context:?}"
+    );
+    assert_eq!(
+        context
+            .delivery
+            .as_ref()
+            .map(|certificate| certificate.head.as_str()),
+        Some(HEAD_A),
+        "the certified delivery binding is readable on the context: {context:?}"
+    );
+
+    // The unbound run: the SAME echo row, and no collection at all. The base
+    // the echo names is never bound as this run's certified feature head.
+    let unbound = Fixture::new("unbound-delivery");
+    let run = admitted_run(&unbound, "ik_202-unbound");
+    let state = unbound.open();
+    record_step_response(
+        &state,
+        &run,
+        "w1",
+        "worktree_create",
+        1,
+        object(vec![
+            ("head", string(BASE_A)),
+            ("branch", string("issue-5")),
+        ]),
+    );
+    assert_eq!(
+        state.run_delivery_certificate(&run).expect("read"),
+        None,
+        "no collection of this run has certified a delivery"
+    );
+    let context = state
+        .run_dispatch_context(&run)
+        .expect("context read")
+        .expect("a recorded dispatch context");
+    assert_eq!(
+        context.feature_head, None,
+        "a head no collection of this run observed is never bound as its certified feature head: {context:?}"
+    );
+    assert_eq!(context.delivery, None, "{context:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #202 AC2 through the product surface: the daemon consumes only the
+// head the run's OWN collection certified
+// ---------------------------------------------------------------------------
+
+/// The spine shape of issue #202: the run's own `collect_outcome` (the head it
+/// certifies), the reviewed-evidence step, then the committed tail.
+fn committed_spine_with_collection() -> Vec<qp::PlannedStep> {
+    vec![
+        qp::PlannedStep {
+            id: "p1".to_string(),
+            kind: "checkout".to_string(),
+            params: Some(resolved()),
+        },
+        qp::PlannedStep {
+            id: "o1".to_string(),
+            kind: "collect_outcome".to_string(),
+            params: Some(object(vec![
+                ("worktree", string("issues-5")),
+                ("branch", string("issue-5")),
+                ("requires_delta", canter::value::bool_(true)),
+            ])),
+        },
+        qp::PlannedStep {
+            id: "r1".to_string(),
+            kind: "review_evidence".to_string(),
+            params: Some(review_params()),
+        },
+        qp::PlannedStep {
+            id: "m1".to_string(),
+            kind: "merge".to_string(),
+            params: Some(object(vec![
+                ("branch", string("issue-5")),
+                ("merge_policy", string("squash")),
+            ])),
+        },
+        qp::PlannedStep {
+            id: "c1".to_string(),
+            kind: "cleanup".to_string(),
+            params: Some(object(vec![
+                ("branch", string("issue-5")),
+                ("worktree", string("issues-5")),
+            ])),
+        },
+    ]
+}
+
+/// Issue #202 (AC2) through the PRODUCT surface (the real daemon + the real
+/// effects): the run's own `collect_outcome` is the only certifier of the
+/// delivery head its later steps may consume. The review consumes the head the
+/// collection observed, and the SAME review step consuming any OTHER head
+/// refuses typed (`refusal.delivery.unbound`, naming the head the run's own
+/// collection certified) BEFORE anything runs. Supervision is submitted
+/// `disabled`: nothing here is a presentation the driver could have made for
+/// us, and no operator retry authorization is minted anywhere.
+#[test]
+fn the_daemon_consumes_only_the_head_the_runs_own_collection_certified() {
+    let fixture = DaemonFixture::new("cert");
+    let base = repos_with_lane_branch(&fixture);
+    let caps_for_tail = tail_boundary_caps();
+    let tail_caps: Vec<&str> = caps_for_tail.iter().map(|cap| cap.as_str()).collect();
+    let (bound, digest) = {
+        let state = fixture.seed();
+        seed_grant_with_caps(&state, "gr_0000000000000005", 5, &tail_caps);
+        let mut request = request_with(vec![selected("#5", &[])]);
+        request.steps = committed_spine_with_collection();
+        request.boundary.caps = tail_boundary_caps();
+        render_bound(&state, &request)
+    };
+    let daemon = fixture.spawn();
+    wait_ready(&fixture);
+    let submitted = rpc_ok(
+        &fixture.socket,
+        &fresh_id(1),
+        "queue.submit",
+        Some(qx::submit_params(
+            &idem_key("certified-consumption-submit"),
+            &digest,
+            1,
+            &bound,
+            &binding_doc(),
+            &role_revision(),
+            ConcurrencyCaps {
+                global: 4,
+                per_repository: 2,
+                per_harness: 2,
+            },
+            Some(true),
+            Some(0),
+            &item_grants(&[("#5", "gr_0000000000000005")]),
+            &[],
+            Some(&supervision::Authorization {
+                desired: "disabled".to_string(),
+                policy: supervision::Policy {
+                    check_interval_secs: 10,
+                    progress_timeout_secs: 60,
+                },
+            }),
+        )),
+    );
+    let run = live_item(&submitted, 5)
+        .get("instance_id")
+        .and_then(Val::as_str)
+        .expect("issue 5 admitted")
+        .to_string();
+
+    // The lane's own delivery: the delivery branch moves past the base.
+    let lane = fixture.dir.join("worktrees/issues-5");
+    std::fs::write(lane.join("delivered.txt"), "delivered\n").expect("write");
+    git(&lane, &["add", "delivered.txt"]);
+    git(&lane, &["commit", "-q", "-m", "lane delivery (synthetic)"]);
+    let delivered = git(&lane, &["rev-parse", "HEAD"]);
+    assert_ne!(delivered, base, "the lane delivered content");
+    assert_eq!(git(&lane, &["branch", "--show-current"]), "issue-5");
+
+    // The run's OWN collection certifies the head it observed.
+    let collected = rpc_ok(
+        &fixture.socket,
+        &fresh_id(31),
+        "apply",
+        Some(step_apply_params(
+            31,
+            &fixture,
+            &run,
+            5,
+            "gr_0000000000000005",
+            "o1",
+            "collect_outcome",
+            object(vec![
+                ("worktree", string("issues-5")),
+                ("branch", string("issue-5")),
+                ("requires_delta", canter::value::bool_(true)),
+            ]),
+            &delivered,
+            &base,
+        )),
+    );
+    assert_eq!(
+        collected.get("head").and_then(Val::as_str),
+        Some(delivered.as_str()),
+        "the collection certified the head it observed: {}",
+        canter::canonical::canonical_text(&collected)
+    );
+
+    // The reviewed-evidence step consumes the certified head.
+    let reviewed = rpc_ok(
+        &fixture.socket,
+        &fresh_id(32),
+        "apply",
+        Some(step_apply_params(
+            32,
+            &fixture,
+            &run,
+            5,
+            "gr_0000000000000005",
+            "r1",
+            "review_evidence",
+            review_params(),
+            &delivered,
+            &base,
+        )),
+    );
+    assert_eq!(
+        reviewed.get("feature_head").and_then(Val::as_str),
+        Some(delivered.as_str()),
+        "the certified head is reviewable: {}",
+        canter::canonical::canonical_text(&reviewed)
+    );
+    assert_eq!(reviewed.get("verdict").and_then(Val::as_str), Some("pass"));
+
+    // Any OTHER head is never consumed: the same step refuses typed, naming
+    // the head the run's own collection certified.
+    let uncertified = "9".repeat(40);
+    let refused = rpc(
+        &fixture.socket,
+        &fresh_id(33),
+        "apply",
+        Some(step_apply_params(
+            33,
+            &fixture,
+            &run,
+            5,
+            "gr_0000000000000005",
+            "r1",
+            "review_evidence",
+            review_params(),
+            &uncertified,
+            &base,
+        )),
+    );
+    assert_eq!(
+        refused.get("ok").and_then(Val::as_bool),
+        Some(false),
+        "a head no collection observed must refuse: {}",
+        canter::canonical::canonical_text(&refused)
+    );
+    let error = refused.get("error").expect("error doc");
+    assert_eq!(
+        error.get("code").and_then(Val::as_str),
+        Some("refusal.delivery.unbound")
+    );
+    let message = error
+        .get("message")
+        .and_then(Val::as_str)
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        message.contains(&delivered),
+        "the refusal names the head the run's own collection certified: {message}"
+    );
+    shutdown(daemon);
+}
+
+// ---------------------------------------------------------------------------
 // AC: two-issue auto-advance, once, and never twice (duplicate + restart)
 // ---------------------------------------------------------------------------
 

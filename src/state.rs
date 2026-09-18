@@ -3219,11 +3219,21 @@ impl State {
     /// newest explicit admission attestation and successful worker heads.
     /// These are caller-observed durable facts; continuation never invents a
     /// topology, resource measurement, or repository head.
+    ///
+    /// Issue #202 (AC2): the run's `feature_head` is bound by the run's own
+    /// COLLECTION alone (the [`DeliveryCertificate`] below, derived from the
+    /// newest successful `collect_outcome` step response) or by a response
+    /// that NAMES a reviewed head explicitly (the review-evidence and
+    /// post-merge-verify records). A `head` echoed by any other effect — e.g.
+    /// the base a `worktree_create`/`checkout` response carries — is never a
+    /// certified feature head: a run whose collection never observed a
+    /// delivery binds NOTHING here.
     pub fn run_dispatch_context(
         &self,
         instance_id: &str,
     ) -> Result<Option<RecordedDispatch>, StateError> {
         let conn = self.lock("run_dispatch_context")?;
+        let delivery = self.delivery_certificate_locked(&conn, instance_id)?;
         let submissions: Vec<String> = {
             let mut statement = conn
                 .prepare(
@@ -3266,7 +3276,12 @@ impl State {
         let mut topology: Option<Val> = None;
         let mut admission: Option<Val> = None;
         let mut integration_base: Option<String> = None;
-        let mut feature_head: Option<String> = None;
+        // Issue #202 (AC2): the collection's own certified head is the ONLY
+        // head this context starts from; the loop below may only override it
+        // with a response that NAMES a reviewed head explicitly.
+        let mut feature_head: Option<String> = delivery
+            .as_ref()
+            .map(|certificate| certificate.head.clone());
         for row in rows {
             let (method, key, line, response_line) =
                 row.map_err(|err| StateError::from_sqlite("run_dispatch_context: row", err))?;
@@ -3339,7 +3354,6 @@ impl State {
                 }
                 if let Some(head) = result
                     .get("feature_head")
-                    .or_else(|| result.get("head"))
                     .and_then(Val::as_str)
                     .filter(|head| crate::formats::is_hex40(head))
                 {
@@ -3352,7 +3366,117 @@ impl State {
             admission,
             integration_base,
             feature_head,
+            delivery,
         }))
+    }
+
+    /// The certified delivery of one run (issue #202 AC2): the delivery
+    /// binding ONE successful `collect_outcome` step of this run observed and
+    /// recorded — the newest such binding in claim order. Derived from
+    /// recorded rows only (never inferred, never a neighbouring effect's
+    /// head): a run whose collection never certified a bindable head has
+    /// `None` here, so no later step can consume a head the run never
+    /// observed.
+    fn delivery_certificate_locked(
+        &self,
+        conn: &Connection,
+        instance_id: &str,
+    ) -> Result<Option<DeliveryCertificate>, StateError> {
+        let mut statement = conn
+            .prepare(
+                "SELECT key, request_line, COALESCE(response, '') FROM idempotency
+                  WHERE method = 'apply' AND outcome IS NOT NULL
+                  ORDER BY rowid",
+            )
+            .map_err(|err| StateError::from_sqlite("run_delivery_certificate: prepare", err))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|err| StateError::from_sqlite("run_delivery_certificate: query", err))?;
+        let mut certificate: Option<DeliveryCertificate> = None;
+        for row in rows {
+            let (key, line, response_line) =
+                row.map_err(|err| StateError::from_sqlite("run_delivery_certificate: row", err))?;
+            let Ok(request) = Val::parse_json(&line) else {
+                continue;
+            };
+            let params = request.get("params").cloned().unwrap_or_else(null);
+            if params.get("instance_id").and_then(Val::as_str) != Some(instance_id) {
+                continue;
+            }
+            let Some(step_id) = params.get("step").and_then(Val::as_str) else {
+                continue;
+            };
+            // Only the run's own collection certifies a delivery head: the
+            // step KIND is the committed plan step's own kind, never a name
+            // heuristic on the step id.
+            let kind = params
+                .get("plan")
+                .and_then(|plan| plan.get("steps"))
+                .and_then(Val::as_array)
+                .and_then(|steps| {
+                    steps
+                        .iter()
+                        .find(|step| step.get("id").and_then(Val::as_str) == Some(step_id))
+                })
+                .and_then(|step| step.get("kind"))
+                .and_then(Val::as_str)
+                .unwrap_or("");
+            if kind != "collect_outcome" {
+                continue;
+            }
+            let Ok(response) = Val::parse_json(&response_line) else {
+                continue;
+            };
+            if response.get("ok").and_then(Val::as_bool) != Some(true) {
+                continue;
+            }
+            let Some(result) = response.get("result") else {
+                continue;
+            };
+            let head = match result
+                .get("head")
+                .and_then(Val::as_str)
+                .filter(|head| crate::formats::is_hex40(head))
+            {
+                Some(head) => head.to_string(),
+                None => continue,
+            };
+            let branch = match result
+                .get("branch")
+                .and_then(Val::as_str)
+                .filter(|branch| crate::formats::is_slug(branch))
+            {
+                Some(branch) => branch.to_string(),
+                None => continue,
+            };
+            certificate = Some(DeliveryCertificate {
+                step_id: step_id.to_string(),
+                key: key.clone(),
+                branch,
+                head,
+                base_head: result
+                    .get("base_head")
+                    .and_then(Val::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            });
+        }
+        Ok(certificate)
+    }
+
+    /// The certified delivery of one run (the locked helper above, read-only).
+    pub fn run_delivery_certificate(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<DeliveryCertificate>, StateError> {
+        let conn = self.lock("run_delivery_certificate")?;
+        self.delivery_certificate_locked(&conn, instance_id)
     }
 
     /// The `harness_start` step of one run whose dispatch is recorded as
@@ -11829,6 +11953,29 @@ pub struct RecordedDispatch {
     pub integration_base: Option<String>,
     /// The newest feature head read by a successful outcome collection.
     pub feature_head: Option<String>,
+    /// The run's own certified delivery binding (issue #202 AC2), when its
+    /// collection observed one: the branch + head + base the run's own
+    /// `collect_outcome` step certified.
+    pub delivery: Option<DeliveryCertificate>,
+}
+
+/// The certified delivery binding of ONE run (issue #202 AC2): the branch,
+/// head and base its own newest successful `collect_outcome` step observed
+/// and recorded, with the record that certifies it (step id + idempotency
+/// key). A certified delivery is the ONLY source of a run's `feature_head`
+/// binding; a head that no collection of this run observed is never consumed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeliveryCertificate {
+    /// The step of the run's committed spine that certified the delivery.
+    pub step_id: String,
+    /// The idempotency key of that collection's recorded claim.
+    pub key: String,
+    /// The delivery branch the collection observed.
+    pub branch: String,
+    /// The certified delivery head (40-hex).
+    pub head: String,
+    /// The recorded collection base (40-hex; empty when unrecorded).
+    pub base_head: String,
 }
 
 /// The plan of one committed supervision check (built by the driver from the
