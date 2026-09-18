@@ -3863,6 +3863,45 @@ impl State {
         }))
     }
 
+    /// Record ONE host-proof renewal (issue #198) as an audited
+    /// `host.proof.renewal` record.
+    ///
+    /// The supervisor measured the host at DISPATCH time and presents that
+    /// measurement in place of the run's lapsed recorded attestation; this
+    /// record makes the re-measurement inspectable (which proof was
+    /// superseded, which measurement replaced it, when it was taken and what
+    /// the host exposed), so the zero-operator witness stays auditable
+    /// without reading any daemon-internal log. It changes no durable row:
+    /// the renewal is an observation the run's own dispatch presents, not a
+    /// mutation of control state.
+    pub fn record_host_proof_renewal(
+        &self,
+        instance_id: &str,
+        key: &str,
+        superseded_at: &str,
+        measured_at: &str,
+        available_bytes: u64,
+    ) -> Result<(), StateError> {
+        self.ensure_writable()?;
+        let mut conn = self.lock("record_host_proof_renewal")?;
+        let tx = conn
+            .transaction()
+            .map_err(|err| StateError::from_sqlite("record_host_proof_renewal: begin", err))?;
+        self.append_audit_locked(
+            &tx,
+            "host.proof.renewal",
+            &format!(
+                "run:{instance_id}:superseded:{superseded_at}:replacement:{measured_at}:available_bytes:{available_bytes}"
+            ),
+            key,
+            None,
+            None,
+        )?;
+        tx.commit()
+            .map_err(|err| StateError::from_sqlite("record_host_proof_renewal: commit", err))?;
+        Ok(())
+    }
+
     /// Advance a running instance: record the current node and review-round
     /// counters (AC4) plus blocker accounting (AC7). The caller computes the
     /// new values with the engine; this only persists them.

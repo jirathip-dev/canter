@@ -1867,8 +1867,12 @@ fn dispatch_request_from(
     let plan =
         crate::mutation::bind_plan(&plan).map_err(|err| (err.code.to_string(), err.message))?;
     // Admission inputs are re-presented exactly as the run's own dispatch
-    // attested them; a fresh host-resource measurement is deliberately NOT
-    // fabricated here, so the admission gate still decides for fan-out steps.
+    // attested them. Issue #198: a LAPSED proof is renewed by the
+    // supervisor's own dispatch path before this builder runs
+    // (`renew_host_proof_for_dispatch` — a measurement taken at dispatch
+    // time), so what arrives here is either a fresh measurement or the
+    // recorded attestation unchanged; the admission gate still decides every
+    // fan-out step for itself.
     let mut flags = vec![
         ("interactive", bool_(false)),
         ("digest_confirmed", bool_(false)),
@@ -1930,6 +1934,12 @@ fn dispatch_request_from(
 
 /// [`dispatch_request_from`] over a freshly read [`DispatchMaterial`]: the
 /// driver's continuation dispatch path.
+///
+/// Issue #198: before the request is built, the run's OWN lapsed
+/// host-resource proof is renewed from a measurement the daemon takes at
+/// THIS dispatch (see [`renew_host_proof_for_dispatch`]) — the supervisor is
+/// a caller of the fan-out admission gate and may never re-present the
+/// submit-time attestation of a slow worker's run.
 fn build_dispatch_request(
     shared: &Arc<Shared>,
     instance_id: &str,
@@ -1937,11 +1947,227 @@ fn build_dispatch_request(
     step_params: Option<&Val>,
     key: &str,
 ) -> Result<Request, String> {
-    let state = shared.lock_state()?;
-    let material = read_dispatch_material(&state, instance_id, None)
-        .map_err(|(code, message)| format!("{code}: {message}"))?;
+    let mut material = {
+        let state = shared.lock_state()?;
+        read_dispatch_material(&state, instance_id, None)
+            .map_err(|(code, message)| format!("{code}: {message}"))?
+    };
+    renew_host_proof_for_dispatch(shared, &mut material, step_id, key);
     dispatch_request_from(&material, step_id, step_params, key)
         .map_err(|(code, message)| format!("{code}: {message}"))
+}
+
+/// The daemon's own host-resource measurement at dispatch time (issue
+/// #198).
+///
+/// The supervisor is a CALLER of the fan-out admission gate: when it
+/// continues a run, the proof it presents must be a measurement taken at
+/// DISPATCH time — never the submit-time attestation echoed back, and never
+/// a fabricated instant. The daemon measures the host through the resource
+/// a lane fan-out consumes: the host's filesystem serving the run's lane
+/// root (`topology.worktrees_root`, where the lane's own worktree lives).
+/// The observation is the free bytes the host exposes there, stamped with
+/// the instant the observation was taken.
+///
+/// A host that does not expose its lane root cannot be observed
+/// (`Unmeasurable`): the daemon then presents the run's recorded proof
+/// unchanged and the admission gate refuses `refusal.admission.proof_stale`
+/// exactly as before — the freshness bound, the caps and every other gate
+/// stay untouched, because this only ever supplies a MEASUREMENT.
+fn measure_host(lane_root: &Path) -> crate::lifecycle::HostMeasurement {
+    match fs2::available_space(lane_root) {
+        Ok(available_bytes) => crate::lifecycle::HostMeasurement::Measured {
+            measured_at_unix: time::unix_now(),
+            available_bytes,
+        },
+        Err(err) => crate::lifecycle::HostMeasurement::Unmeasurable {
+            reason: format!(
+                "the host does not expose the lane root {} ({err})",
+                lane_root.display()
+            ),
+        },
+    }
+}
+
+/// One admission document with its host proof replaced by the measurement
+/// taken at this dispatch (issue #198). Every other key — caps, occupancy —
+/// is preserved verbatim, and the proof object keeps any extra keys: only
+/// its `measured_at` is superseded.
+fn admission_with_renewed_proof(admission: &Val, measured_at: &str) -> Option<Val> {
+    let Val::Obj(mut admission) = admission.clone() else {
+        return None;
+    };
+    let mut proof = match admission.remove("host_proof") {
+        Some(Val::Obj(proof)) => proof,
+        _ => std::collections::BTreeMap::new(),
+    };
+    proof.insert("measured_at".to_string(), string(measured_at));
+    admission.insert("host_proof".to_string(), Val::Obj(proof));
+    Some(Val::Obj(admission))
+}
+
+/// The step kinds the fan-out admission gate guards (issue #9 AC1): the
+/// spawn kinds, plus the reviewer leg of a self-dispatching review step
+/// (issue #193 — it starts the run's own reviewer lane). The supervisor
+/// measures the host for exactly these steps.
+fn fanout_step_kind(step: &Val) -> bool {
+    match step.get("kind").and_then(Val::as_str) {
+        Some("harness_start" | "prompt") => true,
+        Some("review_evidence") => crate::mutation::declares_reviewer_leg(step.get("params")),
+        _ => false,
+    }
+}
+
+/// Renew the run's OWN lapsed host-resource proof at dispatch time (issue
+/// #198), from a measurement the daemon takes NOW — the supervisor's own act,
+/// exactly like the run's lapsed grant window (issue #184).
+///
+/// The defect this closes: the supervisor re-presented the proof the run
+/// recorded at SUBMISSION, so every fan-out step reached more than
+/// [`crate::lifecycle::HOST_PROOF_FRESHNESS_SECS`] after submission (a slow
+/// worker's turn, `run-85a856d6b9e9e7d0` p6) was refused
+/// `refusal.admission.proof_stale` forever.
+///
+/// Bounded and honest by construction:
+/// - only a fan-out step of a run whose own recorded proof has ACTUALLY
+///   lapsed (a fresh proof is presented as recorded, a missing one is never
+///   invented, and a run that is not live never renews);
+/// - only from a measurement of THIS dispatch (`Unmeasurable` hosts renew
+///   nothing and keep the typed refusal);
+/// - recorded BEFORE the renewed proof is presented — one `host.proof.renewal`
+///   journal record (superseded instant, replacement instant, the observed
+///   free bytes) and one `run.host_proof.renewed` log line. A renewal that
+///   cannot be recorded is not presented: the gate then refuses the lapsed
+///   proof exactly as before (fail closed).
+///
+/// Nothing else moves: caps, occupancy, pacing, overlap and the freshness
+/// bound itself stay the admission gate's own unchanged decisions.
+fn renew_host_proof_for_dispatch(
+    shared: &Arc<Shared>,
+    material: &mut DispatchMaterial,
+    step_id: &str,
+    key: &str,
+) -> Option<crate::lifecycle::HostProofRenewal> {
+    // Only a fan-out step owes a proof at all.
+    let step = material
+        .steps
+        .iter()
+        .find(|step| step.get("id").and_then(Val::as_str) == Some(step_id))?;
+    if !fanout_step_kind(step) {
+        return None;
+    }
+    let instance = &material.instance;
+    let presented = material
+        .admission
+        .as_ref()
+        .and_then(|admission| admission.get("host_proof"))
+        .and_then(|proof| proof.get("measured_at"))
+        .and_then(Val::as_str)
+        .and_then(time::unix_from_rfc3339)
+        .map(|measured_at_unix| crate::lifecycle::HostProof { measured_at_unix })?;
+    let now = time::unix_now();
+    if presented.fresh_at(now) {
+        // The run's own proof is still fresh: it is presented as recorded.
+        return None;
+    }
+    // The renewal is the run's own act: only a live run renews (never a
+    // paused, held, blocked, queued or finished one).
+    let live = matches!(instance.status.as_str(), "new" | "running")
+        && !instance.paused
+        && !instance.pause_requested
+        && !instance.human_queue
+        && instance.terminal_blockers == 0;
+    if !live {
+        return None;
+    }
+    // The host resource a fan-out consumes: the lane root its worktree lives
+    // in. A topology that records none names no host to measure.
+    let lane_root = material
+        .topology
+        .get("worktrees_root")
+        .and_then(Val::as_str)
+        .map(PathBuf::from)?;
+    let measurement = measure_host(&lane_root);
+    let Some(renewal) =
+        crate::lifecycle::renew_lapsed_host_proof(Some(presented), &measurement, live, now)
+    else {
+        if let crate::lifecycle::HostMeasurement::Unmeasurable { reason } = &measurement {
+            shared.log.write(
+                "warn",
+                "run.host_proof.unmeasurable",
+                &format!(
+                    "run {} step {step_id}: {reason}; the recorded proof is presented unchanged \
+                     and the admission gate decides",
+                    instance.instance_id
+                ),
+            );
+        }
+        return None;
+    };
+    let superseded_at = time::rfc3339_from_unix(renewal.superseded.measured_at_unix);
+    let measured_at = time::rfc3339_from_unix(renewal.replacement.measured_at_unix);
+    // The audit record comes first: a renewal that cannot be recorded is
+    // never presented.
+    let recorded = {
+        let state = match shared.lock_state() {
+            Ok(state) => state,
+            Err(message) => {
+                shared.log.write(
+                    "error",
+                    "run.host_proof.renewal_failed",
+                    &format!("run {} step {step_id}: {message}", instance.instance_id),
+                );
+                return None;
+            }
+        };
+        state.record_host_proof_renewal(
+            &instance.instance_id,
+            key,
+            &superseded_at,
+            &measured_at,
+            renewal.available_bytes,
+        )
+    };
+    if let Err(err) = recorded {
+        shared.log.write(
+            "error",
+            "run.host_proof.renewal_failed",
+            &format!(
+                "run {} step {step_id}: {}: {}",
+                instance.instance_id, err.code, err.message
+            ),
+        );
+        return None;
+    }
+    // Present the measurement: the run's recorded caps and occupancy ride
+    // along verbatim; only the lapsed proof is superseded.
+    let Some(admission) = material
+        .admission
+        .as_ref()
+        .and_then(|admission| admission_with_renewed_proof(admission, &measured_at))
+    else {
+        shared.log.write(
+            "error",
+            "run.host_proof.renewal_failed",
+            &format!(
+                "run {} step {step_id}: the recorded admission is not an object",
+                instance.instance_id
+            ),
+        );
+        return None;
+    };
+    material.admission = Some(admission);
+    shared.log.write(
+        "info",
+        "run.host_proof.renewed",
+        &format!(
+            "run {} renewed its own lapsed host-resource proof for step {step_id}: superseded \
+             {superseded_at}, measured {measured_at} at dispatch time ({} bytes available at the \
+             lane root)",
+            instance.instance_id, renewal.available_bytes
+        ),
+    );
+    Some(renewal)
 }
 
 /// The `hf-plan/v1` document one committed-spine dispatch binds (issue #92
@@ -9369,6 +9595,93 @@ mod tests {
         assert_eq!(
             LEGACY_CRASH_POINT_ENV, "HERDR_FLEET_CRASH_POINT",
             "pre-rename env var name"
+        );
+    }
+
+    #[test]
+    fn the_supervisor_measures_the_host_for_exactly_the_fanout_steps() {
+        // Issue #198: the renewal is scoped to the steps the fan-out
+        // admission gate guards (issue #9 AC1) — the spawn kinds plus the
+        // reviewer leg of a self-dispatching review step (issue #193, the
+        // live `p6-132` shape). Nothing else is measured.
+        let step = |kind: &str, params: Val| {
+            object(vec![
+                ("id", string("s")),
+                ("kind", string(kind)),
+                ("params", params),
+            ])
+        };
+        for kind in ["harness_start", "prompt"] {
+            assert!(fanout_step_kind(&step(kind, Val::Null)), "{kind}");
+        }
+        assert!(fanout_step_kind(&step(
+            "review_evidence",
+            object(vec![("reviewer_profile", object(vec![]))])
+        )));
+        assert!(
+            !fanout_step_kind(&step("review_evidence", object(vec![]))),
+            "a review step that presents its own facts starts no lane"
+        );
+        for kind in [
+            "checkout",
+            "worktree_create",
+            "collect_outcome",
+            "merge",
+            "cleanup",
+        ] {
+            assert!(!fanout_step_kind(&step(kind, Val::Null)), "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_renewed_admission_supersedes_only_the_lapsed_proof() {
+        // Issue #198: the presented admission keeps its caps and occupancy
+        // verbatim; only the lapsed proof's instant is superseded.
+        let admission = object(vec![
+            (
+                "caps",
+                object(vec![
+                    ("global", integer(8)),
+                    ("repository", integer(2)),
+                    ("harness", integer(2)),
+                ]),
+            ),
+            ("harness_lanes", integer(1)),
+            (
+                "host_proof",
+                object(vec![
+                    ("measured_at", string("2026-09-18T08:38:54Z")),
+                    ("source", string("operator")),
+                ]),
+            ),
+        ]);
+        let renewed =
+            admission_with_renewed_proof(&admission, "2026-09-18T08:59:55Z").expect("an object");
+        assert_eq!(
+            renewed.get("caps"),
+            admission.get("caps"),
+            "the caps ride along verbatim"
+        );
+        assert_eq!(renewed.get("harness_lanes"), admission.get("harness_lanes"));
+        assert_eq!(
+            renewed
+                .get("host_proof")
+                .and_then(|proof| proof.get("measured_at"))
+                .and_then(Val::as_str),
+            Some("2026-09-18T08:59:55Z")
+        );
+        assert_eq!(
+            renewed
+                .get("host_proof")
+                .and_then(|proof| proof.get("source"))
+                .and_then(Val::as_str),
+            Some("operator"),
+            "unknown proof keys are preserved"
+        );
+        assert_eq!(
+            admission_with_renewed_proof(&null(), "2026-09-18T08:59:55Z"),
+            None,
+            "a non-object admission is never rewritten"
         );
     }
 

@@ -338,6 +338,7 @@ jobs:
           "--test harness_adapters",
           "--test herdr_compatibility",
           "--test herdr_pane_execution",
+          "--test host_proof_renewal",
           "--test lane_cli",
           "--test lane_replacement",
           "--test mutation_engine",
