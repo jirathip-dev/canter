@@ -794,6 +794,16 @@ pub fn dispatch_intent(
                 // bounded retries UNSPENT, instead of burning them on a step
                 // that can never succeed.
                 && code != crate::mutation::code::VERDICT_STALE
+                // Issue #202 (AC1): the same discipline for a delivery that
+                // moved past the head its recorded verdict names. The verdict
+                // is a recorded fact and the delivery branch's movement is
+                // external, so re-dispatching the consumer refuses identically
+                // until the delivery re-enters review and a new verdict names
+                // the moved head: the frontier parks typed with the bounded
+                // retries UNSPENT, and the run is never presented as a step
+                // that could still be retried into consumption.
+                && code != crate::mutation::code::DELIVERY_MOVED
+                && code != crate::mutation::code::DELIVERY_UNBOUND
                 && newest_verdict(evidence) != "fail"
                 && evidence
                     .retries
@@ -2497,6 +2507,104 @@ mod tests {
             dispatch_intent(&row, &retryable).map(|intent| intent.step_id),
             Some("p6".to_string()),
             "a retryable diagnosis of the same frontier still retries"
+        );
+    }
+
+    /// Issue #202 (AC1): a MERGE frontier whose recorded diagnosis is
+    /// `refusal.delivery.moved` — a commit landed on the reviewed delivery
+    /// branch after the verdict that names its head — is an IMPOSSIBLE step,
+    /// not a retryable one. The verdict is a recorded fact and the delivery's
+    /// movement is external, so every re-dispatch refuses identically until
+    /// the delivery re-enters review and a new verdict names the moved head:
+    /// the frontier parks TYPED (needs-attention, the recorded code as the
+    /// detail) with the bounded retries UNSPENT — never a silent park, never
+    /// `waiting-approval`, and never a retry into consuming a head no verdict
+    /// names. The same frontier shape with a retryable diagnosis still takes
+    /// its bounded retry.
+    #[test]
+    fn a_moved_delivery_diagnosis_parks_the_merge_frontier_typed_and_unspent() {
+        use crate::state::{EvidenceRow, QueueItemRef};
+        let state = temp_state("moved-delivery-park");
+        let digest = "e".repeat(64);
+        let run = "run-f91ece4defffcced";
+        let policy = Policy {
+            check_interval_secs: 10,
+            progress_timeout_secs: 60,
+        };
+        let at = "2026-09-18T15:40:24Z";
+        let now_unix = time::unix_from_rfc3339(at).expect("instant");
+        state
+            .arm_supervision_for_test(run, "armed", &digest, "merge", policy, at)
+            .expect("arm");
+        let row = state.supervision_by_id(run).expect("read").expect("row");
+        let steps = [
+            ("p5", "collect_outcome"),
+            ("p6", "review_evidence"),
+            ("p7", "merge"),
+            ("p8", "cleanup"),
+        ];
+        let scene = |code: &str| {
+            let pins = run_row(run);
+            let mut evidence = evidence_for(
+                pins.clone(),
+                Some(&digest),
+                &steps,
+                &[
+                    ("p5", "succeeded", ""),
+                    ("p6", "succeeded", ""),
+                    ("p7", "refused", code),
+                ],
+                at,
+            );
+            // The frontier is the run's OWN committed tail step of a run whose
+            // reviewed delivery is verified: the `merge` cap, an admitted
+            // membership item and the newest recorded passing evidence.
+            evidence.run.caps = "[\"merge\",\"cleanup\"]".to_string();
+            evidence.item = Some(QueueItemRef {
+                submission_id: "qs_0123456789abcdef".to_string(),
+                ordinal: 0,
+                work_item: "wi_4aabf3ad5bea87b0".to_string(),
+                issue_number: 132,
+                status: "admitted".to_string(),
+            });
+            evidence.newest_evidence = Some(EvidenceRow {
+                evidence_id: "ev_f91ece4defffcced".to_string(),
+                instance_id: run.to_string(),
+                repository: "example-org/widgets".to_string(),
+                feature_head: "1".repeat(40),
+                integration_base: "2".repeat(40),
+                workflow_hash: pins.workflow_hash.clone(),
+                policy_hash: pins.policy_hash.clone(),
+                verdict: "pass".to_string(),
+                reviewer: "reviewer-1".to_string(),
+                checks: "[{\"name\":\"hosted-ci\",\"status\":\"passed\"}]".to_string(),
+                created_at: at.to_string(),
+            });
+            evidence
+        };
+        let moved = scene(crate::mutation::code::DELIVERY_MOVED);
+        assert!(
+            driver_dispatchable_kind(&moved, "p7", "merge"),
+            "the fixture frontier is a genuinely dispatchable committed tail step"
+        );
+        assert!(
+            dispatch_intent(&row, &moved).is_none(),
+            "a delivery that moved past its verdict is never re-dispatched into consumption"
+        );
+        let verdict = classify(&moved, &digest, &policy, now_unix);
+        assert_eq!(verdict.class, "needs-attention");
+        assert_eq!(verdict.reason, codes::STEP_DIAGNOSED);
+        assert_eq!(verdict.detail, crate::mutation::code::DELIVERY_MOVED);
+        assert!(!verdict.eligible, "the parked frontier is never eligible");
+        assert!(
+            moved.retries.is_empty(),
+            "the bounded retries stay unspent on an impossible step"
+        );
+        let retryable = scene("refusal.worktree.exists");
+        assert_eq!(
+            dispatch_intent(&row, &retryable).map(|intent| intent.step_id),
+            Some("p7".to_string()),
+            "a retryable diagnosis of the same merge frontier still retries"
         );
     }
 

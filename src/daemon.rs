@@ -1717,6 +1717,63 @@ fn refusal_code_of(message: &str) -> &str {
         .unwrap_or(message)
 }
 
+/// Issue #202 (AC2): the delivery head ONE step CONSUMES must be the head the
+/// run's OWN collection certified.
+///
+/// A committed spine that declares a `collect_outcome` step owns its head
+/// binding: that collection is the only observer whose head the run may
+/// review or land. A consumption step that presents any other head — or that
+/// arrives when no collection of this run ever certified a bindable head at
+/// all — refuses typed (`refusal.delivery.unbound`) BEFORE its effect runs, so
+/// a run can never carry a verdict for, or land, a head that no collection of
+/// its own observed. The spine is read from the run's COMMITTED submission
+/// (never from the presented plan, which a caller could trim); a run whose
+/// spine declares no collection declares its own head facts and is untouched
+/// by this gate (the operator's presented-evidence path).
+fn check_certified_consumption(
+    state: &crate::state::State,
+    instance_id: &str,
+    consumed_head: &str,
+    kind: &str,
+) -> Result<(), (String, String)> {
+    let steps = state
+        .run_step_documents(instance_id)
+        .map_err(|err| (err.code.to_string(), err.message))?;
+    let declares_collection = steps
+        .unwrap_or_default()
+        .iter()
+        .any(|step| step.get("kind").and_then(Val::as_str) == Some("collect_outcome"));
+    if !declares_collection {
+        return Ok(());
+    }
+    let certificate = state.run_delivery_certificate(instance_id).map_err(|err| {
+        (
+            err.code.to_string(),
+            format!("certified delivery read failed: {}", err.message),
+        )
+    })?;
+    match certificate {
+        None => Err((
+            crate::mutation::code::DELIVERY_UNBOUND.to_string(),
+            format!(
+                "{kind} consumes the delivery head {consumed_head}, but no collection of \
+                 {instance_id} has certified a delivery: a head this run never observed is \
+                 never consumed"
+            ),
+        )),
+        Some(certificate) if certificate.head != consumed_head => Err((
+            crate::mutation::code::DELIVERY_UNBOUND.to_string(),
+            format!(
+                "{kind} consumes the delivery head {consumed_head}, but this run's own \
+                 collection ({} {}) certified {}: the delivery must re-enter review and a new \
+                 verdict must name {consumed_head} before any step consumes it",
+                certificate.step_id, certificate.key, certificate.head
+            ),
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
 /// The durable material of one committed-spine dispatch (issue #92), read
 /// once: the run row, its committed step spine, the spine's step documents
 /// and the run's own recorded dispatch context (topology + admission
@@ -2783,6 +2840,23 @@ fn method_apply_from(shared: &Arc<Shared>, request: &Request, supervised: bool) 
                     &parsed.policy_hash,
                 )
                 .map_err(|err| (err.code.to_string(), err.message))?;
+                check_certified_consumption(&state, &parsed.instance_id, &feature_head, "merge")?;
+            }
+            "review_evidence" => {
+                // Issue #202 (AC2): the review step consumes a head too, and a
+                // run may only ever review the head its OWN collection
+                // certified. A review for a head no collection observed is a
+                // typed refusal here, BEFORE the reviewer is started — never a
+                // silent review of a head the run never bound, and never a
+                // frontier that parks on an unconsumable verdict.
+                if let Some(feature_head) = parsed.feature_head.clone() {
+                    check_certified_consumption(
+                        &state,
+                        &parsed.instance_id,
+                        &feature_head,
+                        "review_evidence",
+                    )?;
+                }
             }
             "issue_update" => {
                 let closing =

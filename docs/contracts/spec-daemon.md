@@ -625,6 +625,27 @@ clears a repository/fleet-level hold or bypasses a gate.
   records `effect.worker_timeout` as ambiguous and parks as `worker-timeout`
   / `supervision.worker_timeout`, ineligible. Neither a waiting claim nor a
   timed-out attempt is re-dispatched by the supervisor.
+- **Frozen certified delivery and the bound collection head (issue #202)**: a
+  step consumes only the head the run's OWN collection certified. The run's
+  `feature_head` is bound by its newest successful `collect_outcome` (branch +
+  head + base, recorded and attributed); a `head` echoed by any other effect's
+  response never becomes a certified feature head, and a `review_evidence` or
+  `merge` step arriving when no collection certified a delivery refuses typed
+  (`refusal.delivery.unbound`) before any effect runs. A collection that cannot
+  name the 40-hex head and slug branch it observed is a typed non-success
+  (`refusal.collect.unbound`), never a `succeeded` outcome that bound nothing.
+  Once a verdict is recorded against a head, the delivery is FROZEN at exactly
+  that head: with the published integration ref unchanged, the merge consumes
+  the delivery branch only when it is AT that head — a commit that landed on
+  the reviewed delivery afterwards refuses typed
+  (`refusal.delivery.moved`, naming both heads) without publishing or moving
+  anything, and the delivery must re-enter review so a new verdict names the
+  moved head. Like the moved-certificate case below, that diagnosis is
+  deterministic (the verdict is a recorded fact and the delivery's movement is
+  external), so the frontier parks typed with its bounded retries UNSPENT. The
+  published-ref reconciliation (issue #178) is the ONE documented engine
+  refresh and is unchanged: a history rewrite onto the *published* ref whose
+  reviewed content is proven byte-for-byte.
 - **Moved certified head (issue #200)**: a review step whose recorded
   diagnosis is `refusal.evidence.verdict_stale` — the lane checkout is no
   longer the run's certified head — is an IMPOSSIBLE step, not a retryable
