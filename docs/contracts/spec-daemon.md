@@ -613,12 +613,28 @@ clears a repository/fleet-level hold or bypasses a gate.
   worktree on every read. While it waits, its single claim remains in flight:
   `waiting-workers` / `supervision.waiting_workers`, eligible for continued
   checks, not a second dispatch. Collection runs off the reconciliation
-  thread so other runs and timer checks continue. Only `idle`, `done` or
-  `blocked` permits reading the committed delta; a stopped worker with none
-  still refuses `refusal.collect.empty_delta`. Exhausting the collection
-  step's deadline records `effect.worker_timeout` as ambiguous and parks as
-  `worker-timeout` / `supervision.worker_timeout`, ineligible. Neither a
-  waiting claim nor a timed-out attempt is re-dispatched by the supervisor.
+  thread so other runs and timer checks continue. Only a CONFIRMED `idle`,
+  `done` or `blocked` (the same stop state read back twice) permits
+  certifying the delta; a delivery read while the worker is still live, like
+  an empty delta while the worker is still live, stays a wait/re-check
+  (issue #200 — a head read mid-turn can still move), and a stopped worker
+  with no delta still refuses `refusal.collect.empty_delta`. A collection
+  failure that is not emptiness (a refusal of the collection itself, e.g. a
+  diverged or mis-branched lane) certifies no head and stays actionable
+  without waiting for the stop. Exhausting the collection step's deadline
+  records `effect.worker_timeout` as ambiguous and parks as `worker-timeout`
+  / `supervision.worker_timeout`, ineligible. Neither a waiting claim nor a
+  timed-out attempt is re-dispatched by the supervisor.
+- **Moved certified head (issue #200)**: a review step whose recorded
+  diagnosis is `refusal.evidence.verdict_stale` — the lane checkout is no
+  longer the run's certified head — is an IMPOSSIBLE step, not a retryable
+  one: the certificate is a recorded fact and the checkout's movement is
+  external, so a re-dispatch is guaranteed to refuse identically. The
+  frontier parks typed (class `needs-attention`, reason
+  `supervision.step_diagnosed`, the recorded code as the detail, ineligible)
+  with the run's bounded retries UNSPENT, instead of burning the budget on a
+  step that can never succeed. Refusing to review a moved head is unchanged:
+  a reviewer is never started on a head that does not match the certificate.
 - **Lane base (issue #164)**: checkout and lane creation use the exact
   observed integration base, or resolve the published origin ref when no
   observation exists yet; never the local branch. Missing objects are fetched

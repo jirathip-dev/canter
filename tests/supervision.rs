@@ -3181,8 +3181,14 @@ case "$1 $2" in
             printf 'worker delivery\n' > "$checkout/delivery.txt"
             git -C "$checkout" add delivery.txt || exit 8
             git -C "$checkout" -c commit.gpgsign=false commit -qm delivery || exit 8
+            log "worker-delivery-committed"
+            # Issue #200: the delivery lands MID-TURN — the worker stays
+            # working after the commit, so the head it read can still move.
+          else
+            # ...and only NOW does the turn settle. A collection may read the
+            # delta only at this settled turn.
+            printf done > "$STATE/state"
           fi
-          # Delivery lands mid-turn: the worker stays working after the commit.
         else
           printf done > "$STATE/state"
         fi
@@ -3434,10 +3440,44 @@ fn supervised_collection(mode: &str) {
             assert_eq!(collected[0].1, "succeeded", "{attempts:?}");
             assert_eq!(
                 std::fs::read_to_string(fixture.dir.join("herdr-state/state")).unwrap(),
-                "working",
-                "delivery must be collected while the worker is still live"
+                "done",
+                "issue #200: the delta is certified only at the worker's SETTLED turn"
             );
-            assert_ne!(git_output(&lane, &["rev-parse", "HEAD"]).trim(), published);
+            // The delivery landed MID-TURN. The poll log proves the collector
+            // read the lane while the worker was still live and did NOT
+            // certify there — the measured p4→p5 defect was exactly that read.
+            let reads = std::fs::read_to_string(fixture.dir.join("herdr-argv.txt")).unwrap();
+            let landed = reads
+                .find("worker-delivery-committed")
+                .expect("the fixture delivery landed");
+            assert!(
+                reads[landed..].matches("worker-poll working").count() >= 1,
+                "a delivery read while the worker is still live is a WAIT, not a \
+                 certification: {reads}"
+            );
+            // ...and the certified head IS the final settled head: the
+            // recorded collection outcome names the lane's settled commit.
+            let head = git_output(&lane, &["rev-parse", "HEAD"]).trim().to_string();
+            assert_ne!(head, published);
+            let response: String = rusqlite::Connection::open(fixture.db())
+                .unwrap()
+                .query_row(
+                    "SELECT response FROM idempotency
+                      WHERE method = 'apply' AND request_line LIKE '%\"step\":\"collect\"%'
+                      ORDER BY rowid DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let response = Val::parse_json(&response).expect("the collection response parses");
+            assert_eq!(
+                response
+                    .get("result")
+                    .and_then(|result| result.get("head"))
+                    .and_then(Val::as_str),
+                Some(head.as_str()),
+                "the certified head is the FINAL settled head"
+            );
             assert_eq!(
                 std::fs::read_to_string(lane.join("delivery.txt")).unwrap(),
                 "worker delivery\n"

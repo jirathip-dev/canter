@@ -224,6 +224,60 @@ impl Fixture {
             .run_step_attempts(&self.run)
             .unwrap()
     }
+
+    /// Record one further TERMINAL attempt of (run, step) with an outcome code
+    /// (the shape the driver's evidence reads as the step's own diagnosis).
+    fn seed_attempt(&self, step: &str, code: &str) {
+        let key = format!("ik_seed-{step}-{}", code.rsplit('.').next().unwrap());
+        let request_id = "f00dfeed".to_string();
+        let line = canonical_text(&object(vec![
+            ("schema", string("hf-rpc-request/v1")),
+            ("id", string(&request_id)),
+            ("method", string("apply")),
+            (
+                "params",
+                object(vec![
+                    ("idempotency_key", string(&key)),
+                    ("instance_id", string(&self.run)),
+                    ("step", string(step)),
+                ]),
+            ),
+        ]));
+        let state = self.shared.lock_state().unwrap();
+        state
+            .journal_intent(
+                "mutate.checkout",
+                &format!("canter:{}:{step}", self.run),
+                &key,
+                &request_id,
+                "apply",
+                None,
+                None,
+                &line,
+            )
+            .expect("claim the seeded attempt");
+        let outcome = canonical_text(&object(vec![
+            ("schema", string("hf-outcome/v1")),
+            ("plan_id", string("hf_plan_0000000000000000")),
+            ("step_id", string(step)),
+            ("status", string("refused")),
+            ("idempotency_key", string(&key)),
+            ("observed_at", string("2026-09-18T13:04:41Z")),
+            ("result", Val::Null),
+            (
+                "error",
+                object(vec![
+                    ("schema", string("hf-error/v1")),
+                    ("code", string(code)),
+                    ("message", string("recorded fixture diagnosis")),
+                    ("retryable", Val::Bool(false)),
+                ]),
+            ),
+        ]));
+        state
+            .resolve_claim(&key, "apply", "spent", &outcome, Some("{}"))
+            .expect("resolve the seeded attempt");
+    }
 }
 
 impl Drop for Fixture {
@@ -379,4 +433,71 @@ fn operator_reservation_wins_even_over_a_stale_automatic_intent() {
         fixture.retries()[0].consumed_key,
         "ik_fixture-operator-dispatch"
     );
+}
+
+/// Issue #200 (AC2): a frontier whose recorded diagnosis is a MOVED certified
+/// head (`refusal.evidence.verdict_stale`) is an impossible step. However
+/// often the supervision check runs, it is never re-dispatched and the run's
+/// bounded retries stay UNSPENT; a stale dispatch intent of that step (minted
+/// before the refusal was recorded) cannot make the daemon spend one either.
+#[test]
+fn a_moved_head_diagnosis_never_spends_a_bounded_retry() {
+    let fixture = Fixture::new("moved-head-park");
+    let now = time::unix_now();
+    // One real dispatch records the run's own dispatch context (topology).
+    assert!(fixture.tick(now).is_err());
+    let before_tick = fixture.attempts();
+    fixture.seed_attempt("p2", crate::mutation::code::VERDICT_STALE);
+    assert!(
+        fixture.intent().is_none(),
+        "the recorded moved-head refusal parks the frontier"
+    );
+    let before = fixture.attempts();
+    assert_eq!(
+        before.len(),
+        before_tick.len() + 1,
+        "the fixture recorded exactly one further attempt"
+    );
+    let state = fixture.shared.lock_state().unwrap();
+    let row = state.supervision_by_id(&fixture.run).unwrap().unwrap();
+    let evidence = state.supervision_evidence(&fixture.run).unwrap().unwrap();
+    for offset in [1, 5, 15, 35, 100, 1000, 10000] {
+        let plan = check_plan(&row, &evidence, None, false, now + offset);
+        assert!(plan.dispatch.is_none(), "no re-dispatch is ever authorized");
+        assert_eq!(plan.class, "needs-attention");
+        assert_eq!(
+            plan.reason,
+            crate::supervision::codes::STEP_DIAGNOSED,
+            "the recorded code is named as the frontier's own diagnosis"
+        );
+        assert!(!plan.eligible);
+        state.commit_supervision_check(&plan).unwrap();
+    }
+    drop(state);
+    assert_eq!(fixture.attempts(), before, "no further attempt is made");
+    assert!(
+        fixture.retries().is_empty(),
+        "an impossible step never spends a bounded retry"
+    );
+    // A stale intent of the same step cannot make the daemon spend one either:
+    // the supervised recheck refuses it and records no new attempt.
+    let stale = crate::supervision::DispatchIntent {
+        instance_id: fixture.run.clone(),
+        step_id: "p2".into(),
+        kind: "worktree_create".into(),
+        reason: crate::supervision::codes::DISPATCH,
+    };
+    let refused = fixture
+        .driver
+        .dispatch_at(&stale, now + 20000)
+        .expect_err("the supervised frontier is held");
+    assert!(
+        refused.contains(crate::mutation::code::RETRY_REQUIRED),
+        "{refused}"
+    );
+    assert!(
+        fixture.retries().is_empty(),
+        "the daemon spends nothing on an impossible step"
+    );
+    assert_eq!(fixture.attempts(), before, "and records no new attempt");
 }
