@@ -3076,6 +3076,29 @@ fn write_fake_herdr(dir: &Path) -> PathBuf {
     bin
 }
 
+/// [`write_fake_herdr`] with one extra probe: every row also logs its OWN
+/// process working directory, so the #150 witness can show the spawn row
+/// itself runs inside the run's lane worktree (and never at the repo root).
+fn write_fake_herdr_probing_cwd(dir: &Path) -> PathBuf {
+    let bin = dir.join("fakebin-herdr-cwd");
+    std::fs::create_dir_all(&bin).expect("bin dir");
+    let path = bin.join("herdr");
+    let body = FAKE_HERDR_BODY.replacen(
+        "PATH=/usr/bin:/bin",
+        "printf 'row-cwd %s\\n' \"$(pwd)\" >> \"$HOME/herdr-row-cwd.txt\"\nPATH=/usr/bin:/bin",
+        1,
+    );
+    std::fs::write(&path, body).expect("write fake herdr");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("chmod");
+    }
+    bin
+}
+
 /// The fake Herdr CLI body (POSIX shell; it sets its own utility PATH, because
 /// the adapter runs it with the allowlisted environment only).
 const FAKE_HERDR_BODY: &str = r#"#!/bin/sh
@@ -3868,6 +3891,348 @@ fn the_supervised_run_starts_its_worker_in_a_herdr_pane_in_the_lane_worktree() {
             "journal lost {field}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #150 verification (verify150 lane): the pane worker is started INSIDE
+// the run's lane worktree, and an empty delta stays fail-closed.
+//
+// Both witnesses drive the REAL effects through `execute_step` — the exact
+// function `method_apply` (src/daemon.rs) calls for every applied step — over
+// disposable repositories with the fake Herdr CLI on PATH. Nothing here
+// inspects a struct in place of the spawn/collection path.
+// ---------------------------------------------------------------------------
+
+/// #150 half 1, focused witness: the spawn path opens the worker's pane ON the
+/// run's lane worktree, the substrate's own read-back reports that worktree as
+/// the pane's cwd, and every spawn row's own process cwd is that worktree —
+/// never the integration repo root.
+#[test]
+fn verify150_pane_worker_runs_inside_the_runs_lane_worktree() {
+    use canter::mutation::{bind_plan, execute_step, run_session_handle};
+    let fixture = DaemonFixture::new("verify150-pane-worktree");
+    let integration = fixture.dir.join("integration");
+    init_repo(&integration);
+    let worktrees_root = fixture.dir.join("worktrees");
+    std::fs::create_dir_all(&worktrees_root).expect("worktrees root");
+    let lane = worktrees_root.join("issues-5");
+    let session = run_session_handle("run-0000000000000005").expect("run session");
+    let fakebin_herdr = write_fake_herdr_probing_cwd(&fixture.dir);
+    let fakebin_hermes = write_fake_hermes(&fixture.dir);
+    let host_path = std::env::var("PATH").unwrap_or_default();
+    let env = std::collections::BTreeMap::from([
+        (
+            "PATH".to_string(),
+            format!(
+                "{}:{}:{host_path}",
+                fakebin_herdr.display(),
+                fakebin_hermes.display()
+            ),
+        ),
+        (
+            "HOME".to_string(),
+            fixture.dir.to_string_lossy().to_string(),
+        ),
+    ]);
+    let steps = Val::Arr(vec![
+        object(vec![
+            ("id", string("p1")),
+            ("kind", string("worktree_create")),
+            (
+                "params",
+                object(vec![
+                    ("branch", string("issue-5")),
+                    ("worktree", string("issues-5")),
+                ]),
+            ),
+        ]),
+        object(vec![
+            ("id", string("p2")),
+            ("kind", string("harness_start")),
+            (
+                "params",
+                object(vec![
+                    ("harness_key", string(HARNESS)),
+                    ("kind", string("hermes")),
+                ]),
+            ),
+        ]),
+    ]);
+    let plan = bind_plan(&plan_doc_with_steps(steps, 5)).expect("the plan binds");
+    let apply = |step_id: &str, kind: &str, params: &Val| {
+        execute_step(&canter::mutation::EffectContext {
+            plan: &plan,
+            step_id,
+            kind,
+            params: Some(params),
+            repository: REPO,
+            integration_branch: "staging",
+            production_branches: &[],
+            worktrees_root: &worktrees_root,
+            integration_repo: &integration,
+            observed_feature_head: None,
+            observed_integration_base: None,
+            env: &env,
+            role: None,
+            session: Some(&session),
+            archive_root: None,
+            review_root: None,
+            retired_run_ids: &[],
+        })
+    };
+    // The lane worktree first — through the real `worktree_create` effect, so
+    // the spawn below runs against a genuine linked git worktree.
+    let create_params = object(vec![
+        ("branch", string("issue-5")),
+        ("worktree", string("issues-5")),
+    ]);
+    let created = apply("p1", "worktree_create", &create_params);
+    assert_eq!(created.status, "succeeded", "{created:?}");
+    assert!(lane.is_dir(), "the lane worktree exists");
+    // ...then the REAL spawn path.
+    let bind_params = object(vec![
+        ("harness_key", string(HARNESS)),
+        ("kind", string("hermes")),
+    ]);
+    let started = apply("p2", "harness_start", &bind_params);
+    // The observed paths, read back independently of the bind's own status.
+    let rows = std::fs::read_to_string(fixture.dir.join("herdr-argv.txt")).expect("herdr rows");
+    let open_row = rows
+        .lines()
+        .find(|row| row.starts_with("worktree open "))
+        .unwrap_or_else(|| panic!("no `worktree open` row was run: {rows}"));
+    let pane_cwd = std::fs::read_to_string(fixture.dir.join("herdr-state/cwd"))
+        .expect("the pane cwd read-back");
+    let row_cwds = std::fs::read_to_string(fixture.dir.join("herdr-row-cwd.txt"))
+        .expect("the row process cwds");
+    let row_cwds: Vec<&str> = row_cwds
+        .lines()
+        .filter_map(|line| line.strip_prefix("row-cwd "))
+        .collect();
+    let repo_root = integration.canonicalize().expect("the repo root resolves");
+    let lane_canonical = lane.canonicalize().expect("the lane worktree resolves");
+    println!("integration repo root  = {}", repo_root.display());
+    println!("run's lane worktree    = {}", lane.display());
+    println!("spawn row              = {open_row}");
+    println!("pane cwd read-back     = {pane_cwd}");
+    println!("spawn row process cwds = {row_cwds:?}");
+    // The lane worktree and the repo root really differ; the worker's pane is
+    // opened ON the lane worktree and the substrate's own read-back names it.
+    assert_ne!(repo_root, lane_canonical, "the lane is not the repo root");
+    assert_eq!(
+        open_row,
+        format!(
+            "worktree open --cwd {} --path {} --label 5-impl --no-focus",
+            repo_root.display(),
+            lane.display()
+        ),
+        "the pane must be opened ON the run's lane worktree, never at the repo root"
+    );
+    assert_eq!(
+        pane_cwd,
+        lane.to_string_lossy(),
+        "the substrate reports the pane's cwd as the run's lane worktree"
+    );
+    assert_ne!(
+        Path::new(&pane_cwd)
+            .canonicalize()
+            .expect("the pane cwd resolves"),
+        repo_root,
+        "the worker's checkout is not the integration repo root"
+    );
+    assert!(!row_cwds.is_empty(), "the spawn rows ran");
+    for cwd in &row_cwds {
+        assert_eq!(
+            Path::new(cwd).canonicalize().expect("a row cwd resolves"),
+            lane_canonical,
+            "every spawn row ran inside the run's lane worktree"
+        );
+    }
+    // The recorded bind names the pane substrate and the lane worktree.
+    assert_eq!(started.status, "succeeded", "{started:?}");
+    assert_eq!(
+        started.result.get("execution").and_then(Val::as_str),
+        Some("herdr")
+    );
+    assert_eq!(
+        started.result.get("agent").and_then(Val::as_str),
+        Some("impl-5")
+    );
+    let identity = started
+        .result
+        .get("worktree_identity")
+        .expect("the recorded bind carries the workspace's worktree identity");
+    assert_eq!(
+        identity.get("checkout_path").and_then(Val::as_str),
+        Some(lane.to_string_lossy().as_ref()),
+        "the recorded bind's worktree identity is the run's lane worktree"
+    );
+    assert_eq!(
+        identity.get("is_linked_worktree").and_then(Val::as_bool),
+        Some(true)
+    );
+    assert!(
+        started
+            .result
+            .get("pane")
+            .and_then(Val::as_str)
+            .is_some_and(|pane| !pane.is_empty()),
+        "the recorded bind names a pane: {started:?}"
+    );
+    // The bare harness executable was never spawned from the pane substrate.
+    assert!(
+        !lane.join("argv.txt").exists() && !integration.join("argv.txt").exists(),
+        "the pane substrate never spawns the bare harness executable"
+    );
+}
+
+/// #150 half 2, focused witness: with a LIVE worker and no delta the
+/// collection is a bounded WAIT that certifies nothing (`effect.worker_timeout`
+/// at the deadline); with the worker stopped and still no delta it is the
+/// typed `refusal.collect.empty_delta`; and the SAME collection with a real
+/// committed delta certifies exactly that head (positive control) — so the
+/// refusals are the fail-closed rule, not a fixture that can never collect.
+#[test]
+fn verify150_empty_delta_waits_and_never_certifies() {
+    use canter::mutation::{bind_plan, execute_step, run_session_handle};
+    let fixture = DaemonFixture::new("verify150-empty-delta");
+    let integration = fixture.dir.join("integration");
+    init_repo(&integration);
+    let worktrees_root = fixture.dir.join("worktrees");
+    std::fs::create_dir_all(&worktrees_root).expect("worktrees root");
+    let lane = worktrees_root.join("issues-5");
+    init_repo(&lane);
+    let base = git_output(&lane, &["rev-parse", "HEAD"]).trim().to_string();
+    let session = run_session_handle("run-0000000000000005").expect("run session");
+    let bin = write_fake_herdr(&fixture.dir);
+    let env = std::collections::BTreeMap::from([
+        (
+            "PATH".to_string(),
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        ),
+        (
+            "HOME".to_string(),
+            fixture.dir.to_string_lossy().to_string(),
+        ),
+    ]);
+    let worker = fixture.dir.join("herdr-state");
+    std::fs::create_dir_all(&worker).expect("worker state");
+    for (name, value) in [
+        ("name", "impl-5".to_string()),
+        ("cwd", lane.to_string_lossy().to_string()),
+        ("lane", session.session_id.clone()),
+        ("generation", session.identity.generation.to_string()),
+        ("state", "working".to_string()),
+    ] {
+        std::fs::write(worker.join(name), value).expect("worker state file");
+    }
+    let steps = Val::Arr(vec![
+        object(vec![
+            ("id", string("p3")),
+            ("kind", string("prompt")),
+            (
+                "params",
+                object(vec![
+                    ("harness_key", string(HARNESS)),
+                    ("kind", string("hermes")),
+                    ("worktree", string("issues-5")),
+                    ("payload", string("bounded work")),
+                ]),
+            ),
+        ]),
+        object(vec![
+            ("id", string("collect")),
+            ("kind", string("collect_outcome")),
+        ]),
+    ]);
+    let plan = bind_plan(&plan_doc_with_steps(steps, 5)).expect("the plan binds");
+    let apply = |params: &Val| {
+        execute_step(&canter::mutation::EffectContext {
+            plan: &plan,
+            step_id: "collect",
+            kind: "collect_outcome",
+            params: Some(params),
+            repository: REPO,
+            integration_branch: "staging",
+            production_branches: &[],
+            worktrees_root: &worktrees_root,
+            integration_repo: &integration,
+            observed_feature_head: None,
+            observed_integration_base: None,
+            env: &env,
+            role: None,
+            session: Some(&session),
+            archive_root: None,
+            review_root: None,
+            retired_run_ids: &[],
+        })
+    };
+    let collect = |deadline_secs: i64| {
+        object(vec![
+            ("worktree", string("issues-5")),
+            ("branch", string("staging")),
+            ("base_head", string(&base)),
+            ("requires_delta", Val::Bool(true)),
+            ("deadline_secs", integer(deadline_secs)),
+        ])
+    };
+    // Leg 1 — the worker is LIVE and no delta exists: the collection is a
+    // bounded WAIT that certifies nothing. The deadline is generous enough
+    // that the poll really observes the live worker several times even on a
+    // loaded host (each read-back is a subprocess round-trip).
+    let live = apply(&collect(5));
+    println!("live-worker empty collection: {live:?}");
+    assert_eq!(live.status, "ambiguous", "{live:?}");
+    assert_eq!(live.code.as_deref(), Some("effect.worker_timeout"));
+    assert!(
+        live.result.get("head").is_none(),
+        "a live worker's empty delta certifies no head: {live:?}"
+    );
+    let rows = std::fs::read_to_string(fixture.dir.join("herdr-argv.txt")).expect("herdr rows");
+    let live_reads = rows.matches("agent get impl-5").count();
+    assert!(
+        live_reads >= 2,
+        "the live worker was really observed ({live_reads} reads), not assumed: {rows}"
+    );
+    // Leg 2 — the worker has STOPPED and still no delta exists: the typed
+    // refusal, never a certified head.
+    std::fs::write(worker.join("state"), "done").expect("worker stopped");
+    let stopped = apply(&collect(30));
+    println!("stopped-worker empty collection: {stopped:?}");
+    assert_eq!(stopped.status, "refused", "{stopped:?}");
+    assert_eq!(stopped.code.as_deref(), Some("refusal.collect.empty_delta"));
+    assert!(
+        stopped.result.get("head").is_none(),
+        "an empty delta is never recorded as a certified head: {stopped:?}"
+    );
+    assert!(
+        stopped
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("no changed files")),
+        "the refusal names the empty delta: {stopped:?}"
+    );
+    // Leg 3 — positive control: a real committed delta IS certified.
+    std::fs::write(lane.join("delivery.txt"), "worker delivery\n").expect("delivery");
+    git_output(&lane, &["add", "delivery.txt"]);
+    git_output(
+        &lane,
+        &["-c", "commit.gpgsign=false", "commit", "-qm", "delivery"],
+    );
+    let delivered = git_output(&lane, &["rev-parse", "HEAD"]).trim().to_string();
+    assert_ne!(delivered, base, "the delivery moved the lane head");
+    let certified = apply(&collect(30));
+    println!("settled delta collection: {certified:?}");
+    assert_eq!(certified.status, "succeeded", "{certified:?}");
+    assert_eq!(
+        certified.result.get("head").and_then(Val::as_str),
+        Some(delivered.as_str()),
+        "the positive control certifies the lane's committed delta head"
+    );
 }
 
 // ---------------------------------------------------------------------------
