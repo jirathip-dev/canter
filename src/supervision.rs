@@ -208,14 +208,19 @@ fn run_caps(evidence: &SupervisionEvidence) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The spine index of one run's reviewed-evidence step (`None` when the
+/// committed spine carries none): the step whose committed record IS the
+/// delivery (issue #152, and the frontier fact of issue #192).
+pub fn delivery_step_index(steps: &[(String, String)]) -> Option<usize> {
+    steps
+        .iter()
+        .rposition(|(_, kind)| kind == crate::mutation::DELIVERY_STEP_KIND)
+}
+
 /// Whether ONE committed spine step comes AFTER the run's reviewed-evidence
 /// step: the delivery whose tail the step completes (issue #152).
 fn after_delivery_step(evidence: &SupervisionEvidence, step: &str) -> bool {
-    let Some(delivering) = evidence
-        .steps
-        .iter()
-        .rposition(|(_, kind)| kind == crate::mutation::DELIVERY_STEP_KIND)
-    else {
+    let Some(delivering) = delivery_step_index(&evidence.steps) else {
         return false;
     };
     match evidence.steps.iter().position(|(id, _)| id == step) {
@@ -233,6 +238,33 @@ fn declares_reviewer_leg(evidence: &SupervisionEvidence, step: &str) -> bool {
         .reviewer_leg_steps
         .iter()
         .any(|declared| declared == step)
+}
+
+/// Whether one run's recorded frontier has REACHED its own reviewed-evidence
+/// step (issue #192): the `review_evidence` step of the committed spine is
+/// the run's next unachieved step, or is already achieved. Such a run
+/// carries a verified spine (its recorded delivery included) that a
+/// candidate rebuild must never discard, so it is carried forward to its own
+/// committed merge/cleanup tail instead of being superseded.
+///
+/// Fail closed toward preservation: an exhausted spine has reached the step,
+/// while a spine without a `review_evidence` step — or a frontier outside the
+/// spine — never matches, and an unprovable frontier is only ever read as
+/// "reached" when the spine itself proves it. Replacing a preserved run stays
+/// possible through the explicit, audited `run.release` control.
+pub fn frontier_reached_review(steps: &[(String, String)], frontier: Option<&str>) -> bool {
+    let Some(delivering) = delivery_step_index(steps) else {
+        return false;
+    };
+    match frontier {
+        // The spine is exhausted: every committed step, the reviewed-evidence
+        // step included, is achieved.
+        None => true,
+        Some(step) => steps
+            .iter()
+            .position(|(id, _)| id == step)
+            .is_some_and(|index| index >= delivering),
+    }
 }
 
 /// Whether the driver may dispatch ONE kind of ONE step for this run

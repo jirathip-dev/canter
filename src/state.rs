@@ -819,6 +819,27 @@ fn admit_queue_item_in_tx(
                     ),
                 });
             }
+            // Issue #192: a run whose recorded frontier has reached its own
+            // review_evidence step is CARRIED FORWARD, never superseded by a
+            // candidate rebuild. Its verified spine (the recorded delivery
+            // included) is the thing of value and the committed merge/cleanup
+            // tail is still owed, so the later window does not buy a p1
+            // restart. The refusal is deliberate and recorded on this item;
+            // replacing such a run is an explicit operator act — the audited
+            // `run.release` frees its ownership, and a fresh submission then
+            // admits a new run.
+            if owner_reached_review_frontier_locked(ctx.state, tx, &run.instance_id)? {
+                return Ok(AdmissionDecision::Refused {
+                    code: crate::queue_executor::codes::FRONTIER_PRESERVED,
+                    message: format!(
+                        "run {} has reached its review_evidence frontier; a fresh submission \
+                         never supersedes a verified spine — the run keeps its ownership and \
+                         continues its own committed merge/cleanup tail (release the run \
+                         explicitly to replace it)",
+                        run.instance_id
+                    ),
+                });
+            }
             Some(run.instance_id.clone())
         } else {
             let expired_rotation = match item.grant_id {
@@ -1179,6 +1200,59 @@ fn admit_queue_item_in_tx(
     Ok(AdmissionDecision::Admitted {
         instance_id: run_id,
     })
+}
+
+/// Whether the live owner of one issue has reached its own reviewed-evidence
+/// frontier (issue #192): the `review_evidence` step of its committed queue
+/// spine is its recorded frontier, or is already achieved.
+///
+/// Read from the SAME durable facts the driver's own frontier reads — the
+/// committed bound-input line of the run's admitted submission, the recorded
+/// apply attempts, and `current_node` only as the pre-ledger fallback — so
+/// the submission path and the driver can never disagree about where a run
+/// stands. A run without a committed spine, or without a `review_evidence`
+/// step, never matches.
+fn owner_reached_review_frontier_locked(
+    state: &State,
+    conn: &Connection,
+    instance_id: &str,
+) -> Result<bool, StateError> {
+    let line: Option<String> = conn
+        .query_row(
+            "SELECT s.request_line FROM queue_submissions s
+               JOIN queue_submission_items i ON i.submission_id = s.submission_id
+              WHERE i.instance_id = ?1 AND i.status = 'admitted'",
+            params![instance_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|err| StateError::from_sqlite("review frontier: spine", err))?;
+    let Some(line) = line else {
+        return Ok(false);
+    };
+    let steps = bound_steps_of(&line);
+    let current_node: Option<String> = conn
+        .query_row(
+            "SELECT current_node FROM instances WHERE instance_id = ?1",
+            params![instance_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|err| StateError::from_sqlite("review frontier: node", err))?;
+    let Some(current_node) = current_node else {
+        return Ok(false);
+    };
+    let attempts = state.run_step_attempts_with_codes(conn, instance_id)?;
+    let spine: Vec<String> = steps.iter().map(|(id, _)| id.clone()).collect();
+    let recorded: Vec<(String, String)> = attempts
+        .into_iter()
+        .map(|(step, status, _)| (step, status))
+        .collect();
+    let frontier = crate::run_control::frontier_of(&spine, &recorded, &current_node);
+    Ok(crate::supervision::frontier_reached_review(
+        &steps,
+        frontier.as_deref(),
+    ))
 }
 
 /// The admission decision of one membership item, decided inside the
@@ -3413,6 +3487,15 @@ impl State {
             out.push((step, status));
         }
         Ok(out)
+    }
+
+    /// Whether one run's recorded frontier has reached its own
+    /// reviewed-evidence step (issue #192). Read-only; the SAME durable facts
+    /// the submission transaction's own check reads, so the preview and the
+    /// admission agree about a run that a candidate rebuild may not supersede.
+    pub fn run_reached_review_frontier(&self, instance_id: &str) -> Result<bool, StateError> {
+        let conn = self.lock("run_reached_review_frontier")?;
+        owner_reached_review_frontier_locked(self, &conn, instance_id)
     }
 
     /// Every durable retry authorization of one run, oldest first.

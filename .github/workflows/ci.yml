@@ -332,6 +332,7 @@ jobs:
           "--test daemon_rpc",
           "--test executor_authoring",
           "--test executor_lifecycle",
+          "--test frontier_carry_forward",
           "--test grant_issue",
           "--test handoff_crash_acceptance",
           "--test harness_adapters",
