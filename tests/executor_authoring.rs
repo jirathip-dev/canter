@@ -681,31 +681,51 @@ fn cycle2_live_grant_is_not_rotated_by_another_issuance() {
 }
 
 #[test]
-fn f4_later_authorization_rebinds_revision_but_older_window_is_stale() {
+fn f4_a_later_window_never_invalidates_a_live_owner_and_an_older_one_stays_stale() {
     let fixture = Fixture::new();
 
-    let digest_a = fixture.preview(REV);
+    // The OLDER authorization window, minted first for the REV binding.
+    fixture.preview(REV);
     let grant_a = fixture.grant("3600");
-    let admitted_a = fixture.submit(&digest_a, text(&grant_a, &["grant_id"]));
-    let old_run = admitted_a.get("items").and_then(Val::as_array).unwrap()[0]
+
+    // The owner: a run admitted at REV_B under the LATER window.
+    let digest_b = fixture.preview(REV_B);
+    let grant_b = fixture.grant("3600");
+    let admitted_b = fixture.submit(&digest_b, text(&grant_b, &["grant_id"]));
+    let owner = admitted_b.get("items").and_then(Val::as_array).unwrap()[0]
         .get("instance_id")
         .and_then(Val::as_str)
         .unwrap()
         .to_string();
 
-    // B has a distinct binding and a later grant window than A's owner. It
-    // can therefore rebind ownership without depending on grant renewal.
-    let digest_b = fixture.preview(REV_B);
-    let grant_b = fixture.grant("3600");
-    let rebound = fixture.submit(&digest_b, text(&grant_b, &["grant_id"]));
+    // A later window for the moved selection is rebindable — and only
+    // rebindable (issue #209): it never invalidates the live owner. The item
+    // is refused typed, naming the live run and its recorded frontier, and the
+    // incumbent keeps its ownership and its own authorization window.
+    let digest_a = fixture.preview(REV);
+    let later = fixture.grant("3600");
+    let rebound = fixture.submit(&digest_a, text(&later, &["grant_id"]));
     let rebound_item = &rebound.get("items").and_then(Val::as_array).unwrap()[0];
-    assert_eq!(text(rebound_item, &["status"]), "admitted");
-    let new_run = text(rebound_item, &["instance_id"]);
-    assert_ne!(new_run, old_run);
-    let old_status = fixture.ok(&["run", "status", "--run", &old_run]);
-    assert_eq!(text(&old_status, &["run", "status"]), "invalidated");
+    assert_eq!(text(rebound_item, &["status"]), "refused");
+    assert_eq!(text(rebound_item, &["reason"]), "submission.live_run");
+    assert!(
+        text(rebound_item, &["message"]).contains(&owner),
+        "the refusal names the live owner: {rebound:?}"
+    );
+    let owner_status = fixture.ok(&["run", "status", "--run", &owner]);
+    assert_eq!(
+        text(&owner_status, &["run", "status"]),
+        "new",
+        "the incumbent is never invalidated by the submission (its own dispatch state is untouched)"
+    );
+    assert_eq!(
+        text(&owner_status, &["run", "grant_id"]),
+        text(&grant_b, &["grant_id"]),
+        "the incumbent keeps its own authorization window"
+    );
 
-    // A's older authorization cannot move ownership back after B was bound.
+    // The FIRST window is not a LATER authorization than the owner's: the
+    // moved selection stays stale and ownership never moves.
     let digest_a = fixture.preview(REV);
     let stale = fixture.submit(&digest_a, text(&grant_a, &["grant_id"]));
     let stale_item = &stale.get("items").and_then(Val::as_array).unwrap()[0];

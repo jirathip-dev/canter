@@ -94,6 +94,12 @@ pub mod codes {
     /// supersedes it (issue #192). A deliberate replacement is an explicit,
     /// audited `run.release` followed by a fresh submission.
     pub const FRONTIER_PRESERVED: &str = "submission.frontier_preserved";
+    /// The issue's run is LIVE and not terminal, so admission never takes the
+    /// issue (issue #209): a submission is refused typed — naming the live run
+    /// and its recorded frontier — instead of invalidating the incumbent as a
+    /// side effect. Supersession stays an explicit, recorded operator control
+    /// (`run release`), after which a fresh submission admits a new run.
+    pub const LIVE_RUN: &str = "submission.live_run";
 }
 
 /// A typed submission error/refusal (fail closed; stable codes).
@@ -1224,7 +1230,10 @@ fn classify_items(
                     SubmissionVerdict::Refused {
                         code: codes::ALREADY_OWNED,
                         message: format!(
-                            "run {instance_id} already owns this issue under a live grant; a fresh window never rotates a live binding"
+                            "run {instance_id} already owns this issue under a live grant, with frontier {}; a fresh window never rotates a live binding (release the run explicitly to replace it)",
+                            state
+                                .run_frontier_summary(&instance_id)
+                                .map_err(|err| SubmissionError::new(err.code, err.message))?
                         ),
                     }
                 } else {
@@ -1263,8 +1272,12 @@ fn classify_items(
                 SubmissionVerdict::Refused {
                     code: codes::ALREADY_OWNED,
                     message: format!(
-                        "run {instance_id} already owns this issue; a duplicate submission never \
-                         creates a second owner"
+                        "run {instance_id} already owns this issue with frontier {}; a duplicate \
+                         submission never creates a second owner (release the run explicitly to \
+                         replace it)",
+                        state
+                            .run_frontier_summary(&instance_id)
+                            .map_err(|err| SubmissionError::new(err.code, err.message))?
                     ),
                 }
             }
