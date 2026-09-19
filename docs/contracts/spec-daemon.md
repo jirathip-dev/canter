@@ -646,16 +646,24 @@ clears a repository/fleet-level hold or bypasses a gate.
   published-ref reconciliation (issue #178) is the ONE documented engine
   refresh and is unchanged: a history rewrite onto the *published* ref whose
   reviewed content is proven byte-for-byte.
-- **Moved certified head (issue #200)**: a review step whose recorded
-  diagnosis is `refusal.evidence.verdict_stale` — the lane checkout is no
-  longer the run's certified head — is an IMPOSSIBLE step, not a retryable
-  one: the certificate is a recorded fact and the checkout's movement is
-  external, so a re-dispatch is guaranteed to refuse identically. The
-  frontier parks typed (class `needs-attention`, reason
+- **Moved certified head (issue #200, extended by issue #207)**: a review step
+  whose recorded diagnosis is `refusal.evidence.verdict_stale` — the lane
+  checkout is no longer the run's certified head — is an IMPOSSIBLE step, not
+  a retryable one: the certificate is a recorded fact and the checkout's
+  movement is external, so a re-dispatch is guaranteed to refuse identically.
+  The frontier parks typed (class `needs-attention`, reason
   `supervision.step_diagnosed`, the recorded code as the detail, ineligible)
   with the run's bounded retries UNSPENT, instead of burning the budget on a
   step that can never succeed. Refusing to review a moved head is unchanged:
   a reviewer is never started on a head that does not match the certificate.
+  The reviewed work is fenced for the WHOLE review window (issue #207): the
+  self-dispatching review step reads the lane checkout once when the reviewer
+  starts (that check) and AGAIN after the reviewer's verdict is awaited,
+  before anything is recorded. A checkout that moved while the review was
+  open refuses the same deterministic `refusal.evidence.verdict_stale`
+  (naming both heads and the re-entry requirement) — a commit that lands
+  mid-review forces re-entry into review, and no verdict is ever recorded for
+  a delivery that moved under its own review.
 - **Lane base (issue #164)**: checkout and lane creation use the exact
   observed integration base, or resolve the published origin ref when no
   observation exists yet; never the local branch. Missing objects are fetched

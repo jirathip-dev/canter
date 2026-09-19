@@ -559,3 +559,154 @@ fn a_reviewer_leg_whose_binding_is_not_the_declared_role_is_refused() {
     );
     assert!(!fixture.fake_argv().exists());
 }
+
+// ---------------------------------------------------------------------------
+// (d) issue #207 (b): the reviewed work is fenced for the WHOLE review window
+// ---------------------------------------------------------------------------
+
+/// Issue #207 (b). The delivery branch moving TWICE inside the review window
+/// is what #205's freeze/bind semantics could not hold against: a pane worker
+/// keeps committing into the window after the reviewer started. The reviewed
+/// work is therefore fenced for the whole window — the checkout was at the
+/// certified head when the reviewer started AND must still be there when the
+/// verdict is consumed. A commit that lands while the review is open moves
+/// the content the verdict describes, so that verdict is refused at
+/// consumption (`refusal.evidence.verdict_stale`, naming both heads) and the
+/// delivery must re-enter review: never a silent recording of a verdict for a
+/// delivery that moved under it.
+#[test]
+fn a_commit_landing_while_the_review_is_open_forces_re_entry_not_consumption() {
+    let fixture = Fixture::new("mid-window-commit");
+    let params = reviewer_leg_params(&reviewer_binding_doc(), 20);
+    let plan = plan_with_review_step(params.clone());
+    let reviewed = fixture.head.clone();
+    let base = fixture.base.clone();
+    let written = verdict_doc(
+        &reviewed,
+        &base,
+        "pass",
+        Val::Arr(vec![check("exact-head-review", "passed")]),
+    );
+    let verdict_path = fixture.verdict_path();
+    let lane = fixture.lane.clone();
+    let argv = fixture.fake_argv();
+    let reviewed_for_worker = reviewed.clone();
+    // The writer plays the lane worker AND the reviewer: the worker's commit
+    // lands while the reviewer's window is open (after the prompt arrived),
+    // and only then the reviewer's own verdict — for the head it was asked
+    // to review — is written.
+    let mover = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && !argv.exists() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(argv.exists(), "the reviewer was never prompted");
+        std::fs::write(lane.join("mid-review.txt"), "committed under the review\n").expect("write");
+        git(&lane, &["add", "mid-review.txt"]);
+        git(
+            &lane,
+            &["commit", "-qm", "a commit lands while the review is open"],
+        );
+        let moved = git(&lane, &["rev-parse", "HEAD"]).trim().to_string();
+        assert_ne!(
+            moved, reviewed_for_worker,
+            "the checkout moved under the review"
+        );
+        std::fs::write(&verdict_path, &written).expect("the reviewer writes its verdict");
+        moved
+    });
+    let outcome = run_review_step(&fixture, &plan, &params, &reviewed, &base);
+    let moved = mover.join().expect("the writer completes");
+    assert_eq!(outcome.status, "refused", "{outcome:?}");
+    assert_eq!(
+        outcome.code.as_deref(),
+        Some(canter::mutation::code::VERDICT_STALE),
+        "a commit landing mid-review is refused at consumption, never recorded"
+    );
+    let message = outcome.message.clone().unwrap_or_default();
+    assert!(
+        message.contains(&reviewed) && message.contains(&moved),
+        "the refusal names the reviewed head and the moved head: {message}"
+    );
+    assert!(
+        message.contains("fenced for the whole review window"),
+        "the refusal states the fence and the re-entry requirement: {message}"
+    );
+    assert_eq!(
+        git(&fixture.lane, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string(),
+        moved,
+        "the engine consumed nothing and moved nothing: the checkout is the worker's moved head"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (e) issue #207 (a): a verdict written before the run's collection — naming
+// a head the run never certified — can never satisfy the review step
+// ---------------------------------------------------------------------------
+
+/// Issue #207 (a). The verdict on disk predates the run: it names the
+/// branch's OWN earlier head (the head that was there before the run's
+/// collection certified anything), exactly the shape that parked `p6-132` on
+/// `run-32f4bc3df0565189`. A verdict is scoped to a head, and the only head
+/// it may name is the one the run certified — so the out-of-band document is
+/// refused typed at consumption (naming both heads), nothing is recorded, and
+/// the run's own reviewer is what must run at the certified head.
+#[test]
+fn a_verdict_naming_a_pre_collection_head_of_the_same_branch_is_refused() {
+    let fixture = Fixture::new("pre-collection-head");
+    // The branch carries an EARLIER head too: the pre-collection head the
+    // out-of-band review was written against.
+    std::fs::write(fixture.lane.join("earlier.txt"), "earlier\n").expect("write");
+    git(&fixture.lane, &["add", "earlier.txt"]);
+    git(&fixture.lane, &["commit", "-qm", "the pre-collection head"]);
+    let pre_collection = git(&fixture.lane, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+    // The run's collection certifies the branch's CURRENT head.
+    std::fs::write(fixture.lane.join("certified.txt"), "certified\n").expect("write");
+    git(&fixture.lane, &["add", "certified.txt"]);
+    git(&fixture.lane, &["commit", "-qm", "the certified head"]);
+    let certified = git(&fixture.lane, &["rev-parse", "HEAD"])
+        .trim()
+        .to_string();
+    let params = reviewer_leg_params(&reviewer_binding_doc(), 20);
+    let plan = plan_with_review_step(params.clone());
+    let written = verdict_doc(
+        &pre_collection,
+        &fixture.base,
+        "pass",
+        Val::Arr(vec![check("exact-head-review", "passed")]),
+    );
+    let verdict_path = fixture.verdict_path();
+    let argv = fixture.fake_argv();
+    let writer = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && !argv.exists() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(argv.exists(), "the reviewer was never prompted");
+        std::fs::write(&verdict_path, written).expect("the reviewer writes its verdict");
+    });
+    let outcome = run_review_step(&fixture, &plan, &params, &certified, &fixture.base);
+    writer.join().expect("the writer completes");
+    assert_eq!(outcome.status, "refused", "{outcome:?}");
+    assert_eq!(
+        outcome.code.as_deref(),
+        Some(canter::mutation::code::VERDICT_STALE),
+        "a verdict for a head this run did not certify is never consumable evidence"
+    );
+    let message = outcome.message.clone().unwrap_or_default();
+    assert!(
+        message.contains(&pre_collection) && message.contains(&certified),
+        "the refusal names the offered head and the certified head: {message}"
+    );
+    assert_eq!(
+        git(&fixture.lane, &["rev-parse", "HEAD"])
+            .trim()
+            .to_string(),
+        certified,
+        "the refusal consumed nothing and moved nothing"
+    );
+}

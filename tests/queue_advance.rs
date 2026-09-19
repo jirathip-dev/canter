@@ -776,6 +776,343 @@ fn the_daemon_consumes_only_the_head_the_runs_own_collection_certified() {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #207 (AC1): the run's OWN reviewer fires at p6, against the head its
+// OWN collection certified — driven by the run's own supervisor, with ZERO
+// operator dispatches anywhere in the spine
+// ---------------------------------------------------------------------------
+
+/// The registry reviewer row of the self-dispatch witness (synthetic): its
+/// OWN key, provider and model — resolved from the reviewed profile binding,
+/// never a literal in the engine.
+const REVIEW_HARNESS: &str = "harness-rev";
+const REVIEW_PROVIDER: &str = "provider-rev";
+const REVIEW_MODEL: &str = "model-rev";
+
+/// The reviewer's registry-resolved `hf-profile-binding/v1` document (exactly
+/// what `canter queue preview --reviewer-harness KEY` resolves for the row).
+fn reviewer_binding_doc() -> Val {
+    let mut binding = ProfileBinding {
+        key: REVIEW_HARNESS.to_string(),
+        kind: "hermes".to_string(),
+        provider: REVIEW_PROVIDER.to_string(),
+        model: REVIEW_MODEL.to_string(),
+        fallbacks: Vec::new(),
+        configured_limits: Vec::new(),
+        introspection: false,
+        secrets: Vec::new(),
+        revision: String::new(),
+    };
+    binding.revision = binding.revision_of();
+    binding.to_doc()
+}
+
+/// The review step's params (issue #193/#207): the run dispatches its OWN
+/// reviewer through the registry-resolved role binding, in the run's lane.
+fn reviewer_leg_params() -> Val {
+    object(vec![
+        ("execution", string("headless")),
+        ("harness_key", string(REVIEW_HARNESS)),
+        ("kind", string("hermes")),
+        ("executable", string("hermes")),
+        ("reviewer_profile", reviewer_binding_doc()),
+        ("worktree", string("issues-5")),
+        ("deadline_secs", integer(60)),
+    ])
+}
+
+/// The committed spine of the self-dispatch witness: the read step, the
+/// run's own harness_start (it binds the implementer session the reviewer
+/// identity is derived from), the run's OWN collection (the certified head)
+/// and the self-dispatching review step. Every step is driven by the run's
+/// own supervisor: this witness dispatches none of them.
+fn self_dispatch_spine() -> Vec<qp::PlannedStep> {
+    vec![
+        qp::PlannedStep {
+            id: "p1".to_string(),
+            kind: "checkout".to_string(),
+            params: Some(resolved()),
+        },
+        qp::PlannedStep {
+            id: "s1".to_string(),
+            kind: "harness_start".to_string(),
+            params: Some(object(vec![
+                ("execution", string("headless")),
+                ("harness_key", string(HARNESS)),
+            ])),
+        },
+        qp::PlannedStep {
+            id: "o1".to_string(),
+            kind: "collect_outcome".to_string(),
+            params: Some(object(vec![
+                ("worktree", string("issues-5")),
+                ("branch", string("issue-5")),
+                ("requires_delta", canter::value::bool_(true)),
+            ])),
+        },
+        qp::PlannedStep {
+            id: "r1".to_string(),
+            kind: "review_evidence".to_string(),
+            params: Some(reviewer_leg_params()),
+        },
+    ]
+}
+
+/// The submitted dispatch bundle of a supervised run (issues #92/#95): the
+/// topology its steps bind and the host-resource admission its fan-out steps
+/// re-present. It IS the run's own first dispatch material — this witness
+/// issues no operator `apply` at all.
+fn dispatch_bundle(fixture: &DaemonFixture) -> Val {
+    object(vec![
+        (
+            "topology",
+            object(vec![
+                ("integration_branch", string("staging")),
+                (
+                    "worktrees_root",
+                    string(&format!("{}/worktrees", fixture.dir.display())),
+                ),
+                (
+                    "integration_repo",
+                    string(&format!("{}/repo", fixture.dir.display())),
+                ),
+            ]),
+        ),
+        (
+            "admission",
+            object(vec![
+                (
+                    "caps",
+                    object(vec![
+                        ("global", integer(4)),
+                        ("repository", integer(2)),
+                        ("harness", integer(2)),
+                    ]),
+                ),
+                ("harness_lanes", integer(0)),
+                (
+                    "host_proof",
+                    object(vec![("measured_at", string(&canter::time::rfc3339_now()))]),
+                ),
+            ]),
+        ),
+    ])
+}
+
+/// The fake reviewer harness (the `hermes` executable the registry-resolved
+/// reviewer role runs, headless): it records its argv and the review brief it
+/// was prompted with, then plays the REVIEWER — it writes the verdict
+/// document the brief names, naming exactly the head the brief named. The
+/// engine never writes a verdict.
+fn write_fake_reviewer_harness(fixture: &DaemonFixture) -> PathBuf {
+    let bin = fixture.dir.join("fakebin");
+    std::fs::create_dir_all(&bin).expect("fake bin dir");
+    let path = bin.join("hermes");
+    std::fs::write(
+        &path,
+        r#"#!/bin/sh
+set -eu
+last=""
+for arg in "$@"; do last="$arg"; done
+printf '%s\n' "$last" > "$HOME/reviewer-payload.txt"
+printf '%s\n' "$@" > "$HOME/reviewer-argv.txt"
+flat=$(printf '%s' "$last" | tr -d '\n')
+verdict_path=$(printf '%s' "$flat" | sed -n 's/.*"\([^"]*\.json\)".*/\1/p')
+head=$(printf '%s' "$flat" | sed -n 's/.*"feature_head":"\([0-9a-f]\{40\}\)".*/\1/p')
+base=$(printf '%s' "$flat" | sed -n 's/.*"integration_base":"\([0-9a-f]\{40\}\)".*/\1/p')
+test -n "$verdict_path"
+test -n "$head"
+test -n "$base"
+mkdir -p "$(dirname "$verdict_path")"
+printf '%s' "{\"schema\":\"hf-evidence/v1\",\"feature_head\":\"$head\",\"integration_base\":\"$base\",\"verdict\":\"pass\",\"checks\":[{\"name\":\"exact-head-review\",\"status\":\"passed\"}]}" > "$verdict_path"
+"#,
+    )
+    .expect("write fake reviewer");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("chmod");
+    }
+    bin
+}
+
+/// The ONE apply row that dispatched step `r1` of this fixture's daemon, read
+/// from the durable ledger exactly as the driver's own dispatch key records
+/// it (`ik_<run>-<step>-<second>`).
+fn r1_dispatch_key(fixture: &DaemonFixture) -> String {
+    let conn = rusqlite::Connection::open_with_flags(
+        fixture.db(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("read-only connection");
+    let mut statement = conn
+        .prepare("SELECT key FROM idempotency WHERE method = 'apply' AND request_line LIKE '%\"step\":\"r1\"%'")
+        .expect("prepare r1 dispatch read");
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("read r1 dispatch rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("r1 dispatch rows");
+    assert_eq!(rows.len(), 1, "exactly ONE dispatch of r1 exists: {rows:?}");
+    rows.into_iter().next().expect("one row")
+}
+
+/// Issue #207 (AC1). The run's OWN reviewer fires at `p6` against the head
+/// the run's OWN collection certified — through the run's own supervisor,
+/// with ZERO operator dispatches anywhere in the spine. The witness proves
+/// the firing (not merely that the code path exists): the daemon's driver
+/// drives `p1..r1`, the registry-resolved reviewer role really runs (its
+/// recorded argv carries the reviewer's own binding), the written verdict is
+/// consumed as the run's recorded evidence at the certified head, and the
+/// run completes — exactly the ordering the measured `p6-132` park lacked.
+#[test]
+fn the_run_dispatches_its_own_reviewer_at_the_certified_head() {
+    let fixture = DaemonFixture::new("self-review");
+    let base = repos_with_lane_branch(&fixture);
+    let lane = fixture.dir.join("worktrees/issues-5");
+    std::fs::write(lane.join("delivered.txt"), "the reviewed delivery\n").expect("write");
+    git(&lane, &["add", "delivered.txt"]);
+    git(
+        &lane,
+        &["commit", "-q", "-m", "the lane delivery (synthetic)"],
+    );
+    let certified = git(&lane, &["rev-parse", "HEAD"]);
+    assert_ne!(certified, base, "the lane delivered content");
+    let fakebin = write_fake_reviewer_harness(&fixture);
+    let (bound, digest) = {
+        let state = fixture.seed();
+        let caps_for_tail = tail_boundary_caps();
+        let tail_caps: Vec<&str> = caps_for_tail.iter().map(|cap| cap.as_str()).collect();
+        seed_grant_with_caps(&state, "gr_0000000000000005", 5, &tail_caps);
+        let mut request = request_with(vec![selected("#5", &[])]);
+        request.steps = self_dispatch_spine();
+        request.boundary.caps = tail_boundary_caps();
+        render_bound(&state, &request)
+    };
+    let daemon = fixture.spawn_with_path(&fakebin);
+    wait_ready(&fixture);
+    let mut submit = submit_params_doc(
+        &idem_key("self-review-submit"),
+        &bound,
+        &digest,
+        &[("#5", "gr_0000000000000005")],
+        ConcurrencyCaps {
+            global: 4,
+            per_repository: 2,
+            per_harness: 2,
+        },
+        5,
+        60,
+    );
+    match &mut submit {
+        Val::Obj(map) => {
+            map.insert("dispatch".to_string(), dispatch_bundle(&fixture));
+        }
+        _ => unreachable!("submit params are an object"),
+    }
+    let submitted = rpc_ok(&fixture.socket, &fresh_id(1), "queue.submit", Some(submit));
+    let run = live_item(&submitted, 5)
+        .get("instance_id")
+        .and_then(Val::as_str)
+        .expect("issue 5 admitted")
+        .to_string();
+
+    // NO client dispatch of any step happens from here on: the run's own
+    // supervisor owns the committed spine. Poll its own status surface
+    // (bounded, no fixed sleep) until the delivery completes the run.
+    let mut timeline: Vec<String> = Vec::new();
+    let mut id = 700u64;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let attempts = loop {
+        id += 1;
+        let (status, step, kind, attempts) = cursor_sample(&fixture.socket, &run, id);
+        timeline.push(format!(
+            "t{} status={status} next={step}/{kind} attempts={attempts:?}",
+            id - 700
+        ));
+        if status == "done" {
+            break attempts;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the supervisor never drove the spine:\n{}",
+            timeline.join("\n")
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    for step in ["p1", "s1", "o1", "r1"] {
+        assert!(
+            achieved(&attempts, step),
+            "the supervisor itself drove {step}: {attempts:?}\n{}",
+            timeline.join("\n")
+        );
+    }
+    shutdown(daemon);
+
+    // The r1 dispatch is the DRIVER's own: the only apply row for it carries
+    // the driver's dispatch key (no operator key exists in this test), and
+    // the run's own log records the supervisor dispatching it.
+    let driver_key = r1_dispatch_key(&fixture);
+    assert!(
+        driver_key.starts_with(&format!("ik_{run}-r1-")),
+        "r1 was dispatched by the run's own supervisor: {driver_key:?}"
+    );
+    let log = std::fs::read_to_string(fixture.daemon_log()).expect("daemon log");
+    assert!(
+        log.contains("supervision.dispatch") && log.contains("dispatched step r1"),
+        "the supervisor dispatched the review step itself: {log}"
+    );
+
+    // The reviewer RAN under the registry-resolved binding — its own argv
+    // carries the binding pair the registry resolved — against the certified
+    // head (the brief the reviewer was prompted with names it).
+    let payload = std::fs::read_to_string(fixture.dir.join("reviewer-payload.txt"))
+        .expect("the reviewer ran");
+    let argv = std::fs::read_to_string(fixture.dir.join("reviewer-argv.txt"))
+        .expect("the reviewer's argv");
+    assert!(
+        argv.contains(REVIEW_HARNESS)
+            && argv.contains(REVIEW_PROVIDER)
+            && argv.contains(REVIEW_MODEL),
+        "the reviewer ran under the registry-resolved binding: {argv}"
+    );
+    assert!(
+        payload.contains(&certified),
+        "the reviewer was started against the certified head: {payload}"
+    );
+
+    // The recorded evidence IS the verdict the run's own reviewer wrote, at
+    // the head the run's own collection certified — and the reviewer is the
+    // lane reviewer identity, never the implementer's session.
+    let state = fixture.seed();
+    let certificate = state
+        .run_delivery_certificate(&run)
+        .expect("certificate read")
+        .expect("the run's own collection certified a delivery");
+    assert_eq!(certificate.head, certified, "{certificate:?}");
+    assert_eq!(certificate.branch, "issue-5", "{certificate:?}");
+    let evidence = state.evidence_for_instance(&run).expect("evidence read");
+    let newest = evidence
+        .first()
+        .expect("the run's own reviewer recorded evidence");
+    assert_eq!(
+        newest.feature_head, certified,
+        "the evidence names the certified head: {newest:?}"
+    );
+    assert_eq!(newest.verdict, "pass");
+    assert!(
+        newest.checks.contains("exact-head-review"),
+        "the reviewer's own check is recorded: {}",
+        newest.checks
+    );
+    assert_eq!(
+        newest.reviewer, "rev-5-r1",
+        "the reviewer is the lane reviewer identity, not the implementer's session"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // AC: two-issue auto-advance, once, and never twice (duplicate + restart)
 // ---------------------------------------------------------------------------
 
@@ -1706,6 +2043,31 @@ impl DaemonFixture {
             .arg(&self.socket)
             .env("XDG_STATE_HOME", &self.state_dir)
             .env("HOME", &self.dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(
+                std::fs::File::create(self.dir.join("daemon.stderr.log")).expect("stderr log"),
+            ))
+            .spawn()
+            .expect("spawn daemon")
+    }
+
+    /// The same daemon, spawned with `path` PREPENDED to the child's `PATH`:
+    /// the self-dispatching review step's reviewer role runs the harness
+    /// executable the effect resolves from the daemon's own environment, so
+    /// the witness puts its fake reviewer where that resolution looks.
+    fn spawn_with_path(&self, path: &Path) -> Child {
+        std::fs::create_dir_all(&self.state_dir).expect("state home");
+        let mut child_path = path.to_string_lossy().to_string();
+        if let Ok(existing) = std::env::var("PATH") {
+            child_path.push(':');
+            child_path.push_str(&existing);
+        }
+        Command::new(env!("CARGO_BIN_EXE_canter"))
+            .args(["daemon", "run", "--socket"])
+            .arg(&self.socket)
+            .env("XDG_STATE_HOME", &self.state_dir)
+            .env("HOME", &self.dir)
+            .env("PATH", child_path)
             .stdout(Stdio::null())
             .stderr(Stdio::from(
                 std::fs::File::create(self.dir.join("daemon.stderr.log")).expect("stderr log"),
