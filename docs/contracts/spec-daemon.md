@@ -324,12 +324,29 @@ outcome after the effect transaction commits.
 - Acceptance revision hashes are opaque and never sorted lexically. A selected
   revision different from the active owner's revision is `preview.revision_stale`
   unless a route grant for that exact selection was issued AFTER the owner's
-  grant. Presenting that later, still-valid grant atomically invalidates the old
-  run and rebinds the unique ownership row to the new run; presenting an older
-  grant remains stale. A same-revision live window remains
-  `submission.already_owned`; a later issuance may rotate an expired window on
+  grant. A later, still-valid grant makes that exact selection REBINDABLE, and
+  only rebindable: presenting an older grant remains stale, and a live run is
+  never invalidated by admission (issue #209, next bullet). A same-revision
+  live window remains `submission.already_owned`, and a fresh window never
+  rotates a live binding; a later issuance may rotate an EXPIRED window on
   that same run, with `grant.rotation` naming both rows and the new expiry. The
   grant insertion order is the normative authorization-window order.
+- **Live incumbent (issue #209):** a `queue submit` for an issue whose run is
+  live and not terminal is refused typed — `submission.live_run`, naming the
+  live run and its recorded frontier — and the incumbent keeps its unique
+  ownership, its authorization window and its frontier. Admission never
+  invalidates an incumbent as a side effect: the submit path contains no
+  invalidation of a live run at all. The named frontier is the same durable
+  fact the driver's own frontier reads (the committed bound-input spine plus
+  the recorded apply-attempt ledger, with `current_node` only as the
+  pre-ledger fallback): the frontier step with its kind, plus the run's
+  recorded supervision class — the class of its newest committed check, and
+  `unknown` before the first check. Every refusal that declines an item
+  because of a live incumbent names that incumbent the same way
+  (`submission.already_owned` on a same-revision duplicate,
+  `submission.frontier_preserved` at the reviewed-evidence frontier), and the
+  preview reports `preview.live_run` with the same summary instead of
+  presenting the rebind as authorized.
 - **Reviewed-evidence frontier (issue #192):** the rebind above never
   supersedes a run whose recorded frontier has REACHED its own
   `review_evidence` step — that step is the run's next unachieved step, or is
@@ -344,7 +361,8 @@ outcome after the effect transaction commits.
   authorized. Replacing such a run is an explicit, audited act: the
   `run.release` control frees its ownership and the run goes terminal, after
   which a fresh submission admits a new run. A run that has not reached that
-  frontier keeps the rebind semantics above unchanged.
+  frontier is refused `submission.live_run` under the rule above — never
+  superseded.
 - `queue.status` requires `params.submission_id` (`qs_` + 16 hex) and
   returns the same document the submit response carried (a pure
   projection of the committed rows; `state.not_found` for an unknown id).

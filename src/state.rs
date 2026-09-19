@@ -787,7 +787,7 @@ fn admit_queue_item_in_tx(
 ) -> Result<AdmissionDecision, StateError> {
     let scope = format!("worktrees/issues/{}", item.issue_number);
     let mut rotation: Option<(String, String)> = None;
-    let superseded_instance = if let Some(run) = ctx.ownership.get(&item.issue_number) {
+    if let Some(run) = ctx.ownership.get(&item.issue_number) {
         if run.issue_revision != item.issue_revision {
             let Some(candidate_grant) = item.grant_id else {
                 return Ok(AdmissionDecision::Refused {
@@ -832,15 +832,32 @@ fn admit_queue_item_in_tx(
                 return Ok(AdmissionDecision::Refused {
                     code: crate::queue_executor::codes::FRONTIER_PRESERVED,
                     message: format!(
-                        "run {} has reached its review_evidence frontier; a fresh submission \
-                         never supersedes a verified spine — the run keeps its ownership and \
-                         continues its own committed merge/cleanup tail (release the run \
-                         explicitly to replace it)",
-                        run.instance_id
+                        "run {} has reached its review_evidence frontier; {} is its recorded \
+                         frontier — a fresh submission never supersedes a verified spine, the run \
+                         keeps its ownership and continues its own committed merge/cleanup tail \
+                         (release the run explicitly to replace it)",
+                        run.instance_id,
+                        owner_frontier_summary_locked(ctx.state, tx, &run.instance_id)?
                     ),
                 });
             }
-            Some(run.instance_id.clone())
+            // Issue #209: a run that is live and NOT terminal is never
+            // invalidated by admission, wherever its frontier stands. A later
+            // authorization window alone does not make the incumbent
+            // disposable: its recorded frontier (step, kind, class) is named
+            // and the item is refused typed, so an operator decides. The ONE
+            // deliberate route stays the explicit, audited `run.release`,
+            // after which a fresh submission admits a new run.
+            return Ok(AdmissionDecision::Refused {
+                code: crate::queue_executor::codes::LIVE_RUN,
+                message: format!(
+                    "run {} is live with frontier {}; a fresh submission never supersedes a live \
+                     run — the incumbent keeps its ownership and its recorded frontier (release \
+                     the run explicitly to replace it)",
+                    run.instance_id,
+                    owner_frontier_summary_locked(ctx.state, tx, &run.instance_id)?
+                ),
+            });
         } else {
             let expired_rotation = match item.grant_id {
                 Some(candidate) if candidate != run.grant_id => {
@@ -878,7 +895,6 @@ fn admit_queue_item_in_tx(
             };
             if expired_rotation {
                 rotation = Some((run.instance_id.clone(), run.grant_id.clone()));
-                None
             } else {
                 // An owner that appeared after the preview moved the verdict: only
                 // an explicit engine-authorized resume of a still-paused run admits
@@ -923,18 +939,17 @@ fn admit_queue_item_in_tx(
                 return Ok(AdmissionDecision::Refused {
                     code: crate::queue_executor::codes::ALREADY_OWNED,
                     message: format!(
-                        "run {} already owns this issue; a duplicate submission never \
-                         creates a second owner",
-                        run.instance_id
+                        "run {} already owns this issue with frontier {}; a duplicate submission \
+                         never creates a second owner (release the run explicitly to replace it)",
+                        run.instance_id,
+                        owner_frontier_summary_locked(ctx.state, tx, &run.instance_id)?
                     ),
                 });
             }
         }
-    } else {
-        None
-    };
-    // No live owner, or an explicitly later revision authorization: re-verify
-    // the presented grant under the guard (status, epoch and expiry).
+    }
+    // No live owner: re-verify the presented grant under the guard (status,
+    // epoch and expiry).
     let grant_id = item.grant_id.unwrap_or_default();
     let grant: Option<GrantBinding> = tx
         .query_row(
@@ -1071,25 +1086,10 @@ fn admit_queue_item_in_tx(
             ),
         });
     }
-    if let Some(old) = &superseded_instance {
-        let affected = tx
-            .execute(
-                "UPDATE instances SET status = 'invalidated', updated_at = ?2
-                  WHERE instance_id = ?1
-                    AND status IN ('new', 'running', 'paused', 'human_queue', 'blocked')",
-                params![old, ctx.at],
-            )
-            .map_err(|err| StateError::from_sqlite("admit_queue_item: supersede", err))?;
-        if affected != 1 {
-            return Err(state_error(
-                "state.ownership_conflict",
-                format!("owner {old} changed before the revision rebind committed"),
-            ));
-        }
-    }
     // Admitted: one run row plus one unique ownership row, both inside this
-    // transaction. A revision rebind invalidates the old owner in this same
-    // transaction before replacing its ownership row.
+    // transaction. A live incumbent is never invalidated by admission (issue
+    // #209): this path is reached only when no live run owns the issue, and
+    // replacing one is the explicit, audited `run.release`.
     let derived = format!("hf-queue-run/v1|{}|{}", ctx.submission_id, item.work_item);
     let run_id = format!(
         "run-{}",
@@ -1202,21 +1202,55 @@ fn admit_queue_item_in_tx(
     })
 }
 
-/// Whether the live owner of one issue has reached its own reviewed-evidence
-/// frontier (issue #192): the `review_evidence` step of its committed queue
-/// spine is its recorded frontier, or is already achieved.
+/// The recorded frontier of one live run (issue #209): its committed step
+/// spine, its next unachieved step with that step's kind, and its recorded
+/// supervision class.
 ///
 /// Read from the SAME durable facts the driver's own frontier reads — the
 /// committed bound-input line of the run's admitted submission, the recorded
 /// apply attempts, and `current_node` only as the pre-ledger fallback — so
-/// the submission path and the driver can never disagree about where a run
-/// stands. A run without a committed spine, or without a `review_evidence`
-/// step, never matches.
-fn owner_reached_review_frontier_locked(
+/// the submission path, the preview and the driver can never disagree about
+/// where a run stands.
+struct OwnedFrontier {
+    /// The bound step spine as `(step id, step kind)` in spine order.
+    steps: Vec<(String, String)>,
+    /// The next unachieved step, when the recorded ledger establishes one.
+    step: Option<String>,
+    /// That step's kind.
+    kind: String,
+    /// The run's recorded supervision class: the class of its newest
+    /// committed check (a member of the closed classification vocabulary), or
+    /// empty while the run has recorded none.
+    class: String,
+}
+
+impl OwnedFrontier {
+    /// The frontier as one bounded summary: the step and its kind plus the
+    /// recorded supervision class, or the honest statement of what the
+    /// recorded ledger does establish instead.
+    fn summary(&self) -> String {
+        let class = if self.class.is_empty() {
+            "unknown"
+        } else {
+            self.class.as_str()
+        };
+        match &self.step {
+            Some(step) => format!("{step} ({}, supervision class {class})", self.kind),
+            None if self.steps.is_empty() => {
+                format!("no committed spine (supervision class {class})")
+            }
+            None => format!("an unresolved frontier (supervision class {class})"),
+        }
+    }
+}
+
+/// Read one run's recorded frontier under the caller's guard. `None` when the
+/// durable run row itself is unreadable.
+fn owner_frontier_locked(
     state: &State,
     conn: &Connection,
     instance_id: &str,
-) -> Result<bool, StateError> {
+) -> Result<Option<OwnedFrontier>, StateError> {
     let line: Option<String> = conn
         .query_row(
             "SELECT s.request_line FROM queue_submissions s
@@ -1226,11 +1260,8 @@ fn owner_reached_review_frontier_locked(
             |row| row.get(0),
         )
         .optional()
-        .map_err(|err| StateError::from_sqlite("review frontier: spine", err))?;
-    let Some(line) = line else {
-        return Ok(false);
-    };
-    let steps = bound_steps_of(&line);
+        .map_err(|err| StateError::from_sqlite("frontier: spine", err))?;
+    let steps = line.as_deref().map(bound_steps_of).unwrap_or_default();
     let current_node: Option<String> = conn
         .query_row(
             "SELECT current_node FROM instances WHERE instance_id = ?1",
@@ -1238,9 +1269,9 @@ fn owner_reached_review_frontier_locked(
             |row| row.get(0),
         )
         .optional()
-        .map_err(|err| StateError::from_sqlite("review frontier: node", err))?;
+        .map_err(|err| StateError::from_sqlite("frontier: node", err))?;
     let Some(current_node) = current_node else {
-        return Ok(false);
+        return Ok(None);
     };
     let attempts = state.run_step_attempts_with_codes(conn, instance_id)?;
     let spine: Vec<String> = steps.iter().map(|(id, _)| id.clone()).collect();
@@ -1248,11 +1279,58 @@ fn owner_reached_review_frontier_locked(
         .into_iter()
         .map(|(step, status, _)| (step, status))
         .collect();
-    let frontier = crate::run_control::frontier_of(&spine, &recorded, &current_node);
-    Ok(crate::supervision::frontier_reached_review(
-        &steps,
-        frontier.as_deref(),
-    ))
+    let step = crate::run_control::frontier_of(&spine, &recorded, &current_node);
+    let kind = step
+        .as_deref()
+        .and_then(|step| {
+            steps
+                .iter()
+                .find(|(id, _)| id == step)
+                .map(|(_, kind)| kind.clone())
+        })
+        .unwrap_or_default();
+    let class = match state.supervision_row_locked(conn, instance_id)? {
+        Some(row) if row.checks > 0 => row.last_check_class.clone(),
+        _ => String::new(),
+    };
+    Ok(Some(OwnedFrontier {
+        steps,
+        step,
+        kind,
+        class,
+    }))
+}
+
+/// The frontier of one run as one bounded human summary, naming the durable
+/// row that could not be read when there is none to name.
+fn owner_frontier_summary_locked(
+    state: &State,
+    conn: &Connection,
+    instance_id: &str,
+) -> Result<String, StateError> {
+    Ok(match owner_frontier_locked(state, conn, instance_id)? {
+        Some(owned) => owned.summary(),
+        None => "an unreadable run row".to_string(),
+    })
+}
+
+/// Whether the live owner of one issue has reached its own reviewed-evidence
+/// frontier (issue #192): the `review_evidence` step of its committed queue
+/// spine is its recorded frontier, or is already achieved.
+///
+/// A run without a committed spine, or without a `review_evidence` step,
+/// never matches; an unreadable run row never matches.
+fn owner_reached_review_frontier_locked(
+    state: &State,
+    conn: &Connection,
+    instance_id: &str,
+) -> Result<bool, StateError> {
+    Ok(match owner_frontier_locked(state, conn, instance_id)? {
+        Some(owned) => {
+            crate::supervision::frontier_reached_review(&owned.steps, owned.step.as_deref())
+        }
+        None => false,
+    })
 }
 
 /// The admission decision of one membership item, decided inside the
@@ -3620,6 +3698,16 @@ impl State {
     pub fn run_reached_review_frontier(&self, instance_id: &str) -> Result<bool, StateError> {
         let conn = self.lock("run_reached_review_frontier")?;
         owner_reached_review_frontier_locked(self, &conn, instance_id)
+    }
+
+    /// One run's recorded frontier as one bounded summary — its frontier step
+    /// and kind plus its recorded supervision class (issue #209). Read-only;
+    /// the SAME facts the submission transaction's own refusal names, so the
+    /// preview, the submission pre-screen and the admission agree about where
+    /// a live run stands.
+    pub fn run_frontier_summary(&self, instance_id: &str) -> Result<String, StateError> {
+        let conn = self.lock("run_frontier_summary")?;
+        owner_frontier_summary_locked(self, &conn, instance_id)
     }
 
     /// Every durable retry authorization of one run, oldest first.

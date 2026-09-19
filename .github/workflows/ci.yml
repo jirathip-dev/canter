@@ -341,6 +341,7 @@ jobs:
           "--test host_proof_renewal",
           "--test lane_cli",
           "--test lane_replacement",
+          "--test live_run_guard",
           "--test mutation_engine",
           "--test no_network_surface",
           "--test profile_binding",

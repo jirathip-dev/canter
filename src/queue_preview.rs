@@ -106,6 +106,12 @@ pub mod holds {
     /// supersedes it (issue #192); replacing it takes an explicit, audited
     /// release.
     pub const FRONTIER_PRESERVED: &str = "preview.frontier_preserved";
+    /// The active owner is LIVE and not terminal, wherever its recorded
+    /// frontier stands: a fresh submission never invalidates it, so the item
+    /// is presented with its live run and that run's recorded frontier instead
+    /// of as a rebind (issue #209); replacing it takes an explicit, audited
+    /// release.
+    pub const LIVE_RUN: &str = "preview.live_run";
     /// A required dependency is not part of the selected set.
     pub const DEPENDENCY_UNRESOLVED: &str = "preview.dependency_unresolved";
     /// A required dependency is selected but not settled (blocked or owned).
@@ -1132,10 +1138,11 @@ pub fn preview_queue(state: &State, request: &QueueRequest) -> Result<QueuePrevi
     // Items: durable ownership first, then dependency readiness. A moved
     // revision is rebindable only when a later grant window explicitly binds
     // that exact selection; opaque revision hashes are never ordered — and a
-    // run that has reached its reviewed-evidence frontier is carried forward
-    // instead (issue #192), never superseded by a candidate rebuild.
-    let mut rebindable: BTreeSet<(IssueId, String)> = BTreeSet::new();
+    // live, non-terminal run is never presented as supersedable (issues #192,
+    // #209): a run at its reviewed-evidence frontier is carried forward, and
+    // every other live run keeps its ownership and its recorded frontier.
     let mut preserved: BTreeSet<(IssueId, String)> = BTreeSet::new();
+    let mut live: BTreeSet<(IssueId, String)> = BTreeSet::new();
     for issue in &request.selected {
         if let Some(owner) = owned_rows.iter().copied().find(|row| {
             row.repository == issue.id.repository
@@ -1151,18 +1158,17 @@ pub fn preview_queue(state: &State, request: &QueueRequest) -> Result<QueuePrevi
                 )
                 .map_err(|err| PreviewError::new(err.code, err.message))?;
             if authorized {
-                // The later window authorizes the rebind, but a run at its
-                // reviewed-evidence frontier is preserved by the same durable
-                // frontier fact the submission transaction enforces: the
-                // preview never presents a supersession the admission would
-                // refuse.
+                // The later window alone never authorizes a supersession: the
+                // frontier read below is the SAME durable fact the submission
+                // transaction enforces, so the preview never presents a rebind
+                // the admission would refuse.
                 if state
                     .run_reached_review_frontier(&owner.instance_id)
                     .map_err(|err| PreviewError::new(err.code, err.message))?
                 {
                     preserved.insert((issue.id.clone(), issue.revision.clone()));
                 } else {
-                    rebindable.insert((issue.id.clone(), issue.revision.clone()));
+                    live.insert((issue.id.clone(), issue.revision.clone()));
                 }
             }
         }
@@ -1174,8 +1180,7 @@ pub fn preview_queue(state: &State, request: &QueueRequest) -> Result<QueuePrevi
             .filter(|row| row.repository == id.repository && row.issue_number == id.number)
             .collect();
         let witness = rows.first()?;
-        let settled = rows.iter().any(|row| row.issue_revision == revision)
-            || rebindable.contains(&(id.clone(), revision.to_string()));
+        let settled = rows.iter().any(|row| row.issue_revision == revision);
         Some((
             OwnedRun {
                 instance_id: witness.instance_id.clone(),
@@ -1195,11 +1200,13 @@ pub fn preview_queue(state: &State, request: &QueueRequest) -> Result<QueuePrevi
         if let Some(run) = &item.owned
             && item.stale_revision
         {
-            // Issue #192: a later window may authorize a rebind, but a run
-            // that has reached its reviewed-evidence frontier is carried
-            // forward — reported with its own code so the operator is told
-            // the exact deliberate path (an audited release), never a stale
-            // "no later window" claim.
+            // Issues #192/#209: a later window may authorize a rebind, but a
+            // live, non-terminal run is never presented as supersedable — a
+            // run at its reviewed-evidence frontier is carried forward, and
+            // every other live run keeps its ownership and its recorded
+            // frontier. Each case is reported with its own code so the
+            // operator is told the exact deliberate path (an audited release),
+            // never a stale "no later window" claim.
             item_level.push(
                 if preserved.contains(&(item.id.clone(), item.revision.clone())) {
                     Hold {
@@ -1208,6 +1215,18 @@ pub fn preview_queue(state: &State, request: &QueueRequest) -> Result<QueuePrevi
                         message: format!(
                             "run {} has reached its review_evidence frontier; the verified spine is carried forward and a fresh submission never supersedes it — release the run explicitly to replace it",
                             run.instance_id
+                        ),
+                    }
+                } else if live.contains(&(item.id.clone(), item.revision.clone())) {
+                    Hold {
+                        code: holds::LIVE_RUN,
+                        subject: item.id.display(),
+                        message: format!(
+                            "run {} is live with frontier {}; a fresh submission never supersedes a live run — the incumbent keeps its ownership and its recorded frontier (release the run explicitly to replace it)",
+                            run.instance_id,
+                            state
+                                .run_frontier_summary(&run.instance_id)
+                                .map_err(|err| PreviewError::new(err.code, err.message))?
                         ),
                     }
                 } else {
