@@ -2337,6 +2337,136 @@ fn cleanup_accepts_a_squash_landed_lane_and_still_refuses_unlanded_content() {
     assert!(unlanded.repos.worktrees_root.join("issues-123").exists());
 }
 
+/// Issue #132: the sanctioned landing happens on the FORGE (the PR is
+/// squash-merged) and a remote landing never updates the checkout's own
+/// integration ref — so cleanup must certify the landing against the FETCHED,
+/// verified PUBLISHED head, never against the stale local view alone, or the
+/// run can never complete its own cleanup on a squash-policy repository. A
+/// checkout diverged from the published ref is still never certified.
+#[test]
+fn cleanup_certifies_a_squash_landing_visible_only_on_the_published_ref() {
+    let (scenario, _feature, base) = cycle2_reviewed_merge("squash", false);
+    let root = scenario
+        .repos
+        .checkout
+        .parent()
+        .expect("sandbox root")
+        .to_path_buf();
+    let origin = scenario.origin();
+    let checkout = Git::new(&scenario.repos.checkout);
+    // The delivery is pushed to the bare remote (a feature lane, never
+    // integration) and a SECOND clone performs the sanctioned policy squash
+    // there: the published ref moves while the integration checkout's own ref
+    // never sees the landing (no fetch, no local ref update).
+    checkout.run(&["push", "-q", "origin", "issue-123"]);
+    let other = root.join("merge-operator");
+    Git::new(&root).run(&[
+        "clone",
+        "-q",
+        "--branch",
+        "staging",
+        origin.to_str().expect("origin path"),
+        other.to_str().expect("operator path"),
+    ]);
+    let operator = Git::new(&other);
+    operator.run(&["config", "user.name", "merge operator"]);
+    operator.run(&["config", "user.email", "operator@example.invalid"]);
+    operator.run(&["merge", "-q", "--squash", "origin/issue-123"]);
+    operator.run(&[
+        "commit",
+        "-q",
+        "-m",
+        "sanctioned squash landing (synthetic)",
+    ]);
+    operator.run(&["push", "-q", "origin", "staging"]);
+    let published = operator.head("staging");
+    assert_ne!(published, base, "the published integration ref moved");
+    assert_eq!(
+        checkout.head("staging"),
+        base,
+        "the checkout's own ref never sees a remote landing"
+    );
+
+    // Cleanup proves the landing against the fetched published head (content,
+    // because the squash rewrote the commits) and removes the lane. The
+    // checkout's own ref is never moved, and the record names the published
+    // head the proof was made against.
+    let cleaned = scenario.apply_ok(20, "x1", None, None);
+    assert_eq!(cleaned.get("removed").and_then(Val::as_bool), Some(true));
+    let salvage = cleaned.get("salvage").expect("salvage");
+    assert_eq!(
+        salvage.get("landed_by").and_then(Val::as_str),
+        Some("content"),
+        "the squash landing is proven by content"
+    );
+    assert_eq!(
+        salvage.get("published_head").and_then(Val::as_str),
+        Some(published.as_str()),
+        "the proof names the published head it was made against"
+    );
+    assert_eq!(
+        salvage.get("integration_head").and_then(Val::as_str),
+        Some(base.as_str()),
+        "the record keeps the checkout's own head"
+    );
+    assert_eq!(
+        checkout.head("staging"),
+        base,
+        "cleanup never moves the checkout's own ref"
+    );
+    assert!(!scenario.repos.worktrees_root.join("issues-123").exists());
+    assert_eq!(
+        checkout.run(&["branch", "--list", "issue-123"]),
+        "",
+        "the landed lane branch is deleted"
+    );
+
+    // The same published landing while the checkout's own ref carries an
+    // UNPUBLISHED local move: a diverged local view is never certified, and
+    // the lane survives.
+    let (diverged, _feature2, _base2) = cycle2_reviewed_merge("squash", false);
+    let root2 = diverged
+        .repos
+        .checkout
+        .parent()
+        .expect("sandbox root")
+        .to_path_buf();
+    let origin2 = diverged.origin();
+    let checkout2 = Git::new(&diverged.repos.checkout);
+    checkout2.run(&["push", "-q", "origin", "issue-123"]);
+    let other2 = root2.join("merge-operator");
+    Git::new(&root2).run(&[
+        "clone",
+        "-q",
+        "--branch",
+        "staging",
+        origin2.to_str().expect("origin path"),
+        other2.to_str().expect("operator path"),
+    ]);
+    let operator2 = Git::new(&other2);
+    operator2.run(&["config", "user.name", "merge operator"]);
+    operator2.run(&["config", "user.email", "operator@example.invalid"]);
+    operator2.run(&["merge", "-q", "--squash", "origin/issue-123"]);
+    operator2.run(&[
+        "commit",
+        "-q",
+        "-m",
+        "sanctioned squash landing (synthetic)",
+    ]);
+    operator2.run(&["push", "-q", "origin", "staging"]);
+    std::fs::write(diverged.repos.checkout.join("local-move.txt"), "local\n").expect("write");
+    checkout2.run(&["add", "local-move.txt"]);
+    checkout2.run(&["commit", "-q", "-m", "unpublished local move (synthetic)"]);
+    let (code, message) = diverged.apply_err(21, "x1", None, None);
+    assert_eq!(code, "refusal.cleanup.unmerged", "{message}");
+    assert!(diverged.repos.worktrees_root.join("issues-123").exists());
+    assert_eq!(
+        checkout2.run(&["branch", "--list", "issue-123"]),
+        "+ issue-123\n",
+        "the diverged lane branch survives"
+    );
+}
+
 /// Witness (b) (issue #176): the acceptance spine's own shape — without a
 /// landing the delivery's content is not on the published ref, so `p8` cleanup
 /// refuses `refusal.cleanup.unmerged`; with the merge STEP landing and
