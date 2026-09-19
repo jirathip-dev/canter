@@ -133,6 +133,11 @@ and the renderer provenance note live in
 pins included), kept as dated records — see the
 [compatibility contract](docs/contracts/compatibility.md#product-rename-issue-106).
 
+![canter's control layer as built: an operator surface for exceptions and approvals over a single-writer daemon that owns admission and caps, digest-bound grants, one owner per issue, and journaled epochs, and reconciles on a fixed tick with honest states; the typed p1..p8 workflow spine — checkout, worktree create, harness start, prompt, collect outcome, review evidence, merge and publish, cleanup — asks an execution substrate to host the implementer and reviewer roles, the only non-deterministic part of the system; and verification makes the result trustworthy: a committed delta on the lane branch, a pass-or-fail verdict from a reviewer that never implements, read back at the exact head, a merge that publishes per the plan's policy, and a cleanup that proves the landed content](docs/architecture/canter.control-layer.architecture.svg)
+
+Canonical text for the control-layer model — current and target:
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 ## Quickstart
 
 Prerequisites: Rust 1.97.1 (pinned by `rust-toolchain.toml`; see

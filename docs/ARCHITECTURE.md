@@ -80,6 +80,16 @@ authority) -> typed workflow + plan engine -> typed effects + adapters
 - **One daemon per host** on a per-user Unix socket; read-only CLI operations
   remain usable without the daemon.
 
+## Control-layer model (current vs target)
+
+The control chain — what drives a lane's next step — is recorded here in
+**current vs target** terms. This is a documentation record; it authorizes no
+structural change.
+
+**Current:** `owner -> conductor model -> orchestrator model -> lanes`, with **two control planes registered** — the legacy fleet tooling and the canter daemon — so two controllers drive the same chain at once. Model-driven hops sit in the middle of the chain, and every model hop is a conversation turn: **a stalled hop stops the queue**. If any model-driven hop in the middle stalls — an exhausted capacity window, a wedged turn, a human waiting on a ruling — the whole chain stops even though the daemon and the lanes are healthy.
+
+**Target:** `owner -> typed operator surface -> canter daemon (the only driver) -> execution substrate -> implementer/reviewer lanes`. The daemon is the only driver, and models are used only for lane work and exception escalation — **never as a required hop** in the control chain. A model stall then degrades to a waiting lane instead of a stopped queue: the daemon's typed refusals and honest states keep every control-plane outcome observable without a model in the loop.
+
 ## Scheduler-cutover truth
 
 canter does **not** replace Hermes Agent, the Hermes scheduler as a

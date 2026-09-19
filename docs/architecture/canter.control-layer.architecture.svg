@@ -1,0 +1,103 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1500" viewBox="0 0 1400 1500" font-family="Helvetica, Arial, sans-serif">
+  <rect width="1400" height="1500" fill="#0f1216"/>
+
+  <text x="60" y="66" fill="#e8ecf1" font-size="38" font-weight="bold">How Canter works</text>
+  <text x="60" y="102" fill="#8b97a6" font-size="21">A typed control plane. The execution substrate owns processes. Verification is by artifact, never by self-report.</text>
+
+  <rect x="60" y="130" width="1280" height="92" rx="14" fill="#171c23" stroke="#2b3440"/>
+  <text x="88" y="168" fill="#e8ecf1" font-size="25" font-weight="bold">Operator — exceptions and approvals only</text>
+  <text x="88" y="200" fill="#9fb0c0" font-size="20">Read-only observation, plan rendering, and run-scoped controls: status · pause · resume · retry · resolve · release</text>
+
+  <path d="M700 222 L700 268" stroke="#3d4b5c" stroke-width="3" marker-end="url(#a)"/>
+
+  <rect x="60" y="272" width="1280" height="252" rx="14" fill="#151a21" stroke="#2f6f6b" stroke-width="2"/>
+  <text x="88" y="312" fill="#5fd0c6" font-size="26" font-weight="bold">Daemon — single writer, deterministic</text>
+  <text x="88" y="346" fill="#9fb0c0" font-size="20">SQLite state + event/journal · per-user Unix socket RPC · typed refusals (no fake success, no partial effects)</text>
+  <rect x="88" y="366" width="288" height="62" rx="10" fill="#1d2530" stroke="#33404f"/>
+  <text x="108" y="392" fill="#dbe4ee" font-size="19">Admission · caps</text>
+  <text x="108" y="414" fill="#8b97a6" font-size="18">host proof</text>
+  <rect x="396" y="366" width="288" height="62" rx="10" fill="#1d2530" stroke="#33404f"/>
+  <text x="416" y="392" fill="#dbe4ee" font-size="19">Grants · digest-bound</text>
+  <text x="416" y="414" fill="#8b97a6" font-size="18">expiring</text>
+  <rect x="704" y="366" width="288" height="62" rx="10" fill="#1d2530" stroke="#33404f"/>
+  <text x="724" y="392" fill="#dbe4ee" font-size="19">Ownership · one owner</text>
+  <text x="724" y="414" fill="#8b97a6" font-size="18">per issue</text>
+  <rect x="1012" y="366" width="288" height="62" rx="10" fill="#1d2530" stroke="#33404f"/>
+  <text x="1032" y="392" fill="#dbe4ee" font-size="19">Epochs · journals</text>
+  <text x="1032" y="414" fill="#8b97a6" font-size="18">idempotency</text>
+  <text x="88" y="466" fill="#8b97a6" font-size="20">Supervision: reconciles on a fixed tick — dispatch the next step, wait, retry within a bound,</text>
+  <text x="88" y="492" fill="#8b97a6" font-size="20">renew a lapsed grant, renew a stale proof. States are honest: healthy · waiting-approval ·</text>
+  <text x="88" y="516" fill="#8b97a6" font-size="20">needs-attention with the raw refusal code — never "done" without evidence.</text>
+
+  <path d="M700 524 L700 570" stroke="#3d4b5c" stroke-width="3" marker-end="url(#a)"/>
+
+  <rect x="60" y="574" width="1280" height="238" rx="14" fill="#151a21" stroke="#2b3440"/>
+  <text x="88" y="614" fill="#e8ecf1" font-size="26" font-weight="bold">Workflow — the spine (typed, ordered, fenced)</text>
+  <g font-size="19" fill="#dbe4ee" text-anchor="middle">
+    <rect x="88" y="640" width="140" height="72" rx="10" fill="#1d2530" stroke="#33404f"/><text x="158" y="670">p1</text><text x="158" y="696" fill="#8b97a6" font-size="17">checkout</text>
+    <rect x="238" y="640" width="158" height="72" rx="10" fill="#1d2530" stroke="#33404f"/><text x="317" y="670">p2</text><text x="317" y="696" fill="#8b97a6" font-size="17">worktree_create</text>
+    <rect x="406" y="640" width="158" height="72" rx="10" fill="#1d2530" stroke="#33404f"/><text x="485" y="670">p3</text><text x="485" y="696" fill="#8b97a6" font-size="17">harness_start</text>
+    <rect x="574" y="640" width="140" height="72" rx="10" fill="#1d2530" stroke="#33404f"/><text x="644" y="670">p4</text><text x="644" y="696" fill="#8b97a6" font-size="17">prompt</text>
+    <rect x="724" y="640" width="170" height="72" rx="10" fill="#1d2530" stroke="#33404f"/><text x="809" y="670">p5</text><text x="809" y="696" fill="#8b97a6" font-size="17">collect_outcome</text>
+    <rect x="904" y="640" width="180" height="72" rx="10" fill="#1d2530" stroke="#33404f"/><text x="994" y="670">p6</text><text x="994" y="696" fill="#8b97a6" font-size="17">review_evidence</text>
+    <rect x="1094" y="640" width="140" height="72" rx="10" fill="#243b2e" stroke="#3f7a58"/><text x="1164" y="670">p7</text><text x="1164" y="696" fill="#7fd1a3" font-size="16">merge+publish</text>
+    <rect x="1244" y="640" width="76" height="72" rx="10" fill="#243b2e" stroke="#3f7a58"/><text x="1282" y="670">p8</text><text x="1282" y="696" fill="#7fd1a3" font-size="16">cleanup</text>
+  </g>
+  <text x="88" y="748" fill="#8b97a6" font-size="20">The merge step is the run's own actor: it publishes the certified delivery — no hand-merge.</text>
+  <text x="88" y="774" fill="#8b97a6" font-size="20">Cleanup verifies the landed content on the published ref (squash-aware). Every step is a</text>
+  <text x="88" y="798" fill="#8b97a6" font-size="20">digest-bound, journaled request carrying a grant, observed facts and the plan.</text>
+
+  <path d="M700 812 L700 856" stroke="#3d4b5c" stroke-width="3" marker-end="url(#a)"/>
+
+  <rect x="60" y="860" width="620" height="272" rx="14" fill="#151a21" stroke="#5a4a86" stroke-width="2"/>
+  <text x="88" y="900" fill="#b9a6f0" font-size="24" font-weight="bold">Execution substrate</text>
+  <text x="88" y="934" fill="#9fb0c0" font-size="19">The substrate owns workspaces, panes, terminals</text>
+  <text x="88" y="960" fill="#9fb0c0" font-size="19">and agent hosting. Canter asks it to start a role;</text>
+  <text x="88" y="986" fill="#9fb0c0" font-size="19">it never hosts the process itself.</text>
+  <text x="88" y="1020" fill="#9fb0c0" font-size="19">Worktree identity is registered, so lanes group</text>
+  <text x="88" y="1046" fill="#9fb0c0" font-size="19">under the repository in every observing client.</text>
+  <text x="88" y="1080" fill="#9fb0c0" font-size="19">Interrupt, observe and collect all go via it.</text>
+  <text x="88" y="1110" fill="#8b97a6" font-size="18">A retired lane's workspace is reclaimed safely.</text>
+
+  <rect x="720" y="860" width="620" height="272" rx="14" fill="#151a21" stroke="#8a6d3b" stroke-width="2"/>
+  <text x="748" y="900" fill="#f0c674" font-size="24" font-weight="bold">Agent roles — the non-deterministic part</text>
+  <text x="748" y="934" fill="#9fb0c0" font-size="19">An implementer role writes the change;</text>
+  <text x="748" y="960" fill="#9fb0c0" font-size="19">a separate reviewer role judges it.</text>
+  <text x="748" y="986" fill="#9fb0c0" font-size="19">The role binding pins profile, harness, model</text>
+  <text x="748" y="1012" fill="#9fb0c0" font-size="19">and revision. Reviewer ≠ implementer.</text>
+  <text x="748" y="1046" fill="#f0b429" font-size="19">Required skills are declared in the binding and</text>
+  <text x="748" y="1072" fill="#f0b429" font-size="19">installed once with the profile — never injected</text>
+  <text x="748" y="1098" fill="#f0b429" font-size="19">per dispatch, and verified before a lane runs.</text>
+  <text x="748" y="1124" fill="#8b97a6" font-size="18">The daemon never trusts a role's own words.</text>
+
+  <path d="M700 1132 L700 1176" stroke="#3d4b5c" stroke-width="3" marker-end="url(#a)"/>
+
+  <rect x="60" y="1180" width="1280" height="300" rx="14" fill="#151a21" stroke="#2f6f6b" stroke-width="2"/>
+  <text x="88" y="1222" fill="#5fd0c6" font-size="26" font-weight="bold">Verification — what makes the result trustworthy</text>
+
+  <rect x="88" y="1246" width="600" height="106" rx="10" fill="#1a222c" stroke="#33404f"/>
+  <text x="110" y="1278" fill="#dbe4ee" font-size="20" font-weight="bold">Implementation is done</text>
+  <text x="110" y="1308" fill="#9fb0c0" font-size="19">A committed delta must exist on the lane branch,</text>
+  <text x="110" y="1334" fill="#9fb0c0" font-size="19">measured from the pinned base; no delta is refused.</text>
+
+  <rect x="712" y="1246" width="600" height="106" rx="10" fill="#1a222c" stroke="#33404f"/>
+  <text x="734" y="1278" fill="#dbe4ee" font-size="20" font-weight="bold">Review is a verdict</text>
+  <text x="734" y="1308" fill="#9fb0c0" font-size="19">pass | fail, all checks passed, reviewer ≠ implementer,</text>
+  <text x="734" y="1334" fill="#9fb0c0" font-size="19">and the head from a fresh exact-head read-back.</text>
+
+  <rect x="88" y="1364" width="600" height="98" rx="10" fill="#1a222c" stroke="#33404f"/>
+  <text x="110" y="1396" fill="#dbe4ee" font-size="20" font-weight="bold">The merge publishes</text>
+  <text x="110" y="1426" fill="#9fb0c0" font-size="19">The plan's merge policy is honoured onto the published</text>
+  <text x="110" y="1450" fill="#9fb0c0" font-size="19">ref; a stale local view is never merged.</text>
+
+  <rect x="712" y="1364" width="600" height="98" rx="10" fill="#1a222c" stroke="#33404f"/>
+  <text x="734" y="1396" fill="#dbe4ee" font-size="20" font-weight="bold">Cleanup proves the landing</text>
+  <text x="734" y="1426" fill="#9fb0c0" font-size="19">The landed content is verified on the published ref by</text>
+  <text x="734" y="1450" fill="#9fb0c0" font-size="19">content, so a squash-landed change still completes.</text>
+
+  <defs>
+    <marker id="a" markerWidth="10" markerHeight="10" refX="5" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#3d4b5c"/>
+    </marker>
+  </defs>
+</svg>
