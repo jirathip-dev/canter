@@ -867,6 +867,26 @@ release process activates (docs/RELEASING.md), then semver applies.
   certify the landed head by ancestry or by the same fail-closed content fact
   (`tests/mutation_engine.rs`).
 
+### Fixed (issue #132 — cleanup certifies a squash landing visible only on the published ref)
+
+- The spine's `cleanup` no longer refuses its own sanctioned deletion when
+  the landing exists only on the forge: the checkout's own integration ref
+  cannot see a remote (squash) landing, so once the reviewed PR was merged
+  the run could never complete on this repository's (squash) policy. When
+  the local proof refuses `refusal.cleanup.unmerged`, cleanup now proves the
+  landing against the PUBLISHED integration ref — read from `origin`
+  (`git ls-remote`), FETCHED and verified against that read — with the same
+  fail-closed ancestry-or-content fact, and only when the checkout's own ref
+  is strictly BEHIND it; a checkout ahead of, or diverged from, the
+  published view still refuses and is never certified. The checkout's own
+  ref is never moved, an unreadable or unverifiable published ref proves
+  nothing, and the refusal the local view produced stands whenever the
+  published view cannot add a proof. A published-proof salvage record names
+  the `published_head` it was made against and deletes with `-D`. The local
+  and published proofs share the same changed-path/content comparison
+  helpers, so the two routes cannot drift. Real-daemon witnesses in
+  `tests/mutation_engine.rs`.
+
 ### Changed
 
 - Documentation polish (issue #12, PR #13): security recipe doc line fix

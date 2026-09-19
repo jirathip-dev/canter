@@ -96,9 +96,13 @@ Normative rules:
   rewrites the reviewed commits and can never be an ancestor, by the same
   content fact (issue #176, #178).
   Separately, the spine's
-  `cleanup` step proves ancestry or content-equivalence against the local
-  integration ref; it does not itself certify a published remote or forge
-  merge. The content fallback covers every changed path, including both
+  `cleanup` step proves ancestry or content-equivalence against the
+  integration ref: the checkout's own ref first, and — when the sanctioned
+  landing happened on the forge instead, which no checkout's own ref ever
+  sees — the FETCHED, verified PUBLISHED head, which only a checkout
+  strictly behind it may certify against (a checkout ahead of, or diverged
+  from, the published ref is an unpublished local move and refuses; issues
+  #132/#156). The content fallback covers every changed path, including both
   rename endpoints, with NUL-delimited names and literal pathspecs. Partial
   landings and paths that the text adapter cannot compare losslessly refuse
   without removing the lane or branch. The precise fail-closed cases and
