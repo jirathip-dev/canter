@@ -56,6 +56,7 @@ same families — the three cannot drift apart.
 | `hf-capability/v1` | Harness/forge capability negotiation envelope | [spec-capabilities.md](spec-capabilities.md) | No canonical-bytes rule | `capability/capability.harness.valid.json`, `capability/capability.forge.valid.json`, `capability/capability.malformed.json`, `capability/capability.unknown-version.json` |
 | `hf-evidence/v1` | Review evidence record (AC4 bindings) | [spec-review-evidence.md](spec-review-evidence.md) | No canonical-bytes rule | `evidence/evidence.valid.json`, `evidence/evidence.malformed.json`, `evidence/evidence.unknown-version.json` |
 | `hf-board/v1` | Bounded paginated board read page (issue #83 read model) | [spec-board.md](spec-board.md) | No canonical-bytes rule | `board/board.valid.json`, `board/board.page.valid.json`, `board/board.malformed.json`, `board/board.unknown-version.json` |
+| `hf-escalation/v1` | Read-only escalation listing page (issue #208, the ORCH + CANTER contract) | [spec-escalations.md](spec-escalations.md) | No canonical-bytes rule; `cursor` is the (raised_at, id) ordering key of the last row | `escalation/escalation.valid.json`, `escalation/escalation.page.valid.json`, `escalation/escalation.malformed.json`, `escalation/escalation.unknown-version.json` |
 
 ## Embedded scalar formats (no standalone document)
 
@@ -68,6 +69,9 @@ the containing family fixtures:
 | Plan id | `hf_plan_` + 16 lowercase hex | `plan/plan.valid.json` vs grant referencing a malformed plan id (`grant/grant.malformed.json` covers missing bindings) |
 | Grant id | `gr_` + 16 lowercase hex | audit/grant fixtures |
 | Evidence id | `ev_` + 16 lowercase hex | `evidence/*` fixtures |
+| Run id (daemon) | `run-` + 16 lowercase hex | `escalation/*` fixtures (`hf-escalation/v1` names exactly one durable run record) |
+| Escalation id | `esc_` + 16 lowercase hex (content-derived and stable across reads) | `escalation/*` fixtures |
+| Plan step id | the plan's own step id (`p1`, `p6-12`) | `escalation/*`, `outcome/*` fixtures |
 | Request id (daemon) | 8-64 lowercase hex | `rpc/*` fixtures |
 | Idempotency key | `ik_` + 8-64 `[a-z0-9-]` | `rpc/request.malformed.json` (apply without key refused), `outcome/*`, `audit/*` |
 | Repository identity | `owner/name`, no protocol prefix | plan/grant/observation fixtures |

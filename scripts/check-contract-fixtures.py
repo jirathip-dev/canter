@@ -121,6 +121,50 @@ BOARD_RUN_STATES = frozenset({"new", "running", "paused", "human_queue",
 BOARD_NEXT_ACTIONS = frozenset({"resume", "human_decision"})
 BOARD_SOURCE_KINDS = frozenset({"github"})
 BOARD_EVIDENCE_REF_MAX = 4
+# hf-escalation/v1 (issue #208, the ORCH + CANTER contract): the read-only
+# escalation surface. The closed sets below are the contract's stable half —
+# field names, the closed `code` set, and the `answerable_by` operation names
+# are additive-only and never repurposed. Every code is an existing engine
+# code (src/mutation.rs `code` module) whose documented semantics park a run
+# or leave it needing a decision; `waiting-approval` is deliberately NOT a
+# state here (a park never presents as waiting-approval).
+ESCALATION_STATES = frozenset({"needs-attention", "worker-timeout"})
+ESCALATION_CODES = frozenset({
+    "effect.review_timeout",
+    "effect.worker_timeout",
+    "refusal.collect.empty_delta",
+    "refusal.collect.unbound",
+    "refusal.delivery.moved",
+    "refusal.delivery.unbound",
+    "refusal.evidence.verdict_missing",
+    "refusal.evidence.verdict_pending",
+    "refusal.evidence.verdict_stale",
+    "refusal.grant.expired",
+    "refusal.lane.name_collision",
+    "refusal.run.retry_required",
+})
+ESCALATION_NEEDS = frozenset({"orch", "human"})
+# Typed operations an escalation may be answered by. Every member is an
+# existing documented control except `escalation.ack`, which this contract
+# reserves as a surface gap: a live surface never advertises an operation it
+# does not implement, so `escalation.ack` may only appear once the ack
+# operation ships.
+ESCALATION_OPERATIONS = frozenset({
+    "escalation.ack",
+    "grant.issue",
+    "queue.submit",
+    "run.dispatch",
+    "run.pause",
+    "run.release",
+    "run.resume",
+    "run.retry",
+    "run.resolve",
+})
+ESCALATION_MESSAGE_MAX = 512
+RX_ESCALATION_ID = re.compile(r"^esc_[0-9a-f]{16}$")
+RX_RUN_ID = re.compile(r"^run-[0-9a-f]{16}$")
+RX_ESCALATION_STEP_ID = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+RX_ESCALATION_CURSOR = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\|esc_[0-9a-f]{16}$")
 
 
 def canon_json_bytes(obj) -> bytes:
@@ -1149,6 +1193,173 @@ def _validate_board_row(row, previous):
     return (ACCEPT, "board row ok", key)
 
 
+def _escalation_recorded_text(obj: dict, key: str, where: str) -> tuple[str, str] | None:
+    """A recorded-text field: bounded, control-free, and never secret-shaped
+    (redaction is the write boundary; the family validator refuses a record
+    whose text carries an unredacted secret-shaped run)."""
+    value = obj.get(key)
+    if not isinstance(value, str) or not value:
+        return _ref(REFUSE_MALFORMED, "{}: {!r} must be a non-empty string".format(where, key))
+    if len(value) > ESCALATION_MESSAGE_MAX or any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
+        return _ref(REFUSE_MALFORMED,
+                    "{}: {!r} must be <= {} characters without controls".format(
+                        where, key, ESCALATION_MESSAGE_MAX))
+    if _secret_shaped(value):
+        return _ref(REFUSE_MALFORMED,
+                    "{}: {!r} carries an unredacted secret-shaped run".format(where, key))
+    return None
+
+
+def _escalation_head(obj: dict, key: str, where: str) -> tuple[str, str] | None:
+    value = obj.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not RX_HEX40.match(value):
+        return _ref(REFUSE_MALFORMED,
+                    "{}: {!r} must be null or a 40-hex commit".format(where, key))
+    return None
+
+
+def _escalation_optional_timestamp(obj: dict, key: str, where: str) -> tuple[str, str] | None:
+    if key not in obj:
+        return _ref(REFUSE_MALFORMED, "{}: missing required key {!r}".format(where, key))
+    value = obj[key]
+    if value is None:
+        return None
+    if not isinstance(value, str) or not RX_RFC3339_Z.match(value):
+        return _ref(REFUSE_MALFORMED,
+                    "{}: {!r} must be null or RFC3339 UTC (seconds, Z)".format(where, key))
+    return None
+
+
+def _validate_escalation_record(record, previous):
+    """Validate one escalation record; returns (code, message, ordering key).
+
+    The record is a read-only projection of a parked condition: it names the
+    run, the frontier step, the recorded state and the engine's own code, the
+    bounded heads the park is about, who must answer, and the typed operations
+    that can answer. Nothing in it is inferred or invented.
+    """
+    where = "escalation record"
+    if not isinstance(record, dict):
+        return (REFUSE_MALFORMED, "{} must be an object".format(where), None)
+    keys = {"id", "raised_at", "run", "issue", "step", "state", "code",
+            "message", "bound_heads", "needs", "context", "answerable_by"}
+    err = _require_keys(record, keys, keys, where)
+    if err:
+        return (err[0], err[1], None)
+    err = _expect_str(record, "id", where, RX_ESCALATION_ID)
+    if err:
+        return (err[0], err[1], None)
+    err = _expect_timestamp(record, "raised_at", where)
+    if err:
+        return (err[0], err[1], None)
+    err = _expect_str(record, "run", where, RX_RUN_ID)
+    if err:
+        return (err[0], err[1], None)
+    err = _expect_int(record, "issue", where)
+    if err:
+        return (err[0], err[1], None)
+    err = _expect_str(record, "step", where, RX_ESCALATION_STEP_ID)
+    if err:
+        return (err[0], err[1], None)
+    err = _expect_in(record, "state", where, ESCALATION_STATES)
+    if err:
+        return (err[0], err[1], None)
+    err = _expect_in(record, "code", where, ESCALATION_CODES)
+    if err:
+        return (err[0], err[1], None)
+    err = _escalation_recorded_text(record, "message", where)
+    if err:
+        return (err[0], err[1], None)
+    heads = record["bound_heads"]
+    if not isinstance(heads, dict):
+        return (REFUSE_MALFORMED, "{} bound_heads must be an object".format(where), None)
+    head_keys = {"certified", "published", "reviewed"}
+    err = _require_keys(heads, head_keys, head_keys, "{} bound_heads".format(where))
+    if err:
+        return (err[0], err[1], None)
+    for key in ("certified", "published", "reviewed"):
+        err = _escalation_head(heads, key, "{} bound_heads".format(where))
+        if err:
+            return (err[0], err[1], None)
+    err = _expect_in(record, "needs", where, ESCALATION_NEEDS)
+    if err:
+        return (err[0], err[1], None)
+    context = record["context"]
+    if not isinstance(context, dict):
+        return (REFUSE_MALFORMED, "{} context must be an object".format(where), None)
+    context_keys = {"attempts", "run_retries_consumed", "last_progress_at"}
+    err = _require_keys(context, context_keys, context_keys, "{} context".format(where))
+    if err:
+        return (err[0], err[1], None)
+    for key in ("attempts", "run_retries_consumed"):
+        err = _expect_int(context, key, "{} context".format(where))
+        if err:
+            return (err[0], err[1], None)
+    err = _escalation_optional_timestamp(context, "last_progress_at", "{} context".format(where))
+    if err:
+        return (err[0], err[1], None)
+    operations = record["answerable_by"]
+    if not isinstance(operations, list) or not operations:
+        return (REFUSE_MALFORMED,
+                "{} answerable_by must be a non-empty list of typed operations".format(where),
+                None)
+    seen = set()
+    for item in operations:
+        if not isinstance(item, str) or item not in ESCALATION_OPERATIONS:
+            return (REFUSE_MALFORMED,
+                    "{} answerable_by names a non-typed operation {!r}".format(where, item),
+                    None)
+        if item in seen:
+            return (REFUSE_MALFORMED,
+                    "{} answerable_by repeats an operation".format(where), None)
+        seen.add(item)
+    key = (record["raised_at"], record["id"])
+    if previous is not None and key <= previous:
+        return (REFUSE_MALFORMED,
+                "{} records must be in strictly increasing (raised_at, id) "
+                "order".format(where), None)
+    return (ACCEPT, "escalation record ok", key)
+
+
+def validate_escalation(obj: dict) -> tuple[str, str]:
+    """hf-escalation/v1 (issue #208): one bounded, read-only page of open
+    escalations. The closed rules are the machine-checked half of the
+    contract: field names and the `code` set are closed (additive-only), every
+    `answerable_by` entry names a typed operation, a park never presents as
+    `waiting-approval`, and a page is ordered by its (raised_at, id) cursor
+    key — reading is a projection and never a mutation."""
+    keys = {"schema", "escalations", "cursor"}
+    err = _json_obj(obj, "hf-escalation", keys, keys)
+    if err:
+        return err
+    rows = obj["escalations"]
+    if not isinstance(rows, list):
+        return _ref(REFUSE_MALFORMED, "escalation.escalations must be a list")
+    cursor = obj["cursor"]
+    if cursor is not None:
+        if not isinstance(cursor, str) or not RX_ESCALATION_CURSOR.match(cursor):
+            return _ref(REFUSE_MALFORMED,
+                        "escalation.cursor must be null or an <raised_at>|esc_ "
+                        "ordering key")
+        if not rows:
+            return _ref(REFUSE_MALFORMED,
+                        "escalation.cursor cannot exist on an empty page")
+    previous = None
+    last_key = None
+    for record in rows:
+        code, msg, key = _validate_escalation_record(record, previous)
+        if code != ACCEPT:
+            return _ref(code, msg)
+        previous = key
+        last_key = key
+    if cursor is not None and cursor != "{}|{}".format(last_key[0], last_key[1]):
+        return _ref(REFUSE_MALFORMED,
+                    "escalation.cursor must be the ordering key of the last row")
+    return _ref(ACCEPT, "escalation ok")
+
+
 VALIDATORS = {
     "hf-config": validate_config,
     "hf-policy": validate_policy,
@@ -1162,6 +1373,7 @@ VALIDATORS = {
     "hf-workflow": validate_workflow,
     "hf-schedule": validate_schedule,
     "hf-board": validate_board,
+    "hf-escalation": validate_escalation,
     "hf-rpc-request": validate_rpc_request,
     "hf-rpc-response": validate_rpc_response,
     "hf-event": validate_event,

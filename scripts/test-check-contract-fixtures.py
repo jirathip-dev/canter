@@ -213,6 +213,97 @@ def run_discrimination(probe) -> None:
     _check(code == probe.REFUSE_MALFORMED,
            "board unredacted recorded text must refuse-malformed, got " + code)
 
+    # 10c. Escalation surface (issue #208): the closed code set and the
+    #      read-only/answer rules bite.
+
+    def escalation_page(page):
+        return (json.dumps(page, sort_keys=True, separators=(",", ":")).encode() + b"\n")
+
+    def mutated_page(mutate, rel="escalation/escalation.valid.json"):
+        page = json.loads((FIXTURES / rel).read_bytes().decode("utf-8"))
+        mutate(page)
+        return escalation_page(page)
+
+    def first_record(page):
+        return page["escalations"][0]
+
+    # An escalation code outside the closed set must refuse, even when it
+    # looks like a real engine code family.
+    p = _tamper_copy("escalation/escalation.valid.json",
+                     lambda _b: mutated_page(
+                         lambda page: first_record(page).update(code="refusal.delivery.reviewed")))
+    code, _msg = probe.validate_file(p, "hf-escalation")
+    _check(code == probe.REFUSE_MALFORMED,
+           "escalation unlisted code must refuse-malformed, got " + code)
+
+    # A park never presents as waiting-approval (issue #202's park rule).
+    p = _tamper_copy("escalation/escalation.valid.json",
+                     lambda _b: mutated_page(
+                         lambda page: first_record(page).update(state="waiting-approval")))
+    code, _msg = probe.validate_file(p, "hf-escalation")
+    _check(code == probe.REFUSE_MALFORMED,
+           "escalation waiting-approval state must refuse-malformed, got " + code)
+
+    # An escalation nobody can answer is not an escalation: the answer list
+    # must be non-empty and every name a typed operation.
+    for label, mutate in (
+        ("empty", lambda record: record.update(answerable_by=[])),
+        ("untyped", lambda record: record.update(answerable_by=["poke_the_pane"])),
+        ("duplicated", lambda record: record.update(answerable_by=["run.retry", "run.retry"])),
+    ):
+        p = _tamper_copy("escalation/escalation.valid.json",
+                         lambda _b, mutate=mutate: mutated_page(
+                             lambda page: mutate(first_record(page))))
+        code, _msg = probe.validate_file(p, "hf-escalation")
+        _check(code == probe.REFUSE_MALFORMED,
+               "escalation {} answerable_by must refuse-malformed, got {}".format(label, code))
+
+    # A bound head that is not a 40-hex commit must refuse.
+    p = _tamper_copy("escalation/escalation.valid.json",
+                     lambda _b: mutated_page(
+                         lambda page: first_record(page)["bound_heads"].update(
+                             certified="not-a-commit")))
+    code, _msg = probe.validate_file(p, "hf-escalation")
+    _check(code == probe.REFUSE_MALFORMED,
+           "escalation non-hex certified head must refuse-malformed, got " + code)
+
+    # An unredacted secret-shaped message must refuse (redaction is the write
+    # boundary, not a display concern).
+    p = _tamper_copy("escalation/escalation.valid.json",
+                     lambda _b: mutated_page(
+                         lambda page: first_record(page).update(
+                             message="handoff ghp_" + "0123456789abcdef0123456789abcdef012345")))
+    code, _msg = probe.validate_file(p, "hf-escalation")
+    _check(code == probe.REFUSE_MALFORMED,
+           "escalation unredacted message must refuse-malformed, got " + code)
+
+    # Rows out of (raised_at, id) order must refuse.
+    def _reverse_records(page):
+        page["escalations"].reverse()
+    p = _tamper_copy("escalation/escalation.valid.json",
+                     lambda _b: mutated_page(_reverse_records))
+    code, _msg = probe.validate_file(p, "hf-escalation")
+    _check(code == probe.REFUSE_MALFORMED,
+           "escalation rows out of order must refuse-malformed, got " + code)
+
+    # A cursor that is not the ordering key of the last row must refuse.
+    def _wrong_cursor(page):
+        page["cursor"] = "2026-09-06T00:00:05Z|esc_ffffffffffffffff"
+    p = _tamper_copy("escalation/escalation.page.valid.json",
+                     lambda _b: mutated_page(_wrong_cursor,
+                                             "escalation/escalation.page.valid.json"))
+    code, _msg = probe.validate_file(p, "hf-escalation")
+    _check(code == probe.REFUSE_MALFORMED,
+           "escalation cursor that names no row must refuse-malformed, got " + code)
+
+    # Unknown keys stay closed (the surface is additive-only, never silent).
+    p = _tamper_copy("escalation/escalation.valid.json",
+                     lambda _b: mutated_page(
+                         lambda page: first_record(page).update(priority="high")))
+    code, _msg = probe.validate_file(p, "hf-escalation")
+    _check(code == probe.REFUSE_MALFORMED,
+           "escalation unknown key must refuse-malformed, got " + code)
+
     # 11. JSONL event stream: a bad line must refuse-parse.
     p = _tamper_copy("event/events.valid.jsonl",
                      lambda b: b + b'{"schema": "hf-event/v1", broken\n')

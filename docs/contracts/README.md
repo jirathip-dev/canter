@@ -54,7 +54,7 @@ fixtures are refused with the version refusal, non-canonical bytes are
 refused for canonical families, and known-answer `sha256` digests hold.
 `test-check-contract-fixtures.py` mutates committed fixtures in temp copies
 to prove each refusal rule bites, and enforces that this table,
-`schema-registry.md`, the probe registry, and the manifest name the same 17
+`schema-registry.md`, the probe registry, and the manifest name the same 20
 families with the same coverage.
 
 Gate wiring: the probe is deliberately **not** referenced from `justfile` or
