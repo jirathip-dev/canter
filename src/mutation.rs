@@ -67,6 +67,15 @@ pub const PROMPT_DEADLINE_DEFAULT_SECS: u64 = 1800;
 /// it is bounded above the plain I/O default and far below the ceiling.
 pub const HARNESS_START_DEADLINE_DEFAULT_SECS: u64 = 300;
 
+/// Documented default deadline (seconds) for one review step's verdict wait
+/// (`review_evidence`): the reviewer's own round trip — read the certified
+/// head, review it, write the verdict — is the prompt tier's round trip, so
+/// the review kind carries the prompt tier's documented bound instead of
+/// falling into the generic I/O default (issue #217; the 60 s row it landed
+/// in made every live review an `effect.review_timeout` by construction —
+/// measured verdicts take tens of minutes on this host).
+pub const REVIEW_DEADLINE_DEFAULT_SECS: u64 = PROMPT_DEADLINE_DEFAULT_SECS;
+
 /// Upper bound (seconds) on any authorization window the engine mints or
 /// renews for a run: 30 days. A grant is the bounded authorization of ONE
 /// run's own committed work, so no derived window may exceed the documented
@@ -104,13 +113,40 @@ pub fn effect_deadline_secs(kind: &str, params: Option<&Val>) -> Result<u64, Eff
 }
 
 /// The documented per-kind default deadline (seconds). Every effect kind
-/// resolves to a bound; `prompt` and `harness_start` carry their own
-/// documented rows (see the constants above).
+/// resolves to a bound; `prompt`, `collect_outcome`, `harness_start` and
+/// `review_evidence` carry their own documented rows (see the constants
+/// above).
 pub fn default_deadline_secs(kind: &str) -> u64 {
     match kind {
         "prompt" | "collect_outcome" => PROMPT_DEADLINE_DEFAULT_SECS,
+        "review_evidence" => REVIEW_DEADLINE_DEFAULT_SECS,
         "harness_start" => HARNESS_START_DEADLINE_DEFAULT_SECS,
         _ => EFFECT_DEADLINE_DEFAULT_SECS,
+    }
+}
+
+/// The bound (seconds) of ONE `review_evidence` verdict wait (issue #217).
+///
+/// `effective` is the step's effective deadline ([`effect_deadline_secs`]):
+/// the plan's own `deadline_secs` when it declared one, else the per-kind
+/// default ([`REVIEW_DEADLINE_DEFAULT_SECS`]).
+///
+/// `resumed` says this attempt found THIS step's own PROVEN delivery for the
+/// certified head and reviewer lane (issue #214): the reviewer leg is up and
+/// already carries the brief, so the remaining work is the reviewer's and the
+/// fresh window has already been spent once. Such an attempt RENEWS the wait
+/// under the documented overall ceiling ([`EFFECT_DEADLINE_CEILING_SECS`])
+/// instead of re-opening the fresh window a live review has already outrun —
+/// the overall wait never leaves the documented effect ceiling.
+///
+/// A plan that declared its own `deadline_secs` keeps its reviewed policy
+/// (bound by the plan digest): the renewal replaces only the engine's own
+/// default window, never a declared one.
+pub fn review_verdict_wait_secs(effective: u64, declared: bool, resumed: bool) -> u64 {
+    if resumed && !declared {
+        EFFECT_DEADLINE_CEILING_SECS
+    } else {
+        effective
     }
 }
 
@@ -4133,12 +4169,12 @@ fn review_self_dispatch(
     // the reviewer was working). The bare-subprocess substrate has no
     // asynchronous leg — its prompt IS the reviewer's run — so it always
     // re-delivers, unchanged.
-    let delivery = match (leg.execution, recorded) {
+    let (delivery, resumed) = match (leg.execution, recorded) {
         (crate::adapters::ExecutionMode::HerdrPane, Some(recorded))
             if started_lane_reused(&started)
                 && recorded.matches(&inputs.feature_head, &reviewer.session_id) =>
         {
-            recorded
+            (recorded, true)
         }
         _ => {
             match std::fs::remove_file(&verdict_path) {
@@ -4204,12 +4240,22 @@ fn review_self_dispatch(
             {
                 return outcome;
             }
-            recorded
+            (recorded, false)
         }
     };
+    // Issue #217: the wait this attempt opens for the verdict. A RESUMED
+    // attempt (this step's own proven delivery, this head, this lane) renews
+    // it under the documented overall ceiling — the reviewer is the one doing
+    // the waiting-work by then — while a fresh attempt waits the step's
+    // effective bound and a plan that declared its own `deadline_secs` keeps
+    // its reviewed policy either way.
+    let declared = ctx
+        .params
+        .is_some_and(|params| params.get("deadline_secs").is_some());
+    let wait_secs = review_verdict_wait_secs(deadline, declared, resumed);
     let written = match await_written_verdict(
         &verdict_path,
-        Duration::from_secs(deadline),
+        Duration::from_secs(wait_secs),
         &review_delivery_clause(&delivery, &leg.profile.model),
     ) {
         Ok(text) => text,
@@ -6319,6 +6365,22 @@ mod tests {
             PROMPT_DEADLINE_DEFAULT_SECS
         );
         assert_eq!(effect_deadline_secs("collect_outcome", None).unwrap(), 1800);
+        // Issue #217: the review verdict wait carries its own documented row
+        // at the prompt tier — never the generic 60 s I/O default.
+        assert_eq!(
+            effect_deadline_secs("review_evidence", None).expect("default"),
+            REVIEW_DEADLINE_DEFAULT_SECS
+        );
+        assert_eq!(REVIEW_DEADLINE_DEFAULT_SECS, PROMPT_DEADLINE_DEFAULT_SECS);
+        assert!(
+            effect_deadline_secs("review_evidence", None).expect("default")
+                > EFFECT_DEADLINE_DEFAULT_SECS,
+            "the review bound is never the generic I/O default"
+        );
+        assert_eq!(
+            bounded_effect_deadline("review_evidence", None),
+            Some(REVIEW_DEADLINE_DEFAULT_SECS)
+        );
         // A reviewed plan may declare its own bounded deadline...
         let declared = object(vec![("deadline_secs", integer(120))]);
         assert_eq!(
@@ -6342,6 +6404,37 @@ mod tests {
             Some(PROMPT_DEADLINE_DEFAULT_SECS)
         );
         assert_eq!(bounded_effect_deadline("approve", None), None);
+    }
+
+    // Issue #217: the verdict wait ONE `review_evidence` attempt opens. A
+    // fresh attempt waits the step's effective bound; an attempt that RESUMES
+    // this step's own proven delivery (the reviewer leg is up and already
+    // carries the brief, issue #214) renews the wait under the documented
+    // overall ceiling; a declared `deadline_secs` is the plan's own policy and
+    // is never overridden, resumed or not.
+    #[test]
+    fn a_resumed_review_wait_renews_under_the_overall_ceiling_and_never_overrides_policy() {
+        assert_eq!(
+            review_verdict_wait_secs(REVIEW_DEADLINE_DEFAULT_SECS, false, false),
+            REVIEW_DEADLINE_DEFAULT_SECS,
+            "a fresh attempt waits the documented review bound"
+        );
+        assert_eq!(
+            review_verdict_wait_secs(REVIEW_DEADLINE_DEFAULT_SECS, false, true),
+            EFFECT_DEADLINE_CEILING_SECS,
+            "a resumed attempt renews the wait under the documented ceiling"
+        );
+        assert!(
+            review_verdict_wait_secs(REVIEW_DEADLINE_DEFAULT_SECS, false, true)
+                <= EFFECT_DEADLINE_CEILING_SECS,
+            "the renewed wait never leaves the documented ceiling"
+        );
+        assert_eq!(
+            review_verdict_wait_secs(1, true, true),
+            1,
+            "a declared deadline is the plan's reviewed policy: never renewed"
+        );
+        assert_eq!(review_verdict_wait_secs(1, true, false), 1);
     }
 
     /// Issue #92 F7: the pre-screen is TOTAL over the closed step-kind set.

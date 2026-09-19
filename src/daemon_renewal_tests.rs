@@ -537,7 +537,12 @@ fn the_renewed_window_is_derived_from_the_remaining_committed_spine() {
         ],
         false,
     );
-    for (fixture, window) in [(&short, 180_i64), (&long, 3960)] {
+    // The long head's remaining spine is rendered with the DOCUMENTED
+    // deadlines, one per kind: 300 s (`harness_start`) + 1800 s (`prompt`) +
+    // 1800 s (`collect_outcome`) + 1800 s (`review_evidence`, issue #217: the
+    // review verdict wait carries the prompt tier's documented bound, never
+    // the generic 60 s I/O default).
+    for (fixture, window) in [(&short, 180_i64), (&long, 5700)] {
         fixture.lapse();
         let at = time::rfc3339_now();
         let state = fixture.shared.lock_state().unwrap();
@@ -568,7 +573,7 @@ fn the_renewed_window_is_derived_from_the_remaining_committed_spine() {
             "the superseded grant is never renewed again"
         );
     }
-    assert_ne!(180, 3960);
+    assert_ne!(180, 5700);
 }
 
 /// The negative witnesses: a FOREIGN, REVOKED, STALE-EPOCH or RELEASED
