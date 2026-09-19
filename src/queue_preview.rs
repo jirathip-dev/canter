@@ -334,6 +334,216 @@ struct ValidatedIssue {
     requires: Vec<IssueId>,
 }
 
+/// One lane leg a plan binds (issue #210): the identity strings derived from
+/// `(issue, role, round)` alone — never from a run, a generation or the
+/// substrate — so the derivation is stable across retries, identical across
+/// the generations that reclaim one issue, and visible in the rendered plan.
+#[derive(Clone, Debug)]
+pub struct LaneLeg {
+    /// The issue number the leg belongs to.
+    pub issue: u64,
+    /// `implementer` | `reviewer`.
+    pub role: String,
+    /// Positive lane round.
+    pub round: u64,
+    /// Registered Herdr agent name (`impl-<N>`, `rev-<N>-r<R>`, …).
+    pub agent: String,
+    /// Workspace label (`<N>-impl`, `<N>-rev<R>`, …).
+    pub workspace: String,
+    /// Lane checkout relative to the worktrees root (`issues-<N>`, …).
+    pub checkout: String,
+}
+
+fn lane_leg(issue: u64, role: &str, round: u64) -> Option<LaneLeg> {
+    if issue == 0 || round == 0 || !matches!(role, "implementer" | "reviewer") {
+        return None;
+    }
+    let (agent, workspace) = crate::lane::lane_names(issue, role, round);
+    Some(LaneLeg {
+        issue,
+        role: role.to_string(),
+        round,
+        agent,
+        workspace,
+        checkout: crate::lane::lane_checkout(issue, role, round),
+    })
+}
+
+fn lane_leg_doc(leg: &LaneLeg) -> Val {
+    object(vec![
+        ("issue", integer(leg.issue as i64)),
+        ("role", string(&leg.role)),
+        ("round", integer(leg.round as i64)),
+        ("agent", string(&leg.agent)),
+        ("workspace", string(&leg.workspace)),
+        ("checkout", string(&leg.checkout)),
+    ])
+}
+
+/// The lane leg one step binds, for the rendered plan (issue #210): the
+/// validated reviewer lane of a self-dispatching review step, otherwise the
+/// implementer leg whose checkout the step declares — or, for the bind step
+/// itself (`harness_start`) of a single-issue run, the implementer leg that
+/// step resolves. `None` renders as JSON null: a step that binds no lane.
+fn step_lane(
+    review_lanes: &[(String, LaneLeg)],
+    step_id: &str,
+    kind: &str,
+    params: Option<&Val>,
+    selected: &[ValidatedIssue],
+) -> Option<LaneLeg> {
+    if let Some((_, leg)) = review_lanes.iter().find(|(id, _)| id == step_id) {
+        return Some(leg.clone());
+    }
+    let implementer_legs: Vec<LaneLeg> = selected
+        .iter()
+        .filter_map(|issue| lane_leg(issue.id.number as u64, "implementer", 1))
+        .collect();
+    if let Some(checkout) = params
+        .and_then(|params| params.get("worktree"))
+        .and_then(Val::as_str)
+    {
+        return implementer_legs
+            .into_iter()
+            .find(|leg| leg.checkout == checkout);
+    }
+    if kind == "harness_start" && step_is_pane_substrate(params) && implementer_legs.len() == 1 {
+        return implementer_legs.into_iter().next();
+    }
+    None
+}
+
+/// Whether one step declares the pane substrate (which registers a lane
+/// workspace): `herdr` unless the step selects the bare-subprocess fallback
+/// explicitly. A token outside the closed set is left to the effect's own
+/// typed refusal.
+fn step_is_pane_substrate(params: Option<&Val>) -> bool {
+    matches!(
+        params
+            .and_then(|params| params.get("execution"))
+            .and_then(Val::as_str),
+        None | Some("herdr")
+    )
+}
+
+/// The positive `lane_round` a step declares (`None` when the step declares an
+/// invalid one; the effect refuses that typed).
+fn step_lane_round(params: &Val) -> Option<u64> {
+    match params.get("lane_round") {
+        None => Some(1),
+        Some(Val::Int(round)) if *round > 0 => Some(*round as u64),
+        Some(_) => None,
+    }
+}
+
+/// The per-leg lane identity rule of the reviewed spine (issue #210).
+///
+/// ONE lane checkout belongs to exactly ONE leg. The derivation is
+/// `(issue, role, round)` only, so distinct legs derive distinct checkouts by
+/// construction — but a plan can still DECLARE a step that would bind a
+/// sibling leg's checkout, and the measured live defect (`p6-132`'s reviewer
+/// leg binding the implementer lane's `issues-132`) was exactly that shape:
+/// the collision was only discovered at dispatch, by the substrate, as
+/// `refusal.lane.name_collision`. That plan is refused HERE, at preview time,
+/// with a typed code naming both identities.
+///
+/// Returns the reviewer lane each self-dispatching review step binds (the pane
+/// substrate materializes the reviewer's OWN lane at that checkout; the
+/// bare-subprocess fallback runs in the integration checkout and keeps the
+/// run's lane checkout).
+fn validate_lane_identities(
+    steps: &[ValidatedStep],
+    selected: &[ValidatedIssue],
+) -> Result<Vec<(String, LaneLeg)>, PreviewError> {
+    let issues: Vec<u64> = selected
+        .iter()
+        .map(|issue| issue.id.number as u64)
+        .collect();
+    // The legs this plan declares, for naming the owner of a checkout.
+    let mut declared: Vec<LaneLeg> = Vec::new();
+    for number in &issues {
+        if let Some(leg) = lane_leg(*number, "implementer", 1) {
+            declared.push(leg);
+        }
+    }
+    for step in steps {
+        let Some(params) = step.params.as_ref() else {
+            continue;
+        };
+        if step.kind != "review_evidence"
+            || params.get("reviewer_profile").is_none()
+            || !step_is_pane_substrate(step.params.as_ref())
+        {
+            continue;
+        }
+        let Some(round) = step_lane_round(params) else {
+            continue;
+        };
+        for number in &issues {
+            if let Some(leg) = lane_leg(*number, "reviewer", round) {
+                declared.push(leg);
+            }
+        }
+    }
+    let mut reviewer_lanes: Vec<(String, LaneLeg)> = Vec::new();
+    for step in steps {
+        let Some(params) = step.params.as_ref() else {
+            continue;
+        };
+        if step.kind != "review_evidence"
+            || params.get("reviewer_profile").is_none()
+            || !step_is_pane_substrate(step.params.as_ref())
+        {
+            continue;
+        }
+        let Some(round) = step_lane_round(params) else {
+            continue;
+        };
+        let Some(declared_checkout) = params.get("worktree").and_then(Val::as_str) else {
+            continue;
+        };
+        let own = issues.iter().find_map(|number| {
+            lane_leg(*number, "reviewer", round).filter(|leg| leg.checkout == declared_checkout)
+        });
+        if let Some(leg) = own {
+            reviewer_lanes.push((step.id.clone(), leg));
+            continue;
+        }
+        let owner = declared
+            .iter()
+            .find(|leg| leg.checkout == declared_checkout)
+            .cloned();
+        let own_identity = owner
+            .as_ref()
+            .and_then(|owner| lane_leg(owner.issue, "reviewer", round));
+        return Err(PreviewError::new(
+            "usage.queue_lane_identity",
+            format!(
+                "step {:?} would bind the lane checkout {declared_checkout:?} for its reviewer leg \
+                 (lane_round {round}), which is {}; the reviewer leg of that run binds its own lane \
+                 checkout {}. One lane checkout belongs to exactly one leg, so this plan is refused \
+                 before submission instead of colliding at dispatch",
+                step.id,
+                match &owner {
+                    Some(owner) => format!(
+                        "the lane of the {} leg {:?} ({:?})",
+                        owner.role, owner.agent, owner.workspace
+                    ),
+                    None => "not a lane checkout of any leg this plan selects".to_string(),
+                },
+                match &own_identity {
+                    Some(leg) => format!(
+                        "{:?} (agent {:?}, workspace {:?})",
+                        leg.checkout, leg.agent, leg.workspace
+                    ),
+                    None => format!("issues-<N>-rev{round}"),
+                },
+            ),
+        ));
+    }
+    Ok(reviewer_lanes)
+}
+
 struct Validated {
     repository: String,
     host: String,
@@ -347,6 +557,9 @@ struct Validated {
     boundary: ValidatedBoundary,
     steps: Vec<ValidatedStep>,
     selected: Vec<ValidatedIssue>,
+    /// The reviewer lane each self-dispatching review step binds (issue #210),
+    /// validated at preview time.
+    reviewer_lanes: Vec<(String, LaneLeg)>,
 }
 
 /// A bounded branch name: non-empty, no whitespace/control characters, no
@@ -584,6 +797,20 @@ fn validate_request(request: &QueueRequest) -> Result<Validated, PreviewError> {
             requires: requires.into_iter().collect(),
         })
         .collect();
+    let steps: Vec<ValidatedStep> = request
+        .steps
+        .iter()
+        .map(|step| ValidatedStep {
+            id: step.id.clone(),
+            kind: step.kind.clone(),
+            params: step.params.clone(),
+        })
+        .collect();
+    // Issue #210: ONE lane checkout belongs to exactly ONE leg. The per-leg
+    // derivation is visible in the rendered plan and a plan that would bind a
+    // sibling leg's checkout is refused HERE, before submission, instead of
+    // colliding at dispatch.
+    let reviewer_lanes = validate_lane_identities(&steps, &selected)?;
     Ok(Validated {
         repository,
         host: request.host.clone(),
@@ -595,16 +822,9 @@ fn validate_request(request: &QueueRequest) -> Result<Validated, PreviewError> {
         workflow_hash: request.workflow_hash.clone(),
         role,
         boundary,
-        steps: request
-            .steps
-            .iter()
-            .map(|step| ValidatedStep {
-                id: step.id.clone(),
-                kind: step.kind.clone(),
-                params: step.params.clone(),
-            })
-            .collect(),
+        steps,
         selected,
+        reviewer_lanes,
     })
 }
 
@@ -1120,12 +1340,23 @@ pub fn preview_queue(state: &State, request: &QueueRequest) -> Result<QueuePrevi
                 ),
             });
         }
+        // Issue #210 legibility: the lane identity this step binds, derived
+        // from (issue, role, round) — the reviewer leg's OWN lane included, so
+        // `queue preview` shows every leg's lane before submission.
+        let lane = step_lane(
+            &request.reviewer_lanes,
+            &step.id,
+            &step.kind,
+            step.params.as_ref(),
+            &request.selected,
+        );
         steps_doc.push(object(vec![
             ("id", string(&step.id)),
             ("kind", string(&step.kind)),
             ("supported", bool_(supported)),
             ("resolved", bool_(resolved)),
             ("params", step.params.clone().unwrap_or_else(null)),
+            ("lane", lane.as_ref().map(lane_leg_doc).unwrap_or_else(null)),
         ]));
     }
 

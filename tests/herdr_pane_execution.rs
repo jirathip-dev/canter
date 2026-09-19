@@ -2116,11 +2116,11 @@ fn the_harness_start_step_starts_the_worker_in_the_lane_worktrees_pane() {
     assert!(!fixture.bare_spawned());
 }
 
-/// The pane substrate refuses typed when the reviewed plan cannot name exactly
-/// one lane worktree — a pane is never created at a bare cwd and never in the
-/// wrong lane.
+/// The pane substrate refuses typed when the reviewed plan does not bind the
+/// leg's OWN lane checkout — a pane is never created at a bare cwd and never
+/// in a sibling lane (issues #139, #210).
 #[test]
-fn a_plan_without_one_lane_worktree_refuses_typed_on_the_pane_substrate() {
+fn a_plan_without_the_legs_own_lane_checkout_refuses_typed_on_the_pane_substrate() {
     let fixture = Fixture::new("effect-worktree");
     fixture.install(FAKE_HERDR);
     let env = fixture.env(&[]);
@@ -2162,8 +2162,8 @@ fn a_plan_without_one_lane_worktree_refuses_typed_on_the_pane_substrate() {
             .message
             .as_deref()
             .unwrap_or_default()
-            .contains("lane worktree"),
-        "{:?}",
+            .contains("issues-5"),
+        "the refusal names the leg's own lane checkout: {:?}",
         outcome.message
     );
     assert!(
@@ -2175,19 +2175,11 @@ fn a_plan_without_one_lane_worktree_refuses_typed_on_the_pane_substrate() {
         fixture.rows()
     );
 
-    // Two lane worktrees cannot be represented by one pane: refuse, never
-    // panning the wrong lane.
-    let two = bound_plan(vec![
+    // A plan that binds only a DIFFERENT issue's lane never panes the wrong
+    // lane: the leg resolves its own checkout (issues-5) or refuses.
+    let foreign = bound_plan(vec![
         plan_step(
             "p1",
-            "worktree_create",
-            object(vec![
-                ("branch", string("issue-5")),
-                ("worktree", string("issues-5")),
-            ]),
-        ),
-        plan_step(
-            "p2",
             "worktree_create",
             object(vec![
                 ("branch", string("issue-6")),
@@ -2197,7 +2189,7 @@ fn a_plan_without_one_lane_worktree_refuses_typed_on_the_pane_substrate() {
         plan_step("p3", "harness_start", params.clone()),
     ]);
     let ctx = EffectContext {
-        plan: &two,
+        plan: &foreign,
         step_id: "p3",
         kind: "harness_start",
         params: Some(&params),
@@ -2224,6 +2216,15 @@ fn a_plan_without_one_lane_worktree_refuses_typed_on_the_pane_substrate() {
             .unwrap_or_default()
             .contains("headless"),
         "the refusal names the explicit fallback: {:?}",
+        outcome.message
+    );
+    assert!(
+        outcome
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("issues-5"),
+        "the refusal names the leg's own lane checkout: {:?}",
         outcome.message
     );
     assert!(fixture.rows().is_empty(), "{:?}", fixture.rows());
