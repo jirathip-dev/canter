@@ -3602,6 +3602,7 @@ fn collection_invalid_base_refuses_before_any_worker_poll() {
             repository: "example-org/widgets",
             integration_branch: "staging",
             production_branches: &[],
+            publish_route: "push",
             worktrees_root: &root,
             integration_repo: &lane,
             observed_feature_head: None,

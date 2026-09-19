@@ -859,6 +859,10 @@ struct ApplyParams {
     /// Topology: integration branch + production branches + lane paths.
     integration_branch: String,
     production_branches: Vec<String>,
+    /// The topology-declared integration publish route (issue #219): the
+    /// closed `push` | `pull_request` set, defaulted to `push` when the
+    /// topology declares none.
+    integration_publish: String,
     worktrees_root: std::path::PathBuf,
     integration_repo: std::path::PathBuf,
     /// Daemon-owned archive/salvage root (optional; issue #9 AC7).
@@ -1013,6 +1017,30 @@ fn apply_params(request: &Request) -> Result<ApplyParams, (String, String)> {
             ));
         }
     };
+    // Issue #219: the integration PUBLISH route is a closed, DECLARED input.
+    // It is never inferred from a refused push: an engine that fell back
+    // silently would hide the refusal from the operator and violate the
+    // plan-policy discipline (issue #196). Absent means the documented
+    // default (`push`), which is every topology written before this field.
+    let integration_publish = match topology.get("integration_publish") {
+        None | Some(Val::Null) => crate::mutation::INTEGRATION_PUBLISH_DEFAULT.to_string(),
+        Some(value)
+            if value
+                .as_str()
+                .is_some_and(crate::mutation::is_publish_route) =>
+        {
+            value.as_str().expect("checked").to_string()
+        }
+        Some(_) => {
+            return Err((
+                "refusal.malformed".to_string(),
+                format!(
+                    "topology.integration_publish must be one of {:?}",
+                    crate::mutation::INTEGRATION_PUBLISH_ROUTES
+                ),
+            ));
+        }
+    };
     let absolute = |key: &str| -> Result<std::path::PathBuf, (String, String)> {
         let text = topology.get(key).and_then(Val::as_str).ok_or_else(|| {
             (
@@ -1108,6 +1136,7 @@ fn apply_params(request: &Request) -> Result<ApplyParams, (String, String)> {
         integration_base,
         integration_branch,
         production_branches,
+        integration_publish,
         worktrees_root,
         integration_repo,
         archive_root,
@@ -2342,6 +2371,7 @@ fn check_apply_step_contract(
         &crate::mutation::ParamContract {
             integration_branch: &parsed.integration_branch,
             production_branches: &parsed.production_branches,
+            publish_route: &parsed.integration_publish,
             observed_feature_head: parsed.feature_head.as_deref(),
             observed_integration_base: parsed.integration_base.as_deref(),
             has_archive_root: parsed.archive_root.is_some(),
@@ -3043,6 +3073,7 @@ fn method_apply_from(shared: &Arc<Shared>, request: &Request, supervised: bool) 
         repository: &plan.repository,
         integration_branch: &parsed.integration_branch,
         production_branches: &parsed.production_branches,
+        publish_route: &parsed.integration_publish,
         worktrees_root: &parsed.worktrees_root,
         integration_repo: &parsed.integration_repo,
         archive_root: parsed.archive_root.as_deref(),
@@ -4095,10 +4126,14 @@ fn method_run_pause(shared: &Arc<Shared>, request: &Request) -> String {
         let in_flight = state
             .in_flight_run_step(&parsed.instance_id)
             .map_err(|err| (err.code, err.message))?;
+        let last_failure = state
+            .run_step_failure(&parsed.instance_id)
+            .map_err(|err| (err.code, err.message))?;
         Ok(crate::run_control::control_doc(
             &row,
             in_flight.as_deref(),
             Some(&row.resume_digest),
+            last_failure.as_ref(),
         ))
     })();
     match outcome {
@@ -4150,10 +4185,14 @@ fn method_run_resume(shared: &Arc<Shared>, request: &Request) -> String {
         let in_flight = state
             .in_flight_run_step(&parsed.instance_id)
             .map_err(|err| (err.code, err.message))?;
+        let last_failure = state
+            .run_step_failure(&parsed.instance_id)
+            .map_err(|err| (err.code, err.message))?;
         Ok(crate::run_control::control_doc(
             &row,
             in_flight.as_deref(),
             None,
+            last_failure.as_ref(),
         ))
     })();
     match outcome {
@@ -4784,7 +4823,7 @@ fn method_run_dispatch(shared: &Arc<Shared>, request: &Request) -> String {
         Ok(parsed) => parsed,
         Err(err) => return err_response(&request.id, err.code, err.message),
     };
-    let (material, kind, effective, integration_branch, production_branches) = {
+    let (material, kind, effective, integration_branch, production_branches, publish_route) = {
         let state = match shared.lock_state() {
             Ok(state) => state,
             Err(message) => return err_response(&request.id, "state.unavailable", message),
@@ -4887,12 +4926,24 @@ fn method_run_dispatch(shared: &Arc<Shared>, request: &Request) -> String {
         {
             integration_branch = branch.to_string();
         }
+        // Issue #219: the publish route is read from the SAME recorded
+        // topology the dispatch re-presents, and only a route the closed set
+        // admits is ever used (a topology that declared none keeps the
+        // documented default).
+        let publish_route = material
+            .topology
+            .get("integration_publish")
+            .and_then(Val::as_str)
+            .filter(|route| crate::mutation::is_publish_route(route))
+            .unwrap_or(crate::mutation::INTEGRATION_PUBLISH_DEFAULT)
+            .to_string();
         (
             material,
             kind,
             effective,
             integration_branch,
             production_branches,
+            publish_route,
         )
     };
     // Fail closed BEFORE anything is journaled or claimed: a request that is
@@ -4916,6 +4967,7 @@ fn method_run_dispatch(shared: &Arc<Shared>, request: &Request) -> String {
         &crate::mutation::ParamContract {
             integration_branch: &integration_branch,
             production_branches: &production_branches,
+            publish_route: &publish_route,
             observed_feature_head: material.feature_head.as_deref(),
             observed_integration_base: material.integration_base.as_deref(),
             has_archive_root,
@@ -5006,9 +5058,21 @@ fn method_run_status(shared: &Arc<Shared>, request: &Request) -> String {
                 } else {
                     None
                 };
+                // Issue #219: the run's newest recorded failure WITH its raw
+                // message rides the control document, so `run status` answers
+                // "why is this run parked" without a daemon log.
+                let last_failure = match state.run_step_failure(&instance_id) {
+                    Ok(failure) => failure,
+                    Err(err) => return err_response(&request.id, err.code, err.message),
+                };
                 ok_response(
                     &request.id,
-                    crate::run_control::control_doc(&row, in_flight.as_deref(), digest.as_deref()),
+                    crate::run_control::control_doc(
+                        &row,
+                        in_flight.as_deref(),
+                        digest.as_deref(),
+                        last_failure.as_ref(),
+                    ),
                 )
             }
             Ok(None) => err_response(

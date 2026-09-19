@@ -30,7 +30,9 @@
 
 use crate::canonical::sha256_hex;
 use crate::formats;
-use crate::state::{GrantRow, InstanceRow, RUN_RETRY_MAX, RunReleaseOutcome, RunRetryRow};
+use crate::state::{
+    GrantRow, InstanceRow, RUN_RETRY_MAX, RunReleaseOutcome, RunRetryRow, StepFailure,
+};
 use crate::value::{Val, bool_, integer, null, object, string};
 
 /// The run-control document schema id (module-local like the #84 preview
@@ -795,10 +797,15 @@ fn run_block(run: &InstanceRow) -> Val {
 /// is the step of the still-executing dispatch (probed live) and
 /// `resume_digest` is the pause authorization (printed so the operator can
 /// hold it across a restart; `null` when the run carries no pause).
+/// `last_failure` is the newest recorded NON-succeeded step attempt with the
+/// raw message the effect recorded (issue #219): the read-back an operator
+/// uses to see WHY a run is parked, in the same document that reports the
+/// frontier.
 pub fn control_doc(
     run: &InstanceRow,
     in_flight_step: Option<&str>,
     resume_digest: Option<&str>,
+    last_failure: Option<&StepFailure>,
 ) -> Val {
     let state = control_state(run);
     let reached = run.paused || (run.pause_requested && in_flight_step.is_none());
@@ -836,6 +843,21 @@ pub fn control_doc(
             ]),
         ),
         ("scope", scope_block(&run.instance_id)),
+        // Issue #219: the raw reason behind the newest recorded failure, so
+        // `run status` alone tells a refused publish from a conflict or a bad
+        // ref (the measured defect recorded nothing an operator could read).
+        (
+            "last_failure",
+            match last_failure {
+                Some(failure) => object(vec![
+                    ("step", string(&failure.step)),
+                    ("status", string(&failure.status)),
+                    ("code", string(&failure.code)),
+                    ("message", string(&failure.message)),
+                ]),
+                None => null(),
+            },
+        ),
         ("statement", string(CONTROL_STATEMENT)),
     ])
 }

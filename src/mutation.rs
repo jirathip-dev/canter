@@ -252,6 +252,29 @@ pub mod code {
     pub const MERGE_NOT_FF: &str = "effect.merge.not_fast_forward";
     /// The integration merge failed (git-level).
     pub const MERGE_FAILED: &str = "effect.merge.failed";
+    /// The remote REJECTED the publish (issue #219): the ref is protected by
+    /// repository rules, so the update can never be accepted by a direct push
+    /// however the local checkout is shaped. Its own code, so an operator
+    /// never has to read `effect.merge.failed` and guess whether the push was
+    /// refused by policy or simply never arrived.
+    pub const MERGE_PUSH_REJECTED: &str = "effect.merge.push_rejected";
+    /// The forge refused the declared pull-request publish (issue #219): the
+    /// merge was not allowed (rules, an unmergeable head, or a check the
+    /// repository requires). The published ref did not carry the delivery.
+    pub const MERGE_PUBLISH_REJECTED: &str = "effect.merge.publish_rejected";
+    /// A publish could not authenticate with the remote or the forge (issue
+    /// #219): a missing/expired credential is its own class, never a policy
+    /// refusal and never an opaque git-level failure.
+    pub const CREDENTIAL_MISSING: &str = "refusal.credential.missing";
+    /// The declared pull-request publish route has nothing to publish (issue
+    /// #219): no open pull request names the certified head for the
+    /// integration branch. The reviewed delivery must be published as a pull
+    /// request before the merge step can consume it.
+    pub const PR_PUBLISH_MISSING: &str = "refusal.publish.pull_request_missing";
+    /// The declared publish route cannot honour the step's declared merge
+    /// policy (issue #219): a pull-request publish lands the forge's squash
+    /// merge and can never perform an `ff` landing.
+    pub const PUBLISH_POLICY: &str = "refusal.policy.publish";
     /// The executable could not be spawned.
     pub const UNAVAILABLE: &str = "refusal.unavailable";
     /// The child process exceeded its deadline.
@@ -1288,6 +1311,7 @@ impl<'a> EffectContext<'a> {
         ParamContract {
             integration_branch: self.integration_branch,
             production_branches: self.production_branches,
+            publish_route: self.publish_route,
             observed_feature_head: self.observed_feature_head,
             observed_integration_base: self.observed_integration_base,
             has_archive_root: self.archive_root.is_some(),
@@ -1312,6 +1336,13 @@ pub struct EffectContext<'a> {
     pub integration_branch: &'a str,
     /// Configured production branches.
     pub production_branches: &'a [String],
+    /// The topology-declared integration publish route (issue #219): `push`
+    /// (default) publishes the landing by fast-forwarding the integration
+    /// checkout and pushing it; `pull_request` publishes the reviewed delivery
+    /// through the open pull request whose head names the certified head. The
+    /// closed set is [`INTEGRATION_PUBLISH_ROUTES`]; a declared route is never
+    /// inferred from a failed push.
+    pub publish_route: &'a str,
     /// Lane containment root (worktrees live here).
     pub worktrees_root: &'a Path,
     /// The integration checkout the effects operate on (absolute).
@@ -1583,6 +1614,34 @@ fn effect_checkout(ctx: &EffectContext<'_>) -> EffectOutcome {
 // the burn.
 // ---------------------------------------------------------------------------
 
+/// The closed set of integration PUBLISH routes a topology may declare (issue
+/// #219): how the merge step publishes a landing to the integration ref.
+///
+/// `push` is the default and the historical behaviour: the landing is
+/// fast-forwarded into the integration checkout and pushed to the same remote
+/// the published ref was read from. `pull_request` is for a repository whose
+/// own rules forbid a direct push to that ref (a pull-request-only ruleset on
+/// the integration branch and/or a protected branch): there the reviewed
+/// delivery is published through the repository's real integration path — the
+/// open pull request whose head names the certified head, squash-merged by
+/// the authenticated forge CLI — and the published ref is read back and
+/// proven by content exactly as the push route proves it.
+///
+/// A route is DECLARED, never inferred: an engine that silently fell back from
+/// a refused push to another route would violate the plan-policy discipline
+/// (issue #196) and hide the refusal from the operator.
+pub const INTEGRATION_PUBLISH_ROUTES: [&str; 2] = ["push", "pull_request"];
+/// The documented default publish route (a topology that declares none).
+pub const INTEGRATION_PUBLISH_DEFAULT: &str = "push";
+/// The pull-request publish route.
+pub const INTEGRATION_PUBLISH_PULL_REQUEST: &str = "pull_request";
+
+/// Whether a topology-declared publish route value is one of
+/// [`INTEGRATION_PUBLISH_ROUTES`].
+pub fn is_publish_route(route: &str) -> bool {
+    INTEGRATION_PUBLISH_ROUTES.contains(&route)
+}
+
 /// The caller-presented inputs one step kind's param contract resolves
 /// against besides the step params themselves: the topology fields the branch
 /// classification and the archive gate read, and the request-level `observed`
@@ -1594,6 +1653,9 @@ pub struct ParamContract<'a> {
     pub integration_branch: &'a str,
     /// Configured production branches (topology).
     pub production_branches: &'a [String],
+    /// The declared integration publish route (topology); `''` means the
+    /// documented [`INTEGRATION_PUBLISH_DEFAULT`].
+    pub publish_route: &'a str,
     /// The request's freshly observed feature head (`None` when absent).
     pub observed_feature_head: Option<&'a str>,
     /// The request's freshly observed integration base (`None` when absent).
@@ -1603,6 +1665,19 @@ pub struct ParamContract<'a> {
     /// The daemon-owned worktrees root the request presented (`None` only
     /// when the request presented none — the apply path always parses one).
     pub worktrees_root: Option<&'a Path>,
+}
+
+impl<'a> ParamContract<'a> {
+    /// The effective publish route: the declared one, or the documented
+    /// default when the contract declares none (a contract that predates the
+    /// route, and every non-merge caller, keeps the historical `push`).
+    pub fn publish_route(&self) -> &'a str {
+        if is_publish_route(self.publish_route) {
+            self.publish_route
+        } else {
+            INTEGRATION_PUBLISH_DEFAULT
+        }
+    }
 }
 
 /// The containment screen the worktree-reading kinds run (issue #92): the
@@ -2218,6 +2293,10 @@ pub struct MergeInputs {
     pub branch: String,
     /// The closed policy (`squash` | `ff`).
     pub policy: String,
+    /// The topology-declared publish route (issue #219), resolved to one of
+    /// [`INTEGRATION_PUBLISH_ROUTES`] (the documented default when the
+    /// topology declares none).
+    pub route: String,
 }
 
 /// Resolve the params-caused inputs of `merge` (feature branch + policy).
@@ -2273,7 +2352,26 @@ pub fn merge_inputs(
             ),
         ));
     }
-    Ok(MergeInputs { branch, policy })
+    // Issue #219: the declared publish route must be able to honour the
+    // step's declared landing policy. A `pull_request` publish lands the
+    // forge's SQUASH merge (the repository's own integration path): an `ff`
+    // landing has no pull-request equivalent, so the combination refuses
+    // instead of silently landing something the plan did not declare.
+    let route = contract.publish_route();
+    if route == INTEGRATION_PUBLISH_PULL_REQUEST && policy != "squash" {
+        return Err(refusal(
+            code::PUBLISH_POLICY,
+            format!(
+                "the integration ref {:?} publishes through the declared pull_request route, which lands a squash merge and cannot honour merge_policy {policy:?}",
+                contract.integration_branch
+            ),
+        ));
+    }
+    Ok(MergeInputs {
+        branch,
+        policy,
+        route: route.to_string(),
+    })
 }
 
 /// The params-caused inputs of `branch_push`.
@@ -5043,6 +5141,365 @@ fn roll_back_landing(ctx: &EffectContext<'_>, target: &str) -> Result<(), String
     }
 }
 
+/// Classify a failed PUBLISH (a `git push` of a landing, or a forge call that
+/// refuses a merge) into its own typed code (issue #219).
+///
+/// The raw diagnostics stay in the message either way; the code names the
+/// CLASS so an operator can tell a rules refusal from a credential problem
+/// from an unclassifiable local failure without reading stderr. `default` is
+/// the caller's own code for the genuinely unclassifiable case.
+fn classify_publish_failure(text: &str, default: &'static str) -> &'static str {
+    let lowered = text.to_ascii_lowercase();
+    // Credential first: an authentication failure is never reported as a
+    // policy refusal, and a forge's auth error carries no rule marker.
+    const CREDENTIAL_MARKERS: [&str; 8] = [
+        "authentication failed",
+        "could not read username",
+        "could not read password",
+        "permission denied (publickey",
+        "terminal prompts disabled",
+        "bad credentials",
+        "no such identity",
+        "gh_auth_token",
+    ];
+    if CREDENTIAL_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+    {
+        return code::CREDENTIAL_MISSING;
+    }
+    // The remote REFUSED the update: repository rules or a protected ref.
+    // The markers are the ones a REFUSAL prints — a plain `[remote rejected]`
+    // also covers a receiving-side failure that is not a policy refusal (a
+    // read-only remote's `unpacker error`), and that case keeps the caller's
+    // generic code rather than being reported as a rule refusal.
+    const REJECTED_MARKERS: [&str; 6] = [
+        "push declined",
+        "repository rule violations",
+        "gh013",
+        "protected branch hook declined",
+        "pre-receive hook declined",
+        "refusing to allow",
+    ];
+    if REJECTED_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+    {
+        return code::MERGE_PUSH_REJECTED;
+    }
+    // The ref moved under us: the landing is not a fast-forward of the
+    // published head any more.
+    const NOT_FF_MARKERS: [&str; 2] = ["non-fast-forward", "fetch first"];
+    if NOT_FF_MARKERS.iter().any(|marker| lowered.contains(marker)) {
+        return code::MERGE_NOT_FF;
+    }
+    default
+}
+
+/// Run the forge CLI (`gh`) in the integration checkout. A non-zero exit is
+/// classified by [`classify_publish_failure`] against `default` — never
+/// collapsed into a bare adapter code — while spawn failures, deadlines and
+/// process deaths keep their own outcomes untouched.
+fn run_forge(
+    ctx: &EffectContext<'_>,
+    args: &[String],
+    default: &'static str,
+) -> Result<crate::process::ProcOut, EffectOutcome> {
+    let deadline = effect_deadline_secs(ctx.kind, ctx.params)?;
+    let out = crate::adapters::run_grouped(ProcSpec {
+        program: "gh",
+        args,
+        env: ctx.env,
+        cwd: Some(ctx.integration_repo),
+        timeout: Duration::from_secs(deadline),
+    });
+    if let Err(outcome) = outcome_from_run(&out, "gh") {
+        if outcome.code.as_deref() != Some(code::EXIT) {
+            return Err(outcome);
+        }
+        let detail = outcome.message.unwrap_or_default();
+        return Err(failed(classify_publish_failure(&detail, default), detail));
+    }
+    Ok(out)
+}
+
+/// The OPEN pull request that IS one delivery: the forge's own answer for
+/// `gh pr list --head <delivery branch> --base <integration ref> --state
+/// open`. `Ok(None)` when the forge reports none; a forge answer that is not
+/// the documented JSON refuses `refusal.malformed.output` rather than being
+/// guessed at.
+fn open_pull_request(
+    ctx: &EffectContext<'_>,
+    inputs: &MergeInputs,
+) -> Result<Option<(i64, String)>, EffectOutcome> {
+    let args = vec![
+        "pr".to_string(),
+        "list".to_string(),
+        "--repo".to_string(),
+        ctx.repository.to_string(),
+        "--head".to_string(),
+        inputs.branch.clone(),
+        "--base".to_string(),
+        ctx.integration_branch.to_string(),
+        "--state".to_string(),
+        "open".to_string(),
+        "--json".to_string(),
+        "number,headRefOid".to_string(),
+    ];
+    let out = run_forge(ctx, &args, code::MERGE_PUBLISH_REJECTED)?;
+    let text = crate::redact::redact(out.stdout.trim()).to_string();
+    let unreadable = |detail: &str| {
+        failed(
+            code::MALFORMED_OUTPUT,
+            format!(
+                "the forge's pull-request read is not the documented JSON (`gh pr list --json number,headRefOid`): {detail}"
+            ),
+        )
+    };
+    let doc = match Val::parse_json(&text) {
+        Ok(doc) => doc,
+        Err(_) => return Err(unreadable(&text)),
+    };
+    let Some(items) = doc.as_array() else {
+        return Err(unreadable(&text));
+    };
+    let Some(first) = items.first() else {
+        return Ok(None);
+    };
+    let number = first.get("number").and_then(Val::as_int).unwrap_or(0);
+    let head = first
+        .get("headRefOid")
+        .and_then(Val::as_str)
+        .unwrap_or("")
+        .to_string();
+    if number <= 0 || !is_hex40(&head) {
+        return Err(unreadable(&format!("{first:?}")));
+    }
+    Ok(Some((number, head)))
+}
+
+/// The tree of one tree-ish in the integration repo.
+fn tree_of(ctx: &EffectContext<'_>, rev: &str) -> Result<String, EffectOutcome> {
+    Ok(run_git(
+        ctx,
+        ctx.integration_repo,
+        &["rev-parse", "--verify", &format!("{rev}^{{tree}}")],
+    )?
+    .stdout
+    .trim()
+    .to_string())
+}
+
+/// Fast-forward the integration checkout onto a PUBLISHED integration head
+/// (issue #219). The run's later steps (`post_merge_verify`, `cleanup`) read
+/// the LOCAL integration ref, so a checkout left behind a head the forge
+/// published would present a stale view. Only a fast-forward is performed —
+/// never a rewrite, never a forced update — and the fetched head is verified
+/// against the published read first (the same #178 rule: a reconciliation may
+/// only use a view it actually fetched).
+fn advance_checkout_to_published(
+    ctx: &EffectContext<'_>,
+    published: &str,
+) -> Result<(), EffectOutcome> {
+    let checkout_head = run_git(
+        ctx,
+        ctx.integration_repo,
+        &["rev-parse", "--verify", ctx.integration_branch],
+    )?
+    .stdout
+    .trim()
+    .to_string();
+    if checkout_head == published {
+        return Ok(());
+    }
+    let fetched = fetched_published_head(ctx, published)?;
+    if !is_commit_ancestor(ctx, &checkout_head, &fetched) {
+        return Err(failed(
+            code::MERGE_NOT_FF,
+            format!(
+                "the integration checkout is at {checkout_head}, which does not descend from the published integration ref {:?} at {fetched}: an unpublished or diverged local view is never advanced onto it",
+                ctx.integration_branch
+            ),
+        ));
+    }
+    if let Err(outcome) = run_git(ctx, ctx.integration_repo, &["merge", "--ff-only", &fetched]) {
+        if outcome.code.as_deref() != Some(code::EXIT) {
+            return Err(outcome);
+        }
+        let detail = outcome
+            .message
+            .as_deref()
+            .unwrap_or("the fast-forward failed without a message");
+        return Err(failed(
+            code::MERGE_FAILED,
+            format!(
+                "the integration checkout {:?} cannot advance to the published head {fetched}: {detail}",
+                ctx.integration_branch
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// PUBLISH a certified delivery through the repository's own integration path
+/// (issue #219): the open pull request whose head names the certified head,
+/// squash-merged by the authenticated forge CLI.
+///
+/// This is the route for a repository whose rules forbid a direct push to its
+/// integration ref (a pull-request-only ruleset and/or a protected branch):
+/// the repository's real integration path is the pull request, so the merge
+/// step consumes the reviewed delivery there instead of trying to push a ref
+/// the forge will always decline. It is DECLARED by the topology
+/// (`integration_publish: "pull_request"`) and never inferred from a refused
+/// push — a silent fallback would hide the refusal (issue #196's plan-policy
+/// discipline).
+///
+/// Every discipline of the push route is kept: the delivery is frozen at the
+/// certified head the recorded verdict names (the forge is asked to match that
+/// exact head at merge time, so a head that moves mid-flight is refused by the
+/// forge itself), the PUBLISHED ref is read back and must carry the landing,
+/// and the landed content is proven by the same fail-closed content fact the
+/// landing, `post_merge_verify` and the cleanup proof use. Nothing local moves
+/// before the forge reports the landing, and the integration checkout follows
+/// the published head only after the read-back proved it.
+#[allow(clippy::too_many_arguments)]
+fn publish_via_pull_request(
+    ctx: &EffectContext<'_>,
+    inputs: &MergeInputs,
+    target: &str,
+    published_head: &str,
+    reviewed_base: &str,
+    certified_head: &str,
+    branch_head: &str,
+    checkout_head: &str,
+) -> EffectOutcome {
+    // A delivery whose reviewed content is ALREADY on the merge target — a
+    // retry after a partial publish, or a delivery with no content beyond the
+    // base — publishes nothing; the step reports the already-present content
+    // in the same `already-landed` shape the push route reports.
+    let (_reviewed_paths, differing) =
+        match certified_content_differences(ctx, reviewed_base, certified_head, target) {
+            Ok(pair) => pair,
+            Err(outcome) => return outcome,
+        };
+    if differing.is_empty() {
+        if let Err(outcome) = advance_checkout_to_published(ctx, published_head) {
+            return outcome;
+        }
+        let tree = match tree_of(ctx, published_head) {
+            Ok(tree) => tree,
+            Err(outcome) => return outcome,
+        };
+        return ok(merge_outcome_doc(
+            ctx,
+            inputs,
+            "already-landed",
+            checkout_head,
+            target,
+            published_head,
+            published_head,
+            target,
+            certified_head,
+            branch_head,
+            &tree,
+        ));
+    }
+    // The pull request that IS this delivery. Never invented, never opened
+    // from here: the reviewed delivery is published as a pull request by the
+    // run's own delivery step, and this step consumes exactly that.
+    let pull = match open_pull_request(ctx, inputs) {
+        Ok(pull) => pull,
+        Err(outcome) => return outcome,
+    };
+    let Some((number, pull_head)) = pull else {
+        return refusal(
+            code::PR_PUBLISH_MISSING,
+            format!(
+                "the delivery branch {:?} has no OPEN pull request onto {:?} in {}: the declared pull_request publish route needs the reviewed delivery published as a pull request naming the certified head {certified_head}",
+                inputs.branch, ctx.integration_branch, ctx.repository
+            ),
+        );
+    };
+    if pull_head != certified_head {
+        return refusal(
+            code::PR_PUBLISH_MISSING,
+            format!(
+                "the open pull request #{number} of the delivery branch {:?} names head {pull_head}, not the certified head {certified_head} the recorded verdict binds: a pull request a verdict does not name is never merged",
+                inputs.branch
+            ),
+        );
+    }
+    // Merge THROUGH the repository's rules, matching the exact certified head
+    // so a delivery that moves between this read and the merge is refused by
+    // the forge rather than merged unproven.
+    let args = vec![
+        "pr".to_string(),
+        "merge".to_string(),
+        number.to_string(),
+        "--repo".to_string(),
+        ctx.repository.to_string(),
+        "--squash".to_string(),
+        "--match-head-commit".to_string(),
+        certified_head.to_string(),
+    ];
+    if let Err(outcome) = run_forge(ctx, &args, code::MERGE_PUBLISH_REJECTED) {
+        return outcome;
+    }
+    // The forge's landing is real only when the PUBLISHED ref carries it.
+    let published_after = match published_integration_head(ctx) {
+        Ok(head) => head,
+        Err(outcome) => return outcome,
+    };
+    if published_after == published_head {
+        return failed(
+            code::MERGE_PUBLISH_REJECTED,
+            format!(
+                "the forge did not publish the merge of pull request #{number} (head {certified_head}) onto {:?}: the published ref still carries {published_head}; the pull request is left as it was and nothing local moved",
+                ctx.integration_branch
+            ),
+        );
+    }
+    // The landed content, proven by content — the same fail-closed fact the
+    // push landing, `post_merge_verify` and the cleanup proof use.
+    let (landed_paths, landed_differing) =
+        match certified_content_differences(ctx, reviewed_base, certified_head, &published_after) {
+            Ok(pair) => pair,
+            Err(outcome) => return outcome,
+        };
+    if !landed_differing.is_empty() {
+        return failed(
+            code::MERGE_PUBLISH_REJECTED,
+            format!(
+                "the forge published {published_after} on {:?}, but {} of the {} path(s) the review covered relative to {reviewed_base} do not carry the certified content of {certified_head} there (first {:?}): the published ref does not carry the reviewed delivery",
+                ctx.integration_branch,
+                landed_differing.len(),
+                landed_paths.len(),
+                landed_differing.first()
+            ),
+        );
+    }
+    if let Err(outcome) = advance_checkout_to_published(ctx, &published_after) {
+        return outcome;
+    }
+    let tree = match tree_of(ctx, &published_after) {
+        Ok(tree) => tree,
+        Err(outcome) => return outcome,
+    };
+    ok(merge_outcome_doc(
+        ctx,
+        inputs,
+        "landed",
+        checkout_head,
+        target,
+        published_head,
+        &published_after,
+        &published_after,
+        certified_head,
+        branch_head,
+        &tree,
+    ))
+}
+
 /// `merge`: LAND the certified delivery on the integration ref under the
 /// plan's closed policy and PUBLISH it to the integration remote — a
 /// control-plane mutation the daemon journals like every other effect. The
@@ -5201,6 +5658,23 @@ fn effect_merge(ctx: &EffectContext<'_>) -> EffectOutcome {
             ),
         );
     }
+    // Issue #219: the topology-declared publish route chooses HOW the
+    // certified delivery is published. Every check above (the published ref,
+    // the merge target, the #178 reconciliation, the #202 frozen head) is the
+    // SAME for both routes: the only difference is the mechanism that lands
+    // the delivery on the published ref.
+    if inputs.route == INTEGRATION_PUBLISH_PULL_REQUEST {
+        return publish_via_pull_request(
+            ctx,
+            &inputs,
+            &target,
+            &published_head,
+            reviewed_base,
+            &certified_head,
+            &branch_head,
+            &integration_head,
+        );
+    }
     // The landing commit, or `None` when the delivered content is ALREADY on
     // the merge target — a prior landing of this very delivery, or a delivery
     // with no content beyond the base. Nothing is published then (a landing
@@ -5304,8 +5778,18 @@ fn effect_merge(ctx: &EffectContext<'_>) -> EffectOutcome {
                     ),
                 );
             }
+            // Issue #219: a publish that did not happen is never one opaque
+            // code. The push's own diagnostics decide the class — a remote
+            // that REJECTED the update (repository rules / a protected ref), a
+            // remote that could not be authenticated, a ref that moved (a
+            // non-fast-forward), or a genuinely local failure that keeps the
+            // generic code.
+            let publish_code = match &push {
+                Err(_) => classify_publish_failure(&detail, code::MERGE_FAILED),
+                Ok(_) => code::MERGE_FAILED,
+            };
             return failed(
-                code::MERGE_FAILED,
+                publish_code,
                 format!(
                     "the landing {landed_head} was not published to {:?}: {detail}",
                     ctx.integration_branch
@@ -5314,32 +5798,64 @@ fn effect_merge(ctx: &EffectContext<'_>) -> EffectOutcome {
         }
     }
     let landed_head = landing.clone().unwrap_or_else(|| target.clone());
-    ok(object(vec![
-        (
-            "mode",
-            string(if landing.is_some() {
-                "landed"
-            } else {
-                "already-landed"
-            }),
-        ),
+    ok(merge_outcome_doc(
+        ctx,
+        &inputs,
+        if landing.is_some() {
+            "landed"
+        } else {
+            "already-landed"
+        },
+        &integration_head,
+        &target,
+        &published_head,
+        &published_after,
+        &landed_head,
+        &certified_head,
+        &branch_head,
+        &feature_tree,
+    ))
+}
+
+/// The typed `merge` result document, ONE shape for both publish routes
+/// (issue #219): the read-back identities every later step and the operator
+/// read (`published_head` before, `published_after` after, the landed head,
+/// the checkout's head, the certified head the verdict names) plus the
+/// declared publish route.
+#[allow(clippy::too_many_arguments)]
+fn merge_outcome_doc(
+    ctx: &EffectContext<'_>,
+    inputs: &MergeInputs,
+    mode: &str,
+    checkout_head: &str,
+    integration_head: &str,
+    published_head: &str,
+    published_after: &str,
+    landed_head: &str,
+    certified_head: &str,
+    branch_head: &str,
+    result_tree: &str,
+) -> Val {
+    object(vec![
+        ("mode", string(mode)),
         ("landed", bool_(true)),
+        ("publish_route", string(&inputs.route)),
         ("merge_policy", string(&inputs.policy)),
         ("integration_branch", string(ctx.integration_branch)),
-        ("integration_head", string(&target)),
-        ("published_head", string(&published_head)),
-        ("published_after", string(&published_after)),
-        ("landed_head", string(&landed_head)),
-        ("checkout_head", string(&integration_head)),
-        ("certified_head", string(&certified_head)),
-        ("reconciled_head", string(&branch_head)),
+        ("integration_head", string(integration_head)),
+        ("published_head", string(published_head)),
+        ("published_after", string(published_after)),
+        ("landed_head", string(landed_head)),
+        ("checkout_head", string(checkout_head)),
+        ("certified_head", string(certified_head)),
+        ("reconciled_head", string(branch_head)),
         (
             "reconciled",
-            bool_(is_hex40(&certified_head) && branch_head != certified_head),
+            bool_(is_hex40(certified_head) && branch_head != certified_head),
         ),
         ("feature_branch", string(&inputs.branch)),
-        ("result_tree", string(&feature_tree)),
-    ]))
+        ("result_tree", string(result_tree)),
+    ])
 }
 
 /// `post_merge_verify`: prove the merged integration head contains the
@@ -7206,6 +7722,127 @@ mod tests {
         assert!(
             is_expired("not-a-timestamp", "2026-09-06T00:00:00Z"),
             "fail closed"
+        );
+    }
+
+    /// Issue #219: every distinguishable publish failure gets its OWN typed
+    /// code — a refused direct push (repository rules), a credential that
+    /// cannot be read, a ref that moved (non-fast-forward) — and only a
+    /// genuinely unclassifiable failure keeps the caller's generic code.
+    #[test]
+    fn publish_failures_are_classified_into_their_own_typed_codes() {
+        // The measured live shape: the forge's own rule refusal.
+        let live = "the landing a5cb07a7 was not published to \"staging\": git (cwd /tmp/x) \
+                    exited with code 1: To https://example.invalid/o/r.git | ! \
+                    a5cb07a7:refs/heads/staging [remote rejected] (push declined due to \
+                    repository rule violations)";
+        assert_eq!(
+            classify_publish_failure(live, code::MERGE_FAILED),
+            code::MERGE_PUSH_REJECTED
+        );
+        // A protected branch hook declines the update the same way.
+        assert_eq!(
+            classify_publish_failure(
+                "remote: error: protected branch hook declined",
+                code::MERGE_FAILED
+            ),
+            code::MERGE_PUSH_REJECTED
+        );
+        // A credential that cannot be read is never a policy refusal.
+        assert_eq!(
+            classify_publish_failure(
+                "fatal: could not read Username for 'https://example.invalid': terminal prompts disabled",
+                code::MERGE_FAILED
+            ),
+            code::CREDENTIAL_MISSING
+        );
+        assert_eq!(
+            classify_publish_failure(
+                "Permission denied (publickey).\nfatal: Could not read from remote repository.",
+                code::MERGE_FAILED
+            ),
+            code::CREDENTIAL_MISSING
+        );
+        // A ref that moved under the landing is the non-fast-forward class.
+        assert_eq!(
+            classify_publish_failure(
+                "! [rejected]        head -> staging (non-fast-forward)",
+                code::MERGE_FAILED
+            ),
+            code::MERGE_NOT_FF
+        );
+        assert_eq!(
+            classify_publish_failure(
+                "Updates were rejected because the remote contains work that you do not have locally (fetch first)",
+                code::MERGE_FAILED
+            ),
+            code::MERGE_NOT_FF
+        );
+        // Receiving-side failures that are NOT a policy refusal keep the
+        // generic code: a read-only remote's `unpacker error` out of an
+        // otherwise ordinary `[remote rejected]` report, and a local failure
+        // that never reached the remote.
+        assert_eq!(
+            classify_publish_failure(
+                "To /tmp/origin.git | ! abc:refs/heads/staging [remote rejected] (unpacker error)",
+                code::MERGE_FAILED
+            ),
+            code::MERGE_FAILED
+        );
+        assert_eq!(
+            classify_publish_failure(
+                "error: failed to push some refs to '/tmp/origin.git'",
+                code::MERGE_FAILED
+            ),
+            code::MERGE_FAILED
+        );
+    }
+
+    /// Issue #219: the declared publish route must be able to honour the
+    /// step's declared policy — a pull-request publish lands the forge's
+    /// squash merge and refuses to pretend it performed an `ff` landing.
+    #[test]
+    fn a_pull_request_route_refuses_a_merge_policy_it_cannot_honour() {
+        let production = vec!["main".to_string()];
+        let ff = object(vec![
+            ("branch", string("issue-1")),
+            ("merge_policy", string("ff")),
+        ]);
+        let squash = object(vec![
+            ("branch", string("issue-1")),
+            ("merge_policy", string("squash")),
+        ]);
+        let contract = ParamContract {
+            integration_branch: "staging",
+            production_branches: &production,
+            publish_route: INTEGRATION_PUBLISH_PULL_REQUEST,
+            ..ParamContract::default()
+        };
+        let refused =
+            merge_inputs(Some(&ff), &contract).expect_err("an ff landing has no PR equivalent");
+        assert_eq!(refused.code.as_deref(), Some(code::PUBLISH_POLICY));
+        assert!(
+            refused
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("pull_request"),
+            "{refused:?}"
+        );
+        let inputs = merge_inputs(Some(&squash), &contract).expect("squash is the PR landing");
+        assert_eq!(inputs.route, INTEGRATION_PUBLISH_PULL_REQUEST);
+        // A topology that declares no route (and every contract that predates
+        // it) keeps the documented default.
+        let defaulted = ParamContract {
+            integration_branch: "staging",
+            production_branches: &production,
+            ..ParamContract::default()
+        };
+        assert_eq!(
+            merge_inputs(Some(&ff), &defaulted)
+                .expect("the push route keeps ff")
+                .route,
+            INTEGRATION_PUBLISH_DEFAULT
         );
     }
 }

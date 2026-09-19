@@ -1277,7 +1277,7 @@ fn owner_frontier_locked(
     let spine: Vec<String> = steps.iter().map(|(id, _)| id.clone()).collect();
     let recorded: Vec<(String, String)> = attempts
         .into_iter()
-        .map(|(step, status, _)| (step, status))
+        .map(|(step, status, _, _)| (step, status))
         .collect();
     let step = crate::run_control::frontier_of(&spine, &recorded, &current_node);
     let kind = step
@@ -3858,7 +3858,7 @@ impl State {
         let attempts = self.run_step_attempts_with_codes(&conn, instance_id)?;
         let diagnosed = attempts
             .iter()
-            .any(|(step, status, code)| step == step_id && step_attempt_diagnosed(status, code));
+            .any(|(step, status, code, _)| step == step_id && step_attempt_diagnosed(status, code));
         if !diagnosed {
             return Ok(RunRetryClaim::NotRequired);
         }
@@ -11964,6 +11964,22 @@ pub struct QueueItemRef {
     pub status: String,
 }
 
+/// One recorded non-succeeded step attempt with the RAW message the effect
+/// recorded (issue #219). Read-only: exactly the durable outcome's own
+/// `error` block, never a re-derivation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StepFailure {
+    /// The step id the attempt belongs to.
+    pub step: String,
+    /// The recorded attempt status (`failed` | `refused` | `ambiguous` | ...).
+    pub status: String,
+    /// The recorded typed code.
+    pub code: String,
+    /// The recorded message — the underlying diagnostics (git/gh stderr
+    /// included), redacted at the boundary like every other recorded text.
+    pub message: String,
+}
+
 /// The recorded evidence snapshot of one supervised run: exactly the facts a
 /// classification reads, re-read from durable rows under ONE guard. Nothing
 /// here is inferred from activity or from the caller.
@@ -11990,6 +12006,11 @@ pub struct SupervisionEvidence {
     pub reviewer_leg_steps: Vec<String>,
     /// Recorded step attempts as `(step, status, error code)` in claim order.
     pub attempts: Vec<(String, String, String)>,
+    /// The newest recorded NON-succeeded attempt with its RAW recorded message
+    /// (issue #219), when one stands: the read-back an operator uses to see
+    /// WHY a step failed without a daemon log. `None` when the newest recorded
+    /// attempt succeeded, or when the run has no recorded attempt.
+    pub last_failure: Option<StepFailure>,
     /// Every durable retry authorization of the run (the retry cursor and
     /// its timing and the dispatch key that consumed each authorization).
     pub retries: Vec<RunRetryRow>,
@@ -12632,8 +12653,8 @@ fn delivery_completes_run(
     Ok(owed.iter().all(|step| {
         attempts
             .iter()
-            .rfind(|(id, _, _)| id == step)
-            .is_some_and(|(_, status, _)| status == "succeeded")
+            .rfind(|(id, _, _, _)| id == step)
+            .is_some_and(|(_, status, _, _)| status == "succeeded")
     }))
 }
 
@@ -13481,7 +13502,24 @@ impl State {
             );
         }
         drop(statement);
-        let attempts = self.run_step_attempts_with_codes(&conn, instance_id)?;
+        let attempts_with_messages = self.run_step_attempts_with_codes(&conn, instance_id)?;
+        // Issue #219: the newest recorded NON-succeeded attempt's raw message
+        // is read back with the same rows the classification reads, so an
+        // operator sees WHY the frontier is parked (a rejected push, a refused
+        // merge, a missing credential) from `supervision status` alone.
+        let last_failure = attempts_with_messages
+            .last()
+            .filter(|(_, status, _, _)| status != "succeeded")
+            .map(|(step, status, code, message)| StepFailure {
+                step: step.clone(),
+                status: status.clone(),
+                code: code.clone(),
+                message: message.clone(),
+            });
+        let attempts: Vec<(String, String, String)> = attempts_with_messages
+            .into_iter()
+            .map(|(step, status, code, _)| (step, status, code))
+            .collect();
         let mut statement = conn
             .prepare(
                 "SELECT evidence_id, verdict, created_at FROM evidence
@@ -13547,6 +13585,7 @@ impl State {
             steps,
             reviewer_leg_steps,
             attempts,
+            last_failure,
             retries,
             verdicts,
             in_flight,
@@ -13557,15 +13596,20 @@ impl State {
         }))
     }
 
-    /// Recorded step attempts of one run as `(step, status, error code)` in
-    /// claim order, read on the caller's guard. Never inferred: an unreadable
-    /// outcome is skipped, and an attempt without a recorded outcome is not
-    /// an attempt yet (the claim is still in flight).
+    /// Recorded step attempts of one run as `(step, status, error code,
+    /// error message)` in claim order, read on the caller's guard. Never
+    /// inferred: an unreadable outcome is skipped, and an attempt without a
+    /// recorded outcome is not an attempt yet (the claim is still in flight).
+    ///
+    /// The MESSAGE is the raw one the effect recorded (issue #219): the
+    /// durable outcome carries the underlying diagnostics (git/gh stderr
+    /// included), so an operator can read WHY a step failed back read-only
+    /// instead of being left with a bare code.
     fn run_step_attempts_with_codes(
         &self,
         conn: &Connection,
         instance_id: &str,
-    ) -> Result<Vec<(String, String, String)>, StateError> {
+    ) -> Result<Vec<(String, String, String, String)>, StateError> {
         let mut statement = conn
             .prepare(
                 "SELECT method, request_line, outcome FROM idempotency
@@ -13618,9 +13662,44 @@ impl State {
                 .and_then(Val::as_str)
                 .unwrap_or("")
                 .to_string();
-            out.push((step, status, code));
+            let message = outcome
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Val::as_str)
+                .unwrap_or("")
+                .to_string();
+            out.push((step, status, code, message));
         }
         Ok(out)
+    }
+
+    /// The newest recorded NON-succeeded step attempt of one run, with the raw
+    /// message the effect recorded (issue #219): the durable outcome's own
+    /// code + message, so the run's read-back surfaces WHY the step failed —
+    /// the measured defect was a failed effect whose reason existed nowhere an
+    /// operator could read (`audit`/`events`/`run status`/`supervision status`
+    /// all carried only the bare code, and both daemon logs were empty).
+    ///
+    /// `None` when the newest recorded attempt succeeded (the run has no
+    /// standing failure to report) or when the run has no recorded attempt.
+    pub fn run_step_failure(&self, instance_id: &str) -> Result<Option<StepFailure>, StateError> {
+        let conn = self.lock("run_step_failure")?;
+        let attempts = self.run_step_attempts_with_codes(&conn, instance_id)?;
+        Ok(attempts
+            .into_iter()
+            .next_back()
+            .and_then(|(step, status, code, message)| {
+                if status == "succeeded" {
+                    None
+                } else {
+                    Some(StepFailure {
+                        step,
+                        status,
+                        code,
+                        message,
+                    })
+                }
+            }))
     }
 
     /// Record ONE refused continuation dispatch of a supervised run (issue
