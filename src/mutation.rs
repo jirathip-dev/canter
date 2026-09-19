@@ -193,6 +193,12 @@ pub mod code {
     /// The bounded wait for the reviewer's own written verdict expired
     /// (issue #193): a typed outcome, never an unbounded poll.
     pub const REVIEW_TIMEOUT: &str = "effect.review_timeout";
+    /// The engine's OWN record of a proven review-prompt delivery is
+    /// unreadable, ill-formed, or not durably writable (issue #214). Fail
+    /// closed: a re-dispatch never re-prompts a leg it may already have
+    /// delivered to on a guess, and a proven delivery that cannot be
+    /// recorded is refused rather than silently re-delivered.
+    pub const REVIEW_DELIVERY: &str = "refusal.evidence.review_delivery";
     /// Issue closure attempted before merge + post-merge verification.
     pub const CLOSURE_PREMATURE: &str = "refusal.closure.premature";
     /// Cleanup refused a dirty worktree.
@@ -3466,6 +3472,223 @@ pub fn review_verdict_path(
     review_root.join(format!("{}-{step_id}.json", implementer.session_id))
 }
 
+/// The absolute path of the engine's OWN review-delivery record for one
+/// run's review step (issue #214): beside the verdict artifact, in the same
+/// daemon-owned review root, keyed by the same run session and step — so a
+/// re-dispatch of the SAME step is the only reader that can ever match it.
+pub fn review_delivery_receipt_path(
+    review_root: &Path,
+    implementer: &crate::adapters::SessionHandle,
+    step_id: &str,
+) -> PathBuf {
+    review_root.join(format!(
+        "{}-{step_id}.delivery.json",
+        implementer.session_id
+    ))
+}
+
+/// The engine's OWN durable record that one review prompt was PROVEN
+/// delivered to one reviewer leg for one certified head (issue #214).
+///
+/// The reviewer leg's identity, its lane checkout and the verdict path are
+/// all DERIVED, so every dispatch of the step addresses the SAME leg: an
+/// attempt that finds this record knows that leg already carries the review
+/// brief. The record is written only after a delivery the adapter proved
+/// (kick + the agent's own read-back, the #148 discipline), so trusting it
+/// is trusting a proof, never a spawn: a lane that is up but was never
+/// proven prompted has no record and is prompted (and proven) as before.
+///
+/// Re-delivering to a leg that already has the brief is what the measured
+/// p6-132 wall was made of (`run-1d4806c802c1088c`): the second attempt's
+/// prompt could not be taken inside the bounded delivery window while the
+/// reviewer's first turn was still running, so the engine reported the
+/// PROMPTED leg as `refusal.prompt.undelivered` and never consumed the
+/// verdict that leg went on to write. A record that does not name THIS
+/// attempt's certified head and reviewer lane (a fresh lane, a reclaimed
+/// leg, a moved head) is never trusted: that attempt re-delivers and
+/// re-proves, and a delivery that cannot be recorded is refused fail-closed
+/// rather than re-delivered on a guess.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewDelivery {
+    /// The certified reviewed head the delivered prompt asked to review.
+    pub feature_head: String,
+    /// The reviewer lane session the prompt was proven delivered to.
+    pub reviewer_lane: String,
+    /// The Herdr agent the delivery's read-back was verified against (empty
+    /// on the bare-subprocess substrate, which has no pane agent).
+    pub reviewer_agent: String,
+    /// The pane the delivering submission was verified in (empty on the
+    /// bare-subprocess substrate, which has no pane).
+    pub pane: String,
+    /// The submission attempts the PROVEN delivery took (the adapter's own
+    /// count of rows that submitted for it).
+    pub delivery_attempts: i64,
+}
+
+impl ReviewDelivery {
+    fn to_doc(&self) -> Val {
+        object(vec![
+            ("schema", string("hf-review-delivery/v1")),
+            ("feature_head", string(&self.feature_head)),
+            ("reviewer_lane", string(&self.reviewer_lane)),
+            ("reviewer_agent", string(&self.reviewer_agent)),
+            ("pane", string(&self.pane)),
+            ("delivery_attempts", integer(self.delivery_attempts)),
+        ])
+    }
+
+    /// Whether this record is the delivery of THIS attempt's certified head
+    /// to THIS attempt's reviewer lane. Anything else (a moved head, another
+    /// lane round, a reclaimed leg) is not proof for this dispatch.
+    fn matches(&self, feature_head: &str, reviewer_lane: &str) -> bool {
+        self.feature_head == feature_head && self.reviewer_lane == reviewer_lane
+    }
+
+    /// Read the record at `path`. `Ok(None)` when no record exists; a record
+    /// that EXISTS but does not carry its bindings is refused fail-closed —
+    /// the engine never guesses whether a delivery belongs to this step, and
+    /// it never re-prompts a leg it may already have delivered to.
+    fn read(path: &Path) -> Result<Option<ReviewDelivery>, EffectOutcome> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(refusal(
+                    code::REVIEW_DELIVERY,
+                    format!(
+                        "the review delivery record {:?} is unreadable: {err}; the engine never \
+                         guesses whether this step's reviewer was already prompted",
+                        path.display()
+                    ),
+                ));
+            }
+        };
+        let doc = Val::parse_json(&text).map_err(|err| {
+            refusal(
+                code::REVIEW_DELIVERY,
+                format!(
+                    "the review delivery record {:?} is not JSON: {err}",
+                    path.display()
+                ),
+            )
+        })?;
+        if doc.get("schema").and_then(Val::as_str) != Some("hf-review-delivery/v1") {
+            return Err(refusal(
+                code::REVIEW_DELIVERY,
+                format!(
+                    "the review delivery record {:?} schema must be \"hf-review-delivery/v1\"",
+                    path.display()
+                ),
+            ));
+        }
+        let field = |key: &str| -> Result<String, EffectOutcome> {
+            doc.get(key)
+                .and_then(Val::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    refusal(
+                        code::REVIEW_DELIVERY,
+                        format!(
+                            "the review delivery record {:?} carries no string {key:?}",
+                            path.display()
+                        ),
+                    )
+                })
+        };
+        let attempts = doc
+            .get("delivery_attempts")
+            .and_then(Val::as_int)
+            .filter(|attempts| *attempts >= 1)
+            .ok_or_else(|| {
+                refusal(
+                    code::REVIEW_DELIVERY,
+                    format!(
+                        "the review delivery record {:?} must carry a positive \
+                         delivery_attempts count",
+                        path.display()
+                    ),
+                )
+            })?;
+        Ok(Some(ReviewDelivery {
+            feature_head: field("feature_head")?,
+            reviewer_lane: field("reviewer_lane")?,
+            reviewer_agent: field("reviewer_agent")?,
+            pane: field("pane")?,
+            delivery_attempts: attempts,
+        }))
+    }
+
+    /// Durably record the delivery (issue #214). Publish-then-read never
+    /// observes a torn record: the document is written beside the path and
+    /// renamed onto it in one step. A record that cannot land refuses: a
+    /// proven delivery whose proof is lost would be re-delivered by the next
+    /// dispatch, which is exactly the defect this record exists to remove.
+    fn write(&self, path: &Path) -> Result<(), EffectOutcome> {
+        let text = crate::canonical::canonical_text(&self.to_doc());
+        let staged = path.with_extension("tmp");
+        if let Err(err) = std::fs::write(&staged, &text) {
+            return Err(refusal(
+                code::REVIEW_DELIVERY,
+                format!(
+                    "the proven review delivery could not be staged at {:?}: {err}",
+                    staged.display()
+                ),
+            ));
+        }
+        if let Err(err) = std::fs::rename(&staged, path) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(refusal(
+                code::REVIEW_DELIVERY,
+                format!(
+                    "the proven review delivery could not be recorded at {:?}: {err}",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Whether this start REUSED the leg's registered lane (its own generation's
+/// already-registered agent and pane) instead of creating a fresh one. Only
+/// a reused lane is the leg a recorded delivery can belong to: a fresh lane
+/// has never been prompted (issue #214).
+fn started_lane_reused(started: &crate::adapters::OpResult) -> bool {
+    started
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("reused"))
+        .and_then(Val::as_bool)
+        == Some(true)
+}
+
+/// The delivery clause a review timeout's message carries (issue #214
+/// observability): the reviewer lane, its pane, its serving model and the
+/// submission attempts the PROVEN delivery took — so a stuck review is
+/// diagnosable without reading panes, and so the message states exactly
+/// whether the leg was delivered to (and that a re-dispatch re-checks that
+/// same leg's verdict instead of re-prompting it).
+fn review_delivery_clause(delivery: &ReviewDelivery, serving_model: &str) -> String {
+    let mut facts = vec![format!("reviewer lane {:?}", delivery.reviewer_lane)];
+    if !delivery.reviewer_agent.is_empty() {
+        facts.push(format!("agent {:?}", delivery.reviewer_agent));
+    }
+    if !delivery.pane.is_empty() {
+        facts.push(format!("pane {:?}", delivery.pane));
+    }
+    facts.push(format!("serving model {serving_model:?}"));
+    facts.push(format!(
+        "{} submission attempt(s)",
+        delivery.delivery_attempts
+    ));
+    format!(
+        "the review prompt was PROVEN delivered to {} and the delivered leg is left to finish; \
+         a re-dispatch of this step re-checks this same leg's verdict without re-delivering the \
+         prompt",
+        facts.join(", ")
+    )
+}
+
 /// The bounded review brief delivered to the run's own reviewer (issue #193):
 /// the certified head it must review, the observed base, the read-only fence,
 /// and the exact artifact path it must WRITE its verdict to. The engine states
@@ -3870,8 +4093,10 @@ fn review_self_dispatch(
         };
     }
     // The verdict artifact is written by the REVIEWER, never by the engine:
-    // any residue at the path is cleared first, so a stale verdict can never
-    // be consumed as this round's evidence.
+    // any residue at the verdict path is cleared before a prompt, so a stale
+    // verdict can never be consumed as this round's evidence. Beside it the
+    // engine keeps its OWN delivery record (issue #214) — the one durable
+    // fact that tells a re-dispatch this leg already carries the brief.
     let review_root = match ctx.review_root {
         Some(root) => root,
         None => {
@@ -3883,6 +4108,7 @@ fn review_self_dispatch(
         }
     };
     let verdict_path = review_verdict_path(review_root, implementer, ctx.step_id);
+    let receipt_path = review_delivery_receipt_path(review_root, implementer, ctx.step_id);
     if let Err(err) = std::fs::create_dir_all(review_root) {
         return refusal(
             code::REVIEWER_UNBOUND,
@@ -3892,36 +4118,100 @@ fn review_self_dispatch(
             ),
         );
     }
-    match std::fs::remove_file(&verdict_path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return refusal(
-                code::REVIEWER_UNBOUND,
-                format!(
-                    "the verdict path {:?} carries residue that cannot be cleared: {err}",
-                    verdict_path.display()
-                ),
-            );
-        }
-    }
-    let payload = review_brief(inputs, leg, &verdict_path);
-    let request = crate::adapters::OpRequest {
-        op: crate::adapters::Op::Prompt,
-        session: &reviewer,
-        payload: Some(&payload),
-        timeout: Duration::from_secs(deadline),
+    let recorded = match ReviewDelivery::read(&receipt_path) {
+        Ok(recorded) => recorded,
+        Err(outcome) => return outcome,
     };
-    let delivered = crate::adapters::execute_op_in_worktree(&profile, &request, ctx.env, &cwd);
-    if delivered.status != "succeeded" {
-        return EffectOutcome {
-            status: delivered.status,
-            code: delivered.code.map(str::to_string),
-            message: delivered.message,
-            result: null(),
-        };
-    }
-    let written = match await_written_verdict(&verdict_path, Duration::from_secs(deadline)) {
+    // A PROVEN delivery recorded for THIS certified head and THIS reviewer
+    // lane, on a lane this dispatch REUSED, IS the leg that is already
+    // running the review: the delivery discipline is satisfied by that
+    // proof, and re-delivering would both throw away the turn the reviewer
+    // is running and — whenever an in-flight turn cannot take a second
+    // submission inside the bounded delivery window — report the PROMPTED
+    // leg as `refusal.prompt.undelivered` (the measured p6-132 sequence:
+    // `effect.review_timeout`, then two `refusal.prompt.undelivered`, while
+    // the reviewer was working). The bare-subprocess substrate has no
+    // asynchronous leg — its prompt IS the reviewer's run — so it always
+    // re-delivers, unchanged.
+    let delivery = match (leg.execution, recorded) {
+        (crate::adapters::ExecutionMode::HerdrPane, Some(recorded))
+            if started_lane_reused(&started)
+                && recorded.matches(&inputs.feature_head, &reviewer.session_id) =>
+        {
+            recorded
+        }
+        _ => {
+            match std::fs::remove_file(&verdict_path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return refusal(
+                        code::REVIEWER_UNBOUND,
+                        format!(
+                            "the verdict path {:?} carries residue that cannot be cleared: {err}",
+                            verdict_path.display()
+                        ),
+                    );
+                }
+            }
+            let payload = review_brief(inputs, leg, &verdict_path);
+            let request = crate::adapters::OpRequest {
+                op: crate::adapters::Op::Prompt,
+                session: &reviewer,
+                payload: Some(&payload),
+                timeout: Duration::from_secs(deadline),
+            };
+            let delivered =
+                crate::adapters::execute_op_in_worktree(&profile, &request, ctx.env, &cwd);
+            if delivered.status != "succeeded" {
+                return EffectOutcome {
+                    status: delivered.status,
+                    code: delivered.code.map(str::to_string),
+                    message: delivered.message,
+                    result: null(),
+                };
+            }
+            // The delivered leg's own verified identity — the agent, the
+            // pane and the submission attempts the adapter proved — is the
+            // record a re-dispatch reads back. Only the pane substrate has a
+            // leg to resume; the bare-subprocess substrate never reads it.
+            let recorded = ReviewDelivery {
+                feature_head: inputs.feature_head.clone(),
+                reviewer_lane: reviewer.session_id.clone(),
+                reviewer_agent: delivered
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("agent"))
+                    .and_then(Val::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                pane: delivered
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("pane"))
+                    .and_then(Val::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                delivery_attempts: delivered
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload.get("attempts"))
+                    .and_then(Val::as_int)
+                    .unwrap_or(1),
+            };
+            if leg.execution == crate::adapters::ExecutionMode::HerdrPane
+                && let Err(outcome) = recorded.write(&receipt_path)
+            {
+                return outcome;
+            }
+            recorded
+        }
+    };
+    let written = match await_written_verdict(
+        &verdict_path,
+        Duration::from_secs(deadline),
+        &review_delivery_clause(&delivery, &leg.profile.model),
+    ) {
         Ok(text) => text,
         Err(outcome) => return outcome,
     };
@@ -3937,6 +4227,16 @@ fn review_self_dispatch(
     // and the reclaim/cleanup receipts) is recorded too (issue #210): the lane
     // exists FOR the review, so a consumed review removes it — a refused
     // removal is recorded verbatim and the residue stays reclaimable.
+    //
+    // Issue #214 observability: the outcome also names the reviewer's pane,
+    // its SERVING model (the registry-resolved binding the reviewed plan
+    // bound and the leg is launched with — the adapter read-backs carry no
+    // model footer, so this is the recorded resolution, never an observation)
+    // and the delivery attempt count of the PROVEN prompt delivery — so the
+    // disposition of a stuck or resumed review leg is diagnosable from the
+    // recorded step outcome without reading panes. A delivery recorded by an
+    // EARLIER attempt of this step carries its own verified identity and
+    // count forward (the resumed leg is never re-prompted).
     let reviewer_lane_cleanup = match leg.execution {
         crate::adapters::ExecutionMode::Headless => None,
         crate::adapters::ExecutionMode::HerdrPane => {
@@ -3953,6 +4253,16 @@ fn review_self_dispatch(
         ("checks", facts.checks),
         ("reviewer_profile", leg.profile.to_doc()),
         ("reviewer_lane", string(&reviewer.session_id)),
+        (
+            "reviewer_pane",
+            if delivery.pane.is_empty() {
+                null()
+            } else {
+                string(&delivery.pane)
+            },
+        ),
+        ("serving_model", string(&leg.profile.model)),
+        ("delivery_attempts", integer(delivery.delivery_attempts)),
         ("reviewer_workspace", string(&names.workspace)),
         ("reviewer_worktree", string(&worktree.to_string_lossy())),
         ("verdict_path", string(&verdict_path.to_string_lossy())),
@@ -4128,7 +4438,19 @@ fn review_verdict_facts(
 /// artifact that is not yet PARSEABLE JSON is waited out rather than refused,
 /// because a partially written file is indistinguishable from a malformed one
 /// (the #186 lesson: publish-then-read must wait for parseable content).
-fn await_written_verdict(path: &Path, deadline: Duration) -> Result<String, EffectOutcome> {
+///
+/// The timeout outcome's message carries the delivery clause of the attempt
+/// that reached this wait (issue #214): the reviewer lane, its pane, its
+/// serving model and the submission attempts the PROVEN delivery took, plus
+/// the fact that a re-dispatch re-checks this same leg instead of
+/// re-delivering — a stuck review is diagnosable from the recorded outcome
+/// alone (the durable `hf-outcome/v1` for an ambiguous effect drops the
+/// `result`, so the message is where it must ride).
+fn await_written_verdict(
+    path: &Path,
+    deadline: Duration,
+    delivery: &str,
+) -> Result<String, EffectOutcome> {
     let started = Instant::now();
     let interval = Duration::from_millis(50);
     loop {
@@ -4154,8 +4476,8 @@ fn await_written_verdict(path: &Path, deadline: Duration) -> Result<String, Effe
                 status: "ambiguous",
                 code: Some(code::REVIEW_TIMEOUT.to_string()),
                 message: Some(format!(
-                    "the reviewer wrote no verdict at {:?} within {deadline:?}; the review step \
-                     stays parked and nothing is synthesised",
+                    "the reviewer wrote no verdict at {:?} within {deadline:?}; {delivery}; \
+                     nothing is synthesised",
                     path.display()
                 )),
                 result: null(),
