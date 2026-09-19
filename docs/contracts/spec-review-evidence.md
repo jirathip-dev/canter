@@ -123,6 +123,51 @@ The leg runs, in order:
    `effect.review_timeout` (ambiguous, parked), and the engine only ever READS
    that path.
 
+**Proven delivery, recorded — a re-dispatch resumes, never re-delivers
+(issue #214).** The pane-substrate prompt reports success only through the
+#148 discipline (the agent's own read-back shows the task arrived AND its
+lifecycle moved), and a delivery PROVEN that way is recorded by the engine
+beside the verdict artifact as one `hf-review-delivery/v1` document
+(`<state>/reviews/<lane session>-<step id>.delivery.json`): the certified
+head, the reviewer lane, the adapter-verified agent and pane, and the
+submission attempt count. Every dispatch of the step addresses the SAME
+derived leg (the lane identity, its checkout and the verdict path are all
+derived, issue #210), so when a re-dispatch REUSES that leg's registered lane
+and finds the record bound to THIS certified head and THIS reviewer lane, the
+delivery is never repeated: the attempt resumes the bounded verdict wait. The
+duplicate delivery is exactly what the measured chain was made of
+(`run-1d4806c802c1088c`, p6-132): while the reviewer's turn was running the
+substrate could not take a second submission inside the prompt's bounded
+delivery window, so the re-attempts reported the PROMPTED leg as
+`refusal.prompt.undelivered` while the reviewer went on to write its PASS
+verdict — and the late verdict was cleared before the next prompt instead of
+being consumed. In the shipped shape:
+
+- a leg that is up but UNPROMPTED has no record and is prompted (and proven)
+  as before — a start alone is never a delivery;
+- a record that does not name this attempt's certified head and reviewer lane
+  (a fresh lane, a reclaimed leg, a moved head) is never trusted: that attempt
+  re-delivers and re-proves;
+- the residue clear runs only before a delivery, so a verdict already at the
+  path is consumed by the resumed wait (and validated exactly as any written
+  verdict — `verdict_stale`/`verdict_malformed`/`verdict_pending` refuse it);
+- a delivery record that EXISTS but cannot be read refuses
+  `refusal.evidence.review_delivery` fail-closed, and a proven delivery that
+  cannot be recorded refuses the same way instead of being delivered again on
+  a guess;
+- the bare-subprocess substrate has no asynchronous leg (its prompt IS the
+  reviewer's run), so it always re-delivers and never reads a record.
+
+The recorded step outcome names the reviewer lane, its pane, its SERVING
+model (the registry-resolved binding the reviewed plan bound and the leg is
+launched with — the adapter read-backs carry no model footer, so this is the
+recorded resolution, never an observation) and the delivery attempt count; the
+ambiguous `effect.review_timeout` outcome carries the same facts in its
+message, because the durable `hf-outcome/v1` of a non-succeeded effect carries
+no `result` ([spec-plans.md](spec-plans.md), "Typed outcomes"). So a stuck or
+resumed review leg is diagnosable — and honourably re-driven by the run's own
+bounded retries — from the recorded outcomes alone.
+
 The written verdict must name the exact reviewed sha (`feature_head`), the
 observed `integration_base` when it names one, a closed `verdict`
 (`pass`|`fail`) and a non-empty `checks` list whose statuses are explicit

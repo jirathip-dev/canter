@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 use canter::adapters::{LaneNames, SessionHandle};
 use canter::config::ProfileBinding;
 use canter::mutation::{
-    EffectContext, PlanBindings, bind_plan, execute_step, review_verdict_path,
-    reviewer_session_handle, run_session_handle,
+    EffectContext, PlanBindings, bind_plan, execute_step, review_delivery_receipt_path,
+    review_verdict_path, reviewer_session_handle, run_session_handle,
 };
 use canter::value::{Val, integer, object, string};
 
@@ -681,11 +681,33 @@ case "$1 $2" in
   "agent prompt")
     log "$*"
     id=$(id_of_agent "$3")
+    # Issue #214: an agent whose turn is still running cannot take a second
+    # submission — the row reports the substrate's own bounded wait
+    # (`agent_prompt_stalled`, a closed transient code) and nothing arrives.
+    if [ -f "$STATE/$id.state" ] && [ "$(cat "$STATE/$id.state")" = "working" ]; then
+      printf '{"error":{"code":"agent_prompt_stalled","message":"the pending turn has not settled"}}\n' >&2
+      exit 1
+    fi
+    # A `no-take` fixture (the #148 round-1 shape): the text reaches the pane
+    # but the agent's own lifecycle never moves — the submission was never
+    # taken, so the delivery must never be proven from the text alone.
+    if [ -f "$STATE/no-take" ]; then
+      printf '%s' "$4" > "$STATE/$id.content"
+      printf '{"id":"cli:agent:prompt","result":{"agent_status":"idle","submitted":true},"type":"agent_prompt"}\n'
+      exit 0
+    fi
     printf '%s' "$4" > "$STATE/$id.content"
-    printf 'done' > "$STATE/$id.state"
+    # A long-turn fixture (`long-turns` marker) keeps the agent working, so
+    # the reviewer's turn outlives one attempt's verdict wait.
+    if [ -f "$STATE/long-turns" ]; then
+      printf 'working' > "$STATE/$id.state"
+    else
+      printf 'done' > "$STATE/$id.state"
+    fi
     printf '%s' "$(( $(cat "$STATE/$id.seq") + 1 ))" > "$STATE/$id.seq"
     printf 'prompted' > "$STATE/$id.prompted"
-    printf '{"id":"cli:agent:prompt","result":{"agent_status":"done","submitted":true},"type":"agent_prompt"}\n'
+    printf '{"id":"cli:agent:prompt","result":{"agent_status":"%s","submitted":true},"type":"agent_prompt"}\n' \
+      "$(cat "$STATE/$id.state")"
     ;;
   "agent read")
     log "$*"
@@ -1281,5 +1303,272 @@ fn a_retired_generations_reviewer_lane_is_reclaimed_while_a_live_one_is_never_ad
     assert!(
         live.reviewer_lane.is_dir(),
         "the live checkout is preserved"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #214: the reviewer leg's PROVEN delivery across attempts
+// ---------------------------------------------------------------------------
+
+/// The number of prompt-delivery rows the fake substrate recorded — ONE
+/// proven delivery per prompt, and never a second one for the same leg.
+fn prompt_rows(fixture: &LaneFixture) -> usize {
+    fixture
+        .rows()
+        .iter()
+        .filter(|row| row.starts_with("agent prompt "))
+        .count()
+}
+
+/// W1 + W4 (issue #214): the reviewer's first turn outlives the attempt's
+/// bounded verdict wait — the exact p6-132 shape. The prompt was PROVEN
+/// delivered to the run's own reviewer lane; the run's own bounded re-attempt
+/// of the SAME step (same derived leg, same certified head) must NOT re-deliver
+/// the prompt — while the turn is running the substrate cannot take a second
+/// submission, which is the measured `refusal.prompt.undelivered` chain — and
+/// must CONSUME the verdict the leg writes after the first wait, with no
+/// operator dispatch involved. W4: both outcomes carry the reviewer lane, its
+/// pane, its serving model and the delivery attempt count.
+#[test]
+fn a_re_attempted_review_step_consumes_the_late_verdict_without_re_prompting_the_leg() {
+    let fixture = LaneFixture::new("late-verdict");
+    fixture.seed_run_lane();
+    // The reviewer's turn does not settle inside one attempt's wait.
+    std::fs::write(fixture.state.join("long-turns"), "").expect("the reviewer is mid-turn");
+    let params = lane_review_params(&format!("issues-{ISSUE}-rev1"), 1);
+    let plan = plan_with_review_step(params.clone());
+    let reviewer = reviewer_session_handle(&fixture.session, 1).expect("the reviewer session");
+    let verdict_path = review_verdict_path(&fixture.review_root, &fixture.session, STEP);
+
+    // Attempt 1: the prompt is PROVEN delivered (the agent took it), the
+    // verdict has not been written yet.
+    let first = run_lane_review_step(&fixture, &plan, &params, &[]);
+    assert_eq!(first.status, "ambiguous", "{first:?}");
+    assert_eq!(
+        first.code.as_deref(),
+        Some(canter::mutation::code::REVIEW_TIMEOUT)
+    );
+    assert_eq!(
+        prompt_rows(&fixture),
+        1,
+        "the first attempt delivered the review prompt: {:?}",
+        fixture.rows()
+    );
+    // The engine's own delivery record names THIS leg for THIS certified
+    // head: the proof the re-attempt reads back instead of re-delivering.
+    let receipt_path = review_delivery_receipt_path(&fixture.review_root, &fixture.session, STEP);
+    let receipt = canter::value::Val::parse_json(
+        &std::fs::read_to_string(&receipt_path).expect("the delivery is recorded"),
+    )
+    .expect("the record parses");
+    assert_eq!(
+        receipt.get("schema").and_then(Val::as_str),
+        Some("hf-review-delivery/v1")
+    );
+    assert_eq!(
+        receipt.get("feature_head").and_then(Val::as_str),
+        Some(fixture.head.as_str())
+    );
+    assert_eq!(
+        receipt.get("reviewer_lane").and_then(Val::as_str),
+        Some(reviewer.session_id.as_str()),
+        "the record names the derived reviewer lane"
+    );
+    assert_eq!(
+        receipt.get("pane").and_then(Val::as_str),
+        Some("w1:p1"),
+        "the record names the pane the submission was verified in"
+    );
+    assert_eq!(
+        receipt.get("delivery_attempts").and_then(Val::as_int),
+        Some(1)
+    );
+    // W4 for the STUCK leg: the timeout outcome itself is diagnosable —
+    // reviewer lane, pane, serving model and delivery attempt count.
+    let message = first.message.clone().unwrap_or_default();
+    assert!(
+        message.contains(&reviewer.session_id)
+            && message.contains("w1:p1")
+            && message.contains(REVIEWER_MODEL)
+            && message.contains("1 submission attempt(s)"),
+        "the timeout records the reviewer identity, pane, serving model and attempt count: {message}"
+    );
+
+    // The reviewer's own late write — after attempt 1's bounded wait.
+    std::fs::write(&verdict_path, passing_verdict(&fixture)).expect("the reviewer writes");
+
+    // The run's own bounded re-attempt of the SAME step.
+    let second = run_lane_review_step(&fixture, &plan, &params, &[]);
+    assert_eq!(second.status, "succeeded", "{second:?}");
+    let result = &second.result;
+    assert_eq!(
+        result.get("feature_head").and_then(Val::as_str),
+        Some(fixture.head.as_str())
+    );
+    assert_eq!(result.get("verdict").and_then(Val::as_str), Some("pass"));
+    assert_eq!(
+        result.get("reviewer_lane").and_then(Val::as_str),
+        Some(reviewer.session_id.as_str()),
+        "the consumed verdict is attributed to the same derived leg"
+    );
+    assert_eq!(
+        result.get("reviewer_pane").and_then(Val::as_str),
+        Some("w1:p1"),
+        "W4: the outcome names the leg's pane"
+    );
+    assert_eq!(
+        result.get("serving_model").and_then(Val::as_str),
+        Some(REVIEWER_MODEL),
+        "W4: the outcome names the serving model the leg was launched with"
+    );
+    assert_eq!(
+        result.get("delivery_attempts").and_then(Val::as_int),
+        Some(1),
+        "W4: the outcome carries the proven delivery's attempt count"
+    );
+    // The re-attempt never re-delivered: one prompt row, one agent start.
+    assert_eq!(
+        prompt_rows(&fixture),
+        1,
+        "the delivered leg is never re-prompted: {:?}",
+        fixture.rows()
+    );
+    assert_eq!(
+        fixture
+            .rows()
+            .iter()
+            .filter(|row| row.starts_with("agent start "))
+            .count(),
+        1,
+        "the same leg is reused, never re-started: {:?}",
+        fixture.rows()
+    );
+    // The consumed review runs its lane cleanup; the reviewer's turn is still
+    // RUNNING, so the close is refused with the substrate's own reason and
+    // recorded without forcing: the lane stays reclaimable residue (issue
+    // #210, unchanged — a live turn's workspace is never closed).
+    let cleanup = second
+        .result
+        .get("reviewer_lane_cleanup")
+        .expect("the lane cleanup receipt");
+    assert_eq!(
+        cleanup
+            .get("workspace")
+            .and_then(|workspace| workspace.get("closed"))
+            .and_then(Val::as_bool),
+        Some(false),
+        "an unfinished reviewer turn is never closed: {cleanup:?}"
+    );
+    let reason = cleanup
+        .get("workspace")
+        .and_then(|workspace| workspace.get("message"))
+        .and_then(Val::as_str)
+        .unwrap_or_default();
+    assert!(
+        reason.contains("still working"),
+        "the recorded refusal names the live turn: {reason}"
+    );
+    assert!(
+        fixture.reviewer_lane.is_dir(),
+        "the unfinished turn's checkout is preserved, never forced"
+    );
+    assert_eq!(
+        fixture.workspace_ids(),
+        vec!["E1".to_string(), "w1".to_string()],
+        "the run's lane and the preserved reviewer lane are the only registrations"
+    );
+}
+
+/// W3 (issue #214): an ambiguous review timeout must resolve bounded and
+/// typed. Re-attempting the same step against the SAME live, PROVEN-prompted
+/// leg yields the same typed timeout again — never the terminal
+/// `refusal.prompt.undelivered` the measured chain produced at p6-132 when
+/// the second attempt tried to re-deliver into a running turn.
+#[test]
+fn an_ambiguous_review_timeout_never_resolves_into_a_terminal_prompt_refusal() {
+    let fixture = LaneFixture::new("timeout-chain");
+    fixture.seed_run_lane();
+    std::fs::write(fixture.state.join("long-turns"), "").expect("the reviewer is mid-turn");
+    let params = lane_review_params(&format!("issues-{ISSUE}-rev1"), 1);
+    let plan = plan_with_review_step(params.clone());
+    let reviewer = reviewer_session_handle(&fixture.session, 1).expect("the reviewer session");
+
+    let first = run_lane_review_step(&fixture, &plan, &params, &[]);
+    assert_eq!(first.status, "ambiguous", "{first:?}");
+    assert_eq!(
+        first.code.as_deref(),
+        Some(canter::mutation::code::REVIEW_TIMEOUT)
+    );
+    let second = run_lane_review_step(&fixture, &plan, &params, &[]);
+    assert_eq!(
+        second.status, "ambiguous",
+        "the re-attempt stays a typed wait, never a terminal refusal: {second:?}"
+    );
+    assert_eq!(
+        second.code.as_deref(),
+        Some(canter::mutation::code::REVIEW_TIMEOUT)
+    );
+    assert_ne!(
+        second.code.as_deref(),
+        Some(canter::adapters::CODE_PROMPT_UNDELIVERED),
+        "a leg that is up and PROVEN prompted is never reported as undelivered"
+    );
+    assert_eq!(
+        prompt_rows(&fixture),
+        1,
+        "the proven delivery is not repeated by the re-attempt: {:?}",
+        fixture.rows()
+    );
+    let message = second.message.clone().unwrap_or_default();
+    assert!(
+        message.contains(&reviewer.session_id)
+            && message.contains("w1:p1")
+            && message.contains(REVIEWER_MODEL),
+        "the typed wait still names the reviewer lane, pane and serving model: {message}"
+    );
+    // The delivery record is what the re-attempt reads; it is still there and
+    // still bound to this step's head and leg.
+    assert!(
+        review_delivery_receipt_path(&fixture.review_root, &fixture.session, STEP).exists(),
+        "the proven delivery stays on record for the next re-attempt"
+    );
+}
+
+/// W2 (issue #214, negative): the delivery proof is the #148 pair — the task
+/// text reached the agent AND the agent's own lifecycle moved to take it. A
+/// row whose text reached the pane while the agent never took it must NOT
+/// count as a delivered review prompt: the review step refuses
+/// `refusal.prompt.undelivered`, records no delivery, and never advances to a
+/// verdict wait. Neutering the proof (accepting the text alone — the #148
+/// round-1 defect) makes this witness FAIL, because the step would then pass
+/// the unprompted leg off as delivered.
+#[test]
+fn a_review_row_the_agent_never_took_is_never_a_proven_delivery() {
+    let fixture = LaneFixture::new("no-take");
+    fixture.seed_run_lane();
+    std::fs::write(fixture.state.join("no-take"), "").expect("the agent never takes");
+    let params = lane_review_params(&format!("issues-{ISSUE}-rev1"), 1);
+    let plan = plan_with_review_step(params.clone());
+
+    let outcome = run_lane_review_step(&fixture, &plan, &params, &[]);
+    assert_eq!(outcome.status, "refused", "{outcome:?}");
+    assert_eq!(
+        outcome.code.as_deref(),
+        Some(canter::adapters::CODE_PROMPT_UNDELIVERED),
+        "an untaken submission is never a delivery: {outcome:?}"
+    );
+    assert_eq!(
+        prompt_rows(&fixture),
+        1,
+        "the row ran and was judged, not retried blindly: {:?}",
+        fixture.rows()
+    );
+    assert!(
+        !review_delivery_receipt_path(&fixture.review_root, &fixture.session, STEP).exists(),
+        "a delivery that was never proven is never recorded"
+    );
+    assert!(
+        !review_verdict_path(&fixture.review_root, &fixture.session, STEP).exists(),
+        "the step never advanced to a verdict wait"
     );
 }
