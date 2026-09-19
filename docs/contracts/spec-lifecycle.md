@@ -153,6 +153,18 @@ attestation (`run_control::DispatchParams::admission`), exactly as before.
   pathspec magic are names, not quoting or patterns. Git compares content,
   existence and modes; submodule changes are not ignored. Integration-only
   changes outside the lane's changed paths do not block cleanup.
+- When the local proof refuses `refusal.cleanup.unmerged`, cleanup proves the
+  landing against the **published** integration ref (issue #132): the
+  sanctioned landing happens on the forge, and a remote landing never updates
+  the checkout's own ref. The published head is read from the checkout's
+  `origin` (`git ls-remote`), FETCHED into the checkout's remote-tracking ref
+  and verified against that read; only a checkout **strictly behind** it may
+  certify from this view — a checkout ahead of, or diverged from, the
+  published ref is an unpublished local move and refuses. The same
+  ancestry-or-content fact is then proven against the fetched head, never a
+  weaker one. An unreadable or unverifiable published ref proves nothing and
+  leaves the checkout's own refusal standing; the checkout's ref is never
+  moved.
 - A **partial landing** means at least one changed path differs from the
   lane's final state: an addition is absent/modified, a deletion survives,
   or only one half of a rename landed. It refuses `refusal.cleanup.unmerged`,
@@ -164,8 +176,10 @@ attestation (`run_control::DispatchParams::admission`), exactly as before.
   delta. Git errors/timeouts propagate without deletion.
 - The salvage record names `landed_by: ancestor | content` (the latter also
   records `merge_base`). Cleanup removes the clean worktree then deletes
-  the branch using `-d` for ancestry or `-D` for proven content. Content proof
-  does not establish a forge merge or check the published remote; standalone
+  the branch using `-d` for ancestry or `-D` for proven content; a proof made
+  against the published head deletes with `-D` and also records the
+  `published_head` it was made against. The proof does not itself perform or
+  claim a forge merge (the forge owns the policy merge); standalone
   `branch_delete` remains ancestry-only. Refs #132, #172.
 
 ## 6. Remote transport contract (AC5/AC6, capability C16)
