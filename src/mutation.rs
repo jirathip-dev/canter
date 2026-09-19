@@ -3648,6 +3648,32 @@ fn review_self_dispatch(
         Ok(text) => text,
         Err(outcome) => return outcome,
     };
+    // Issue #207 (b): the reviewed work is fenced for the WHOLE review window.
+    // The lane checkout was AT the certified head when the reviewer started
+    // (checked above); it must STILL be there now, before anything is
+    // recorded. A commit that landed while the review was open moved the
+    // content this run's verdict describes, so that verdict is never
+    // consumed: the step refuses typed and the delivery must re-enter review
+    // — a commit landing mid-review is never a silent consumption of a
+    // delivery that moved under its own review, and the run's recorded
+    // evidence can only ever name a head that was the branch for the whole
+    // window.
+    let settled = match run_git(ctx, &worktree, &["rev-parse", "--verify", "HEAD"]) {
+        Ok(out) => out.stdout.trim().to_string(),
+        Err(outcome) => return outcome,
+    };
+    if settled != inputs.feature_head {
+        return refusal(
+            code::VERDICT_STALE,
+            format!(
+                "the lane checkout moved from the reviewed head {} to {settled} while the \
+                 review was open: the reviewed work is fenced for the whole review window, so \
+                 a commit landing mid-review is never consumed; the delivery must re-enter \
+                 review and a new review must name {settled}",
+                inputs.feature_head
+            ),
+        );
+    }
     let facts = match review_verdict_facts(&written, inputs) {
         Ok(facts) => facts,
         Err(outcome) => return outcome,
