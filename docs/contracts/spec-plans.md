@@ -259,15 +259,16 @@ runs control-plane effects:
   (`harness_start`, `prompt`) may declare `params.execution`, a closed token
   (`herdr` | `headless`):
   - absent ⇒ `herdr`, the product substrate: the role runs inside a Herdr
-    pane registered for the run's linked worktree (`worktree open --cwd … --path …`), the
+    pane registered for the leg's OWN lane checkout (`worktree open --cwd … --path …`), the
     prompt is delivered through `herdr agent prompt`, and observation/
     interruption/terminal outcome are collected through the `herdr agent`
     rows (see [spec-capabilities.md](spec-capabilities.md), "Execution
-    substrates"). The bind step resolves the lane worktree from the reviewed
-    plan: a plan that binds no `worktree` (or more than one, e.g. a
-    multi-issue submission) refuses typed on this substrate and names the
-    explicit fallback instead of creating a pane at a bare cwd or in the
-    wrong lane;
+    substrates"). The bind step resolves that path from the reviewed plan —
+    the leg's lane checkout, derived from `(issue, role, round)` (issue #210;
+    the reviewer leg binds `issues-<N>-rev<R>`, never the implementer lane's
+    checkout) — and a plan that does not bind the leg's own lane refuses typed
+    on this substrate and names the explicit fallback instead of creating a
+    pane at a bare cwd or in a sibling leg's lane;
   - `headless` ⇒ the pre-#139 bare-subprocess row, selected explicitly by the
     reviewed plan. It is never chosen silently, and a Herdr failure never
     falls back to it: the substrate is a step param, so it is bound by the

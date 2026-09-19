@@ -167,6 +167,18 @@ can run with **no harness credentials** (AC7).
     A retry/fix round of the same lane retains its original workspace and
     agent names. Another lane holding the name or checkout refuses
     `refusal.lane.name_collision`; no suffix, rename or adoption is allowed.
+    **Per-leg lane identity (issue #210)**: the same triple derives the leg's
+    lane CHECKOUT (`src/lane.rs`, the ONE derivation): the implementer leg
+    round 1 keeps the run's own lane worktree (`issues-<N>`), and every
+    reviewer leg binds its OWN checkout (`issues-<N>-rev<R>`) — so a run's
+    reviewer can never resolve the checkout its implementer lane holds (the
+    measured `132-rev1`-held-by-`132-impl` collision) and distinct legs derive
+    distinct names AND checkouts by construction. The derivation is visible in
+    the rendered plan (`canter queue preview` renders each lane-binding step's
+    derived `lane`: issue, role, round, agent, workspace, checkout), and a plan
+    that would bind TWO legs to ONE checkout is refused at preview time with
+    the typed `usage.queue_lane_identity` naming both identities — a collision
+    is never first discovered at dispatch time.
     **A retired generation's residue is reclaimed (issue #190)**: a run the
     ledger records as terminal (`invalidated` / `done`) no longer holds its
     issue's ownership, so its lane generation is residue — and the worktree

@@ -820,6 +820,165 @@ fn unsupported_and_unresolved_executable_steps_are_named_holds() {
     assert!(!preview.ready);
 }
 
+// ---------------------------------------------------------------------------
+// Issue #210: per-leg lane identity is unique by construction
+// ---------------------------------------------------------------------------
+
+/// One `review_evidence` step that declares the reviewer leg (issue #193) and
+/// the lane checkout IT binds for that leg (issue #210).
+fn reviewer_leg_step(worktree: &str, execution: &str) -> PlannedStep {
+    let mut binding = ProfileBinding {
+        key: "lane-rev".to_string(),
+        kind: "hermes".to_string(),
+        provider: "provider-rev".to_string(),
+        model: "model-rev".to_string(),
+        fallbacks: Vec::new(),
+        configured_limits: Vec::new(),
+        introspection: false,
+        secrets: Vec::new(),
+        revision: String::new(),
+    };
+    binding.revision = binding.revision_of();
+    step(
+        "p6-5",
+        "review_evidence",
+        Some(object(vec![
+            ("execution", string(execution)),
+            ("harness_key", string("lane-rev")),
+            ("kind", string("hermes")),
+            ("reviewer_profile", binding.to_doc()),
+            ("worktree", string(worktree)),
+        ])),
+    )
+}
+
+/// W2 (issue #210): a plan that would bind TWO legs to ONE lane checkout —
+/// the measured live shape, a reviewer leg declaring the implementer lane's
+/// checkout — is refused at PREVIEW time with a typed code naming both
+/// identities. It is never discovered at dispatch time by the substrate as
+/// `refusal.lane.name_collision`.
+#[test]
+fn a_plan_that_would_bind_two_legs_to_one_lane_checkout_is_refused_at_preview_time() {
+    let fixture = Fixture::new("lane-collision");
+    let state = fixture.open();
+    let mut request = base_request();
+    request.steps = vec![
+        step("p1", "checkout", Some(resolved_params())),
+        step(
+            "p4-5",
+            "prompt",
+            Some(object(vec![
+                ("worktree", string("issues-5")),
+                ("branch", string("issue-5")),
+            ])),
+        ),
+        reviewer_leg_step("issues-5", "herdr"),
+    ];
+    let error = preview_queue(&state, &request)
+        .expect_err("a plan that would collide two legs on one checkout refuses");
+    assert_eq!(error.code, "usage.queue_lane_identity", "{}", error.message);
+    // The refusal names BOTH identities: the reviewer leg's own lane and the
+    // implementer leg that owns the checkout the step would bind.
+    for needle in [
+        "\"rev-5-r1\"",
+        "\"5-rev1\"",
+        "issues-5-rev1",
+        "\"impl-5\"",
+        "\"5-impl\"",
+        "issues-5",
+    ] {
+        assert!(
+            error.message.contains(needle),
+            "the refusal names {needle}: {}",
+            error.message
+        );
+    }
+
+    // A checkout that is no leg's lane refuses too — never a silent pane at
+    // an unbound path.
+    request.steps.pop();
+    request
+        .steps
+        .push(reviewer_leg_step("issues-5-somewhere", "herdr"));
+    let error = preview_queue(&state, &request)
+        .expect_err("a checkout no leg derives refuses before submission");
+    assert_eq!(error.code, "usage.queue_lane_identity", "{}", error.message);
+
+    // The positive control: the SAME step binding the reviewer leg's OWN lane
+    // renders, and the rendered plan carries the derivation (issue #210
+    // legibility) for the reviewer leg AND for the implementer leg.
+    request.steps.pop();
+    request
+        .steps
+        .push(reviewer_leg_step("issues-5-rev1", "herdr"));
+    let preview = render(&state, &request);
+    let steps = array(&preview.doc, "steps");
+    let lane_of = |id: &str| -> Val {
+        steps
+            .iter()
+            .find(|step| step.get("id").and_then(Val::as_str) == Some(id))
+            .and_then(|step| step.get("lane").cloned())
+            .unwrap_or_else(|| panic!("step {id} renders with its lane identity: {steps:?}"))
+    };
+    let reviewer = lane_of("p6-5");
+    assert_eq!(reviewer.get("role").and_then(Val::as_str), Some("reviewer"));
+    assert_eq!(reviewer.get("round").and_then(Val::as_int), Some(1));
+    assert_eq!(
+        reviewer.get("agent").and_then(Val::as_str),
+        Some("rev-5-r1")
+    );
+    assert_eq!(
+        reviewer.get("workspace").and_then(Val::as_str),
+        Some("5-rev1")
+    );
+    assert_eq!(
+        reviewer.get("checkout").and_then(Val::as_str),
+        Some("issues-5-rev1")
+    );
+    let implementer = lane_of("p4-5");
+    assert_eq!(
+        implementer.get("role").and_then(Val::as_str),
+        Some("implementer")
+    );
+    assert_eq!(
+        implementer.get("agent").and_then(Val::as_str),
+        Some("impl-5")
+    );
+    assert_eq!(
+        implementer.get("workspace").and_then(Val::as_str),
+        Some("5-impl")
+    );
+    assert_eq!(
+        implementer.get("checkout").and_then(Val::as_str),
+        Some("issues-5")
+    );
+    assert_ne!(
+        reviewer, implementer,
+        "the reviewer leg's lane identity is distinct by construction"
+    );
+
+    // The bare-subprocess fallback has no lane registration: the rule is the
+    // pane substrate's, and the fallback keeps the run's lane checkout.
+    request.steps.pop();
+    request
+        .steps
+        .push(reviewer_leg_step("issues-5", "headless"));
+    let preview = render(&state, &request);
+    let steps = array(&preview.doc, "steps");
+    let headless = steps
+        .iter()
+        .find(|step| step.get("id").and_then(Val::as_str) == Some("p6-5"))
+        .expect("the headless review step renders");
+    assert_eq!(
+        headless
+            .get("lane")
+            .and_then(|lane| lane.get("role"))
+            .and_then(Val::as_str),
+        Some("implementer"),
+        "the fallback binds the run's lane checkout, unchanged: {headless:?}"
+    );
+}
+
 #[test]
 fn protected_branch_and_production_boundaries_are_named_holds() {
     let fixture = Fixture::new("branch");

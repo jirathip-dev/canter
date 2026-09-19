@@ -96,11 +96,27 @@ The leg runs, in order:
    fact and the checkout's movement is external — so a re-dispatch can never
    repair it: the frontier parks typed with the run's bounded retries unspent
    (issue #200) instead of retrying an impossible step;
-3. the reviewer is started through the SAME role-bound adapter the rest of the
-   spine uses (`Start`, then the bounded review brief as `Prompt`), in the
-   run's lane, under the registry-resolved binding, with the reviewer lane
+3. **the reviewer leg binds its OWN lane checkout (issue #210)**: on the pane
+   substrate the plan binds the reviewer leg's lane — derived from
+   `(issue, reviewer, lane_round)` as `issues-<N>-rev<R>` — never the
+   implementer lane's checkout the run's own worker holds (that shape refused
+   `refusal.lane.name_collision` at p6-132 on the live spine). The effect
+   materializes that checkout at the certified head (a canter-created,
+   detached, clean linked worktree), verifies an existing one (a moved or
+   dirty reviewer lane refuses and is left untouched, never repaired), and
+   reclaims the LEDGER-TERMINAL generations' reviewer lanes of that same
+   identity first — their registrations closed, their stale checkouts cleared,
+   both recorded on the step outcome (`retired_reviewer_lanes`) — while a live
+   or foreign holder is never adopted (its refusal stands). Once the verdict
+   is consumed the lane is removed (`reviewer_lane_cleanup`; a refused removal
+   is recorded verbatim and the residue stays reclaimable). The bare-subprocess
+   fallback has no lane registration and keeps the run's lane checkout as its
+   anchor, unchanged;
+4. the reviewer is started through the SAME role-bound adapter the rest of the
+   spine uses (`Start`, then the bounded review brief as `Prompt`), in its own
+   lane checkout, under the registry-resolved binding, with the reviewer lane
    identity (`rev-<issue>-r<round>`) the adapter verifies back;
-4. the engine then consumes the verdict the REVIEWER writes — as one
+5. the engine then consumes the verdict the REVIEWER writes — as one
    `hf-evidence/v1` object at the daemon-owned verdict path named in the brief
    (`<state>/reviews/<lane session>-<step id>.json`), outside every lane
    worktree. Nothing is synthesised: a missing artifact at the deadline is

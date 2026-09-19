@@ -12,6 +12,10 @@ pub struct LaneNames {
 
 impl LaneNames {
     /// Closed roles and positive issue/round numbers prevent arbitrary names.
+    ///
+    /// The names themselves are the ONE per-leg derivation (`crate::lane`):
+    /// the same triple also derives the leg's lane checkout (issue #210), so
+    /// the two halves of a leg's identity can never drift.
     pub fn new(issue: u64, role: &str, round: u64) -> Result<Self, AdapterError> {
         if issue == 0 || round == 0 || !matches!(role, "implementer" | "reviewer") {
             return Err(AdapterError::refusal(
@@ -19,17 +23,7 @@ impl LaneNames {
                 "lane names require a positive issue/round and implementer|reviewer role",
             ));
         }
-        let (agent, workspace) = match (role, round) {
-            ("implementer", 1) => (format!("impl-{issue}"), format!("{issue}-impl")),
-            ("implementer", _) => (
-                format!("impl-{issue}-r{round}"),
-                format!("{issue}-impl{round}"),
-            ),
-            _ => (
-                format!("rev-{issue}-r{round}"),
-                format!("{issue}-rev{round}"),
-            ),
-        };
+        let (agent, workspace) = crate::lane::lane_names(issue, role, round);
         Ok(Self { agent, workspace })
     }
 }

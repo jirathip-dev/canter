@@ -232,7 +232,9 @@ pub fn queue_run_steps(
     }];
     for number in issues {
         let branch = format!("issue-{number}");
-        let worktree = format!("issues-{number}");
+        // Issue #210: the lane identity is derived per leg, never re-spelled.
+        // The implementer leg round 1 binds the run's own lane checkout.
+        let worktree = crate::lane::lane_checkout(*number, "implementer", 1);
         steps.push(PlanStep {
             id: format!("p2-{number}"),
             kind: "worktree_create".to_string(),
@@ -257,7 +259,7 @@ pub fn queue_run_steps(
     });
     for number in issues {
         let branch = format!("issue-{number}");
-        let worktree = format!("issues-{number}");
+        let worktree = crate::lane::lane_checkout(*number, "implementer", 1);
         steps.push(PlanStep {
             id: format!("p4-{number}"),
             kind: "prompt".to_string(),
@@ -295,6 +297,19 @@ pub fn queue_run_steps(
         // registry's, never a literal in this repository) — so the run
         // dispatches its OWN reviewer at the certified head and consumes the
         // verdict that reviewer writes.
+        //
+        // Issue #210: the reviewer leg binds its OWN lane checkout, derived
+        // from (issue, reviewer, round), so it can never resolve the checkout
+        // the run's implementer lane holds (the measured `132-rev1` held by
+        // `132-impl` collision). The bare-subprocess fallback has no lane
+        // registration and runs in the integration checkout, so it keeps
+        // binding the run's lane checkout byte for byte.
+        let review_lane = match execution {
+            crate::adapters::ExecutionMode::HerdrPane => {
+                crate::lane::lane_checkout(*number, "reviewer", 1)
+            }
+            crate::adapters::ExecutionMode::Headless => worktree.clone(),
+        };
         let review_params = match reviewer {
             None => object(vec![]),
             Some(reviewer) => object(vec![
@@ -303,7 +318,7 @@ pub fn queue_run_steps(
                 ("kind", string(reviewer.kind)),
                 ("executable", string(reviewer.executable)),
                 ("reviewer_profile", reviewer.binding.clone()),
-                ("worktree", string(&worktree)),
+                ("worktree", string(&review_lane)),
             ]),
         };
         steps.push(PlanStep {
@@ -766,6 +781,20 @@ mod tests {
             .filter(|step| step.kind == "review_evidence")
             .collect();
         assert_eq!(review_steps.len(), 2, "one review step per selected issue");
+        // Issue #210: the reviewer leg binds its OWN lane checkout, derived
+        // from (issue, reviewer, round) — never the implementer lane's
+        // checkout the run's own worker holds.
+        let implementer_lanes: Vec<&str> = spine
+            .iter()
+            .filter(|step| step.kind != "review_evidence")
+            .filter_map(|step| step.params.as_ref())
+            .filter_map(|params| params.get("worktree"))
+            .filter_map(Val::as_str)
+            .collect();
+        assert!(
+            implementer_lanes.contains(&"issues-5") && implementer_lanes.contains(&"issues-6"),
+            "the implementer legs keep the run's own lane checkouts: {implementer_lanes:?}"
+        );
         for step in review_steps {
             let params = step.params.as_ref().expect("review params");
             assert_eq!(
@@ -773,12 +802,14 @@ mod tests {
                 Some("lane-rev"),
                 "the review step names the REGISTRY reviewer role key"
             );
+            let lane = params.get("worktree").and_then(Val::as_str);
             assert!(
-                matches!(
-                    params.get("worktree").and_then(Val::as_str),
-                    Some("issues-5" | "issues-6")
-                ),
-                "the reviewer runs in the run's own lane worktree"
+                matches!(lane, Some("issues-5-rev1" | "issues-6-rev1")),
+                "the reviewer leg binds its own lane checkout: {lane:?}"
+            );
+            assert!(
+                !implementer_lanes.contains(&lane.unwrap_or_default()),
+                "the reviewer lane can never be an implementer lane checkout"
             );
             let profile = params.get("reviewer_profile").expect("the binding");
             assert_eq!(

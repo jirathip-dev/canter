@@ -246,6 +246,9 @@ pub mod code {
     pub const WORKTREE_EXISTS: &str = "refusal.worktree.exists";
     /// The addressed worktree is not the worker output location the run bound.
     pub const OUTPUT_LOCATION: &str = "refusal.worker.output_location";
+    /// A step would bind a lane checkout that belongs to a different leg
+    /// (issue #210): one lane checkout belongs to exactly one leg.
+    pub const LANE_IDENTITY: &str = "refusal.lane.identity";
 }
 
 /// A typed engine error/refusal.
@@ -1768,50 +1771,70 @@ fn plan_lane_worktrees(ctx: &EffectContext<'_>) -> Vec<String> {
     worktrees
 }
 
-/// The run's lane worktree for the pane substrate (issue #139): the pane is
-/// created IN the run's lane worktree and never at a bare cwd, so the bind
-/// step resolves that path from the reviewed plan and refuses typed when the
-/// plan cannot name exactly one. A plan that binds several lane worktrees
-/// (a multi-issue submission) is refused rather than given a pane in the
-/// wrong lane — the operator keeps the explicit `params.execution =
-/// "headless"` fallback for that shape.
-fn run_lane_worktree(ctx: &EffectContext<'_>, what: &str) -> Result<PathBuf, EffectOutcome> {
-    let worktrees = plan_lane_worktrees(ctx);
-    match worktrees.len() {
-        1 => {
-            let worktree = contained_path(ctx.worktrees_root, &worktrees[0])
-                .map_err(|err| refusal(err.code, err.message))?;
-            if !worktree.is_dir() {
-                return Err(refusal(
-                    code::OUTPUT_LOCATION,
-                    format!(
-                        "{what} binds the lane worktree {:?}, which is not a directory; the Herdr \
-                         pane substrate creates the worker's pane there and never at a bare cwd",
-                        worktrees[0]
-                    ),
-                ));
-            }
-            Ok(worktree)
+/// The declared lane leg of one step (issues #154, #210): the closed role
+/// (`implementer` by default, `reviewer`) and a positive round (default `1`).
+/// ONE parse feeds both the names (`LaneNames`) and the lane checkout
+/// (`lane_checkout`), so the two halves of a leg's identity can never drift.
+fn step_lane_leg(params: Option<&Val>) -> Result<(&str, u64), EffectOutcome> {
+    let role = match params.and_then(|params| params.get("lane_role")) {
+        None => "implementer",
+        Some(Val::Str(role)) if matches!(role.as_str(), "implementer" | "reviewer") => {
+            role.as_str()
         }
-        0 => Err(refusal(
+        Some(_) => {
+            return Err(refusal(
+                code::BAD_PARAMS,
+                "lane_role must be implementer|reviewer",
+            ));
+        }
+    };
+    let round = match params.and_then(|params| params.get("lane_round")) {
+        None => 1,
+        Some(Val::Int(round)) if *round > 0 => *round as u64,
+        Some(_) => {
+            return Err(refusal(
+                code::BAD_PARAMS,
+                "lane_round must be a positive integer",
+            ));
+        }
+    };
+    Ok((role, round))
+}
+
+/// The lane worktree a step's OWN leg resolves for the pane substrate (issues
+/// #139, #210): the pane is created in the leg's lane checkout and never at a
+/// bare cwd or in a sibling leg's lane. The checkout is derived from the
+/// step's declared `(role, round)` and the plan's issue — never invented at
+/// effect time — and the reviewed plan must bind it; a plan that does not is
+/// refused here rather than given a pane in the wrong lane.
+fn run_lane_worktree(ctx: &EffectContext<'_>, what: &str) -> Result<PathBuf, EffectOutcome> {
+    let (role, round) = step_lane_leg(ctx.params)?;
+    let relative = crate::lane::lane_checkout(ctx.plan.issue_number as u64, role, round);
+    if !plan_lane_worktrees(ctx)
+        .iter()
+        .any(|bound| bound == &relative)
+    {
+        return Err(refusal(
             code::BAD_PARAMS,
             format!(
                 "{what} runs on the Herdr pane substrate, which creates the worker's pane in the \
-                 run's lane worktree, and no plan step binds a `worktree`; declare \
+                 leg's own lane checkout {relative:?}, and no plan step binds that lane; declare \
                  params.execution = \"headless\" to run the bare-subprocess fallback explicitly"
             ),
-        )),
-        _ => Err(refusal(
+        ));
+    }
+    let worktree = contained_path(ctx.worktrees_root, &relative)
+        .map_err(|err| refusal(err.code, err.message))?;
+    if !worktree.is_dir() {
+        return Err(refusal(
             code::OUTPUT_LOCATION,
             format!(
-                "{what}: this plan binds {} lane worktrees ({worktrees:?}); the Herdr pane \
-                 substrate binds ONE lane worktree per run and refuses rather than panning the \
-                 wrong lane — declare params.execution = \"headless\" to run the bare-subprocess \
-                 fallback explicitly",
-                worktrees.len()
+                "{what} binds the lane checkout {relative:?}, which is not a directory; the Herdr \
+                 pane substrate creates the worker's pane there and never at a bare cwd"
             ),
-        )),
+        ));
     }
+    Ok(worktree)
 }
 
 /// The params-caused inputs of `prompt`.
@@ -2731,15 +2754,9 @@ fn effect_harness_start(ctx: &EffectContext<'_>) -> EffectOutcome {
         Err(outcome) => return outcome,
     };
     if profile.execution == crate::adapters::ExecutionMode::HerdrPane {
-        let role = match params.get("lane_role") {
-            None => "implementer",
-            Some(Val::Str(role)) => role.as_str(),
-            Some(_) => return refusal(code::BAD_PARAMS, "lane_role must be implementer|reviewer"),
-        };
-        let round = match params.get("lane_round") {
-            None => 1,
-            Some(Val::Int(round)) if *round > 0 => *round as u64,
-            Some(_) => return refusal(code::BAD_PARAMS, "lane_round must be a positive integer"),
+        let (role, round) = match step_lane_leg(ctx.params) {
+            Ok(leg) => leg,
+            Err(outcome) => return outcome,
         };
         profile.lane_names =
             match crate::adapters::LaneNames::new(ctx.plan.issue_number as u64, role, round) {
@@ -3455,7 +3472,7 @@ pub fn review_verdict_path(
 /// the live bindings it will record; it never states a verdict.
 fn review_brief(inputs: &ReviewEvidenceInputs, leg: &ReviewerLeg, verdict_path: &Path) -> String {
     format!(
-        "Review the exact head {} of this run's lane worktree {:?} against the integration base \
+        "Review the exact head {} of this run's reviewer lane checkout {:?} against the integration base \
          {}, read-only: do not commit, push, or edit the checkout. Your verdict IS the evidence \
          this run's review step consumes, so write it yourself as ONE JSON document to the exact \
          path {:?}: {{\"schema\":\"hf-evidence/v1\",\"feature_head\":\"{}\",\
@@ -3476,6 +3493,232 @@ fn review_brief(inputs: &ReviewEvidenceInputs, leg: &ReviewerLeg, verdict_path: 
     )
 }
 
+/// Verify an existing lane checkout is a resolvable linked worktree AT the
+/// certified head and clean (issue #210): a moved or dirty checkout is
+/// refused, never repaired — the deterministic #200 rule the moved-checkout
+/// refusal already carries, so no re-dispatch can silently review another sha.
+fn verify_reviewer_lane(
+    ctx: &EffectContext<'_>,
+    relative: &str,
+    lane: &Path,
+    feature_head: &str,
+) -> Result<(), EffectOutcome> {
+    let head = match run_git(ctx, lane, &["rev-parse", "--verify", "HEAD"]) {
+        Ok(out) => out.stdout.trim().to_string(),
+        Err(outcome) => {
+            return Err(refusal(
+                code::LANE_IDENTITY,
+                format!(
+                    "the reviewer lane checkout {relative:?} is not a resolvable linked worktree \
+                     of this run's repository ({}); a reviewer lane is only ever a canter-created \
+                     checkout, so this one is refused and left untouched",
+                    outcome.message.as_deref().unwrap_or_default()
+                ),
+            ));
+        }
+    };
+    if head != feature_head {
+        return Err(refusal(
+            code::VERDICT_STALE,
+            format!(
+                "the reviewer lane checkout {relative:?} is at {head}, not the certified reviewed \
+                 head {feature_head}; a reviewer is never started on a moved checkout"
+            ),
+        ));
+    }
+    let status = run_git(ctx, lane, &["status", "--porcelain"])?.stdout;
+    if !status.trim().is_empty() {
+        return Err(refusal(
+            code::LANE_IDENTITY,
+            format!(
+                "the reviewer lane checkout {relative:?} is not clean; a reviewer lane is a clean \
+                 canter-owned checkout, so this one is refused and left untouched"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Fold the stale checkout removal of one reclaimed reviewer lane into its
+/// retire document (issue #210): the registration was closed first, so the
+/// clean checkout at that lane is the retired generation's residue too. A
+/// refused removal (dirty, unregistered) is recorded verbatim, never forced.
+fn retire_lane_checkout_doc(
+    ctx: &EffectContext<'_>,
+    mut doc: Val,
+    relative: &str,
+    lane: &Path,
+) -> Val {
+    let lane_text = lane.to_string_lossy().into_owned();
+    let removal = match run_git(
+        ctx,
+        ctx.integration_repo,
+        &["worktree", "remove", &lane_text],
+    ) {
+        Ok(_) => object(vec![("removed", bool_(true))]),
+        Err(outcome) => object(vec![
+            ("removed", bool_(false)),
+            (
+                "code",
+                string(outcome.code.as_deref().unwrap_or(code::MALFORMED_OUTPUT)),
+            ),
+            (
+                "message",
+                string(outcome.message.as_deref().unwrap_or_default()),
+            ),
+        ]),
+    };
+    if let Val::Obj(fields) = &mut doc {
+        fields.insert("checkout".to_string(), string(relative));
+        fields.insert("checkout_removal".to_string(), removal);
+    }
+    doc
+}
+
+/// Materialize the reviewer leg's OWN lane checkout at the certified head
+/// (issue #210), reclaiming the retired generations' reviewer lanes of that
+/// identity first (#190/#173 direction).
+///
+/// The pane substrate registers ONE workspace per checkout, so a reviewer leg
+/// that bound the run's own lane checkout collides with the implementer lane
+/// holding it (`refusal.lane.name_collision`, measured on run-a1eb1f68dc9f2976).
+/// The reviewer leg therefore binds its own checkout — derived from
+/// `(issue, reviewer, round)` and visible in the rendered plan — and this
+/// effect materializes it: a ledger-terminal generation's reviewer lane is
+/// reclaimed (registration closed, stale checkout cleared, both recorded on
+/// the step outcome), then THIS generation's lane is created at the certified
+/// head. A live or foreign holder is never adopted: its retire is refused and
+/// the lane is left untouched (#157), and the substrate refusal stands.
+fn ensure_reviewer_lane(
+    ctx: &EffectContext<'_>,
+    leg: &ReviewerLeg,
+    feature_head: &str,
+    retired: &mut Vec<Val>,
+) -> Result<PathBuf, EffectOutcome> {
+    let issue = ctx.plan.issue_number as u64;
+    let relative = crate::lane::lane_checkout(issue, "reviewer", leg.round);
+    if relative != leg.worktree {
+        return Err(refusal(
+            code::LANE_IDENTITY,
+            format!(
+                "the reviewed plan binds lane checkout {:?} for this run's reviewer leg, but the \
+                 reviewer leg's own lane checkout is {relative:?} (issue {issue}, reviewer, round \
+                 {}); ONE lane checkout belongs to exactly one leg, so a plan that binds another \
+                 leg's checkout is refused here and by the preview — re-render the plan",
+                leg.worktree, leg.round
+            ),
+        ));
+    }
+    let lane = contained_path(ctx.worktrees_root, &relative)
+        .map_err(|err| refusal(err.code, err.message))?;
+    if lane.is_dir() {
+        for run in ctx.retired_run_ids {
+            let retired_reviewer = match run_session_handle(run)
+                .and_then(|implementer| reviewer_session_handle(&implementer, leg.round))
+            {
+                Ok(session) => session,
+                Err(outcome) => {
+                    retired.push(retire_refusal_doc(
+                        run,
+                        outcome.code.as_deref().unwrap_or(code::LANE_IDENTITY),
+                        outcome.message.as_deref().unwrap_or_default(),
+                    ));
+                    continue;
+                }
+            };
+            match crate::adapters::retire_lane_workspace(
+                &retired_reviewer,
+                &lane,
+                ctx.env,
+                crate::adapters::ADAPTER_TIMEOUT,
+            ) {
+                Ok(Some(doc)) => {
+                    retired.push(retire_lane_checkout_doc(ctx, doc, &relative, &lane));
+                }
+                Ok(None) => {}
+                Err(err) => retired.push(retire_refusal_doc(
+                    &retired_reviewer.session_id,
+                    err.code,
+                    &err.message,
+                )),
+            }
+        }
+    }
+    if lane.is_dir() {
+        verify_reviewer_lane(ctx, &relative, &lane, feature_head)?;
+        return Ok(lane);
+    }
+    if let Some(parent) = lane.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let lane_text = lane.to_string_lossy().into_owned();
+    match run_git(
+        ctx,
+        ctx.integration_repo,
+        &["worktree", "add", "--detach", &lane_text, feature_head],
+    ) {
+        Ok(_) => {}
+        Err(outcome) => return Err(outcome),
+    }
+    verify_reviewer_lane(ctx, &relative, &lane, feature_head)?;
+    Ok(lane)
+}
+
+/// Remove the reviewer leg's own lane once its verdict is consumed (issue
+/// #210): the lane exists FOR the review, so a consumed review leaves no
+/// orphan workspace and no orphan checkout. Refusals — a workspace whose agent
+/// is not settled, a checkout git will not remove — are recorded on the step
+/// outcome and never forced; the residue stays reclaimable (#190).
+fn remove_reviewer_lane(
+    ctx: &EffectContext<'_>,
+    reviewer: &crate::adapters::SessionHandle,
+    lane: &Path,
+) -> Val {
+    let workspace = match crate::adapters::close_lane_workspace(
+        reviewer,
+        lane,
+        ctx.env,
+        crate::adapters::ADAPTER_TIMEOUT,
+    ) {
+        Ok(()) => object(vec![("closed", bool_(true))]),
+        Err(err) => object(vec![
+            ("closed", bool_(false)),
+            ("code", string(err.code)),
+            ("message", string(&err.message)),
+        ]),
+    };
+    let checkout = if workspace.get("closed").and_then(Val::as_bool) == Some(true) {
+        let lane_text = lane.to_string_lossy().into_owned();
+        match run_git(
+            ctx,
+            ctx.integration_repo,
+            &["worktree", "remove", &lane_text],
+        ) {
+            Ok(_) => object(vec![("removed", bool_(true))]),
+            Err(outcome) => object(vec![
+                ("removed", bool_(false)),
+                (
+                    "code",
+                    string(outcome.code.as_deref().unwrap_or(code::MALFORMED_OUTPUT)),
+                ),
+                (
+                    "message",
+                    string(outcome.message.as_deref().unwrap_or_default()),
+                ),
+            ]),
+        }
+    } else {
+        object(vec![
+            ("removed", bool_(false)),
+            (
+                "skipped",
+                string("the lane workspace is still held; the checkout is preserved"),
+            ),
+        ])
+    };
+    object(vec![("workspace", workspace), ("checkout", checkout)])
+}
+
 /// Start the run's own reviewer through the role-bound pane adapter and
 /// consume the verdict it writes (issue #193).
 fn review_self_dispatch(
@@ -3493,35 +3736,46 @@ fn review_self_dispatch(
              implementer session (harness_start); the reviewer identity is never invented",
         );
     };
-    let worktree = match contained_path(ctx.worktrees_root, &leg.worktree) {
-        Ok(path) => path,
-        Err(err) => return refusal(err.code, err.message),
+    // Issue #210: the reviewer's lane is its OWN checkout on the pane
+    // substrate. The bare-subprocess fallback runs in the integration checkout
+    // and keeps the plan's lane checkout as its evidence anchor, byte for
+    // byte; the pane lane is materialized below, after the reviewer identity
+    // is derived and validated.
+    let headless_lane = match leg.execution {
+        crate::adapters::ExecutionMode::Headless => {
+            let worktree = match contained_path(ctx.worktrees_root, &leg.worktree) {
+                Ok(path) => path,
+                Err(err) => return refusal(err.code, err.message),
+            };
+            if !worktree.is_dir() {
+                return refusal(
+                    code::OUTPUT_LOCATION,
+                    format!(
+                        "review_evidence binds the lane worktree {:?}, which is not a directory",
+                        leg.worktree
+                    ),
+                );
+            }
+            // The lane checkout must BE the certified head: a reviewer is never
+            // started on a moved checkout, so the reviewed sha cannot drift.
+            let head = match run_git(ctx, &worktree, &["rev-parse", "--verify", "HEAD"]) {
+                Ok(out) => out.stdout.trim().to_string(),
+                Err(outcome) => return outcome,
+            };
+            if head != inputs.feature_head {
+                return refusal(
+                    code::VERDICT_STALE,
+                    format!(
+                        "the run's lane checkout is at {head}, not the certified reviewed head {}; a \
+                         reviewer is never started on a moved head",
+                        inputs.feature_head
+                    ),
+                );
+            }
+            Some(worktree)
+        }
+        crate::adapters::ExecutionMode::HerdrPane => None,
     };
-    if !worktree.is_dir() {
-        return refusal(
-            code::OUTPUT_LOCATION,
-            format!(
-                "review_evidence binds the lane worktree {:?}, which is not a directory",
-                leg.worktree
-            ),
-        );
-    }
-    // The lane checkout must BE the certified head: a reviewer is never
-    // started on a moved checkout, so the reviewed sha cannot drift.
-    let head = match run_git(ctx, &worktree, &["rev-parse", "--verify", "HEAD"]) {
-        Ok(out) => out.stdout.trim().to_string(),
-        Err(outcome) => return outcome,
-    };
-    if head != inputs.feature_head {
-        return refusal(
-            code::VERDICT_STALE,
-            format!(
-                "the run's lane checkout is at {head}, not the certified reviewed head {}; a \
-                 reviewer is never started on a moved head",
-                inputs.feature_head
-            ),
-        );
-    }
     let reviewer = match reviewer_session_handle(implementer, leg.round) {
         Ok(session) => session,
         Err(outcome) => return outcome,
@@ -3569,6 +3823,29 @@ fn review_self_dispatch(
     if leg.execution == crate::adapters::ExecutionMode::HerdrPane {
         profile.lane_names = Some(names.clone());
     }
+    let mut retired_reviewer_lanes: Vec<Val> = Vec::new();
+    let worktree = match headless_lane {
+        Some(worktree) => worktree,
+        None => {
+            match ensure_reviewer_lane(ctx, leg, &inputs.feature_head, &mut retired_reviewer_lanes)
+            {
+                Ok(lane) => lane,
+                Err(mut outcome) => {
+                    // A reclaim that already happened is recorded on the failed
+                    // outcome too, exactly as the pane bind records its own
+                    // pre-bind retire (issue #190).
+                    if !retired_reviewer_lanes.is_empty() {
+                        let note = retire_note(&retired_reviewer_lanes);
+                        outcome.message = Some(match outcome.message {
+                            Some(message) => format!("{message}; {note}"),
+                            None => note,
+                        });
+                    }
+                    return outcome;
+                }
+            }
+        }
+    };
     let deadline = match effect_deadline_secs(ctx.kind, ctx.params) {
         Ok(secs) => secs,
         Err(outcome) => return outcome,
@@ -3656,6 +3933,16 @@ fn review_self_dispatch(
     // this dispatch started (never a caller-supplied string), and the
     // registry-resolved binding is recorded alongside it so the resolution is
     // auditable: key, kind, provider, model and the revision the plan bound.
+    // On the pane substrate the reviewer's OWN lane (checkout, label, agent
+    // and the reclaim/cleanup receipts) is recorded too (issue #210): the lane
+    // exists FOR the review, so a consumed review removes it — a refused
+    // removal is recorded verbatim and the residue stays reclaimable.
+    let reviewer_lane_cleanup = match leg.execution {
+        crate::adapters::ExecutionMode::Headless => None,
+        crate::adapters::ExecutionMode::HerdrPane => {
+            Some(remove_reviewer_lane(ctx, &reviewer, &worktree))
+        }
+    };
     ok(object(vec![
         ("repository", string(ctx.repository)),
         ("feature_head", string(&inputs.feature_head)),
@@ -3666,7 +3953,14 @@ fn review_self_dispatch(
         ("checks", facts.checks),
         ("reviewer_profile", leg.profile.to_doc()),
         ("reviewer_lane", string(&reviewer.session_id)),
+        ("reviewer_workspace", string(&names.workspace)),
+        ("reviewer_worktree", string(&worktree.to_string_lossy())),
         ("verdict_path", string(&verdict_path.to_string_lossy())),
+        ("retired_reviewer_lanes", Val::Arr(retired_reviewer_lanes)),
+        (
+            "reviewer_lane_cleanup",
+            reviewer_lane_cleanup.unwrap_or_else(null),
+        ),
     ]))
 }
 

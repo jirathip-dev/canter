@@ -4542,7 +4542,9 @@ fn reviewer_leg_step() -> qp::PlannedStep {
             ("harness_key", string("lane-rev")),
             ("kind", string("hermes")),
             ("reviewer_profile", reviewer_leg_binding_doc()),
-            ("worktree", string("issues-5")),
+            // Issue #210: the reviewer leg binds its OWN lane checkout, never
+            // the implementer lane's `issues-5` the run's own worker holds.
+            ("worktree", string("issues-5-rev1")),
         ])),
     }
 }
