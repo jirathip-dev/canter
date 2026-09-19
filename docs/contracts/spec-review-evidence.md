@@ -121,7 +121,13 @@ The leg runs, in order:
    (`<state>/reviews/<lane session>-<step id>.json`), outside every lane
    worktree. Nothing is synthesised: a missing artifact at the deadline is
    `effect.review_timeout` (ambiguous, parked), and the engine only ever READS
-   that path.
+   that path. The deadline is the step's own effective bound: the plan's
+   declared `deadline_secs` when it declared one, else the documented review
+   row `REVIEW_DEADLINE_DEFAULT_SECS` (1800 s, the prompt tier — a verdict
+   round trip is a worker-turn-class wait, issue #217; before that row the
+   kind fell into the generic 60 s I/O default and every live review —
+   measured verdicts take tens of minutes — was an `effect.review_timeout` by
+   construction).
 
 **Proven delivery, recorded — a re-dispatch resumes, never re-delivers
 (issue #214).** The pane-substrate prompt reports success only through the
@@ -134,7 +140,14 @@ submission attempt count. Every dispatch of the step addresses the SAME
 derived leg (the lane identity, its checkout and the verdict path are all
 derived, issue #210), so when a re-dispatch REUSES that leg's registered lane
 and finds the record bound to THIS certified head and THIS reviewer lane, the
-delivery is never repeated: the attempt resumes the bounded verdict wait. The
+delivery is never repeated: the attempt resumes the bounded verdict wait, and
+— on a plan that declared no `deadline_secs` of its own — that resumed wait is
+RENEWED under the overall ceiling (`EFFECT_DEADLINE_CEILING_SECS`, 3600 s;
+issue #217: the reviewer is the one doing the waiting-work by then, so the
+attempt waits the maximum this effect family is ever allowed to wait instead
+of re-opening the fresh 1800 s window a live review has already outrun; a
+declared `deadline_secs` is the plan's own reviewed policy and is never
+overridden). The
 duplicate delivery is exactly what the measured chain was made of
 (`run-1d4806c802c1088c`, p6-132): while the reviewer's turn was running the
 substrate could not take a second submission inside the prompt's bounded

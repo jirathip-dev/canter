@@ -235,6 +235,17 @@ fn reviewer_leg_params(binding: &Val, deadline: i64) -> Val {
     ])
 }
 
+/// The same reviewer-leg params with NO `deadline_secs`: the documented
+/// per-kind default table decides the bound (the issue #217 witness shape —
+/// a reviewed plan that declares no deadline of its own).
+fn reviewer_leg_params_without_deadline(binding: &Val) -> Val {
+    let Val::Obj(mut fields) = reviewer_leg_params(binding, 0) else {
+        unreachable!("the reviewer-leg params are an object");
+    };
+    fields.remove("deadline_secs");
+    Val::Obj(fields)
+}
+
 fn run_review_step(
     fixture: &Fixture,
     plan: &PlanBindings,
@@ -387,6 +398,58 @@ fn the_run_dispatches_its_own_reviewer_and_consumes_the_verdict_it_writes() {
 }
 
 // ---------------------------------------------------------------------------
+// (issue #217) the verdict wait's documented bound
+// ---------------------------------------------------------------------------
+
+/// W217-1 (issue #217): a review step that declares NO `deadline_secs` waits
+/// under the documented review bound — the prompt tier — not the generic
+/// 60 s I/O default the kind used to fall into (which made every live review
+/// an `effect.review_timeout` by construction: measured verdicts take tens of
+/// minutes). The effective bound this witness pins RIDES the step outcome
+/// (`deadline_secs`, issue #92 F1), so the pinned value is the one the
+/// verdict wait USED. The bound is asserted as literals on purpose: this
+/// witness must compile — and FAIL — at the pre-#217 bound.
+///
+/// RED (pre-#217): the outcome records 60 -> this test fails.
+/// GREEN (reviewed): the outcome records 1800 -> this test passes.
+/// Raw exits: `cargo test --locked --test review_dispatch
+/// a_review_step_without_a_declared_deadline_waits_under_the_documented_review_bound`
+#[test]
+fn a_review_step_without_a_declared_deadline_waits_under_the_documented_review_bound() {
+    let fixture = Fixture::new("review-bound");
+    let params = reviewer_leg_params_without_deadline(&reviewer_binding_doc());
+    let plan = plan_with_review_step(params.clone());
+    let written = verdict_doc(
+        &fixture.head,
+        &fixture.base,
+        "pass",
+        Val::Arr(vec![check("exact-head-review", "passed")]),
+    );
+    let outcome = review_with_written_verdict(&fixture, &plan, &params, written);
+    assert_eq!(outcome.status, "succeeded", "{outcome:?}");
+    assert_eq!(
+        outcome.result.get("verdict").and_then(Val::as_str),
+        Some("pass"),
+        "the verdict the reviewer wrote is the one consumed: {outcome:?}"
+    );
+    let bound = outcome
+        .result
+        .get("deadline_secs")
+        .and_then(Val::as_int)
+        .expect("the effective bound rides the step outcome (issue #92 F1)");
+    assert_eq!(
+        bound, 1800,
+        "the documented review verdict bound (REVIEW_DEADLINE_DEFAULT_SECS, the \
+         prompt tier): {outcome:?}"
+    );
+    assert!(
+        bound > 60,
+        "never the generic I/O default (EFFECT_DEADLINE_DEFAULT_SECS) that made \
+         every live review a timeout: {bound}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // (b) negatives: no verdict / wrong sha / pending -> parked, typed, no advance
 // ---------------------------------------------------------------------------
 
@@ -397,11 +460,23 @@ fn a_reviewer_that_writes_no_verdict_parks_the_frontier_with_a_typed_timeout() {
     let plan = plan_with_review_step(params.clone());
     let head = fixture.head.clone();
     let base = fixture.base.clone();
+    let started = Instant::now();
     let outcome = run_review_step(&fixture, &plan, &params, &head, &base);
+    let elapsed = started.elapsed();
     assert_eq!(outcome.status, "ambiguous", "{outcome:?}");
     assert_eq!(
         outcome.code.as_deref(),
         Some(canter::mutation::code::REVIEW_TIMEOUT)
+    );
+    // The window the reviewer cannot satisfy ends TYPED and bounded — the
+    // declared one second was really waited, and the wait never hangs.
+    assert!(
+        elapsed >= Duration::from_secs(1),
+        "the declared window was actually waited: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "the verdict wait is bounded, never a hang: {elapsed:?}"
     );
     assert!(
         fixture.fake_argv().exists(),
