@@ -3251,3 +3251,162 @@ fn symlinked_cleanup_targets_are_refused() {
         "symlink stays in place"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #222: a retired generation's lane residue (checkout AND local branch)
+// is reclaimed for the next same-issue run, with its own typed refusal code
+// ---------------------------------------------------------------------------
+
+/// The measured defect: a terminal prior run for the same issue left the lane
+/// checkout (`refusal.worktree.exists`) AND the local lane branch (raw
+/// `git ... exited with code 255: a branch named 'issue-123' already exists`,
+/// reported as the generic `adapter.exit`) in the integration clone, so the
+/// next run's `p2` could only proceed after an operator deleted them by hand.
+///
+/// This witness drives the whole sequence over the real daemon socket:
+/// a ledger-terminal generation for THIS issue, a sibling lane that a LIVE
+/// issue holds, the stale artifacts, then the typed refusal (RED), the
+/// reclaim-and-create (GREEN), and `harness_start` (the run reaches `p3`).
+#[test]
+fn a_terminal_generations_lane_residue_is_reclaimed_with_its_own_code() {
+    // The retired generation's lane identity IS this issue's lane identity
+    // (one lane identity per issue), so its residue is what blocks `p2`.
+    let retired = "run-22222222222abcde";
+    let mut steps = vec![
+        step(
+            "w1",
+            "worktree_create",
+            Some(object(vec![
+                ("branch", string("issue-123")),
+                ("worktree", string("issues-123")),
+            ])),
+        ),
+        step(
+            "w2",
+            "worktree_create",
+            Some(object(vec![
+                ("branch", string("issue-123")),
+                ("worktree", string("issues-123")),
+            ])),
+        ),
+    ];
+    steps.push(flow_steps()[1].clone());
+    let scenario = Scenario::new("i222rec", "2999-01-01T00:00:00Z", steps);
+
+    // The run ledger: ONE terminal generation of this repository issue. The
+    // reclaim authority is this row alone — a live run never resolves into it.
+    let at = "2026-09-06T00:00:00Z";
+    let state = State::open(&scenario.fixture.paths().db_path, Retention::default())
+        .expect("open state for the retired generation");
+    state
+        .start_instance(retired, GRANT_ID, "fleet-doctrine-1", at)
+        .expect("retired generation instance");
+    state
+        .release_run(
+            retired,
+            "the previous generation of this issue is terminal",
+            "ik_issue-222-retired",
+            at,
+        )
+        .expect("release the previous generation");
+    drop(state);
+
+    // The residue the retired generation left: its registered lane checkout
+    // AND its local lane branch (at a delivery commit, not the recorded base).
+    let git = Git::new(&scenario.repos.checkout);
+    let worktrees = &scenario.repos.worktrees_root;
+    std::fs::create_dir_all(worktrees).expect("worktrees root");
+    let lane = worktrees.join("issues-123");
+    git.run(&[
+        "worktree",
+        "add",
+        "-b",
+        "issue-123",
+        lane.to_str().unwrap(),
+        "staging",
+    ]);
+    Git::new(&lane).run(&["commit", "--allow-empty", "-m", "retired delivery"]);
+    let retired_tip = git.head("issue-123");
+
+    // A lane a DIFFERENT (live) issue holds in the same integration clone.
+    let foreign_lane = worktrees.join("issues-999");
+    git.run(&[
+        "worktree",
+        "add",
+        "-b",
+        "issue-999",
+        foreign_lane.to_str().unwrap(),
+        "staging",
+    ]);
+    let foreign_tip = git.head("issue-999");
+
+    // AC2 RED half: the stale branch is NOT recoverable from the remote (a
+    // local-only delivery), so it is never deleted. The collision is refused
+    // with its OWN typed code naming the branch — never `adapter.exit`.
+    let (code, message) = scenario.apply_err(222, "w1", None, None);
+    println!("STALE-BRANCH REFUSAL {code}: {message}");
+    assert_eq!(
+        code, "refusal.worktree.branch_exists",
+        "the stale-branch collision has its own typed code: {message}"
+    );
+    assert!(
+        message.contains("issue-123"),
+        "the refusal names the branch: {message}"
+    );
+    assert!(
+        !lane.exists(),
+        "the retired generation's registered checkout was reclaimed"
+    );
+    assert_eq!(
+        git.head("issue-123"),
+        retired_tip,
+        "a local-only lane branch is never deleted"
+    );
+
+    // AC2 GREEN half: published (recoverable from the remote) ⇒ reclaimed,
+    // and the lane is created CLEAN at the recorded base (a refresh, not an
+    // adoption of the retired delivery).
+    git.run(&["push", "origin", "issue-123"]);
+    let created = scenario.apply_ok(223, "w2", None, None);
+    assert_eq!(
+        created.get("branch").and_then(Val::as_str),
+        Some("issue-123")
+    );
+    let reclaimed = created.get("reclaimed").expect("the reclaim is recorded");
+    println!("RECLAIMED {}", canter::canonical::canonical_text(reclaimed));
+    assert!(lane.exists(), "the new lane exists");
+    let new_head = git.head("HEAD");
+    assert_eq!(
+        created.get("head").and_then(Val::as_str),
+        Some(new_head.as_str())
+    );
+    assert_ne!(
+        new_head, retired_tip,
+        "the new lane starts at the recorded base, not the retired delivery"
+    );
+    assert_eq!(
+        git.head("issue-123"),
+        new_head,
+        "the reclaimed branch was refreshed to the base"
+    );
+
+    // AC1: the run reaches `p3` (harness_start) with no operator action.
+    let harness = scenario.apply_ok(224, "h1", None, None);
+    assert!(
+        harness.get("worktree_identity").is_some(),
+        "p3 bound the lane harness: {}",
+        canter::canonical::canonical_text(&harness)
+    );
+
+    // AC3: the live sibling lane was never touched.
+    assert_eq!(
+        git.head("issue-999"),
+        foreign_tip,
+        "another live issue's branch is untouched"
+    );
+    assert!(foreign_lane.exists(), "its checkout is untouched");
+    assert!(
+        git.run(&["worktree", "list"]).contains("issues-999"),
+        "its registration is untouched"
+    );
+}

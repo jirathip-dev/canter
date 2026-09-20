@@ -309,6 +309,11 @@ pub mod code {
     pub const WORKER_TIMEOUT: &str = "effect.worker_timeout";
     /// An existing lane cannot safely be created at the recorded base.
     pub const WORKTREE_EXISTS: &str = "refusal.worktree.exists";
+    /// A local lane branch already exists in the integration clone and is not
+    /// a retired generation's reclaimable residue (issue #222): the duplicate
+    /// lane cannot be created at the recorded base, and the branch name is
+    /// carried so an operator can act without parsing `last_failure`.
+    pub const WORKTREE_BRANCH_EXISTS: &str = "refusal.worktree.branch_exists";
     /// The addressed worktree is not the worker output location the run bound.
     pub const OUTPUT_LOCATION: &str = "refusal.worker.output_location";
     /// A step would bind a lane checkout that belongs to a different leg
@@ -2802,6 +2807,18 @@ fn lane_integration_base(ctx: &EffectContext<'_>) -> Result<String, EffectOutcom
 }
 
 /// Create a contained lane at the recorded/published integration base.
+///
+/// Issue #222: a ledger-TERMINAL generation's lane residue in the integration
+/// clone — its registered lane checkout AND its local lane branch — is
+/// reclaimed before the duplicate-lane refusals, so a new run for the same
+/// issue reaches `harness_start` without an operator deleting artifacts by
+/// hand (the measured `refusal.worktree.exists` and the raw
+/// `git ... exited with code 255: a branch named 'issue-N' already exists`
+/// reported as the generic `adapter.exit`). The reclaim is scoped by
+/// construction: the daemon resolves the retired instance ids for exactly
+/// this repository issue (a live run is never in that set, and a sibling
+/// issue's run resolves to a different set), and only the branch and checkout
+/// THIS step is about to create are touched.
 fn effect_worktree_create(ctx: &EffectContext<'_>) -> EffectOutcome {
     let (branch, relative) = match worktree_create_inputs(ctx.params, &ctx.param_contract()) {
         Ok(inputs) => inputs,
@@ -2811,12 +2828,37 @@ fn effect_worktree_create(ctx: &EffectContext<'_>) -> EffectOutcome {
         Ok(path) => path,
         Err(err) => return refusal(err.code, err.message),
     };
+    // The reclaim authority is the run ledger (only a terminal generation of
+    // THIS issue is in the set): with no terminal generation nothing is
+    // touched and the duplicate-lane refusals below stay the answer.
+    let reclaimed = if ctx.retired_run_ids.is_empty() {
+        Vec::new()
+    } else {
+        reclaim_retired_lane_residue(ctx, &branch, &relative, &worktree)
+    };
+    // Whatever the reclaim did — reclaimed or refused — travels with the
+    // refusal message: the retire happened, so it is audited either way.
+    let note = reclaim_note(&reclaimed);
     if worktree.exists() {
         return refusal(
             code::WORKTREE_EXISTS,
             format!(
-                "worktree {} already exists; a duplicate lane cannot be created",
+                "worktree {} already exists; a duplicate lane cannot be created{note}",
                 worktree.display()
+            ),
+        );
+    }
+    // Issue #222 AC2: the stale-branch collision is its own typed code that
+    // NAMES the branch — never a raw git 255 resolved as `adapter.exit`.
+    if local_ref_tip(ctx, &format!("refs/heads/{branch}")).is_some() {
+        return refusal(
+            code::WORKTREE_BRANCH_EXISTS,
+            format!(
+                "the integration clone already has the local lane branch {branch:?} and it is not \
+                 a retired generation's reclaimable residue (a local-only branch is never deleted, \
+                 and a branch a live lane holds is never adopted); the duplicate lane cannot be \
+                 created at the recorded base — resolve {branch:?} (its owner, or an operator) and \
+                 re-dispatch{note}"
             ),
         );
     }
@@ -2850,7 +2892,7 @@ fn effect_worktree_create(ctx: &EffectContext<'_>) -> EffectOutcome {
                 Ok(out) => out.stdout,
                 Err(_) => return failed(code::MALFORMED_OUTPUT, "cannot read worktree status"),
             };
-            ok(object(vec![
+            let mut fields = vec![
                 ("branch", string(&branch)),
                 ("worktree", string(&worktree.to_string_lossy())),
                 ("head", string(&head)),
@@ -2860,10 +2902,205 @@ fn effect_worktree_create(ctx: &EffectContext<'_>) -> EffectOutcome {
                     "contained",
                     bool_(is_contained(ctx.worktrees_root, &worktree)),
                 ),
-            ]))
+            ];
+            if !reclaimed.is_empty() {
+                fields.push(("reclaimed", Val::Arr(reclaimed)));
+            }
+            ok(object(fields))
         }
         Err(outcome) => outcome,
     }
+}
+
+/// The tip of one LOCAL ref in the integration clone (`None` when it does not
+/// exist): a pure read-back, never a fetch.
+fn local_ref_tip(ctx: &EffectContext<'_>, refname: &str) -> Option<String> {
+    let out = run_git(
+        ctx,
+        ctx.integration_repo,
+        &["rev-parse", "--verify", "--quiet", refname],
+    )
+    .ok()?;
+    let tip = out.stdout.trim().to_string();
+    is_hex40(&tip).then_some(tip)
+}
+
+/// The published tip of one lane branch on `origin` (`None` when the branch
+/// was never published): the reclaim's recoverability witness — the content of
+/// a local branch this read cannot recover is never destroyed.
+fn published_branch_tip(ctx: &EffectContext<'_>, branch: &str) -> Option<String> {
+    let refname = format!("refs/heads/{branch}");
+    let out = run_git(
+        ctx,
+        ctx.integration_repo,
+        &["ls-remote", "origin", &refname],
+    )
+    .ok()?;
+    let tip = out.stdout.split_whitespace().next()?.to_string();
+    is_hex40(&tip).then_some(tip)
+}
+
+/// The checkout paths the integration clone registers as worktrees
+/// (`git worktree list --porcelain`). A live generation's lane is registered
+/// there, so its checkout is never confused with residue. Paths are
+/// canonicalized before they are compared: git reports resolved paths (on
+/// macOS `/private/var/...` for a `/var/...` root), and a byte comparison
+/// would miss the very registration this read exists for.
+fn registered_worktree_paths(ctx: &EffectContext<'_>) -> Vec<PathBuf> {
+    match run_git(
+        ctx,
+        ctx.integration_repo,
+        &["worktree", "list", "--porcelain"],
+    ) {
+        Ok(out) => out
+            .stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .map(PathBuf::from)
+            .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Whether `path` is one of the integration clone's registered worktrees.
+fn is_registered_worktree(path: &Path, registered: &[PathBuf]) -> bool {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    registered.iter().any(|candidate| candidate == &resolved)
+}
+
+/// Issue #222: reclaim the lane residue a ledger-TERMINAL generation of this
+/// repository issue left in the integration clone, and return one record of
+/// the attempt (removed, or refused with its reason).
+///
+/// Policy, stated because the issue asks which one is implemented: the retired
+/// generation's REGISTERED lane checkout at this leg's own relative path is
+/// removed (never forced — a dirty or unregistered path is left alone), and
+/// its local lane branch is deleted only when the published branch on `origin`
+/// carries the same tip, i.e. when the branch is re-creatable from the remote
+/// (a refresh: the lane is then created clean at the recorded base). A branch
+/// whose content is NOT recoverable — a local-only delivery — is never
+/// deleted, and a branch a live lane holds cannot be deleted at all
+/// (`git branch -D` refuses a branch checked out in a worktree); both cases
+/// surface as `refusal.worktree.branch_exists` naming the branch instead of
+/// the raw git failure the issue measured.
+fn reclaim_retired_lane_residue(
+    ctx: &EffectContext<'_>,
+    branch: &str,
+    relative: &str,
+    worktree: &Path,
+) -> Vec<Val> {
+    let registered = registered_worktree_paths(ctx);
+    let checkout = if !worktree.exists() {
+        object(vec![
+            ("checkout", string(relative)),
+            ("removed", bool_(true)),
+            ("message", string("no checkout residue")),
+        ])
+    } else if is_registered_worktree(worktree, &registered) {
+        let text = worktree.to_string_lossy().into_owned();
+        failure_doc(
+            run_git(ctx, ctx.integration_repo, &["worktree", "remove", &text]),
+            &[("checkout", string(relative))],
+        )
+    } else {
+        // An existing path this clone does not register as a worktree is not
+        // the retired generation's checkout: nothing is forced and the
+        // duplicate-lane refusal below stays the answer.
+        object(vec![
+            ("checkout", string(relative)),
+            ("removed", bool_(false)),
+            ("code", string(code::WORKTREE_EXISTS)),
+            (
+                "message",
+                string(
+                    "the existing path is not a registered worktree of the integration clone; \
+                     nothing is forced",
+                ),
+            ),
+        ])
+    };
+    let branch_tip = local_ref_tip(ctx, &format!("refs/heads/{branch}"));
+    let published = published_branch_tip(ctx, branch);
+    let lane_branch = match (branch_tip.as_deref(), published.as_deref()) {
+        (None, _) => object(vec![
+            ("branch", string(branch)),
+            ("removed", bool_(true)),
+            ("message", string("no branch residue")),
+        ]),
+        (Some(tip), Some(published_tip)) if published_tip == tip => {
+            let removal = run_git(ctx, ctx.integration_repo, &["branch", "-D", branch]);
+            failure_doc(
+                removal,
+                &[
+                    ("branch", string(branch)),
+                    ("tip", string(tip)),
+                    ("published_tip", string(published_tip)),
+                ],
+            )
+        }
+        (Some(tip), published_tip) => object(vec![
+            ("branch", string(branch)),
+            ("tip", string(tip)),
+            (
+                "published_tip",
+                published_tip.map(string).unwrap_or_else(null),
+            ),
+            ("removed", bool_(false)),
+            (
+                "message",
+                string(
+                    "the local branch is not recoverable from the published branch; a local-only \
+                     delivery is never deleted",
+                ),
+            ),
+        ]),
+    };
+    vec![object(vec![
+        (
+            "generations",
+            Val::Arr(ctx.retired_run_ids.iter().map(|id| string(id)).collect()),
+        ),
+        ("checkout_residue", checkout),
+        ("branch_residue", lane_branch),
+    ])]
+}
+
+/// The compact record of a reclaim attempt, appended to a refusal message so
+/// the retire is audited even when the step itself refuses: empty when there
+/// was nothing to reclaim.
+fn reclaim_note(reclaimed: &[Val]) -> String {
+    if reclaimed.is_empty() {
+        return String::new();
+    }
+    format!(
+        "; reclaimed {}",
+        crate::canonical::canonical_text(&Val::Arr(reclaimed.to_vec()))
+    )
+}
+
+/// One reclaim sub-step's record: `removed: true` on success, otherwise the
+/// typed code and message of the refused git call, merged with `fields`.
+fn failure_doc(
+    outcome: Result<crate::process::ProcOut, EffectOutcome>,
+    fields: &[(&'static str, Val)],
+) -> Val {
+    let mut out: Vec<(&str, Val)> = fields.to_vec();
+    match outcome {
+        Ok(_) => out.push(("removed", bool_(true))),
+        Err(outcome) => {
+            out.push(("removed", bool_(false)));
+            out.push((
+                "code",
+                string(outcome.code.as_deref().unwrap_or(code::MALFORMED_OUTPUT)),
+            ));
+            out.push((
+                "message",
+                string(outcome.message.as_deref().unwrap_or_default()),
+            ));
+        }
+    }
+    object(out)
 }
 
 /// `harness_start`: bind a lane harness session (identity triple + session
