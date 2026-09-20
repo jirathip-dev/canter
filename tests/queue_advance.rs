@@ -2601,6 +2601,7 @@ fn the_supervisor_dispatch_capability_for_the_committed_tail_is_typed_and_closed
             item: if membership { Some(item()) } else { None },
             newest_evidence: if newest { Some(evidence_row()) } else { None },
             dispatch_refusal: None,
+            fix_round: None,
         }
     }
 
@@ -2863,6 +2864,7 @@ fn only_a_reviewed_pass_with_green_checks_at_the_run_pins_is_a_delivery() {
             }),
             newest_evidence: newest,
             dispatch_refusal: None,
+            fix_round: None,
         }
     }
     let green = r#"[{"name":"hosted-ci","status":"passed"}]"#;

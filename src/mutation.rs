@@ -235,6 +235,26 @@ pub mod code {
     /// delivered to on a guess, and a proven delivery that cannot be
     /// recorded is refused rather than silently re-delivered.
     pub const REVIEW_DELIVERY: &str = "refusal.evidence.review_delivery";
+    /// A recorded review FAIL could not be handed to the run's fix round
+    /// (issue #238): the run carries no review root or no committed
+    /// implementer leg, so no fix round can be dispatched and none is
+    /// invented.
+    pub const FIX_UNBOUND: &str = "refusal.fix.unbound";
+    /// The fix round's lane could not be created (or its existing checkout
+    /// could not be verified) at the certified reviewed head (issue #238).
+    pub const FIX_LANE: &str = "refusal.fix.lane";
+    /// The fix round's leg could not be started through the role-bound
+    /// adapter (issue #238): its OWN code, carrying the substrate's refusal
+    /// verbatim in the message, so a spawn refusal is never read as a prompt
+    /// refusal and never as a review diagnosis.
+    pub const FIX_SPAWN: &str = "refusal.fix.spawn";
+    /// The fix round's instruction could not be PROVEN delivered to the fix
+    /// leg (issue #238): its OWN code, carrying the substrate's refusal.
+    pub const FIX_PROMPT: &str = "refusal.fix.prompt";
+    /// The run's automatic fix-round bound is spent and the certified head
+    /// still fails (issue #238): the escalation, whose message names the
+    /// failures the reviewer recorded. Never a silent park.
+    pub const FIX_BOUND_EXHAUSTED: &str = "refusal.fix.bound_exhausted";
     /// Issue closure attempted before merge + post-merge verification.
     pub const CLOSURE_PREMATURE: &str = "refusal.closure.premature";
     /// Cleanup refused a dirty worktree.
@@ -4313,6 +4333,609 @@ fn remove_reviewer_lane(
     object(vec![("workspace", workspace), ("checkout", checkout)])
 }
 
+// ---------------------------------------------------------------------------
+// The fix-round handoff of a recorded review FAIL (issue #238)
+// ---------------------------------------------------------------------------
+
+/// The number of automatic fix rounds one run may dispatch before a recorded
+/// review FAIL escalates (issue #238).
+///
+/// ONE fact, deliberately shared with the doctrine's own budget
+/// ([`crate::engine::NORMAL_REVIEW_ROUNDS`]): the reviewed workflow authorizes
+/// at most that many normal review/fix rounds before exhaustion enters the
+/// human queue, so this handoff can never dispatch more automatic repair
+/// rounds than the workflow the run executes under.
+pub const FIX_ROUNDS_MAX: u32 = crate::engine::NORMAL_REVIEW_ROUNDS;
+
+/// The fix leg's session identity for one lane round (issue #238): derived
+/// ONCE from the run's own bound implementer session and the round, exactly
+/// as the reviewer identity is derived (#193) — never caller-supplied, stable
+/// across restarts, and never the identity of the leg it repairs.
+pub fn fix_session_handle(
+    implementer: &crate::adapters::SessionHandle,
+    round: u64,
+) -> Result<crate::adapters::SessionHandle, EffectOutcome> {
+    let digest =
+        sha256_hex(format!("hf-fix-session/v1|{}|{round}", implementer.session_id).as_bytes());
+    let session_id = format!("lane-{}", &digest[..16]);
+    let identity = crate::adapters::bind_identity(&session_id, &session_id, 1)
+        .map_err(|err| refusal(err.code, err.message))?;
+    crate::adapters::new_session(&session_id, identity)
+        .map_err(|err| refusal(err.code, err.message))
+}
+
+/// The absolute path of the engine's OWN fix-round record for one run's
+/// review step (issue #238): beside the reviewer's verdict and delivery
+/// artifacts, in the same daemon-owned review root, keyed by the run's own
+/// session and the step — only a dispatch of that same step reads it.
+pub fn fix_round_receipt_path(
+    review_root: &Path,
+    implementer: &crate::adapters::SessionHandle,
+    step_id: &str,
+) -> PathBuf {
+    review_root.join(format!(
+        "{}-{step_id}.fix-round.json",
+        implementer.session_id
+    ))
+}
+
+/// The engine's OWN durable record that ONE review FAIL was handed to the
+/// run's fix round (issue #238).
+///
+/// The certified head is the idempotency key: a fix round dispatched for one
+/// head is never re-dispatched for that head (a re-dispatch of the same
+/// review attempt reuses the running round), and a MOVED head opens the next
+/// round of the same automatic budget. The record is written only after a
+/// delivery the substrate proved, so a round is never counted for a prompt
+/// that never reached its leg — those refuse typed instead
+/// (`refusal.fix.spawn` / `refusal.fix.prompt`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FixRoundReceipt {
+    /// The fix round (1-based) this record names.
+    pub round: u32,
+    /// The automatic bound in force when the round was dispatched.
+    pub bound: u32,
+    /// The certified reviewed head the round was dispatched for.
+    pub feature_head: String,
+    /// The fix leg's lane session (the registered identity).
+    pub lane: String,
+    /// The agent the substrate verified the leg as ('' headless).
+    pub agent: String,
+    /// The workspace label the leg's lane was registered under ('' headless).
+    pub workspace: String,
+    /// The pane the leg was started in ('' headless).
+    pub pane: String,
+    /// The submission attempts the proven delivery took.
+    pub delivery_attempts: i64,
+}
+
+impl FixRoundReceipt {
+    /// The receipt as the step outcome records it.
+    fn to_doc(&self, failures: &[Val], reused: bool) -> Val {
+        object(vec![
+            ("schema", string("hf-fix-round/v1")),
+            ("round", integer(self.round as i64)),
+            ("bound", integer(self.bound as i64)),
+            ("feature_head", string(&self.feature_head)),
+            ("lane", string(&self.lane)),
+            ("agent", string(&self.agent)),
+            ("workspace", string(&self.workspace)),
+            ("pane", string(&self.pane)),
+            ("delivery_attempts", integer(self.delivery_attempts)),
+            ("failures", Val::Arr(failures.to_vec())),
+            ("reused", bool_(reused)),
+        ])
+    }
+
+    /// Read the record at `path`. `Ok(None)` when none exists; a record that
+    /// exists but does not carry its bindings is refused fail-closed — the
+    /// engine never guesses whether a round was already dispatched, and it
+    /// never burns another round on a guess.
+    fn read(path: &Path) -> Result<Option<FixRoundReceipt>, EffectOutcome> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(refusal(
+                    code::FIX_UNBOUND,
+                    format!(
+                        "the fix-round record {:?} is unreadable: {err}; the engine never \
+                         guesses whether this FAIL already reached a fix round",
+                        path.display()
+                    ),
+                ));
+            }
+        };
+        let doc = Val::parse_json(&text).map_err(|err| {
+            refusal(
+                code::FIX_UNBOUND,
+                format!(
+                    "the fix-round record {:?} is not JSON: {err}",
+                    path.display()
+                ),
+            )
+        })?;
+        if doc.get("schema").and_then(Val::as_str) != Some("hf-fix-round/v1") {
+            return Err(refusal(
+                code::FIX_UNBOUND,
+                format!(
+                    "the fix-round record {:?} must be an \"hf-fix-round/v1\" document",
+                    path.display()
+                ),
+            ));
+        }
+        let text_field = |key: &str| -> Result<String, EffectOutcome> {
+            doc.get(key)
+                .and_then(Val::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    refusal(
+                        code::FIX_UNBOUND,
+                        format!(
+                            "the fix-round record {:?} carries no {key:?}",
+                            path.display()
+                        ),
+                    )
+                })
+        };
+        let int_field = |key: &str| -> Result<i64, EffectOutcome> {
+            doc.get(key).and_then(Val::as_int).ok_or_else(|| {
+                refusal(
+                    code::FIX_UNBOUND,
+                    format!(
+                        "the fix-round record {:?} carries no {key:?}",
+                        path.display()
+                    ),
+                )
+            })
+        };
+        Ok(Some(FixRoundReceipt {
+            round: u32::try_from(int_field("round")?).map_err(|_| {
+                refusal(
+                    code::FIX_UNBOUND,
+                    format!(
+                        "the fix-round record {:?} round is out of range",
+                        path.display()
+                    ),
+                )
+            })?,
+            bound: u32::try_from(int_field("bound")?).map_err(|_| {
+                refusal(
+                    code::FIX_UNBOUND,
+                    format!(
+                        "the fix-round record {:?} bound is out of range",
+                        path.display()
+                    ),
+                )
+            })?,
+            feature_head: text_field("feature_head")?,
+            lane: text_field("lane")?,
+            agent: doc
+                .get("agent")
+                .and_then(Val::as_str)
+                .unwrap_or("")
+                .to_string(),
+            workspace: doc
+                .get("workspace")
+                .and_then(Val::as_str)
+                .unwrap_or("")
+                .to_string(),
+            pane: doc
+                .get("pane")
+                .and_then(Val::as_str)
+                .unwrap_or("")
+                .to_string(),
+            delivery_attempts: int_field("delivery_attempts")?,
+        }))
+    }
+
+    /// Write the record — carrying the failures the instruction was derived
+    /// from — so the round the bound counts is also the round's own evidence.
+    /// A record that cannot be written is refused rather than leaving a
+    /// dispatched round uncountable against the bound.
+    fn write(&self, path: &Path, failures: &[Val]) -> Result<(), EffectOutcome> {
+        let bytes = canonical_bytes(&self.to_doc(failures, false));
+        std::fs::write(path, bytes).map_err(|err| {
+            refusal(
+                code::FIX_UNBOUND,
+                format!(
+                    "the fix-round record {:?} is not writable: {err}",
+                    path.display()
+                ),
+            )
+        })
+    }
+}
+
+/// The named checks a recorded verdict FAILED (issue #238): the exact facts
+/// the fix instruction is derived from. A verdict with no failed check still
+/// fails as a whole — the failure clause says so rather than naming none.
+fn failing_checks(checks: &Val) -> Vec<Val> {
+    checks
+        .as_array()
+        .map(|checks| {
+            checks
+                .iter()
+                .filter(|check| check.get("status").and_then(Val::as_str) == Some("failed"))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The failures as one bounded human clause (the ESCALATION text of issue
+/// #238: the code names the class, this names the failures).
+fn failures_clause(failures: &[Val]) -> String {
+    if failures.is_empty() {
+        return "the reviewer recorded no individually failed check; its verdict is the failure"
+            .to_string();
+    }
+    failures
+        .iter()
+        .map(|check| {
+            format!(
+                "check {:?} is failed",
+                check.get("name").and_then(Val::as_str).unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The run's own committed implementer leg (issue #238): the lane leg the run
+/// itself was built by, resolved from the run's OWN committed plan — never
+/// from a caller, a default or a literal.
+///
+/// The leg is the LOWEST-round `implementer` harness step of the committed
+/// spine (the run's own lane); the fix round's legs are the later rounds of
+/// that same lane (`crate::lane`: `impl-<N>-r<R>` / `issues-<N>-impl<R>`), so
+/// the fix instruction runs under the run's reviewed role binding with the
+/// run's own declared lane inputs.
+struct ImplementerLeg {
+    /// The run's role-resolved harness profile (kind/executable/binding).
+    profile: crate::adapters::Profile,
+    /// The run's own implementer round (the fix rounds follow it).
+    round: u64,
+    /// The run's own lane checkout, relative to the worktrees root.
+    worktree: String,
+    /// The run's own feature branch, when the committed plan declares one.
+    branch: Option<String>,
+}
+
+fn run_implementer_leg(ctx: &EffectContext<'_>) -> Result<ImplementerLeg, EffectOutcome> {
+    let steps = ctx
+        .plan
+        .doc
+        .get("steps")
+        .and_then(Val::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let issue = ctx.plan.issue_number as u64;
+    let mut leg: Option<ImplementerLeg> = None;
+    for step in &steps {
+        let kind = step.get("kind").and_then(Val::as_str).unwrap_or("");
+        if !matches!(kind, "harness_start" | "prompt") {
+            continue;
+        }
+        let Some(params) = step.get("params") else {
+            continue;
+        };
+        let (role, round) = step_lane_leg(Some(params))?;
+        if role != "implementer" {
+            continue;
+        }
+        if leg.as_ref().is_some_and(|leg| leg.round <= round) {
+            continue;
+        }
+        // `harness_start` declares no worktree of its own (the lane is
+        // created by the run's own worktree step): the leg's checkout is
+        // derived from the same `(role, round)` triple the names come from.
+        let worktree = params
+            .get("worktree")
+            .and_then(Val::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| crate::lane::lane_checkout(issue, "implementer", round));
+        let profile = harness_profile(ctx, params)?;
+        leg = Some(ImplementerLeg {
+            profile,
+            round,
+            worktree,
+            branch: None,
+        });
+    }
+    let mut leg = leg.ok_or_else(|| {
+        refusal(
+            code::FIX_UNBOUND,
+            "this run's committed plan declares no implementer harness step, so a review FAIL has \
+             no leg to hand its fix round to; the fix leg is never invented",
+        )
+    })?;
+    // The run's own feature branch: the branch its lane checkout was created
+    // on, as the committed plan declares it. The fix instruction names it when
+    // it is known; it is never guessed from a path or a label.
+    for step in &steps {
+        let kind = step.get("kind").and_then(Val::as_str).unwrap_or("");
+        if kind != "worktree_create" {
+            continue;
+        }
+        if let Some(branch) = step
+            .get("params")
+            .and_then(|params| params.get("branch"))
+            .and_then(Val::as_str)
+            && is_slug(branch)
+        {
+            leg.branch = Some(branch.to_string());
+        }
+        break;
+    }
+    Ok(leg)
+}
+
+/// Verify an existing fix-round lane checkout is a clean linked worktree AT
+/// the certified reviewed head (issue #238). A moved or dirty checkout is
+/// refused, never repaired: a fix round is only ever dispatched at the head
+/// whose verdict failed.
+fn verify_fix_lane(
+    ctx: &EffectContext<'_>,
+    relative: &str,
+    lane: &Path,
+    feature_head: &str,
+) -> Result<PathBuf, EffectOutcome> {
+    let head = match run_git(ctx, lane, &["rev-parse", "--verify", "HEAD"]) {
+        Ok(out) => out.stdout.trim().to_string(),
+        Err(outcome) => {
+            return Err(EffectOutcome {
+                status: outcome.status,
+                code: Some(code::FIX_LANE.to_string()),
+                message: Some(format!(
+                    "the fix round's lane checkout {relative:?} is not a resolvable linked \
+                     worktree of this run's repository ({}); it is refused and left untouched",
+                    outcome.message.as_deref().unwrap_or_default()
+                )),
+                result: null(),
+            });
+        }
+    };
+    if head != feature_head {
+        return Err(refusal(
+            code::FIX_LANE,
+            format!(
+                "the fix round's lane checkout {relative:?} is at {head}, not the certified \
+                 reviewed head {feature_head}; a fix round is only ever dispatched at the head \
+                 whose review failed"
+            ),
+        ));
+    }
+    let status = run_git(ctx, lane, &["status", "--porcelain"])?.stdout;
+    if !status.trim().is_empty() {
+        return Err(refusal(
+            code::FIX_LANE,
+            format!(
+                "the fix round's lane checkout {relative:?} is not clean; a fix leg is only ever \
+                 started on a clean checkout, so this one is refused and left untouched"
+            ),
+        ));
+    }
+    Ok(lane.to_path_buf())
+}
+
+/// The fix leg's lane checkout at the certified head: created when absent
+/// (the same way the reviewer leg's lane is), verified when present — so the
+/// FAIL handoff both CREATES and REUSES a fix leg lane (issue #238).
+fn ensure_fix_lane(
+    ctx: &EffectContext<'_>,
+    relative: &str,
+    feature_head: &str,
+) -> Result<PathBuf, EffectOutcome> {
+    let lane = contained_path(ctx.worktrees_root, relative)
+        .map_err(|err| refusal(code::FIX_LANE, err.message))?;
+    if lane.is_dir() {
+        return verify_fix_lane(ctx, relative, &lane, feature_head);
+    }
+    if let Some(parent) = lane.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let lane_text = lane.to_string_lossy().into_owned();
+    match run_git(
+        ctx,
+        ctx.integration_repo,
+        &["worktree", "add", "--detach", &lane_text, feature_head],
+    ) {
+        Ok(_) => {}
+        Err(outcome) => {
+            return Err(EffectOutcome {
+                status: outcome.status,
+                code: Some(code::FIX_LANE.to_string()),
+                message: Some(format!(
+                    "the fix round's lane {relative:?} could not be created at the certified head \
+                     {feature_head}: {}",
+                    outcome.message.as_deref().unwrap_or_default()
+                )),
+                result: null(),
+            });
+        }
+    }
+    verify_fix_lane(ctx, relative, &lane, feature_head)
+}
+
+/// The fix instruction ONE recorded review FAIL produces (issue #238): built
+/// from the verdict the reviewer wrote — the certified head it reviewed, the
+/// integration base, and the failing checks it named — never from a human
+/// summary. The instruction states what the leg must do and what the engine
+/// does NOT do for it.
+fn fix_brief(
+    inputs: &ReviewEvidenceInputs,
+    leg: &ImplementerLeg,
+    round: u32,
+    bound: u32,
+    failures: &[Val],
+) -> String {
+    let branch = match &leg.branch {
+        Some(branch) => format!("the run's feature branch {branch:?}"),
+        None => "the run's own feature branch".to_string(),
+    };
+    format!(
+        "Automatic fix round {} of {}: the review of the certified head {} against integration \
+         base {} recorded verdict \"fail\". The failures the reviewer recorded are: {}. Fix \
+         exactly those, in this fix leg's own lane checkout {:?} (a checkout of the reviewed \
+         head — do not amend or rewrite it). Commit your change and push it to {} so the \
+         reviewed head moves: the engine records nothing on your behalf and only a moved head \
+         is re-reviewed. Your role is {:?}.",
+        round,
+        bound,
+        inputs.feature_head,
+        inputs.integration_base,
+        failures_clause(failures),
+        leg.worktree,
+        branch,
+        leg.profile.key,
+    )
+}
+
+/// Dispatch the run's fix round for ONE recorded review FAIL (issue #238):
+/// resolve the run's own committed implementer leg, keep or create the fix
+/// leg's lane at the certified head, start the leg through the same
+/// role-bound adapter the rest of the spine uses, deliver the fix
+/// instruction derived from the recorded verdict, and prove that delivery
+/// before recording it.
+///
+/// Every step failure keeps its OWN code (`refusal.fix.lane` / `spawn` /
+/// `prompt`) with the substrate's refusal in the message, so the FAIL
+/// handoff's disposition is readable from the recorded attempt alone.
+/// The bound is enforced BEFORE any effect: a run whose automatic rounds are
+/// spent escalates with `refusal.fix.bound_exhausted`, whose message names
+/// the failures — it never parks silently and never dispatches an unbounded
+/// number of repair rounds.
+fn dispatch_fix_round(
+    ctx: &EffectContext<'_>,
+    inputs: &ReviewEvidenceInputs,
+    facts: &VerdictFacts,
+    implementer: &crate::adapters::SessionHandle,
+) -> Result<Val, EffectOutcome> {
+    let Some(review_root) = ctx.review_root else {
+        return Err(refusal(
+            code::FIX_UNBOUND,
+            "review_evidence has no daemon-owned review root to record the fix round in; a \
+             presented plan declares its own review facts and dispatches no fix leg",
+        ));
+    };
+    let failures = failing_checks(&facts.checks);
+    let leg = run_implementer_leg(ctx)?;
+    let issue = ctx.plan.issue_number as u64;
+    let receipt_path = fix_round_receipt_path(review_root, implementer, ctx.step_id);
+    if let Err(err) = std::fs::create_dir_all(review_root) {
+        return Err(refusal(
+            code::FIX_UNBOUND,
+            format!(
+                "the review root {:?} is not creatable: {err}",
+                review_root.display()
+            ),
+        ));
+    }
+    let recorded = FixRoundReceipt::read(&receipt_path)?;
+    // One fix round per certified head: re-dispatching the review step this
+    // round was handed to REUSES it — the leg already carries the
+    // instruction, and re-prompting it would burn the bound the workflow gave.
+    if let Some(recorded) = &recorded
+        && recorded.feature_head == inputs.feature_head
+    {
+        return Ok(recorded.to_doc(&failures, true));
+    }
+    let round = recorded
+        .as_ref()
+        .map(|recorded| recorded.round)
+        .unwrap_or(0)
+        + 1;
+    if round > FIX_ROUNDS_MAX {
+        return Err(refusal(
+            code::FIX_BOUND_EXHAUSTED,
+            format!(
+                "the run's automatic fix-round bound ({FIX_ROUNDS_MAX}) is spent and the reviewed \
+                 head {} still fails: {}. The item escalates to the human queue instead of \
+                 parking silently",
+                inputs.feature_head,
+                failures_clause(&failures)
+            ),
+        ));
+    }
+    let leg_round = leg.round + round as u64;
+    let relative = crate::lane::lane_checkout(issue, "implementer", leg_round);
+    let lane = ensure_fix_lane(ctx, &relative, &inputs.feature_head)?;
+    let session = fix_session_handle(implementer, leg_round)?;
+    let names = crate::adapters::LaneNames::new(issue, "implementer", leg_round)
+        .map_err(|err| refusal(err.code, err.message))?;
+    let mut profile = leg.profile.clone();
+    profile.lane_names = Some(names.clone());
+    let deadline = effect_deadline_secs(ctx.kind, ctx.params)?;
+    // Start (create or reuse) the fix leg through the substrate the run's own
+    // leg declared. Its refusal is the fix round's own spawn refusal.
+    let start = crate::adapters::OpRequest {
+        op: crate::adapters::Op::Start,
+        session: &session,
+        payload: None,
+        timeout: Duration::from_secs(deadline),
+    };
+    let started = crate::adapters::execute_op_in_worktree(&profile, &start, ctx.env, &lane);
+    if started.status != "succeeded" {
+        return Err(EffectOutcome {
+            status: started.status,
+            code: Some(code::FIX_SPAWN.to_string()),
+            message: Some(format!(
+                "the fix round's leg could not be started ({}): {}",
+                started.code.unwrap_or(""),
+                started.message.unwrap_or_default()
+            )),
+            result: null(),
+        });
+    }
+    // Deliver the instruction the recorded verdict produced. A prompt the
+    // substrate did not take is the fix round's own prompt refusal — never a
+    // silent park and never a counted round.
+    let brief = fix_brief(inputs, &leg, round, FIX_ROUNDS_MAX, &failures);
+    let prompt = crate::adapters::OpRequest {
+        op: crate::adapters::Op::Prompt,
+        session: &session,
+        payload: Some(&brief),
+        timeout: Duration::from_secs(deadline),
+    };
+    let delivered = crate::adapters::execute_op_in_worktree(&profile, &prompt, ctx.env, &lane);
+    if delivered.status != "succeeded" {
+        return Err(EffectOutcome {
+            status: delivered.status,
+            code: Some(code::FIX_PROMPT.to_string()),
+            message: Some(format!(
+                "the fix round's instruction was not delivered to lane {:?} ({}): {}",
+                session.session_id,
+                delivered.code.unwrap_or(""),
+                delivered.message.unwrap_or_default()
+            )),
+            result: null(),
+        });
+    }
+    let payload = delivered.payload.clone().unwrap_or_else(null);
+    let receipt = FixRoundReceipt {
+        round,
+        bound: FIX_ROUNDS_MAX,
+        feature_head: inputs.feature_head.clone(),
+        lane: session.session_id.clone(),
+        agent: payload
+            .get("agent")
+            .and_then(Val::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        workspace: names.workspace.clone(),
+        pane: payload
+            .get("pane")
+            .and_then(Val::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        delivery_attempts: payload.get("attempts").and_then(Val::as_int).unwrap_or(1),
+    };
+    receipt.write(&receipt_path, &failures)?;
+    Ok(receipt.to_doc(&failures, false))
+}
+
 /// Start the run's own reviewer through the role-bound pane adapter and
 /// consume the verdict it writes (issue #193).
 fn review_self_dispatch(
@@ -4624,6 +5247,23 @@ fn review_self_dispatch(
             Some(remove_reviewer_lane(ctx, &reviewer, &worktree))
         }
     };
+    // Issue #238: a recorded review FAIL is a normal, expected outcome of the
+    // review step — never a terminal, silent one. The run's fix round is
+    // dispatched HERE, in the effect that consumed the verdict, exactly the
+    // way the reviewer leg was dispatched above: the fix leg's lane is created
+    // (or reused) at the certified head, the fix instruction is derived from
+    // the recorded verdict, and its delivery is proven before this outcome is
+    // recorded. A refusal (no committed implementer leg, a spawn or prompt the
+    // substrate did not take, an exhausted bound) returns the fix round's own
+    // typed code, which the step attempt then carries to `run status` and
+    // `supervision status`.
+    let fix_round = match facts.verdict.as_str() {
+        "fail" => match dispatch_fix_round(ctx, inputs, &facts, implementer) {
+            Ok(doc) => doc,
+            Err(outcome) => return outcome,
+        },
+        _ => null(),
+    };
     ok(object(vec![
         ("repository", string(ctx.repository)),
         ("feature_head", string(&inputs.feature_head)),
@@ -4652,6 +5292,7 @@ fn review_self_dispatch(
             "reviewer_lane_cleanup",
             reviewer_lane_cleanup.unwrap_or_else(null),
         ),
+        ("fix_round", fix_round),
     ]))
 }
 

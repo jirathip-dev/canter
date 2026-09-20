@@ -8644,6 +8644,77 @@ pub(crate) fn dispatch_refusal_of(
     })
 }
 
+/// The newest recorded fix-round dispatch of one run (issue #238), read from
+/// the run's own step outcomes: the review step that consumed a FAIL records
+/// the fix round it handed that FAIL to in its result document, so the round
+/// the run is waiting on is a recorded fact and not a second ledger. `None`
+/// when no step of the run ever dispatched a fix round.
+fn newest_fix_round_locked(
+    conn: &Connection,
+    instance_id: &str,
+) -> Result<Option<SupervisionFixRound>, StateError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT request_line, outcome FROM idempotency
+              WHERE method = 'apply' AND outcome IS NOT NULL
+                AND outcome LIKE '%fix_round%'
+              ORDER BY rowid",
+        )
+        .map_err(|err| StateError::from_sqlite("supervision fix round: prepare", err))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(|err| StateError::from_sqlite("supervision fix round: query", err))?;
+    let mut newest: Option<SupervisionFixRound> = None;
+    for row in rows {
+        let (line, outcome) =
+            row.map_err(|err| StateError::from_sqlite("supervision fix round: row", err))?;
+        let Some(outcome) = outcome else {
+            continue;
+        };
+        let Ok(request) = Val::parse_json(&line) else {
+            continue;
+        };
+        let params = request.get("params").cloned().unwrap_or_else(null);
+        if params.get("instance_id").and_then(Val::as_str) != Some(instance_id) {
+            continue;
+        }
+        let Ok(outcome) = Val::parse_json(&outcome) else {
+            continue;
+        };
+        let Some(fix) = outcome
+            .get("result")
+            .and_then(|result| result.get("fix_round"))
+        else {
+            continue;
+        };
+        if fix.get("schema").and_then(Val::as_str) != Some("hf-fix-round/v1") {
+            continue;
+        }
+        let (Some(round), Some(bound), Some(lane), Some(feature_head)) = (
+            fix.get("round").and_then(Val::as_int),
+            fix.get("bound").and_then(Val::as_int),
+            fix.get("lane").and_then(Val::as_str),
+            fix.get("feature_head").and_then(Val::as_str),
+        ) else {
+            continue;
+        };
+        newest = Some(SupervisionFixRound {
+            step: params
+                .get("step")
+                .and_then(Val::as_str)
+                .unwrap_or("")
+                .to_string(),
+            feature_head: feature_head.to_string(),
+            round,
+            bound,
+            lane: lane.to_string(),
+        });
+    }
+    Ok(newest)
+}
+
 /// Read a grant row out of an `hf-grant/v1` document (validated by the
 /// caller through [`crate::schema::validate_doc`]).
 fn grant_row_from_doc(doc: &Val) -> Result<GrantRow, StateError> {
@@ -12030,6 +12101,10 @@ pub struct SupervisionEvidence {
     /// The NEWEST recorded REFUSAL of this run's own continuation dispatch
     /// (issue #141), when one exists.
     pub dispatch_refusal: Option<SupervisionDispatchRefusal>,
+    /// The NEWEST recorded fix-round dispatch of this run's review step
+    /// (issue #238), when one exists: the round of the automatic bound the
+    /// recorded FAIL was handed to.
+    pub fix_round: Option<SupervisionFixRound>,
 }
 
 /// One recorded refusal of a supervised continuation dispatch (issue #141).
@@ -12048,6 +12123,28 @@ pub struct SupervisionDispatchRefusal {
     pub code: String,
     /// When the refusal was recorded (RFC3339 UTC).
     pub at: String,
+}
+
+/// One recorded fix-round dispatch of a supervised run (issue #238).
+///
+/// A review FAIL no longer parks the run: the review step hands the failure
+/// to the run's own fix round, and the apply outcome of that step carries the
+/// dispatch (round of the automatic bound, the fix leg's lane and the
+/// certified head it was dispatched for). Reading it back lets the
+/// classification report the fix round as live work — "awaiting a fix round"
+/// — instead of reporting a FAIL that nothing continues.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SupervisionFixRound {
+    /// The review step whose recorded FAIL was handed to the fix round.
+    pub step: String,
+    /// The certified head the fix round was dispatched for.
+    pub feature_head: String,
+    /// The fix round (1-based) and the automatic bound it counts against.
+    pub round: i64,
+    /// See [`SupervisionFixRound::round`].
+    pub bound: i64,
+    /// The fix leg's lane session (the identity the instruction reached).
+    pub lane: String,
 }
 
 /// The recorded dispatch context of one run: the first topology it bound,
@@ -13576,6 +13673,12 @@ impl State {
             .optional()
             .map_err(|err| StateError::from_sqlite("supervision_evidence: dispatch refusal", err))?
             .and_then(|(target, at)| dispatch_refusal_of(instance_id, &target, &at));
+        // Issue #238: the newest recorded fix-round dispatch of this run. The
+        // review step's own apply outcome carries it (round of the automatic
+        // bound, the fix leg's lane, the certified head it was handed), so the
+        // classification reads the FAIL handoff from the same records it
+        // classifies the step from — never from a second bookkeeping row.
+        let fix_round = newest_fix_round_locked(&conn, instance_id)?;
         Ok(Some(SupervisionEvidence {
             run,
             has_dispatch_context,
@@ -13593,6 +13696,7 @@ impl State {
             item,
             newest_evidence,
             dispatch_refusal,
+            fix_round,
         }))
     }
 
@@ -17217,5 +17321,127 @@ mod tests {
             .cancel_lane_replacement(&record.replacement_id, "too late", at)
             .expect_err("cancel after retirement");
         assert_eq!(err.code, replacement_code::RETIRED, "{}", err.message);
+    }
+
+    /// The fix-round read-back of issue #238: the review step's own apply
+    /// outcome carries the round a recorded FAIL was handed to, and the read
+    /// returns exactly THIS run's newest one — another run's round and a
+    /// non-fix outcome of the same run are never read as its handoff.
+    #[test]
+    fn a_recorded_fix_round_is_read_back_from_the_runs_own_outcome() {
+        let conn = Connection::open_in_memory().expect("memory db");
+        conn.execute_batch(
+            "CREATE TABLE idempotency (key TEXT PRIMARY KEY, request_id TEXT NOT NULL,
+                method TEXT NOT NULL, status TEXT NOT NULL, epoch INTEGER NOT NULL,
+                request_line TEXT NOT NULL, outcome TEXT);",
+        )
+        .expect("idempotency schema");
+        let insert = |key: &str, run: &str, step: &str, fix: Option<(i64, &str)>| {
+            let request = object(vec![(
+                "params",
+                object(vec![("instance_id", string(run)), ("step", string(step))]),
+            )]);
+            let result = match fix {
+                Some((round, lane)) => object(vec![(
+                    "fix_round",
+                    object(vec![
+                        ("schema", string("hf-fix-round/v1")),
+                        ("round", integer(round)),
+                        ("bound", integer(3)),
+                        ("feature_head", string(&"a".repeat(40))),
+                        ("lane", string(lane)),
+                    ]),
+                )]),
+                None => object(vec![("verdict", string("pass"))]),
+            };
+            let outcome = object(vec![("status", string("succeeded")), ("result", result)]);
+            conn.execute(
+                "INSERT INTO idempotency (key, request_id, method, status, epoch,
+                    request_line, outcome) VALUES (?1, 'req', 'apply', 'spent', 1, ?2, ?3)",
+                params![key, canonical_text(&request), canonical_text(&outcome)],
+            )
+            .expect("idempotency row");
+        };
+        insert("ik-a-1", "run-a", "p6-5", None);
+        insert("ik-b-1", "run-b", "p6-5", Some((1, "lane-other")));
+        insert("ik-a-2", "run-a", "p6-5", Some((1, "lane-first")));
+        insert("ik-a-3", "run-a", "p6-5", Some((2, "lane-second")));
+
+        let read = newest_fix_round_locked(&conn, "run-a")
+            .expect("read")
+            .expect("this run's recorded fix round");
+        assert_eq!(read.step, "p6-5");
+        assert_eq!(read.round, 2, "the NEWEST recorded round is read");
+        assert_eq!(read.bound, 3);
+        assert_eq!(read.lane, "lane-second");
+        assert_eq!(read.feature_head, "a".repeat(40));
+        assert!(
+            newest_fix_round_locked(&conn, "run-c")
+                .expect("read")
+                .is_none(),
+            "a run that never dispatched a fix round has none"
+        );
+    }
+
+    /// AC4 of issue #238 at the durable-record level: a fix round whose
+    /// instruction the substrate refused is the review step's own recorded
+    /// failure, so `run status` (and the classification's `last_failure`)
+    /// carries the fix round's OWN code — never a generic diagnosis.
+    #[test]
+    fn a_refused_fix_round_is_the_runs_own_recorded_failure() {
+        let path = temp_db("fix-refused.db");
+        let state = State::open(&path, Retention::default()).expect("state open");
+        {
+            let conn = state.lock("test: refuse a fix round").expect("lock");
+            let request = object(vec![(
+                "params",
+                object(vec![
+                    ("instance_id", string("run-0123456789abcdef")),
+                    ("step", string("p6-5")),
+                ]),
+            )]);
+            let outcome = object(vec![
+                ("status", string("failed")),
+                ("result", null()),
+                (
+                    "error",
+                    object(vec![
+                        ("code", string(crate::mutation::code::FIX_PROMPT)),
+                        (
+                            "message",
+                            string(
+                                "the fix round's instruction was not delivered to lane \
+                                 \"lane-0123456789abcdef\" (adapter.exit): the substrate never \
+                                 took the submission",
+                            ),
+                        ),
+                    ]),
+                ),
+            ]);
+            conn.execute(
+                "INSERT INTO idempotency (key, request_id, method, status, epoch,
+                    request_line, outcome, claimed_at, resolved_at)
+                 VALUES (?1, 'req', 'apply', 'spent', 1, ?2, ?3,
+                    '2026-09-20T00:00:00Z', '2026-09-20T00:00:01Z')",
+                params![
+                    "ik_run-0123456789abcdef-p6-5",
+                    canonical_text(&request),
+                    canonical_text(&outcome)
+                ],
+            )
+            .expect("recorded apply outcome");
+        }
+        let failure = state
+            .run_step_failure("run-0123456789abcdef")
+            .expect("read")
+            .expect("the refused fix round is the run's standing failure");
+        assert_eq!(failure.step, "p6-5");
+        assert_eq!(failure.status, "failed");
+        assert_eq!(failure.code, crate::mutation::code::FIX_PROMPT);
+        assert!(
+            failure.message.contains("not delivered"),
+            "the substrate's own reason rides along: {}",
+            failure.message
+        );
     }
 }
