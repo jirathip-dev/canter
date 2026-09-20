@@ -359,6 +359,20 @@ fn cli_submit_and_status_agree_with_the_daemon_readback() {
     assert_eq!(exit, 0, "human status exit; stderr: {stderr}");
     assert!(stdout.contains("admitted 1"), "human rendering: {stdout}");
     assert!(stdout.contains("refused 1"), "human rendering: {stdout}");
+    // #236: the human text carries the producer's own message for each item,
+    // so the CLI text — not only `--json` — shows the fact a refusal names.
+    let messages: Vec<String> = items
+        .iter()
+        .filter_map(|item| item.get("message").and_then(Val::as_str))
+        .map(str::to_string)
+        .collect();
+    assert!(!messages.is_empty(), "the readback carries item messages");
+    for message in &messages {
+        assert!(
+            stdout.contains(message),
+            "the human rendering must carry {message:?}: {stdout}"
+        );
+    }
 
     // The daemon-side readback returns the same document again.
     let mut connection = Connection::open(&fixture.socket).expect("connect");

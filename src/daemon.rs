@@ -1373,6 +1373,8 @@ fn admission_gate(
         repository: plan.repository.clone(),
         harness_key,
         scope: instance.scope.clone(),
+        issue_number: instance.issue_number,
+        identity: instance.instance_id.clone(),
     };
     let mut running = Vec::new();
     for row in state
@@ -1390,6 +1392,10 @@ fn admission_gate(
                 repository: row.repository.clone(),
                 harness_key: String::new(),
                 scope: row.scope.clone(),
+                // The durable identity of the holding lane: a cap refusal
+                // names the run and issue that occupy the slot (#236).
+                issue_number: row.issue_number,
+                identity: row.instance_id.clone(),
             });
         }
     }
@@ -7649,6 +7655,11 @@ fn successor_admission(
                     .unwrap_or("")
                     .to_string(),
                 scope: scope.to_string(),
+                // The caller-attested lanes record repository, harness key and
+                // declared scope (and nothing else): a cap refusal names what
+                // it actually has — the declared worktree (#236).
+                issue_number: 0,
+                identity: String::new(),
             });
         }
     }
@@ -7661,6 +7672,8 @@ fn successor_admission(
         repository,
         harness_key: harness_key.to_string(),
         scope: worktree.to_string(),
+        issue_number: 0,
+        identity: String::new(),
     };
     crate::lifecycle::check_fanout_admission(
         &proposed,

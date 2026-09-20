@@ -61,8 +61,9 @@ pub const SELECTED_MAX: usize = 64;
 pub const STEPS_MAX: usize = 32;
 
 /// Bound on the rendered same-repository running lanes (overflow is
-/// reported explicitly, never silently dropped).
-pub const RUNNING_LANES_MAX: usize = 32;
+/// reported explicitly, never silently dropped). The same window a cap
+/// refusal names occupants through — one authority (#236).
+pub const RUNNING_LANES_MAX: usize = crate::lifecycle::LANE_OCCUPANTS_MAX;
 
 /// Closed item statuses (the acceptance vocabulary).
 pub const ITEM_STATUSES: [&str; 3] = ["eligible", "blocked", "already_owned"];
@@ -1154,27 +1155,22 @@ fn digest_document(request: &Validated) -> Val {
     ])
 }
 
-/// The counted lanes rendered as `id (run on scope)` names (#236): a cap
-/// refusal must name what occupies the cap, not only its count. Bounded by
-/// the same window the `concurrency.lanes` rendering uses.
-fn lane_occupants(lanes: &[&InstanceRow]) -> String {
-    let names = lanes
+/// The counted durable lanes as the admission gate's footprints (#236): the
+/// SAME rows the preview counts, so the one authoritative occupancy renderer
+/// (`crate::lifecycle::lane_occupants`) names exactly them. Harness occupancy
+/// is client-attested and not durable state, so the per-harness axis has no
+/// rows to convert.
+fn lane_footprints(lanes: &[&InstanceRow]) -> Vec<crate::lifecycle::LaneFootprint> {
+    lanes
         .iter()
-        .take(RUNNING_LANES_MAX)
-        .map(|row| {
-            format!(
-                "{}#{} ({} on {})",
-                row.repository, row.issue_number, row.instance_id, row.scope
-            )
+        .map(|row| crate::lifecycle::LaneFootprint {
+            repository: row.repository.clone(),
+            harness_key: String::new(),
+            scope: row.scope.clone(),
+            issue_number: row.issue_number,
+            identity: row.instance_id.clone(),
         })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let overflow = lanes.len().saturating_sub(RUNNING_LANES_MAX);
-    if overflow == 0 {
-        names
-    } else {
-        format!("{names}, +{overflow} more")
-    }
+        .collect()
 }
 
 /// Render the deterministic, effect-free preview of one exact selected-issue
@@ -1264,8 +1260,10 @@ pub fn preview_queue(state: &State, request: &QueueRequest) -> Result<QueuePrevi
             code: admission::CAP_GLOBAL,
             subject: "global".to_string(),
             message: format!(
-                "the global concurrency cap ({}) is reached ({} active lanes); fan-out refuses",
-                request.caps.global, running_total
+                "the global concurrency cap ({}) is reached ({} active lanes: {}); fan-out refuses",
+                request.caps.global,
+                running_total,
+                crate::lifecycle::lane_occupants(lane_footprints(&counted).iter())
             ),
         });
     }
@@ -1278,7 +1276,7 @@ pub fn preview_queue(state: &State, request: &QueueRequest) -> Result<QueuePrevi
                 request.caps.per_repository,
                 request.repository,
                 running_repository,
-                lane_occupants(&same_repository)
+                crate::lifecycle::lane_occupants(lane_footprints(&same_repository).iter())
             ),
         });
     }
