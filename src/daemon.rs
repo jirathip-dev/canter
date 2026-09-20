@@ -3044,7 +3044,13 @@ fn method_apply_from(shared: &Arc<Shared>, request: &Request, supervised: bool) 
     // set (a run that is not terminal still holds its issue's ownership), so
     // the retire can never close a live generation's workspace. Only a bind
     // step can retire, so nothing else pays for the resolution.
-    let retired_run_ids: Vec<String> = if kind == "harness_start" {
+    //
+    // Issue #222: `worktree_create` resolves the SAME set — the same issue's
+    // terminal generations also leave the lane checkout and the local lane
+    // branch behind in the integration clone, and those are what block the
+    // next run's lane creation. The resolution is scoped to this repository
+    // issue, so a sibling issue's run can never be in it.
+    let retired_run_ids: Vec<String> = if kind == "harness_start" || kind == "worktree_create" {
         let state = match shared.lock_state() {
             Ok(state) => state,
             Err(message) => {
