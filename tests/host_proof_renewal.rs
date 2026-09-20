@@ -22,6 +22,11 @@
 //! live services, no network.
 #[path = "support/process_group.rs"]
 mod process_group;
+#[path = "support/wait_bounds.rs"]
+// The ceilings are shared by every driver-driven wait; a crate uses a subset,
+// so the module's unused half is not a defect here.
+#[allow(dead_code)]
+mod wait_bounds;
 
 use canter::canonical::canonical_text;
 use canter::state::{Retention, State};
@@ -94,7 +99,7 @@ fn item_of<'a>(doc: &'a Val, id: &str) -> &'a Val {
 /// per-suite budget (`scripts/ci-test-driver.py` runs every suite with
 /// `PER_SUITE_SECONDS = 300`, serial) so a genuinely stuck frontier still
 /// reports itself instead of being killed by the driver.
-const FRONTIER_NO_PROGRESS_SECS: u64 = 240;
+const FRONTIER_NO_PROGRESS_SECS: u64 = wait_bounds::FRONTIER_NO_PROGRESS_SECS;
 
 /// The durable progress a frontier wait tracks: the whole recorded cursor —
 /// frontier, attempt ledger, in-flight step — canonically rendered, so any

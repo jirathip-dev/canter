@@ -28,6 +28,12 @@ use canter::state::{
 };
 use canter::value::{Val, integer, object, string};
 
+#[path = "support/wait_bounds.rs"]
+// The ceilings are shared by every driver-driven wait; a crate uses a
+// subset, so the module's unused half is not a defect here.
+#[allow(dead_code)]
+mod wait_bounds;
+
 const REPO: &str = "example-org/widgets";
 const HOST: &str = "host-1";
 const HARNESS: &str = "lane-1";
@@ -556,7 +562,7 @@ fn rpc_ok(socket: &Path, id: &str, method: &str, params: Option<Val>) -> Val {
 /// so a single starved wake can never fail a witness, and it stays inside the
 /// CI test driver's per-suite budget (`scripts/ci-test-driver.py`,
 /// `PER_SUITE_SECONDS = 300`).
-const NO_PROGRESS_SECS: u64 = 120;
+const NO_PROGRESS_SECS: u64 = wait_bounds::STATE_NO_PROGRESS_SECS;
 
 /// The durable progress a recorded-state wait tracks: the run's control state
 /// and boundary, canonically rendered, so any recorded transition counts as

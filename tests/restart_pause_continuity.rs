@@ -33,6 +33,12 @@ use canter::state::{QueueSubmissionPlan, Retention, State};
 use canter::supervision;
 use canter::value::{Val, integer, object, string};
 
+#[path = "support/wait_bounds.rs"]
+// The ceilings are shared by every driver-driven wait; a crate uses a
+// subset, so the module's unused half is not a defect here.
+#[allow(dead_code)]
+mod wait_bounds;
+
 // ---------------------------------------------------------------------------
 // Constants and the #84/#85/#95/#96 fixture shape
 // ---------------------------------------------------------------------------
@@ -62,7 +68,7 @@ const CRASH_AFTER_COMMIT: &str = "queue.advance.after-commit";
 /// The production-default timer fallback cadence (the pause matrix runs the
 /// DEFAULT policy, so a delayed wake is bounded by the same interval a live
 /// daemon would use).
-const DEFAULT_INTERVAL_SECS: i64 = 60;
+const DEFAULT_INTERVAL_SECS: i64 = wait_bounds::CHECK_INTERVAL_SECS as i64;
 const DEFAULT_TIMEOUT_SECS: i64 = 7200;
 
 /// A long check interval keeps the timer fallback out of the test window for

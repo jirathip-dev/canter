@@ -42,6 +42,12 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
+#[path = "support/wait_bounds.rs"]
+// The ceilings are shared by every driver-driven wait; a crate uses a
+// subset, so the module's unused half is not a defect here.
+#[allow(dead_code)]
+mod wait_bounds;
+
 // ---------------------------------------------------------------------------
 // Constants and builders (synthetic identities only)
 // ---------------------------------------------------------------------------
@@ -62,7 +68,7 @@ const POLICY_HASH: &str = "feedface01234567feedface01234567feedface01234567feedf
 /// so a single starved wake can never fail a witness — and it stays inside the
 /// CI test driver's per-suite budget (`scripts/ci-test-driver.py`,
 /// `PER_SUITE_SECONDS = 300`).
-const NO_PROGRESS_SECS: u64 = 120;
+const NO_PROGRESS_SECS: u64 = wait_bounds::STATE_NO_PROGRESS_SECS;
 
 fn config() -> Config {
     Config {

@@ -34,6 +34,12 @@ use canter::supervision;
 use canter::value::{Val, integer, null, object, string};
 use process_group::{GroupChild, assert_no_process_for_socket};
 
+#[path = "support/wait_bounds.rs"]
+// The ceilings are shared by every driver-driven wait; a crate uses a
+// subset, so the module's unused half is not a defect here.
+#[allow(dead_code)]
+mod wait_bounds;
+
 // ---------------------------------------------------------------------------
 // Constants and builders (the #84/#85 fixture shape, one selected issue)
 // ---------------------------------------------------------------------------
@@ -711,7 +717,7 @@ fn request_repaired_frontier(
 /// single starved wake can never fail a witness, and it stays inside the CI
 /// test driver's per-suite budget (`scripts/ci-test-driver.py`,
 /// `PER_SUITE_SECONDS = 300`).
-const NO_PROGRESS_SECS: u64 = 120;
+const NO_PROGRESS_SECS: u64 = wait_bounds::STATE_NO_PROGRESS_SECS;
 
 /// The durable progress a recorded-state wait tracks: the cursor plus the
 /// committed check ledger (count, last check, continuation) of the recorded

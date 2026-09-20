@@ -1,6 +1,11 @@
 //! Isolated supported-surface executor proofs. No live services or direct DB writes.
 #[path = "support/process_group.rs"]
 mod process_group;
+#[path = "support/wait_bounds.rs"]
+// The ceilings are shared by every driver-driven wait; a crate uses a subset,
+// so the module's unused half is not a defect here.
+#[allow(dead_code)]
+mod wait_bounds;
 
 use canter::canonical::canonical_text;
 use canter::value::{Val, integer, object, string};
@@ -28,7 +33,7 @@ const REV_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 /// starved wake can never fail a witness, and it stays inside the CI test
 /// driver's per-suite budget (`scripts/ci-test-driver.py`,
 /// `PER_SUITE_SECONDS = 300`).
-const NO_PROGRESS_SECS: u64 = 120;
+const NO_PROGRESS_SECS: u64 = wait_bounds::STATE_NO_PROGRESS_SECS;
 
 /// The durable progress a recorded-state wait tracks: the cursor plus the
 /// committed check ledger (count, last check, continuation), canonically
