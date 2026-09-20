@@ -124,8 +124,20 @@ impl Fixture {
             "bin/hermes",
             "#!/bin/sh\nprintf 'x\\n' >> \"$HOME/prompt-count\"\nprintf 'worker delta\\n' > autonomous.txt\ngit add autonomous.txt\ngit -c user.name=Worker -c user.email=worker@example.invalid commit -m 'worker delivery'\nprintf '%s\\n' \"$@\" > \"$HOME/prompt-argv\"\nprintf 'fixture output\\n'\n",
         );
+        // Issue #225: the publish path COMPUTES the hosted CI conclusion at
+        // the certified head through the forge CLI, so the fixture answers the
+        // deterministic green check its own head carries.
+        fixture.write(
+            "bin/gh",
+            "#!/bin/sh\ncase \"$1\" in\n  run)\n    case \"$2\" in\n      list) printf '[{\"databaseId\":4242,\"workflowName\":\"ci\",\"status\":\"completed\",\"conclusion\":\"success\"}]'; exit 0 ;;\n    esac ;;\nesac\nexit 1\n",
+        );
         std::fs::set_permissions(
             fixture.path("bin/hermes"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            fixture.path("bin/gh"),
             std::fs::Permissions::from_mode(0o755),
         )
         .unwrap();

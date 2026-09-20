@@ -1718,9 +1718,34 @@ impl DaemonFixture {
 
     fn spawn(&self) -> Child {
         std::fs::create_dir_all(&self.state_dir).expect("state home");
+        // Issue #225: the publish path COMPUTES the hosted CI conclusion at the
+        // certified head through the forge CLI, so the fixture provides the
+        // deterministic green check its own fixture head carries.
+        let bin = self.dir.join("fakebin");
+        std::fs::create_dir_all(&bin).expect("fakebin dir");
+        let gh = bin.join("gh");
+        std::fs::write(
+            &gh,
+            "#!/bin/sh\ncase \"$1\" in\n  run)\n    case \"$2\" in\n      list) printf '[{\"databaseId\":4242,\"workflowName\":\"ci\",\"status\":\"completed\",\"conclusion\":\"success\"}]'; exit 0 ;;\n    esac ;;\nesac\nexit 1\n",
+        )
+        .expect("fake gh");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod +x");
+        }
         Command::new(env!("CARGO_BIN_EXE_canter"))
             .args(["daemon", "run", "--socket"])
             .arg(&self.socket)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
             .env("XDG_STATE_HOME", &self.state_dir)
             .env("HOME", &self.dir)
             .stdout(Stdio::null())
