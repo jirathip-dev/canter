@@ -1338,21 +1338,21 @@ fn admission_gate(
     };
     // Per-harness axis: the attested active-lane count on this harness key.
     let harness_lanes = admission.harness_lanes.unwrap_or(0);
+    let harness_key = params
+        .and_then(|p| p.get("harness_key"))
+        .and_then(Val::as_str)
+        .unwrap_or("");
     if usize::try_from(harness_lanes).unwrap_or(usize::MAX) >= caps.per_harness {
         return Err(err_response(
             &request.id,
             crate::lifecycle::code::CAP_HARNESS,
             format!(
-                "the per-harness concurrency cap ({}) is reached ({} attested lanes on this harness); refuse fan-out",
-                caps.per_harness, harness_lanes
+                "the per-harness concurrency cap ({}) is reached ({} attested lanes on harness {:?}); refuse fan-out",
+                caps.per_harness, harness_lanes, harness_key
             ),
         ));
     }
-    let harness_key = params
-        .and_then(|p| p.get("harness_key"))
-        .and_then(Val::as_str)
-        .unwrap_or("")
-        .to_string();
+    let harness_key = harness_key.to_string();
     // State-derived lanes + the proposed footprint.
     let state = match shared.lock_state() {
         Ok(state) => state,

@@ -1154,6 +1154,29 @@ fn digest_document(request: &Validated) -> Val {
     ])
 }
 
+/// The counted lanes rendered as `id (run on scope)` names (#236): a cap
+/// refusal must name what occupies the cap, not only its count. Bounded by
+/// the same window the `concurrency.lanes` rendering uses.
+fn lane_occupants(lanes: &[&InstanceRow]) -> String {
+    let names = lanes
+        .iter()
+        .take(RUNNING_LANES_MAX)
+        .map(|row| {
+            format!(
+                "{}#{} ({} on {})",
+                row.repository, row.issue_number, row.instance_id, row.scope
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let overflow = lanes.len().saturating_sub(RUNNING_LANES_MAX);
+    if overflow == 0 {
+        names
+    } else {
+        format!("{names}, +{overflow} more")
+    }
+}
+
 /// Render the deterministic, effect-free preview of one exact selected-issue
 /// run. The only read is the existing durable state read API; nothing is
 /// spawned, granted, written or unpaused.
@@ -1251,8 +1274,11 @@ pub fn preview_queue(state: &State, request: &QueueRequest) -> Result<QueuePrevi
             code: admission::CAP_REPOSITORY,
             subject: request.repository.clone(),
             message: format!(
-                "the per-repository concurrency cap ({}) is reached for {:?} ({} active lanes); fan-out refuses",
-                request.caps.per_repository, request.repository, running_repository
+                "the per-repository concurrency cap ({}) is reached for {:?} ({} active lanes: {}); fan-out refuses",
+                request.caps.per_repository,
+                request.repository,
+                running_repository,
+                lane_occupants(&same_repository)
             ),
         });
     }
@@ -1263,8 +1289,8 @@ pub fn preview_queue(state: &State, request: &QueueRequest) -> Result<QueuePrevi
             code: admission::CAP_HARNESS,
             subject: request.harness_key.clone(),
             message: format!(
-                "the per-harness concurrency cap ({}) is reached ({} attested lanes on this harness); fan-out refuses",
-                request.caps.per_harness, lanes
+                "the per-harness concurrency cap ({}) is reached ({lanes} attested lanes on harness {:?}); fan-out refuses",
+                request.caps.per_harness, request.harness_key
             ),
         });
     }

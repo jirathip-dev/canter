@@ -187,6 +187,17 @@ fn top_codes(doc: &Val) -> Vec<String> {
     codes(array(doc, "holds"))
 }
 
+/// The rendered message of the first hold carrying `code` (#236: a cap
+/// refusal must name what occupies the cap, not only the count).
+fn hold_message(doc: &Val, code: &str) -> String {
+    array(doc, "holds")
+        .iter()
+        .find(|hold| hold.get("code").and_then(Val::as_str) == Some(code))
+        .and_then(|hold| hold.get("message").and_then(Val::as_str))
+        .unwrap_or_else(|| panic!("the {code} hold is rendered with a message"))
+        .to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Durable state seeds (synthetic; the same grant/instance path the daemon
 // uses, so ownership facts are real durable rows)
@@ -669,6 +680,26 @@ fn concurrency_is_shown_and_exhausted_capacities_are_named_holds() {
     assert!(
         top.contains(&"refusal.admission.cap_harness".to_string()),
         "the attested per-harness occupancy is exhausted: {top:?}"
+    );
+    // #236 AC2: a cap refusal names what occupies the cap — the count, the
+    // cap, and the lane identities (here: issue and run id per lane) — so an
+    // operator can see who holds the slot instead of a bare count.
+    let repository_hold = hold_message(doc, "refusal.admission.cap_repository");
+    for needle in [
+        "run-cap-0001",
+        "run-cap-0002",
+        "example-org/widgets#5",
+        "example-org/widgets#6",
+    ] {
+        assert!(
+            repository_hold.contains(needle),
+            "the per-repository refusal must name {needle}: {repository_hold}"
+        );
+    }
+    let harness_hold = hold_message(doc, "refusal.admission.cap_harness");
+    assert!(
+        harness_hold.contains("\"lane-1\""),
+        "the per-harness refusal must name the harness that occupies the cap: {harness_hold}"
     );
     let concurrency = doc.get("concurrency").expect("concurrency");
     let running = concurrency.get("running").expect("running");
