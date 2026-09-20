@@ -47,6 +47,27 @@ fn item_of<'a>(doc: &'a Val, id: &str) -> &'a Val {
         .unwrap_or_else(|| panic!("item {id} in {doc:?}"))
 }
 
+/// The no-progress ceiling of a frontier wait, in seconds (issue #232).
+///
+/// Progress-driven, never a fixed wall-clock bound: the driver wakes
+/// semantically on each committed step and otherwise re-checks on its
+/// bounded timer fallback (`canter::supervision::DEFAULT_CHECK_INTERVAL_SECS`,
+/// 60 s), so one starved wake legitimately holds the frontier for a little
+/// over a minute on a loaded host. Four ticks is the ceiling — a starved
+/// wake can never fail the witness — and it stays comfortably inside the CI
+/// test driver's per-suite budget (`scripts/ci-test-driver.py`,
+/// `PER_SUITE_SECONDS = 300`), so a genuinely stuck frontier still reports
+/// itself instead of being killed by the driver.
+const FRONTIER_NO_PROGRESS_SECS: u64 = 240;
+
+/// The durable progress a frontier wait tracks: the whole recorded cursor —
+/// frontier, attempt ledger, in-flight step — canonically rendered, so any
+/// new attempt, settlement or frontier move counts as progress while a
+/// re-read of an unchanged cursor does not.
+fn frontier_progress(sup: &Val) -> String {
+    canonical_text(field(sup, &["cursor"]))
+}
+
 fn hold_codes(item: &Val) -> Vec<String> {
     field(item, &["holds"])
         .as_array()
@@ -379,17 +400,40 @@ impl Fixture {
         std::fs::read_to_string(self.path("state/canter/journal/audit.jsonl")).unwrap()
     }
 
-    /// Wait (bounded) until the run's recorded frontier is `step`, and return
-    /// the supervision status document that shows it.
+    /// Wait until the run's recorded frontier is `step`, and return the
+    /// supervision status document that shows it.
+    ///
+    /// PROGRESS-DRIVEN, never a fixed wall-clock bound (issue #232): the
+    /// ceiling is `FRONTIER_NO_PROGRESS_SECS` of NO durable progress, and any
+    /// new recorded attempt, settlement or frontier move resets it. A
+    /// genuinely stuck frontier still fails, naming the progress observed and
+    /// the elapsed time.
     fn wait_for_frontier(&self, run: &str, step: &str) -> Val {
-        let deadline = Instant::now() + Duration::from_secs(90);
+        let started = Instant::now();
+        let mut last_progress = started;
+        let mut progress = String::new();
         loop {
             let sup = self.supervision(run);
             if text(&sup, &["cursor", "next_step"]) == step {
                 return sup;
             }
-            if Instant::now() >= deadline {
-                panic!("the frontier never reached {step}: {sup:?}");
+            let observed = frontier_progress(&sup);
+            if observed != progress {
+                progress = observed;
+                last_progress = Instant::now();
+            }
+            let stalled = last_progress.elapsed().as_secs();
+            if stalled >= FRONTIER_NO_PROGRESS_SECS {
+                panic!(
+                    "the frontier never reached {step}: no progress for {stalled}s of {}s \
+                     waited (frontier {:?}, {} recorded attempt(s), in_flight {:?}): {sup:?}",
+                    started.elapsed().as_secs(),
+                    text(&sup, &["cursor", "next_step"]),
+                    field(&sup, &["cursor", "attempts"])
+                        .as_array()
+                        .map_or(0, Vec::len),
+                    text(&sup, &["cursor", "in_flight"]),
+                );
             }
             std::thread::sleep(Duration::from_millis(100));
         }
