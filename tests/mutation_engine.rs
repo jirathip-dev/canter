@@ -89,6 +89,8 @@ impl Git {
             .current_dir(&self.cwd)
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
+            // #226: copy nothing from the host's shared git templates.
+            .env("GIT_TEMPLATE_DIR", "")
             .env("HOME", std::env::var("HOME").unwrap_or_default())
             .env("GIT_AUTHOR_NAME", "test")
             .env("GIT_AUTHOR_EMAIL", "test@example.invalid")

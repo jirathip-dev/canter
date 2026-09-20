@@ -190,6 +190,8 @@ fn make_widgets_repo(sandbox: &Sandbox) -> PathBuf {
             .args(args)
             .current_dir(&repo)
             .env_clear()
+            // #226: copy nothing from the host's shared git templates.
+            .env("GIT_TEMPLATE_DIR", "")
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("GIT_AUTHOR_NAME", "test")
             .env("GIT_AUTHOR_EMAIL", "test@example.invalid")

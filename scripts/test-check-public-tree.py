@@ -19,6 +19,10 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCANNER = os.path.join(HERE, "check-public-tree.py")
+# Scratch repositories are never initialised from the host's shared git
+# template directory (issue #226): that copy belongs to the machine and fails
+# intermittently under CI. An empty template directory copies nothing.
+GIT_TEMPLATE_ENV = dict(os.environ, GIT_TEMPLATE_DIR="")
 
 
 def _build_abs_unix_path() -> str:
@@ -82,7 +86,7 @@ class ScannerFixtureTest(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="hf-public-tree-test-")
         self.repo = self._tmp.name
-        subprocess.run(["git", "init", "-q", self.repo], check=True)
+        subprocess.run(["git", "init", "-q", self.repo], check=True, env=GIT_TEMPLATE_ENV)
         subprocess.run(
             ["git", "-C", self.repo, "config", "user.email", "test@example.invalid"],
             check=True,
@@ -236,7 +240,7 @@ class OperationalTests(unittest.TestCase):
 
     def test_empty_tracked_tree_is_never_clean(self) -> None:
         with tempfile.TemporaryDirectory(prefix="hf-public-tree-empty-") as tmp:
-            subprocess.run(["git", "init", "-q", tmp], check=True)
+            subprocess.run(["git", "init", "-q", tmp], check=True, env=GIT_TEMPLATE_ENV)
             proc = _run_scanner(tmp)
         self.assertEqual(proc.returncode, 3, "expected exit 3, got {}".format(proc.returncode))
 

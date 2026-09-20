@@ -442,6 +442,8 @@ fn init_repo(path: &Path) {
         let status = Command::new("git")
             .args(&args)
             .current_dir(path)
+            // #226: copy nothing from the host's shared git templates.
+            .env("GIT_TEMPLATE_DIR", "")
             .status()
             .expect("git runs");
         assert!(status.success(), "git {args:?}");

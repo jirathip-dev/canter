@@ -188,12 +188,18 @@ impl Fixture {
     }
 
     fn git(&self, args: &[&str]) -> String {
+        self.git_at(&self.path("repo"), args)
+    }
+
+    fn git_at(&self, directory: &std::path::Path, args: &[&str]) -> String {
         let out = Command::new("/usr/bin/git")
             .arg("-C")
-            .arg(self.path("repo"))
+            .arg(directory)
             .args(args)
             .env("HOME", &self.root)
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            // #226: copy nothing from the host's shared git templates.
+            .env("GIT_TEMPLATE_DIR", "")
             .output()
             .unwrap();
         assert!(
@@ -561,4 +567,75 @@ fn a_submit_time_proof_renews_at_dispatch_time_and_the_fanout_steps_are_reached(
     let socket = fixture.path("d.sock");
     fixture.stop();
     assert_no_process_for_socket(&socket);
+}
+
+/// Issue #226: the harness initialises scratch repositories itself — never
+/// from the HOST's shared git template directory.
+///
+/// `git init` copies that directory by default (git's compiled-in default,
+/// `$GIT_TEMPLATE_DIR`, or `init.templateDir`). Under CI the shared copy
+/// fails intermittently (`fatal: cannot copy .../hooks/fsmonitor-watchman.sample`)
+/// and reddens a suite that owns no defect, so every fixture `git` command
+/// points git at an EMPTY template directory instead.
+#[test]
+fn scratch_repositories_never_read_the_host_git_templates() {
+    let fixture = Fixture::new();
+    // The "host" here is the fixture's own `HOME`: a template directory
+    // configured the way a machine or CI image configures one, holding a hook
+    // that cannot be read — exactly the copy that reddened staging.
+    let templates = fixture.path("host-templates");
+    let hooks = templates.join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    std::fs::write(hooks.join("host-marker.sample"), "host hook\n").unwrap();
+    let unreadable = hooks.join("unreadable.sample");
+    std::fs::write(&unreadable, "host hook\n").unwrap();
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+    fixture.write(
+        ".gitconfig",
+        &format!("[init]\n\ttemplateDir = {}\n", templates.display()),
+    );
+
+    // Positive control: a raw `git init` in this very environment DOES depend
+    // on the host template and dies on the copy, so a harness init that still
+    // consulted the host could not pass by accident.
+    let control_dir = fixture.path("control");
+    std::fs::create_dir_all(&control_dir).unwrap();
+    let control = Command::new("/usr/bin/git")
+        .arg("-C")
+        .arg(&control_dir)
+        .args(["init", "-q", "-b", "staging"])
+        .env("HOME", &fixture.root)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("control init");
+    let control_err = String::from_utf8_lossy(&control.stderr).into_owned();
+    assert!(
+        !control.status.success() && control_err.contains("cannot copy"),
+        "the host template must be the one CI died on: {control_err}"
+    );
+
+    // The witness: N scratch repositories initialised CONCURRENTLY through the
+    // harness path every fixture uses.
+    const SCRATCH: usize = 8;
+    std::thread::scope(|scope| {
+        let inits: Vec<_> = (0..SCRATCH)
+            .map(|index| {
+                let directory = fixture.path(&format!("scratch-{index}"));
+                std::fs::create_dir_all(&directory).unwrap();
+                let harness = &fixture;
+                scope.spawn(move || harness.git_at(&directory, &["init", "-q", "-b", "staging"]))
+            })
+            .collect();
+        for init in inits {
+            init.join().expect("every harness scratch init succeeds");
+        }
+    });
+    for index in 0..SCRATCH {
+        let directory = fixture.path(&format!("scratch-{index}"));
+        assert!(
+            !directory.join(".git/hooks/host-marker.sample").exists(),
+            "the host's hook was imported into {}",
+            directory.display()
+        );
+    }
 }

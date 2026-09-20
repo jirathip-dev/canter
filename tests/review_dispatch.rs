@@ -53,6 +53,8 @@ fn git(cwd: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .args(args)
         .current_dir(cwd)
+        // #226: copy nothing from the host's shared git templates.
+        .env("GIT_TEMPLATE_DIR", "")
         .output()
         .expect("git runs");
     assert!(

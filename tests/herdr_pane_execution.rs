@@ -385,6 +385,8 @@ impl Fixture {
         ] {
             let out = std::process::Command::new("git")
                 .args(args)
+                // #226: copy nothing from the host's shared git templates.
+                .env("GIT_TEMPLATE_DIR", "")
                 .output()
                 .expect("git fixture");
             assert!(
