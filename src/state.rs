@@ -220,6 +220,12 @@ pub enum RunRetryClaim {
 /// The number of bounded retries one (run, step) may ever authorize.
 pub const RUN_RETRY_MAX: i64 = 3;
 
+/// The longest reason ONE recorded continuation-dispatch refusal carries
+/// (issue #230): the engine's own message is recorded so a status read can
+/// name WHY the frontier never lands, bounded so one refusal can never bloat
+/// the audit row.
+pub const DISPATCH_REFUSAL_REASON_MAX: usize = 300;
+
 /// Whether one RECORDED step attempt is a step diagnosis: an outcome of an
 /// attempt that actually ran (or whose work was refused for a reason of the
 /// step's own), and therefore one the bounded-retry fence bounds.
@@ -237,6 +243,57 @@ pub fn step_attempt_diagnosed(status: &str, code: &str) -> bool {
         return false;
     }
     code != crate::mutation::code::GRANT_EXPIRED
+}
+
+/// The journal action ONE recorded check re-evaluation is written under
+/// (issue #230). The record lives in the same hash-chained `audit` journal as
+/// every other mutation: it is the durable, attributed, tamper-evident trace
+/// of the one control that may re-run a check producer.
+pub const REEVALUATION_ACTION: &str = "run.reevaluate";
+
+/// ONE recorded check re-evaluation of one (run, step) (issue #230): the
+/// operator identity and reason that authorized it, the evidence record whose
+/// checks were not passing, and when it was journaled. The record carries no
+/// check status and no verdict — it authorizes a RECOMPUTATION, never a
+/// result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunReevaluationRow {
+    /// The plan-local step whose own checks were re-evaluated.
+    pub step_id: String,
+    /// The evidence record whose checks were not passing (`ev_` + 16 hex).
+    pub evidence_id: String,
+    /// The recorded operator identity that authorized the re-evaluation.
+    pub operator: String,
+    /// The recorded operator reason.
+    pub reason: String,
+    /// When the record was journaled (RFC3339 UTC).
+    pub at: String,
+}
+
+/// Parse one recorded re-evaluation target (`run:<id>:step:<step>:evidence:
+/// <evidence>:operator:<operator>:reason:<reason>`, the step and the length
+/// prefix supplied by the reader) back into its typed record. A target that
+/// does not carry all of the fields is not readable evidence and yields
+/// `None` (never a guessed operator or reason).
+fn reevaluation_of(
+    prefix: &str,
+    step_id: &str,
+    target: &str,
+    at: &str,
+) -> Option<RunReevaluationRow> {
+    let rest = target.strip_prefix(prefix)?;
+    let (evidence_id, rest) = rest.split_once(":operator:")?;
+    let (operator, reason) = rest.split_once(":reason:")?;
+    if evidence_id.is_empty() || operator.is_empty() || step_id.is_empty() {
+        return None;
+    }
+    Some(RunReevaluationRow {
+        step_id: step_id.to_string(),
+        evidence_id: evidence_id.to_string(),
+        operator: operator.to_string(),
+        reason: reason.to_string(),
+        at: at.to_string(),
+    })
 }
 
 /// The recorded outcome of ONE explicit run release (issue #146): the run
@@ -3900,6 +3957,88 @@ impl State {
             return Ok(RunRetryClaim::Missing);
         }
         Ok(RunRetryClaim::Consumed(retry_id))
+    }
+
+    /// Record ONE bounded check re-evaluation of one (run, step) in the
+    /// durable journal (issue #230), attributed to the operator identity and
+    /// the reason that presented it. The record claims nothing, authorizes
+    /// nothing by itself and presents no check status: it is the audited
+    /// trace of the re-run that follows.
+    pub fn record_run_reevaluation(
+        &self,
+        instance_id: &str,
+        step_id: &str,
+        evidence_id: &str,
+        operator: &str,
+        reason: &str,
+        key: &str,
+    ) -> Result<RunReevaluationRow, StateError> {
+        self.ensure_writable()?;
+        let mut conn = self.lock("record_run_reevaluation")?;
+        let tx = conn
+            .transaction()
+            .map_err(|err| StateError::from_sqlite("run.reevaluate: begin", err))?;
+        // The record is colon-delimited and parsed back the same way: the
+        // reason is LAST so it may carry any printable text, and the identity
+        // is refused a colon so the fields around it stay unambiguous (the
+        // control's own parser enforces that, this is the second reader).
+        if operator.contains(':') || evidence_id.contains(':') {
+            return Err(state_error(
+                "state.reevaluation_invalid",
+                "a re-evaluation record carries no ':' in its operator or evidence identity",
+            ));
+        }
+        let target = format!(
+            "run:{instance_id}:step:{step_id}:evidence:{evidence_id}:operator:{operator}:reason:{reason}"
+        );
+        let row = self.append_audit_locked(&tx, REEVALUATION_ACTION, &target, key, None, None)?;
+        tx.commit()
+            .map_err(|err| StateError::from_sqlite("run.reevaluate: commit", err))?;
+        // The instant is read back from the record's OWN canonical line: one
+        // clock read wrote it, so the row can never name another instant.
+        let at = Val::parse_json(&row.line)
+            .ok()
+            .and_then(|doc| doc.get("at").and_then(Val::as_str).map(str::to_string))
+            .unwrap_or_default();
+        Ok(RunReevaluationRow {
+            step_id: step_id.to_string(),
+            evidence_id: evidence_id.to_string(),
+            operator: operator.to_string(),
+            reason: reason.to_string(),
+            at,
+        })
+    }
+
+    /// Every recorded check re-evaluation of one (run, step), oldest first —
+    /// the durable record the bound and the attribution are read from.
+    pub fn run_reevaluations(
+        &self,
+        instance_id: &str,
+        step_id: &str,
+    ) -> Result<Vec<RunReevaluationRow>, StateError> {
+        let conn = self.lock("run_reevaluations")?;
+        let prefix = format!("run:{instance_id}:step:{step_id}:evidence:");
+        let mut statement = conn
+            .prepare(
+                "SELECT target, at FROM audit
+                      WHERE action = ?2 AND target LIKE ?1
+                      ORDER BY seq",
+            )
+            .map_err(|err| StateError::from_sqlite("run_reevaluations: prepare", err))?;
+        let rows = statement
+            .query_map(params![format!("{prefix}%"), REEVALUATION_ACTION], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|err| StateError::from_sqlite("run_reevaluations: query", err))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (target, at) =
+                row.map_err(|err| StateError::from_sqlite("run_reevaluations: row", err))?;
+            if let Some(record) = reevaluation_of(&prefix, step_id, &target, &at) {
+                out.push(record);
+            }
+        }
+        Ok(out)
     }
 
     /// Renew the OWN lapsed authorization window of one live run (issue
@@ -8633,13 +8772,18 @@ pub(crate) fn dispatch_refusal_of(
     at: &str,
 ) -> Option<SupervisionDispatchRefusal> {
     let rest = target.strip_prefix(instance_id)?.strip_prefix(':')?;
-    let (step, code) = rest.split_once(':')?;
+    let (step, rest) = rest.split_once(':')?;
+    let (code, reason) = match rest.split_once(":reason:") {
+        Some((code, reason)) => (code, reason),
+        None => (rest, ""),
+    };
     if step.is_empty() || code.is_empty() {
         return None;
     }
     Some(SupervisionDispatchRefusal {
         step: step.to_string(),
         code: code.to_string(),
+        reason: reason.to_string(),
         at: at.to_string(),
     })
 }
@@ -12046,6 +12190,10 @@ pub struct SupervisionDispatchRefusal {
     /// The engine's own typed refusal code (e.g.
     /// `refusal.admission.proof_stale`).
     pub code: String,
+    /// The engine's own refusal message — the REASON the continuation was
+    /// refused (issue #230: a status that names only the code still leaves an
+    /// operator guessing). Bounded at the recording site.
+    pub reason: String,
     /// When the refusal was recorded (RFC3339 UTC).
     pub at: String,
 }
@@ -13714,14 +13862,18 @@ impl State {
     /// code instead of reporting its next step eligible while nothing runs.
     ///
     /// The record is journaling only: it claims nothing, authorizes nothing
-    /// and never becomes an attempt (no effect ran).
+    /// and never becomes an attempt (no effect ran). The engine's own MESSAGE
+    /// is recorded beside its code (issue #230): the reason is the actionable
+    /// half, and the status read names both.
     pub fn record_supervision_dispatch_refusal(
         &self,
         instance_id: &str,
         step: &str,
         code: &str,
+        reason: &str,
     ) -> Result<AuditRow, StateError> {
-        let outcome = self.record_supervision_dispatch_refusal_inner(instance_id, step, code);
+        let outcome =
+            self.record_supervision_dispatch_refusal_inner(instance_id, step, code, reason);
         if let Err(err) = &outcome {
             self.poison_on(err);
         }
@@ -13733,6 +13885,7 @@ impl State {
         instance_id: &str,
         step: &str,
         code: &str,
+        reason: &str,
     ) -> Result<AuditRow, StateError> {
         self.ensure_writable()?;
         let mut conn = self.lock("record_supervision_dispatch_refusal")?;
@@ -13741,10 +13894,19 @@ impl State {
             .map_err(|err| StateError::from_sqlite("supervision.dispatch_refused: begin", err))?;
         let mut key = format!("ik_sv-refused-{instance_id}");
         key.truncate(64);
+        // The reason is LAST and bounded: the code is a closed literal, the
+        // message is the engine's own text (git/gh stderr included) and is
+        // never parsed back apart from the `:reason:` marker.
+        let reason: String = reason.chars().take(DISPATCH_REFUSAL_REASON_MAX).collect();
+        let target = if reason.is_empty() {
+            format!("{instance_id}:{step}:{code}")
+        } else {
+            format!("{instance_id}:{step}:{code}:reason:{reason}")
+        };
         let audit = self.append_audit_locked(
             &tx,
             crate::supervision::codes::DISPATCH_REFUSED,
-            &format!("{instance_id}:{step}:{code}"),
+            &target,
             &key,
             None,
             None,

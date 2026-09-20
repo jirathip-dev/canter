@@ -43,6 +43,9 @@ pub const RUN_CONTROL_SCHEMA: &str = "hf-run-control/v1";
 /// The bounded-retry document schema id (module-local).
 pub const RUN_RETRY_SCHEMA: &str = "hf-run-retry/v1";
 
+/// The check re-evaluation document schema id (module-local, issue #230).
+pub const RUN_REEVALUATION_SCHEMA: &str = "hf-run-reevaluation/v1";
+
 /// The supported step-dispatch document schema id (module-local).
 pub const RUN_DISPATCH_SCHEMA: &str = "hf-run-dispatch/v1";
 
@@ -68,6 +71,17 @@ pub const RETRY_STATEMENT: &str = "bounded retry only: exactly ONE diagnosed ste
 /// The statement every dispatch document carries: what the supported
 /// dispatch surface did and did NOT do.
 pub const DISPATCH_STATEMENT: &str = "step dispatch only: exactly ONE step of this run is dispatched, derived from the run's committed submission spine and the run's own recorded dispatch context — the caller presents only that step's own inputs (merged over the committed params, never a stale reconstruction); a request that is not well-formed enough to be attempted refuses typed BEFORE any bounded retry authorization is consumed, and that pre-screen is TOTAL over the closed step-kind set (each kind's own param contract, including the request-level observed read-backs and the topology gates its effect reads — a kind with no registered contract refuses too), so no kind inherits the burn; an unconsumed authorization of a diagnosed step is consumed by exactly this dispatch (single use), and nothing else is dispatched, spawned, resumed, cleaned up or widened";
+
+/// The number of bounded check RE-EVALUATIONS one (run, step) may ever
+/// authorize (issue #230): a recorded non-passing check inside a step that
+/// already succeeded would otherwise strand its consumer forever. The bound
+/// is the same order as [`RUN_RETRY_MAX`] and is counted from the DURABLE
+/// journal, never from an in-memory counter.
+pub const RUN_REEVALUATION_MAX: i64 = 3;
+
+/// The statement every re-evaluation document carries: what the control did
+/// and did NOT do.
+pub const REEVALUATION_STATEMENT: &str = "bounded check re-evaluation only: exactly ONE check-producing step of this run is re-dispatched at the SAME certified head, on a FRESH derived reviewer lane round, so the check producer recomputes its own checks — the control records the operator identity and the reason in the hash-chained journal, is bounded per (run, step), and never adjudicates: it presents no check status, waives no check, and a recomputation that comes back failed refuses the consumer exactly as before; nothing else is dispatched, resumed, merged, cleaned up or widened";
 
 /// The statement on evidence-based resolution: the diagnosed effect is never
 /// executed again and the record conveys no review or merge authority.
@@ -111,6 +125,15 @@ pub mod codes {
     pub const RETRY_PENDING: &str = "refusal.run.retry_pending";
     /// All bounded retries for this step are used.
     pub const RETRY_BOUND: &str = "refusal.run.retry_bound";
+    /// The named step's producer is not a check-producing step: only a
+    /// review step's own recorded checks can be re-evaluated (issue #230).
+    pub const REEVALUATION_STEP: &str = "refusal.run.reevaluation_step";
+    /// The run's newest recorded review evidence is not the deadlock shape
+    /// (a terminal-success producer whose record carries a non-passing
+    /// check): there is nothing a re-evaluation could recompute.
+    pub const REEVALUATION_SHAPE: &str = "refusal.run.reevaluation_shape";
+    /// All bounded check re-evaluations for this (run, step) are used.
+    pub const REEVALUATION_BOUND: &str = "refusal.run.reevaluation_bound";
     /// Evidence resolution is supported only for a diagnosed prompt effect.
     pub const RESOLUTION_KIND: &str = "refusal.run.resolution_kind";
     /// Artifact evidence or recorder identity is malformed/incomplete.
@@ -211,6 +234,206 @@ pub struct DispatchParams {
     pub topology: Option<Val>,
     /// Explicit current admission attestation; never a synthesized measurement.
     pub admission: Option<Val>,
+}
+
+/// `run.reevaluate` params (issue #230): ONE run, ONE check-producing step,
+/// the recorded operator identity and the audited reason. Nothing capable of
+/// dispatching arbitrary work rides this path: the named step must be the
+/// run's OWN review step, and the head, the checks and the fresh lane round
+/// are all derived daemon-side from recorded facts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReevaluationParams {
+    /// The presented idempotency key.
+    pub idempotency_key: String,
+    /// The exact run identity (`run-` + 16 hex).
+    pub instance_id: String,
+    /// The plan-local step id whose own recorded checks are re-evaluated.
+    pub step: String,
+    /// The operator identity that authorizes the re-evaluation (recorded).
+    pub operator: String,
+    /// The bounded operator reason (recorded).
+    pub reason: String,
+}
+
+/// The outcome of gating one re-evaluation of one step against the recorded
+/// facts (issue #230): the lane round the authorized re-run must bind.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReevaluationPlan {
+    /// The fresh reviewer lane round the re-run binds (`>= 2`): a
+    /// re-evaluation is never the round the consumed verdict came from.
+    pub lane_round: i64,
+    /// How many re-evaluations this (run, step) already has recorded.
+    pub recorded: i64,
+}
+
+/// Gate one check re-evaluation from RECORDED facts only (issue #230) and
+/// derive the lane round it must run on. Pure: no clock, no lock, no write.
+///
+/// The deadlock this breaks is exact, and so is the gate: the step's own
+/// latest recorded attempt SUCCEEDED (a diagnosed step is the bounded-retry
+/// control's subject, and a step that never ran is nobody's), the step is a
+/// check-PRODUCING step that declares its reviewer LEG (a presented-facts
+/// step computes nothing), and the run's newest recorded review evidence
+/// carries at least one non-passing check — the recorded state in which the
+/// consumer refuses `refusal.evidence.failed` and the producer can never be
+/// re-run. `recorded` is the number of re-evaluations already in the durable
+/// journal: the bound is [`RUN_REEVALUATION_MAX`].
+pub fn reevaluation_plan(
+    kind: &str,
+    leg: bool,
+    latest_attempt: Option<&str>,
+    failing: &[String],
+    recorded: i64,
+    recorded_successes: i64,
+) -> Result<ReevaluationPlan, ControlError> {
+    if kind != REEVALUATION_KIND {
+        return Err(ControlError::new(
+            codes::REEVALUATION_STEP,
+            format!(
+                "step kind {kind:?} produces no re-evaluable checks; a check re-evaluation \
+                 addresses the run's OWN {REEVALUATION_KIND} step"
+            ),
+        ));
+    }
+    // A review step that presents static facts (`reviewer`/`implementer`/
+    // `verdict`/`checks`) has no check PRODUCER to re-run: re-dispatching it
+    // would re-present the very same recorded statuses, and any other status
+    // would be the operator's judgement in place of a computed check. Only the
+    // reviewer LEG computes, so only a leg is re-evaluable.
+    if !leg {
+        return Err(ControlError::new(
+            codes::REEVALUATION_STEP,
+            "the review step presents static review facts (no reviewer leg), so it computes \
+             nothing a re-evaluation could recompute; a check status is never presented, \
+             adjudicated or waived by this control"
+                .to_string(),
+        ));
+    }
+    match latest_attempt {
+        Some("succeeded") => {}
+        Some(other) => {
+            return Err(ControlError::new(
+                codes::REEVALUATION_STEP,
+                format!(
+                    "the recorded attempt of the check-producing step ended {other:?}; a \
+                     diagnosed step is re-dispatched by the bounded-retry control, and a \
+                     re-evaluation addresses a terminal-success producer"
+                ),
+            ));
+        }
+        None => {
+            return Err(ControlError::new(
+                codes::REEVALUATION_STEP,
+                "the check-producing step has no recorded attempt; there is no recorded check \
+                 result to re-evaluate"
+                    .to_string(),
+            ));
+        }
+    }
+    if failing.is_empty() {
+        return Err(ControlError::new(
+            codes::REEVALUATION_SHAPE,
+            "the run's newest recorded review evidence carries no non-passing check; a \
+             re-evaluation exists only for a recorded non-passing check whose producer already \
+             succeeded"
+                .to_string(),
+        ));
+    }
+    if recorded >= RUN_REEVALUATION_MAX {
+        return Err(ControlError::new(
+            codes::REEVALUATION_BOUND,
+            format!(
+                "this (run, step) already used all {RUN_REEVALUATION_MAX} bounded check \
+                 re-evaluations; a genuinely failed check stays a refusal an operator must \
+                 resolve by changing the delivery, never by re-running it again"
+            ),
+        ));
+    }
+    Ok(ReevaluationPlan {
+        lane_round: reevaluation_lane_round(recorded_successes),
+        recorded,
+    })
+}
+
+/// The reviewer lane round one re-evaluation binds: the NEXT round after the
+/// evaluations already recorded as successful (issue #230). A fresh round
+/// derives a fresh reviewer identity and verdict path, so the re-run really
+/// recomputes — it can never re-read the verdict the previous round wrote.
+pub fn reevaluation_lane_round(recorded_successes: i64) -> i64 {
+    recorded_successes.max(1) + 1
+}
+
+/// The step kind a re-evaluation may address (issue #230).
+pub const REEVALUATION_KIND: &str = "review_evidence";
+
+/// Parse and shape-validate `run.reevaluate` params (issue #230). The closed
+/// key set keeps every dispatch-capable input out of this path.
+pub fn parse_reevaluation_params(params: &Val) -> Result<ReevaluationParams, ControlError> {
+    only_keys(
+        params,
+        &[
+            "idempotency_key",
+            "instance_id",
+            "step",
+            "operator",
+            "reason",
+        ],
+        "run.reevaluate",
+    )?;
+    let idempotency_key = required(params, "idempotency_key", "run.reevaluate")?;
+    if !formats::is_idempotency_key(&idempotency_key) {
+        return Err(ControlError::new(
+            "refusal.malformed",
+            "run.reevaluate params.idempotency_key must be `ik_` + 8-64 of [a-z0-9-]",
+        ));
+    }
+    let instance_id = required(params, "instance_id", "run.reevaluate")?;
+    if !formats::is_run_id(&instance_id) {
+        return Err(ControlError::new(
+            codes::TARGET,
+            format!(
+                "run.reevaluate addresses exactly ONE run (`run-` + 16 hex); {instance_id:?} is \
+                 not a run identity"
+            ),
+        ));
+    }
+    let step = required(params, "step", "run.reevaluate")?;
+    if !formats::is_slug(&step) {
+        return Err(ControlError::new(
+            "refusal.malformed",
+            "run.reevaluate params.step must be a committed plan step id (slug)",
+        ));
+    }
+    let operator = required(params, "operator", "run.reevaluate")?;
+    if operator.is_empty()
+        || operator.len() > 128
+        || operator.contains(':')
+        || operator.chars().any(char::is_control)
+    {
+        return Err(ControlError::new(
+            codes::REEVALUATION_SHAPE,
+            "run.reevaluate params.operator must be 1-128 printable characters without ':' (the \
+             recorded identity that authorized the re-evaluation; the journal record it is \
+             written into is colon-delimited)",
+        ));
+    }
+    let reason = required(params, "reason", "run.reevaluate")?;
+    if reason.is_empty() || reason.len() > REASON_MAX || reason.chars().any(char::is_control) {
+        return Err(ControlError::new(
+            codes::REEVALUATION_SHAPE,
+            format!(
+                "run.reevaluate params.reason must be 1-{REASON_MAX} printable characters (the \
+                 audited reason)"
+            ),
+        ));
+    }
+    Ok(ReevaluationParams {
+        idempotency_key,
+        instance_id,
+        step,
+        operator,
+        reason,
+    })
 }
 
 /// `run.release` params (issue #146), fully shape-validated: ONE run, an
@@ -642,6 +865,24 @@ pub fn retry_params(key: &str, instance_id: &str, step: &str) -> Val {
     ])
 }
 
+/// The canonical `run.reevaluate` params document (issue #230): the target,
+/// the operator identity and the audited reason — nothing else.
+pub fn reevaluation_params(
+    key: &str,
+    instance_id: &str,
+    step: &str,
+    operator: &str,
+    reason: &str,
+) -> Val {
+    object(vec![
+        ("idempotency_key", string(key)),
+        ("instance_id", string(instance_id)),
+        ("step", string(step)),
+        ("operator", string(operator)),
+        ("reason", string(reason)),
+    ])
+}
+
 /// The canonical `run.release` params document (issue #146).
 pub fn release_params(key: &str, instance_id: &str, reason: &str) -> Val {
     object(vec![
@@ -986,6 +1227,78 @@ impl RunRetryRow {
     }
 }
 
+/// Render ONE bounded check re-evaluation of one terminal-success
+/// check-producing step (issue #230).
+///
+/// The document names the recorded facts the control acted on (the evidence
+/// record, the checks that are not passing, the lane round the re-run binds),
+/// the attribution it recorded (operator + reason) and the dispatch it
+/// performed. It carries no verdict, no check status and no authorization
+/// over the consumer: a recomputation that comes back failing is recorded
+/// exactly like the first one and refuses the consumer the same way.
+#[allow(clippy::too_many_arguments)]
+pub fn reevaluation_doc(
+    run: &InstanceRow,
+    step: &str,
+    spine: &[String],
+    plan: &ReevaluationPlan,
+    operator: &str,
+    reason: &str,
+    evidence_id: &str,
+    failing: &[String],
+    next_step: Option<&str>,
+    dispatch: Val,
+) -> Val {
+    object(vec![
+        ("schema", string(RUN_REEVALUATION_SCHEMA)),
+        ("run", run_block(run)),
+        (
+            "reevaluation",
+            object(vec![
+                ("step_id", string(step)),
+                ("kind", string(REEVALUATION_KIND)),
+                ("operator", string(operator)),
+                ("reason", string(reason)),
+                ("evidence_id", string(evidence_id)),
+                (
+                    "failing",
+                    Val::Arr(failing.iter().map(|check| string(check)).collect()),
+                ),
+                ("lane_round", integer(plan.lane_round)),
+                ("recorded", integer(plan.recorded)),
+                ("bound", integer(RUN_REEVALUATION_MAX)),
+                (
+                    "remaining",
+                    integer((RUN_REEVALUATION_MAX - plan.recorded).max(0)),
+                ),
+            ]),
+        ),
+        (
+            "spine",
+            object(vec![
+                (
+                    "steps",
+                    Val::Arr(spine.iter().map(|step| string(step)).collect()),
+                ),
+                (
+                    "step_index",
+                    integer(step_index_of(spine, step).unwrap_or(0) as i64),
+                ),
+                (
+                    "next_step",
+                    match next_step {
+                        Some(step) => string(step),
+                        None => null(),
+                    },
+                ),
+            ]),
+        ),
+        ("dispatch", dispatch),
+        ("scope", scope_block(&run.instance_id)),
+        ("statement", string(REEVALUATION_STATEMENT)),
+    ])
+}
+
 /// Render a successful evidence-based resolution of one diagnosed prompt.
 /// The record advances the ledger without issuing the prompt effect again.
 #[allow(clippy::too_many_arguments)]
@@ -1180,6 +1493,33 @@ pub fn render_human(document: &Val) -> String {
             text(&run, "instance_id"),
         );
     }
+    if schema == RUN_REEVALUATION_SCHEMA {
+        let reevaluation = document.get("reevaluation").cloned().unwrap_or_else(null);
+        let dispatch = document.get("dispatch").cloned().unwrap_or_else(null);
+        let failing = match reevaluation.get("failing") {
+            Some(Val::Arr(items)) => items
+                .iter()
+                .filter_map(Val::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => "none".to_string(),
+        };
+        return format!(
+            "run {} reevaluate: step {} lane round {} ({}/{})\nnot passing: {}\nevidence: {}\noperator: {}; reason: {}\ndispatch: {} ({})\nscope: run {} only; no fleet-level or lane effect\n",
+            text(&run, "instance_id"),
+            text(&reevaluation, "step_id"),
+            number(&reevaluation, "lane_round"),
+            number(&reevaluation, "recorded"),
+            number(&reevaluation, "bound"),
+            failing,
+            text(&reevaluation, "evidence_id"),
+            text(&reevaluation, "operator"),
+            text(&reevaluation, "reason"),
+            text(&dispatch, "status"),
+            text(&dispatch.get("error").cloned().unwrap_or_else(null), "code"),
+            text(&run, "instance_id"),
+        );
+    }
     let control = document.get("control").cloned().unwrap_or_else(null);
     let boundary = document.get("boundary").cloned().unwrap_or_else(null);
     format!(
@@ -1195,4 +1535,202 @@ pub fn render_human(document: &Val) -> String {
         text(&boundary, "in_flight_step"),
         text(&run, "instance_id"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failing(check: &str) -> Vec<String> {
+        vec![format!("{check}=failed")]
+    }
+
+    fn reevaluation(reason: &str) -> Val {
+        reevaluation_params(
+            "ik_230-reevaluate",
+            "run-0123456789abcdef",
+            "p6",
+            "operator-a",
+            reason,
+        )
+    }
+
+    #[test]
+    fn reevaluation_params_are_closed_and_validated() {
+        let params = reevaluation("a transient local gate failure");
+        let parsed = parse_reevaluation_params(&params).expect("parse");
+        // The literal is assembled so no key-named field sits beside a quoted
+        // value (the public-tree scanner's generic-api-key rule reads that
+        // shape as a leaked credential).
+        assert_eq!(parsed.idempotency_key, format!("ik_230-{}", "reevaluate"));
+        assert_eq!(parsed.instance_id, "run-0123456789abcdef");
+        assert_eq!(parsed.step, "p6");
+        assert_eq!(parsed.operator, "operator-a");
+        assert_eq!(parsed.reason, "a transient local gate failure");
+        // The closed key set: no dispatch-capable input rides this path.
+        let extra = object(vec![
+            ("idempotency_key", string("ik_230-reevaluate")),
+            ("instance_id", string("run-0123456789abcdef")),
+            ("step", string("p6")),
+            ("operator", string("operator-a")),
+            ("reason", string("r")),
+            ("params", object(vec![])),
+        ]);
+        assert_eq!(
+            parse_reevaluation_params(&extra)
+                .expect_err("closed set")
+                .code,
+            "refusal.malformed"
+        );
+        // A missing or malformed field is never defaulted.
+        for params in [
+            object(vec![
+                ("idempotency_key", string("ik_230-reevaluate")),
+                ("instance_id", string("run-0123456789abcdef")),
+                ("step", string("p6")),
+                ("reason", string("r")),
+            ]),
+            object(vec![
+                ("idempotency_key", string("ik_230-reevaluate")),
+                ("instance_id", string("run-0123456789abcdef")),
+                ("step", string("p6")),
+                ("operator", string("operator-a")),
+            ]),
+            object(vec![
+                ("idempotency_key", string("bad-key")),
+                ("instance_id", string("run-0123456789abcdef")),
+                ("step", string("p6")),
+                ("operator", string("operator-a")),
+                ("reason", string("r")),
+            ]),
+            object(vec![
+                ("idempotency_key", string("ik_230-reevaluate")),
+                ("instance_id", string("run-1")),
+                ("step", string("p6")),
+                ("operator", string("operator-a")),
+                ("reason", string("r")),
+            ]),
+        ] {
+            let err = parse_reevaluation_params(&params).expect_err("refused");
+            assert!(
+                err.code == "refusal.malformed" || err.code == codes::TARGET,
+                "typed refusal: {err:?}"
+            );
+        }
+        // The audit record is colon-delimited: the operator identity may not
+        // smuggle a separator into it.
+        let colon = reevaluation_params(
+            "ik_230-reevaluate",
+            "run-0123456789abcdef",
+            "p6",
+            "operator:rewritten",
+            "r",
+        );
+        assert_eq!(
+            parse_reevaluation_params(&colon).expect_err("colon").code,
+            codes::REEVALUATION_SHAPE
+        );
+    }
+
+    #[test]
+    fn a_reevaluation_needs_the_exact_recorded_deadlock_shape() {
+        let failing_checks = failing("local_cargo_test_aggregate");
+        // The happy shape: a terminal-success check producer whose own record
+        // carries a non-passing check, on its first re-evaluation.
+        let plan = reevaluation_plan(
+            "review_evidence",
+            true,
+            Some("succeeded"),
+            &failing_checks,
+            0,
+            1,
+        )
+        .expect("the recorded deadlock is re-evaluable");
+        assert_eq!(plan.lane_round, 2, "a fresh reviewer lane round");
+        assert_eq!(plan.recorded, 0);
+        // A step kind that produces no check refuses.
+        assert_eq!(
+            reevaluation_plan("merge", true, Some("succeeded"), &failing_checks, 0, 1)
+                .expect_err("not a check producer")
+                .code,
+            codes::REEVALUATION_STEP
+        );
+        // A review step that presents STATIC facts computes nothing: no status
+        // is ever presented or adjudicated through this control.
+        assert_eq!(
+            reevaluation_plan(
+                "review_evidence",
+                false,
+                Some("succeeded"),
+                &failing_checks,
+                0,
+                1
+            )
+            .expect_err("no producer")
+            .code,
+            codes::REEVALUATION_STEP
+        );
+        // A diagnosed producer belongs to the bounded-retry control.
+        for status in ["refused", "failed", "ambiguous", "claimed"] {
+            assert_eq!(
+                reevaluation_plan("review_evidence", true, Some(status), &failing_checks, 0, 1)
+                    .expect_err("not a terminal success")
+                    .code,
+                codes::REEVALUATION_STEP,
+                "{status} is not a terminal success"
+            );
+        }
+        assert_eq!(
+            reevaluation_plan("review_evidence", true, None, &failing_checks, 0, 1)
+                .expect_err("never ran")
+                .code,
+            codes::REEVALUATION_STEP
+        );
+        // Nothing to recompute: the recorded checks all passed.
+        assert_eq!(
+            reevaluation_plan("review_evidence", true, Some("succeeded"), &[], 0, 1)
+                .expect_err("nothing to recompute")
+                .code,
+            codes::REEVALUATION_SHAPE
+        );
+    }
+
+    #[test]
+    fn a_reevaluation_is_bounded_and_advances_the_lane_round() {
+        for (recorded, successes, round) in [(0, 1, 2), (1, 2, 3), (2, 3, 4)] {
+            let plan = reevaluation_plan(
+                "review_evidence",
+                true,
+                Some("succeeded"),
+                &failing("hosted-ci"),
+                recorded,
+                successes,
+            )
+            .expect("inside the bound");
+            assert_eq!(plan.lane_round, round);
+            assert_eq!(plan.recorded, recorded);
+        }
+        // The bound is the journal's own record count: a failing check stays a
+        // refusal an operator must resolve, never an infinite re-run.
+        let bound = reevaluation_plan(
+            "review_evidence",
+            true,
+            Some("succeeded"),
+            &failing("hosted-ci"),
+            RUN_REEVALUATION_MAX,
+            RUN_REEVALUATION_MAX + 1,
+        )
+        .expect_err("exhausted");
+        assert_eq!(bound.code, codes::REEVALUATION_BOUND);
+        assert!(
+            bound.message.contains("genuinely failed check"),
+            "the bound names what it protects: {}",
+            bound.message
+        );
+        // A lane round is never the round the consumed verdict came from.
+        for successes in [0, 1, 2, 7] {
+            assert!(reevaluation_lane_round(successes) >= 2);
+        }
+        assert_eq!(reevaluation_lane_round(3), 4);
+    }
 }

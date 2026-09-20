@@ -1097,8 +1097,10 @@ pub fn evidence_matches_live(
     Ok(())
 }
 
-/// Whether every named check in the evidence record passed.
-pub fn evidence_checks_passed(evidence: &EvidenceView) -> Result<bool, MutationError> {
+/// The named checks of one evidence record that are NOT `passed`, rendered
+/// `name=status` (issue #230): the exact fact the consumer refuses on and the
+/// exact set a re-evaluation recomputes. Order is the recorded order.
+pub fn failing_checks(evidence: &EvidenceView) -> Result<Vec<String>, MutationError> {
     let checks = Val::parse_json(&evidence.checks).map_err(|err| {
         MutationError::new(
             code::MALFORMED_OUTPUT,
@@ -1108,12 +1110,23 @@ pub fn evidence_checks_passed(evidence: &EvidenceView) -> Result<bool, MutationE
     let items = checks.as_array().ok_or_else(|| {
         MutationError::new(code::MALFORMED_OUTPUT, "evidence checks is not an array")
     })?;
-    Ok(items.iter().all(|item| {
-        matches!(
-            item.get("status"),
-            Some(Val::Str(status)) if status == "passed"
-        )
-    }))
+    Ok(items
+        .iter()
+        .filter_map(|item| {
+            let name = item.get("name").and_then(Val::as_str)?;
+            let status = item
+                .get("status")
+                .and_then(Val::as_str)
+                .unwrap_or("unknown");
+            (status != "passed").then(|| format!("{name}={status}"))
+        })
+        .collect())
+}
+
+/// Whether every named check in the evidence record passed. One derivation
+/// with [`failing_checks`]: a record whose failing set is empty passed.
+pub fn evidence_checks_passed(evidence: &EvidenceView) -> Result<bool, MutationError> {
+    Ok(failing_checks(evidence)?.is_empty())
 }
 
 /// The merge-gate evidence bundle: the instance must carry a latest
@@ -1154,8 +1167,9 @@ pub fn check_merge_evidence(
         return Err(MutationError::new(
             code::EVIDENCE_FAILED,
             format!(
-                "review evidence {} has failed/pending checks",
-                evidence.evidence_id
+                "review evidence {} has failed/pending checks: {}",
+                evidence.evidence_id,
+                failing_checks(evidence)?.join(", ")
             ),
         ));
     }
@@ -7857,6 +7871,101 @@ mod tests {
             code::PRODUCTION_CONFIRMATION
         );
         assert!(check_production_confirmation(Some("tty"), true, true, false).is_ok());
+    }
+
+    /// Issue #230: a recorded non-`passed` check refuses its consumer with the
+    /// SAME typed code it always did (never weakened) and now NAMES itself; and
+    /// the consumer reads the newest record — so a RE-EVALUATED record at the
+    /// same head/base passes, while the frozen one never does. The recompute
+    /// is a new record, never an edit of the old one.
+    #[test]
+    fn a_non_passing_check_refuses_the_consumer_and_names_itself() {
+        let base = EvidenceView {
+            evidence_id: "ev_0123456789abcdef".to_string(),
+            feature_head: "a".repeat(40),
+            integration_base: "b".repeat(40),
+            workflow_hash: "0".repeat(64),
+            policy_hash: "f".repeat(64),
+            verdict: "pass".to_string(),
+            reviewer: "reviewer-1".to_string(),
+            checks: r#"[{"name":"hosted-ci","status":"passed"},{"name":"local_cargo_test_aggregate","status":"failed"}]"#
+                .to_string(),
+            created_at: "2026-09-06T00:00:00Z".to_string(),
+        };
+        let refused = check_merge_evidence(
+            Some(&base),
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &"0".repeat(64),
+            &"f".repeat(64),
+        )
+        .expect_err("a non-passing check refuses the merge");
+        assert_eq!(
+            refused.code,
+            code::EVIDENCE_FAILED,
+            "the same typed code the gate always returned"
+        );
+        assert!(
+            refused
+                .message
+                .contains("local_cargo_test_aggregate=failed"),
+            "the refusal names the check that is not passing: {}",
+            refused.message
+        );
+        assert_eq!(
+            failing_checks(&base).expect("failing set"),
+            vec!["local_cargo_test_aggregate=failed".to_string()]
+        );
+        assert_eq!(
+            failing_checks(&base).expect("failing set").len(),
+            1,
+            "only the non-passing check is named"
+        );
+        // The RE-EVALUATED record — same head, same base, the checks the
+        // producer recomputed — is what the consumer reads next.
+        let reevaluated = EvidenceView {
+            evidence_id: "ev_fedcba9876543210".to_string(),
+            checks: r#"[{"name":"hosted-ci","status":"passed"},{"name":"local_cargo_test_aggregate","status":"passed"}]"#
+                .to_string(),
+            created_at: "2026-09-06T01:00:00Z".to_string(),
+            ..base.clone()
+        };
+        assert!(
+            check_merge_evidence(
+                Some(&reevaluated),
+                &"a".repeat(40),
+                &"b".repeat(40),
+                &"0".repeat(64),
+                &"f".repeat(64),
+            )
+            .is_ok(),
+            "a recomputed record at the same certified head passes the gate"
+        );
+        assert!(
+            failing_checks(&reevaluated)
+                .expect("failing set")
+                .is_empty()
+        );
+        // ...and a recomputation that comes back FAILING refuses exactly as
+        // the first one did (nothing was upgraded or waived).
+        let still_failing = EvidenceView {
+            checks: r#"[{"name":"local_cargo_test_aggregate","status":"failed"},{"name":"hosted-ci","status":"passed"}]"#
+                .to_string(),
+            created_at: "2026-09-06T02:00:00Z".to_string(),
+            ..base
+        };
+        assert_eq!(
+            check_merge_evidence(
+                Some(&still_failing),
+                &"a".repeat(40),
+                &"b".repeat(40),
+                &"0".repeat(64),
+                &"f".repeat(64),
+            )
+            .expect_err("still failing")
+            .code,
+            code::EVIDENCE_FAILED
+        );
     }
 
     #[test]

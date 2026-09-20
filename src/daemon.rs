@@ -612,6 +612,7 @@ fn dispatch(shared: &Arc<Shared>, request: &Request) -> String {
         "run.pause" => method_run_pause(shared, request),
         "run.resume" => method_run_resume(shared, request),
         "run.retry" => method_run_retry(shared, request),
+        "run.reevaluate" => method_run_reevaluate(shared, request),
         "run.release" => method_run_release(shared, request),
         "run.resolve" => method_run_resolve(shared, request),
         "run.dispatch" => method_run_dispatch(shared, request),
@@ -1556,6 +1557,7 @@ impl DaemonDispatch {
                     &intent.instance_id,
                     &intent.step_id,
                     refusal_code_of(&message),
+                    &message,
                     &key,
                 );
                 self.note_refused(
@@ -1573,6 +1575,7 @@ impl DaemonDispatch {
                 &intent.instance_id,
                 &intent.step_id,
                 &code,
+                &message,
                 &key,
             );
             shared.log.write(
@@ -1667,7 +1670,14 @@ impl DaemonDispatch {
         // against the run, so the run's own surfaces can classify it instead
         // of reporting the step eligible while nothing happens. A dispatch
         // that reached its claim already has a recorded attempt.
-        record_unclaimed_dispatch_refusal(shared, &intent.instance_id, &intent.step_id, code, key);
+        record_unclaimed_dispatch_refusal(
+            shared,
+            &intent.instance_id,
+            &intent.step_id,
+            code,
+            message,
+            key,
+        );
         shared.log.write(
             "warn",
             "supervision.dispatch_refused",
@@ -1694,14 +1704,17 @@ impl DaemonDispatch {
 /// leaves no idempotency row (and therefore no attempt), no pane and no
 /// journal record, so the run's own evidence can never name it. Those are
 /// exactly the refusals recorded here; a dispatch that reached its claim has
-/// its own outcome row and is not recorded twice. A state that cannot record
-/// it is logged, and the refusal still returns to the driver (a missing
-/// journal record never becomes a silent success).
+/// its own outcome row and is not recorded twice. The engine's own MESSAGE
+/// rides the record with its code (issue #230), so the run's status can name
+/// the reason an operator has to act on. A state that cannot record it is
+/// logged, and the refusal still returns to the driver (a missing journal
+/// record never becomes a silent success).
 fn record_unclaimed_dispatch_refusal(
     shared: &Arc<Shared>,
     instance_id: &str,
     step: &str,
     code: &str,
+    message: &str,
     key: &str,
 ) {
     let state = match shared.lock_state() {
@@ -1727,7 +1740,7 @@ fn record_unclaimed_dispatch_refusal(
             return;
         }
     }
-    if let Err(err) = state.record_supervision_dispatch_refusal(instance_id, step, code) {
+    if let Err(err) = state.record_supervision_dispatch_refusal(instance_id, step, code, message) {
         shared.log.write(
             "error",
             "supervision.dispatch_refused.record_failed",
@@ -4804,7 +4817,346 @@ fn method_run_resolve(shared: &Arc<Shared>, request: &Request) -> String {
     response
 }
 
-/// `run.dispatch` (issue #92): the SUPPORTED step-dispatch surface. The
+/// The gated facts one re-evaluation reads under a SINGLE state guard before it
+/// dispatches anything (issue #230): the run row, its committed spine, the
+/// derived re-evaluation plan, the evidence whose checks are recomputed, the
+/// checks that are not passing and the next step the run has not achieved.
+type ReevaluationGate = Result<
+    (
+        crate::state::InstanceRow,
+        Vec<String>,
+        crate::run_control::ReevaluationPlan,
+        String,
+        Vec<String>,
+        Option<String>,
+    ),
+    (&'static str, String),
+>;
+
+/// `run.reevaluate` (issue #230): re-dispatch the run's OWN terminal-success
+/// check-producing step at the same certified head, on a FRESH lane round, so
+/// the checks it recorded are RECOMPUTED instead of being trusted forever.
+///
+/// The deadlock this breaks is exact: a transient failure was recorded inside
+/// the evidence of a step that SUCCEEDED, so its consumer refuses
+/// (`refusal.evidence.failed`) and the producer can never be re-run
+/// (`refusal.run.step_done`). The control neither waives nor adjudicates a
+/// check — it re-runs the check PRODUCER, whose fresh verdict is recorded and
+/// consumed exactly like the first one, so a genuinely failed, reproducible
+/// check comes back failed and the consumer still refuses. It is bounded per
+/// (run, step) from the durable journal, attributed (operator identity and
+/// reason) and journaled BEFORE anything is dispatched.
+fn method_run_reevaluate(shared: &Arc<Shared>, request: &Request) -> String {
+    let Some(params) = request.params.as_ref() else {
+        return err_response(
+            &request.id,
+            "refusal.malformed",
+            "run.reevaluate requires params: idempotency_key, instance_id, step, operator, reason",
+        );
+    };
+    let parsed = match crate::run_control::parse_reevaluation_params(params) {
+        Ok(parsed) => parsed,
+        Err(err) => return err_response(&request.id, err.code, err.message),
+    };
+    let target = format!("run:{}:{}", parsed.instance_id, parsed.step);
+    let key = match journal_mutation(shared, request, "mutate.run.reevaluate", &target) {
+        Intent::Claimed { key } => key,
+        Intent::Replay { response } => return replay(shared, &response),
+        Intent::Refused { code, message } => return err_response(&request.id, code, &message),
+    };
+    crash_point("run.control.after-intent");
+    // The gated facts the re-dispatch needs, read under ONE guard and then
+    // released: the dispatch itself must never run holding the state lock.
+    let gated = (|| -> ReevaluationGate {
+        let state = shared
+            .lock_state()
+            .map_err(|message| ("state.unavailable", message))?;
+        let run = state
+            .instance_by_id(&parsed.instance_id)
+            .map_err(|err| (err.code, err.message))?
+            .ok_or_else(|| {
+                (
+                    "state.not_found",
+                    format!("no instance {:?}", parsed.instance_id),
+                )
+            })?;
+        if run.status == "done" || run.status == "invalidated" {
+            return Err((
+                crate::run_control::codes::TERMINAL,
+                format!(
+                    "run {} is {}; a terminal run is never re-evaluated",
+                    parsed.instance_id, run.status
+                ),
+            ));
+        }
+        if run.paused || run.pause_requested {
+            return Err((
+                crate::run_control::codes::PAUSED,
+                format!(
+                    "run {} is {}; a paused run is resumed before its checks are re-evaluated",
+                    parsed.instance_id,
+                    crate::run_control::control_state(&run)
+                ),
+            ));
+        }
+        let epoch = state
+            .current_epoch()
+            .map_err(|err| (err.code, err.message))?;
+        if epoch != run.state_epoch {
+            return Err((
+                crate::mutation::code::EPOCH_STALE,
+                format!(
+                    "run {} was pinned to epoch {}; the live epoch is {epoch}",
+                    parsed.instance_id, run.state_epoch
+                ),
+            ));
+        }
+        let grant = state
+            .grant_by_id(&run.grant_id)
+            .map_err(|err| (err.code, err.message))?;
+        match grant {
+            Some(grant) if grant.status == "active" => {
+                if crate::mutation::is_expired(&grant.expires_at, &time::rfc3339_now()) {
+                    return Err((
+                        crate::mutation::code::GRANT_EXPIRED,
+                        format!(
+                            "grant {} of run {} expired at {}; rotate it explicitly before re-evaluating its checks",
+                            grant.grant_id, parsed.instance_id, grant.expires_at
+                        ),
+                    ));
+                }
+            }
+            Some(grant) => {
+                return Err((
+                    crate::mutation::code::GRANT_INACTIVE,
+                    format!(
+                        "grant {} of run {} is {}; a revoked grant refuses the re-evaluation",
+                        grant.grant_id, parsed.instance_id, grant.status
+                    ),
+                ));
+            }
+            None => {
+                return Err((
+                    crate::mutation::code::GRANT_INACTIVE,
+                    format!(
+                        "grant {:?} of run {} does not exist; a revoked grant refuses the re-evaluation",
+                        run.grant_id, parsed.instance_id
+                    ),
+                ));
+            }
+        }
+        let spine = state
+            .run_step_spine(&parsed.instance_id)
+            .map_err(|err| (err.code, err.message))?
+            .ok_or_else(|| {
+                (
+                    crate::run_control::codes::SCOPE,
+                    format!(
+                        "run {} has no committed queue submission spine; a re-evaluation addresses queue runs only",
+                        parsed.instance_id
+                    ),
+                )
+            })?;
+        let step = spine
+            .iter()
+            .find(|step| *step == &parsed.step)
+            .cloned()
+            .ok_or_else(|| {
+                (
+                    crate::run_control::codes::STEP_UNKNOWN,
+                    format!(
+                        "step {:?} is not a step of run {} (spine {:?})",
+                        parsed.step, parsed.instance_id, spine
+                    ),
+                )
+            })?;
+        // The step's OWN recorded kind, from the run's committed spine (the
+        // same documents the dispatch path derives its plan from).
+        let kind = state
+            .run_step_documents(&parsed.instance_id)
+            .map_err(|err| (err.code, err.message))?
+            .unwrap_or_default()
+            .iter()
+            .find(|step| step.get("id").and_then(Val::as_str) == Some(parsed.step.as_str()))
+            .and_then(|step| crate::mutation::step_kind(step).ok())
+            .unwrap_or_default();
+        let attempts = state
+            .run_step_attempts(&parsed.instance_id)
+            .map_err(|err| (err.code, err.message))?;
+        // The step's own declared shape: only a reviewer LEG computes checks.
+        let declares_reviewer_leg = state
+            .run_step_documents(&parsed.instance_id)
+            .map_err(|err| (err.code, err.message))?
+            .unwrap_or_default()
+            .iter()
+            .find(|step| step.get("id").and_then(Val::as_str) == Some(parsed.step.as_str()))
+            .and_then(|step| step.get("params"))
+            .is_some_and(|params| crate::mutation::declares_reviewer_leg(Some(params)));
+        let latest_attempt = attempts
+            .iter()
+            .rfind(|(id, _)| id == &step)
+            .map(|(_, status)| status.clone());
+        let successes = attempts
+            .iter()
+            .filter(|(id, status)| id == &step && status == "succeeded")
+            .count() as i64;
+        let next_step = crate::run_control::frontier_of(&spine, &attempts, &run.current_node);
+        // The recorded check result the consumer refuses on: the run's newest
+        // review-evidence row, read exactly as the merge gate reads it.
+        let newest = state
+            .evidence_for_instance(&parsed.instance_id)
+            .map_err(|err| (err.code, err.message))?
+            .into_iter()
+            .next();
+        let (evidence_id, failing) = match &newest {
+            Some(row) => {
+                let view = crate::mutation::EvidenceView {
+                    evidence_id: row.evidence_id.clone(),
+                    feature_head: row.feature_head.clone(),
+                    integration_base: row.integration_base.clone(),
+                    workflow_hash: row.workflow_hash.clone(),
+                    policy_hash: row.policy_hash.clone(),
+                    verdict: row.verdict.clone(),
+                    reviewer: row.reviewer.clone(),
+                    checks: row.checks.clone(),
+                    created_at: row.created_at.clone(),
+                };
+                let failing = crate::mutation::failing_checks(&view)
+                    .map_err(|err| (err.code, err.message))?;
+                (row.evidence_id.clone(), failing)
+            }
+            None => (String::new(), Vec::new()),
+        };
+        let report = state
+            .run_reevaluations(&parsed.instance_id, &parsed.step)
+            .map_err(|err| (err.code, err.message))?;
+        let recorded = report.len() as i64;
+        // ONE pure gate over the recorded facts: a diagnosed step belongs to
+        // the bounded-retry control, a step that never ran to nobody, and a
+        // record whose checks all passed has nothing to recompute.
+        let plan = crate::run_control::reevaluation_plan(
+            &kind,
+            declares_reviewer_leg,
+            latest_attempt.as_deref(),
+            &failing,
+            recorded,
+            successes,
+        )
+        .map_err(|err| (err.code, err.message))?;
+        // The record is written BEFORE the re-dispatch (the mutate-intent
+        // discipline): the operator's act, its attribution and its slot in
+        // the bound exist durably even if the re-run that follows is refused.
+        state
+            .record_run_reevaluation(
+                &parsed.instance_id,
+                &parsed.step,
+                &evidence_id,
+                &parsed.operator,
+                &parsed.reason,
+                &key,
+            )
+            .map_err(|err| (err.code, err.message))?;
+        Ok((run, spine, plan, evidence_id, failing, next_step))
+    })();
+    let (run, spine, plan, evidence_id, failing, next_step) = match gated {
+        Ok(gated) => gated,
+        Err((code, message)) => {
+            return finish_mutation(
+                shared,
+                request,
+                &key,
+                "run.reevaluate",
+                false,
+                null(),
+                Some((code, message)),
+            );
+        }
+    };
+    // The re-dispatch itself: the SAME dispatch path every other step uses,
+    // with the fresh lane round the control derived merged over the step's
+    // committed params and nothing else — the control presents no check
+    // status, no verdict and no head.
+    let inner_key = {
+        let mut inner = format!(
+            "ik_{}-{}-r{}",
+            parsed.instance_id.trim_start_matches("run-"),
+            parsed.step,
+            plan.lane_round
+        );
+        inner.truncate(64);
+        inner
+    };
+    let step_params = object(vec![("lane_round", integer(plan.lane_round))]);
+    let dispatch_params = crate::run_control::dispatch_params(
+        &inner_key,
+        &parsed.instance_id,
+        &parsed.step,
+        Some(step_params),
+    );
+    let dispatch_request = Request {
+        id: request.id.clone(),
+        method: "run.dispatch".to_string(),
+        line: crate::canonical::canonical_text(&dispatch_params),
+        params: Some(dispatch_params),
+    };
+    let response = run_dispatch(shared, &dispatch_request, Some(parsed.step.as_str()));
+    let doc = match Val::parse_json(response.trim()) {
+        Ok(doc) => doc,
+        Err(message) => {
+            return finish_mutation(
+                shared,
+                request,
+                &key,
+                "run.reevaluate",
+                false,
+                null(),
+                Some(("refusal.malformed", message)),
+            );
+        }
+    };
+    if doc.get("ok").and_then(Val::as_bool) != Some(true) {
+        let error = doc.get("error").cloned().unwrap_or_else(null);
+        let code = error
+            .get("code")
+            .and_then(Val::as_str)
+            .unwrap_or("refusal.malformed")
+            .to_string();
+        let message = error
+            .get("message")
+            .and_then(Val::as_str)
+            .unwrap_or("the re-evaluation dispatch was refused")
+            .to_string();
+        // The re-evaluation RECORD stays (the operator's act, bounded and
+        // attributed); the dispatch's own refusal is journaled by the
+        // dispatch path exactly as any other refused dispatch, and the typed
+        // code is carried VERBATIM — never remapped.
+        return finish_control_refusal(shared, request, &key, "run.reevaluate", &code, message);
+    }
+    let dispatch_outcome = doc.get("result").cloned().unwrap_or_else(null);
+    let document = crate::run_control::reevaluation_doc(
+        &run,
+        &parsed.step,
+        &spine,
+        &plan,
+        &parsed.operator,
+        &parsed.reason,
+        &evidence_id,
+        &failing,
+        next_step.as_deref(),
+        dispatch_outcome,
+    );
+    finish_mutation(
+        shared,
+        request,
+        &key,
+        "run.reevaluate",
+        true,
+        document,
+        None,
+    )
+}
+
+/// The supported step-dispatch surface (issue #92): the
 /// caller presents the run, the committed-spine step and only that step's own
 /// inputs; the plan document, the issue/grant/workflow pins, the topology and
 /// the admission inputs are DERIVED from the run's committed submission and
@@ -4817,7 +5169,17 @@ fn method_run_resolve(shared: &Arc<Shared>, request: &Request) -> String {
 /// fence, idempotency) re-derives there: a re-dispatch of a diagnosed step
 /// consumes exactly one unconsumed authorization, and the operator's own
 /// (corrected) params are what the effect receives.
+///
+/// `reevaluation` is the internal authorization ONE control derives (issue
+/// #230: the plan-local step `run.reevaluate` gated, journaled and derived a
+/// fresh lane round for). It is never presented by a caller and it relaxes
+/// exactly ONE fence — the terminal-success frontier refusal below, for that
+/// exact step, and only when it really is the run's own check producer.
 fn method_run_dispatch(shared: &Arc<Shared>, request: &Request) -> String {
+    run_dispatch(shared, request, None)
+}
+
+fn run_dispatch(shared: &Arc<Shared>, request: &Request, reevaluation: Option<&str>) -> String {
     let Some(params) = request.params.as_ref() else {
         return err_response(
             &request.id,
@@ -4868,23 +5230,42 @@ fn method_run_dispatch(shared: &Arc<Shared>, request: &Request) -> String {
                     .rev()
                     .find(|(step, _)| step == &parsed.step)
                     .is_some_and(|(_, status)| status == "succeeded");
-            let code = if terminal {
-                crate::run_control::codes::STEP_DONE
-            } else {
-                crate::run_control::codes::STEP_ORDER
-            };
-            let message = if terminal {
-                format!(
-                    "step {:?} of run {} has already succeeded; the effect is never repeated",
-                    parsed.step, parsed.instance_id
-                )
-            } else {
-                format!(
-                    "step {:?} is not the current frontier step of run {} (next step {:?})",
-                    parsed.step, parsed.instance_id, frontier
-                )
-            };
-            return err_response(&request.id, code, message);
+            // Issue #230: exactly ONE authorized case dispatches a step past
+            // the frontier — the control's re-evaluation of the run's OWN
+            // terminal-success check producer, whose recorded evidence
+            // carries a non-passing check. The authorization is never
+            // presented by a caller (the `run.reevaluate` control derives it
+            // from recorded facts after journaling the operator, the reason
+            // and the bound), the step must really be that producer, and the
+            // re-run only ADDS a record: the frozen evidence is never edited.
+            let reevaluated = reevaluation == Some(parsed.step.as_str())
+                && terminal
+                && material
+                    .steps
+                    .iter()
+                    .find(|step| step.get("id").and_then(Val::as_str) == Some(parsed.step.as_str()))
+                    .and_then(|step| crate::mutation::step_kind(step).ok())
+                    .as_deref()
+                    == Some(crate::run_control::REEVALUATION_KIND);
+            if !reevaluated {
+                let code = if terminal {
+                    crate::run_control::codes::STEP_DONE
+                } else {
+                    crate::run_control::codes::STEP_ORDER
+                };
+                let message = if terminal {
+                    format!(
+                        "step {:?} of run {} has already succeeded; the effect is never repeated",
+                        parsed.step, parsed.instance_id
+                    )
+                } else {
+                    format!(
+                        "step {:?} is not the current frontier step of run {} (next step {:?})",
+                        parsed.step, parsed.instance_id, frontier
+                    )
+                };
+                return err_response(&request.id, code, message);
+            }
         }
         let step = match material
             .steps
@@ -8463,6 +8844,61 @@ fn finish_mutation(
     };
     publish_after_state_change(shared, None);
     response
+}
+
+/// Resolve ONE run-control claim with an ALREADY-TYPED refusal an inner path
+/// produced (issue #230): the code is carried VERBATIM — never remapped to a
+/// generic one — and the control's own outcome row records it exactly as any
+/// other refused control.
+fn finish_control_refusal(
+    shared: &Arc<Shared>,
+    request: &Request,
+    key: &str,
+    method: &str,
+    code: &str,
+    message: String,
+) -> String {
+    let response = err_response(&request.id, code, &message);
+    let state = match shared.lock_state() {
+        Ok(state) => state,
+        Err(lock_message) => {
+            return err_response(
+                &request.id,
+                "state.unavailable",
+                format!(
+                    "the control was refused ({code}) and the state lock is lost: {lock_message}"
+                ),
+            );
+        }
+    };
+    let outcome = daemon_outcome(key, "failed", error_val(code, &message));
+    let resolved = match state.resolve_claim(
+        key,
+        method,
+        "spent",
+        &canonical_text(&outcome),
+        Some(&response),
+    ) {
+        Ok(_) => response,
+        Err(err) => {
+            shared.log.write(
+                "error",
+                "outcome.journal_failed",
+                &format!("{}: {}", err.code, err.message),
+            );
+            err_response(
+                &request.id,
+                err.code,
+                format!(
+                    "the refusal could not be journaled (fail closed): {}",
+                    err.message
+                ),
+            )
+        }
+    };
+    drop(state);
+    publish_after_state_change(shared, None);
+    resolved
 }
 
 /// Resolve a claim on an ALREADY-LOCKED state handle (no locking, no

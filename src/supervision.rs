@@ -1389,6 +1389,25 @@ pub fn status_doc(
                         ),
                     ]),
                 ),
+                // Issue #230: the ENGINE's own refusal of this frontier's
+                // continuation, named with BOTH its code and its reason. The
+                // classification already refuses to report such a frontier
+                // eligible; without this block the operator still saw only a
+                // class, never the engine's own words for why nothing landed.
+                // Read-time only and PAIRED with the read-time class: a
+                // superseded refusal is never presented as current.
+                (
+                    "refusal",
+                    match &evidence.dispatch_refusal {
+                        Some(refusal) if verdict.reason == codes::DISPATCH_REFUSED => object(vec![
+                            ("step", string(&refusal.step)),
+                            ("code", string(&refusal.code)),
+                            ("reason", string(&refusal.reason)),
+                            ("at", string(&refusal.at)),
+                        ]),
+                        _ => null(),
+                    },
+                ),
                 (
                     "continuation",
                     object(vec![
@@ -1940,6 +1959,18 @@ pub fn render_human(doc: &Val) -> String {
             text(&failure, "message")
         ));
     }
+    // Issue #230: a continuation the ENGINE refuses is rendered with the
+    // engine's own code AND reason — an operator reading `supervision status`
+    // sees why the named frontier never lands instead of a silent idle.
+    let refusal = evaluation.get("refusal").cloned().unwrap_or_else(null);
+    if refusal.get("code").and_then(Val::as_str).is_some() {
+        lines.push(format!(
+            "refused continuation {} ({}): {}",
+            text(&refusal, "step"),
+            text(&refusal, "code"),
+            text(&refusal, "reason")
+        ));
+    }
     lines.extend([
         format!(
             "last check {} ({}, {})",
@@ -2108,7 +2139,8 @@ mod tests {
 
     /// [`evidence_for`] with ONE recorded continuation-dispatch refusal
     /// (issue #141) — the durable record a refused frontier dispatch leaves
-    /// behind instead of an attempt row.
+    /// behind instead of an attempt row. The recorded REASON (issue #230) is
+    /// exercised by its own witness below.
     fn evidence_with_refusal(
         run: InstanceRow,
         submission_digest: Option<&str>,
@@ -2121,6 +2153,7 @@ mod tests {
         evidence.dispatch_refusal = Some(crate::state::SupervisionDispatchRefusal {
             step: refusal.0.to_string(),
             code: refusal.1.to_string(),
+            reason: String::new(),
             at: refusal.2.to_string(),
         });
         evidence
@@ -2731,10 +2764,22 @@ mod tests {
         let state = temp_state("refusal-record");
         let run = "run-0123456789abcdef";
         state
-            .record_supervision_dispatch_refusal(run, "p3", "refusal.admission.proof_stale")
+            .record_supervision_dispatch_refusal(
+                run,
+                "p3",
+                "refusal.admission.proof_stale",
+                "the recorded admission proof is older than the live window",
+            )
             .expect("record");
         let (_, lines) = state.journal_tail(0, 1_000).expect("journal");
-        let target = format!("{run}:p3:refusal.admission.proof_stale");
+        // The reader takes the target from the audit row itself (never a
+        // reconstruction): the code AND the engine's reason ride it (issue #230).
+        let target = lines
+            .iter()
+            .find(|line| line.contains(codes::DISPATCH_REFUSED) && line.contains(run))
+            .and_then(|line| Val::parse_json(line).ok())
+            .and_then(|doc| doc.get("target").and_then(Val::as_str).map(str::to_string))
+            .expect("the recorded target");
         assert!(
             lines
                 .iter()
@@ -2744,6 +2789,10 @@ mod tests {
         let read = dispatch_refusal_of(run, &target, "2026-09-15T11:52:12Z").expect("read back");
         assert_eq!(read.step, "p3");
         assert_eq!(read.code, "refusal.admission.proof_stale");
+        assert_eq!(
+            read.reason, "the recorded admission proof is older than the live window",
+            "the engine's own reason rides the durable record (issue #230)"
+        );
         assert_eq!(read.at, "2026-09-15T11:52:12Z");
         for (instance, foreign) in [
             ("run-ffffffffffffffff", target.as_str()),
@@ -2755,6 +2804,115 @@ mod tests {
                 dispatch_refusal_of(instance, foreign, "2026-09-15T11:52:12Z").is_none(),
                 "not this run's refusal: {foreign:?}"
             );
+        }
+    }
+
+    /// Issue #230: a continuation the ENGINE refused is reported with the
+    /// engine's own code AND its reason. The classification already refuses to
+    /// report such a frontier eligible; this witness pins that the STATUS an
+    /// operator reads also carries the engine's own words, which is what makes
+    /// the refusal actionable.
+    #[test]
+    fn a_refused_continuation_reports_the_engine_code_and_reason() {
+        let run = "run-0123456789abcdef";
+        let digest = "d".repeat(64);
+        let at = "2026-09-15T11:52:12Z";
+        let policy = Policy {
+            check_interval_secs: 10,
+            progress_timeout_secs: 60,
+        };
+        let now_unix = time::unix_from_rfc3339("2026-09-15T11:53:12Z").expect("instant");
+        let reason = "review evidence ev_f791aff0247293eb has failed/pending checks: \
+                      local_cargo_test_aggregate=failed";
+        let mut evidence = evidence_for(
+            run_row(run),
+            Some(&digest),
+            &[("p1", "review_evidence"), ("p2", "merge")],
+            &[],
+            at,
+        );
+        evidence.dispatch_refusal = Some(crate::state::SupervisionDispatchRefusal {
+            step: "p1".to_string(),
+            code: "refusal.evidence.failed".to_string(),
+            reason: reason.to_string(),
+            at: at.to_string(),
+        });
+        let verdict = classify(&evidence, &digest, &policy, now_unix);
+        assert_eq!(verdict.class, "needs-attention");
+        assert_eq!(verdict.reason, codes::DISPATCH_REFUSED);
+        assert!(
+            !verdict.eligible,
+            "a refused continuation is never eligible"
+        );
+        assert_eq!(verdict.detail, "refusal.evidence.failed");
+        let row = supervision_row_for(run, at);
+        let doc = status_doc(&row, &evidence, None, &verdict, now_unix);
+        let refusal = doc
+            .get("evaluation")
+            .and_then(|evaluation| evaluation.get("refusal"))
+            .cloned()
+            .unwrap_or_else(null);
+        assert_eq!(
+            refusal.get("code").and_then(Val::as_str),
+            Some("refusal.evidence.failed"),
+            "the status names the engine's own code"
+        );
+        assert_eq!(
+            refusal.get("reason").and_then(Val::as_str),
+            Some(reason),
+            "the status names the engine's own reason"
+        );
+        let human = render_human(&doc);
+        assert!(
+            human.contains(
+                "refused continuation p1 (refusal.evidence.failed): review evidence \
+                 ev_f791aff0247293eb has failed/pending checks"
+            ),
+            "the human read names the code and the reason: {human}"
+        );
+        // A superseded refusal (progress moved past it) is never presented as
+        // current, and the status carries no refusal block for it.
+        let mut superseded = evidence.clone();
+        superseded.progress_at = "2026-09-15T11:59:00Z".to_string();
+        let verdict = classify(&superseded, &digest, &policy, now_unix);
+        assert_ne!(verdict.reason, codes::DISPATCH_REFUSED);
+        let doc = status_doc(&row, &superseded, None, &verdict, now_unix);
+        assert!(
+            doc.get("evaluation")
+                .and_then(|evaluation| evaluation.get("refusal"))
+                .is_some_and(Val::is_null),
+            "a superseded refusal is not presented as current"
+        );
+    }
+
+    /// The durable supervision row of one run, as the status read builds it.
+    fn supervision_row_for(run: &str, at: &str) -> crate::state::SupervisionRow {
+        crate::state::SupervisionRow {
+            instance_id: run.to_string(),
+            supervision_id: "sv_0123456789abcdef".to_string(),
+            desired: "armed".to_string(),
+            owner_generation: 1,
+            run_generation: 1,
+            authorization_digest: "d".repeat(64),
+            approved_boundary: "review".to_string(),
+            check_interval_secs: 10,
+            progress_timeout_secs: 60,
+            progress_marker: "m".repeat(64),
+            progress_at: at.to_string(),
+            progress_source: "attempt".to_string(),
+            checks: 0,
+            continuation_reports: 0,
+            continuation_open: false,
+            continuation_since: String::new(),
+            last_check_at: at.to_string(),
+            last_check_class: "healthy".to_string(),
+            last_check_reason: codes::DISPATCH.to_string(),
+            last_check_trigger: "timer".to_string(),
+            next_check_at: at.to_string(),
+            next_check_unix: 0,
+            next_check_reason: codes::DISPATCH.to_string(),
+            armed_at: at.to_string(),
+            updated_at: at.to_string(),
         }
     }
 

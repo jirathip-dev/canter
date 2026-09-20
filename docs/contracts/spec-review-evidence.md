@@ -195,6 +195,33 @@ the frontier instead of being recorded. An ill-formed document refuses
 state, so a reviewer can neither move them nor strand the tail with a stale
 value.
 
+A check recorded non-`passed` inside the evidence of a step that SUCCEEDED is
+the ONE recorded state in which the tail can strand itself (issue #230): the
+consumer refuses `refusal.evidence.failed` and the producer can never be
+re-run (`refusal.run.step_done`), while supervision keeps reporting the
+frontier from its recorded class alone. The shipped shape is RECOMPUTATION,
+never adjudication:
+
+- the `run.reevaluate` control (spec-daemon.md) re-runs the run's OWN
+  `review_evidence` step — the reviewer LEG only, never a step that presents
+  static review facts — at the SAME certified head, on a FRESH derived lane
+  round, bounded per `(run, step)` from the durable journal and attributed
+  (operator identity + reason) in the hash-chained audit BEFORE anything is
+  dispatched. The control presents no check status, no verdict and no head:
+  it cannot make a check pass;
+- the re-run's verdict is recorded through the ordinary review path, so a
+  recomputation that comes back FAILING is a new record that refuses the
+  consumer with the same `refusal.evidence.failed`, and
+- the consumer reads the NEWEST recorded evidence only (the merge gate and
+  the crash-point read both take `ORDER BY created_at DESC LIMIT 1`), so what
+  it consumes is the recomputed fact, never a result frozen at review time.
+  The superseded row stays as history; nothing rewrites or deletes it.
+
+A continuation the engine refuses is also named: the recorded refusal now
+carries the engine's own message beside its code, and the supervision status
+renders both (`evaluation.refusal` / the human read), so a parked run states
+WHY its frontier never lands instead of reporting an idle fleet.
+
 The certified delivery (issue #202): a step may only ever consume the head the
 run's OWN `collect_outcome` step certified. That binding is recorded and
 attributed (`run_delivery_certificate`: the newest successful collection's step
