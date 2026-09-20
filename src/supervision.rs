@@ -359,6 +359,20 @@ pub mod codes {
     pub const TERMINAL_HOLD: &str = "supervision.terminal_hold";
     /// The newest recorded review verdict is a failure.
     pub const REVIEW_FAILED: &str = "supervision.review_failed";
+    /// The review step's FAIL handoff to the run's fix round could not be
+    /// dispatched (issue #238): the fix round's OWN code (a lane that could
+    /// not be created, a spawn or prompt the substrate did not take) is
+    /// carried as `detail`, so the missing piece is named instead of the run
+    /// parking on the FAIL.
+    pub const FIX_REFUSED: &str = "supervision.fix_round_refused";
+    /// The run's automatic fix-round bound is spent and the certified head
+    /// still fails (issue #238): the escalation, whose detail names the
+    /// engine's own `refusal.fix.bound_exhausted` — never a silent park.
+    pub const FIX_EXHAUSTED: &str = "supervision.fix_rounds_exhausted";
+    /// The recorded FAIL was handed to the run's fix round (issue #238) and
+    /// the fix leg carries the instruction: the run waits on its own repair
+    /// round, and `detail` names the fix leg's lane.
+    pub const FIX_DISPATCHED: &str = "supervision.fix_round_dispatched";
     /// The next step's latest attempt was refused for capacity.
     pub const CAPACITY_BLOCKED: &str = "supervision.capacity_blocked";
     /// A step dispatch is in flight: legitimate long-running work.
@@ -956,8 +970,50 @@ pub fn classify(
     if run.human_queue || run.status == "blocked" || run.terminal_blockers > 0 {
         return Verdict::new("needs-attention", codes::TERMINAL_HOLD, false, "");
     }
+    // Issue #238: the review step hands a recorded FAIL to the run's own fix
+    // round, so a FAIL is reported with the handoff's recorded disposition —
+    // never as a bare park nothing continues:
+    // - the handoff was REFUSED (the fix leg's lane could not be created, the
+    //   spawn or the prompt was not taken, or the automatic bound is spent):
+    //   the fix round's OWN engine code is the detail, so the class is
+    //   actionable (`fix round refused: <code>`, or the escalation);
+    // - the handoff was DISPATCHED for the current verdict's head: the run
+    //   waits on its own repair leg, and the detail names its lane.
+    if let Some(failure) = &evidence.last_failure
+        && failure.code.starts_with("refusal.fix.")
+    {
+        return Verdict::new(
+            "needs-attention",
+            if failure.code == crate::mutation::code::FIX_BOUND_EXHAUSTED {
+                codes::FIX_EXHAUSTED
+            } else {
+                codes::FIX_REFUSED
+            },
+            false,
+            &failure.code,
+        );
+    }
     if newest_verdict(evidence) == "fail" {
-        return Verdict::new("needs-attention", codes::REVIEW_FAILED, false, "");
+        if let Some(fix) = &evidence.fix_round
+            && evidence
+                .newest_evidence
+                .as_ref()
+                .is_some_and(|newest| newest.feature_head == fix.feature_head)
+        {
+            return Verdict::new("waiting-workers", codes::FIX_DISPATCHED, false, &fix.lane);
+        }
+        // A FAIL whose review step recorded no fix round at all — a plan that
+        // presents its own review facts, or a run recorded before this
+        // handoff existed — still names the frontier it parks on instead of
+        // reporting an unexplained `needs-attention`.
+        let review_step = evidence
+            .steps
+            .iter()
+            .rev()
+            .find(|(_, kind)| kind == crate::mutation::DELIVERY_STEP_KIND)
+            .map(|(step, _)| step.clone())
+            .unwrap_or_default();
+        return Verdict::new("needs-attention", codes::REVIEW_FAILED, false, &review_step);
     }
     let next = next_unachieved_step(evidence);
     let next_step = next
@@ -1940,6 +1996,20 @@ pub fn render_human(doc: &Val) -> String {
             text(&failure, "message")
         ));
     }
+    // Issue #238: the FAIL handoff's recorded disposition, rendered with the
+    // fix leg's lane or the fix round's OWN engine code — so a human read
+    // tells "awaiting a fix round" from "fix round refused: <code>".
+    let reason = text(&evaluation, "reason");
+    let detail = text(&evaluation, "detail");
+    if reason.starts_with("supervision.fix_round") && !detail.is_empty() {
+        lines.push(match reason.as_str() {
+            codes::FIX_DISPATCHED => format!("fix round dispatched to lane {detail}"),
+            codes::FIX_EXHAUSTED => {
+                format!("fix round refused: {detail} (the automatic bound is spent)")
+            }
+            _ => format!("fix round refused: {detail}"),
+        });
+    }
     lines.extend([
         format!(
             "last check {} ({}, {})",
@@ -2103,6 +2173,7 @@ mod tests {
             item: None,
             newest_evidence: None,
             dispatch_refusal: None,
+            fix_round: None,
         }
     }
 
@@ -2756,6 +2827,176 @@ mod tests {
                 "not this run's refusal: {foreign:?}"
             );
         }
+    }
+
+    /// The recorded review FAIL of one run at `head` (issue #238): the newest
+    /// verdict is a failure and its evidence row names the certified head.
+    fn evidence_with_failed_review(
+        run: InstanceRow,
+        steps: &[(&str, &str)],
+        head: &str,
+    ) -> SupervisionEvidence {
+        let digest = "d".repeat(64);
+        let mut evidence = evidence_for(
+            run,
+            Some(&digest),
+            steps,
+            &[("p6", "succeeded", "")],
+            "2026-09-13T00:00:30Z",
+        );
+        evidence.verdicts = vec![(
+            "ev_0123456789abcdef".to_string(),
+            "fail".to_string(),
+            "2026-09-13T00:00:20Z".to_string(),
+        )];
+        evidence.newest_evidence = Some(crate::state::EvidenceRow {
+            evidence_id: "ev_0123456789abcdef".to_string(),
+            instance_id: "run-0123456789abcdef".to_string(),
+            repository: "example-org/widgets".to_string(),
+            feature_head: head.to_string(),
+            integration_base: "b".repeat(40),
+            workflow_hash: "a".repeat(64),
+            policy_hash: "c".repeat(64),
+            verdict: "fail".to_string(),
+            reviewer: "lane-reviewer".to_string(),
+            checks: r#"[{"name":"AC1-cursor","status":"failed"}]"#.to_string(),
+            created_at: "2026-09-13T00:00:20Z".to_string(),
+        });
+        evidence
+    }
+
+    #[test]
+    fn a_recorded_review_fail_reports_its_fix_round_handoff_never_a_silent_park() {
+        let policy = Policy::default();
+        let digest = "d".repeat(64);
+        let steps = [
+            ("p1", "checkout"),
+            ("p2", "prompt"),
+            ("p6", "review_evidence"),
+        ];
+        let head = "e".repeat(40);
+        let now_unix = time::unix_from_rfc3339("2026-09-13T00:00:30Z").expect("instant");
+        let classify_at =
+            |evidence: SupervisionEvidence| classify(&evidence, &digest, &policy, now_unix);
+
+        // (1) The FAIL was handed to the run's own fix round for THIS head:
+        //     the run is waiting on that repair leg, and the detail names it.
+        let mut dispatched =
+            evidence_with_failed_review(run_row("run-0123456789abcdef"), &steps, &head);
+        dispatched.fix_round = Some(crate::state::SupervisionFixRound {
+            step: "p6".to_string(),
+            feature_head: head.clone(),
+            round: 1,
+            bound: 3,
+            lane: "lane-0123456789abcdef".to_string(),
+        });
+        let verdict = classify_at(dispatched.clone());
+        assert_eq!(verdict.class, "waiting-workers");
+        assert_eq!(verdict.reason, codes::FIX_DISPATCHED);
+        assert_eq!(verdict.detail, "lane-0123456789abcdef");
+        assert_eq!(dispatched.fix_round.as_ref().expect("recorded").bound, 3);
+        assert!(
+            !verdict.eligible,
+            "a dispatched fix round is work in flight, never completion"
+        );
+
+        // (2) The recorded round belongs to ANOTHER head (the certified head
+        //     moved past it): it is not this FAIL's handoff, and the FAIL
+        //     still names the review step it parks on.
+        let mut stale = dispatched;
+        stale.fix_round.as_mut().expect("recorded").feature_head = "f".repeat(40);
+        let verdict = classify_at(stale);
+        assert_eq!(verdict.class, "needs-attention");
+        assert_eq!(verdict.reason, codes::REVIEW_FAILED);
+        assert_eq!(verdict.detail, "p6");
+
+        // (3) The handoff was REFUSED: the fix round's OWN engine code is the
+        //     detail, so the missing piece is actionable — never a bare park.
+        let mut refused =
+            evidence_with_failed_review(run_row("run-0123456789abcdef"), &steps, &head);
+        refused.last_failure = Some(crate::state::StepFailure {
+            step: "p6".to_string(),
+            status: "failed".to_string(),
+            code: crate::mutation::code::FIX_PROMPT.to_string(),
+            message: "the fix round's instruction was not delivered".to_string(),
+        });
+        let verdict = classify_at(refused.clone());
+        assert_eq!(verdict.class, "needs-attention");
+        assert_eq!(verdict.reason, codes::FIX_REFUSED);
+        assert_eq!(verdict.detail, crate::mutation::code::FIX_PROMPT);
+        assert!(!verdict.eligible);
+
+        // (4) The automatic bound is spent: the escalation keeps its own code.
+        refused
+            .last_failure
+            .as_mut()
+            .expect("recorded failure")
+            .code = crate::mutation::code::FIX_BOUND_EXHAUSTED.to_string();
+        let verdict = classify_at(refused);
+        assert_eq!(verdict.reason, codes::FIX_EXHAUSTED);
+        assert_eq!(verdict.detail, crate::mutation::code::FIX_BOUND_EXHAUSTED);
+
+        // (5) The human read says WHY the run is ineligible instead of
+        //     reporting a bare `eligible false`: the fix round's own code,
+        //     and the lane the dispatched handoff reached.
+        let human = render_human(&object(vec![
+            (
+                "run",
+                object(vec![
+                    ("instance_id", string("run-0123456789abcdef")),
+                    ("status", string("running")),
+                ]),
+            ),
+            (
+                "supervision",
+                object(vec![
+                    ("id", string("sv_0123456789abcdef")),
+                    ("desired", string("armed")),
+                ]),
+            ),
+            (
+                "evaluation",
+                object(vec![
+                    ("class", string("needs-attention")),
+                    ("reason", string(codes::FIX_REFUSED)),
+                    ("eligible", bool_(false)),
+                    ("detail", string(crate::mutation::code::FIX_PROMPT)),
+                ]),
+            ),
+        ]));
+        assert!(
+            human.contains("fix round refused: refusal.fix.prompt"),
+            "{human}"
+        );
+        let dispatched_human = render_human(&object(vec![
+            (
+                "run",
+                object(vec![
+                    ("instance_id", string("run-0123456789abcdef")),
+                    ("status", string("running")),
+                ]),
+            ),
+            (
+                "supervision",
+                object(vec![
+                    ("id", string("sv_0123456789abcdef")),
+                    ("desired", string("armed")),
+                ]),
+            ),
+            (
+                "evaluation",
+                object(vec![
+                    ("class", string("waiting-workers")),
+                    ("reason", string(codes::FIX_DISPATCHED)),
+                    ("eligible", bool_(false)),
+                    ("detail", string("lane-0123456789abcdef")),
+                ]),
+            ),
+        ]));
+        assert!(
+            dispatched_human.contains("fix round dispatched to lane lane-0123456789abcdef"),
+            "{dispatched_human}"
+        );
     }
 
     #[test]

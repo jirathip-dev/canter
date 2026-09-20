@@ -221,3 +221,57 @@ either shape. The step still requires the `review` capability and phase at
 effect time, the reviewer's identity is still checked distinct, and the
 reviewer's dispatch passes the same fan-out admission gate (`harness_start` /
 `prompt` carry it) — the same caps, host-resource proof and overlap fence.
+
+## The FAIL handoff: the run's own fix round (issue #238)
+
+A recorded review FAIL is a normal, expected outcome of the review step — never
+a terminal, silent one. The SAME effect that consumed the failing verdict hands
+it to the run's own fix round before its outcome is recorded, so a FAIL reaches
+a repair leg with no operator action between the two. The handoff is stated
+positively and negatively:
+
+- the fix leg is the run's OWN implementer lane, next round (`crate::lane`:
+  `impl-<N>-r<R>` / `issues-<N>-impl<R>`), resolved from the run's committed
+  spine — its `harness_start`/`prompt` step supplies the reviewed role binding
+  (and, for a run without a committed role configuration, the plan-declared
+  key/kind), and its `worktree_create` step names the branch the instruction
+  must push to. No leg is invented, no profile is defaulted, and no caller
+  supplies an identity;
+- the fix leg's lane CHECKOUT is created (or reused) at the certified head by
+  the engine, exactly like the reviewer leg's own lane (issue #210). A checkout
+  that exists but is not a clean linked worktree at the reviewed head refuses
+  `refusal.fix.lane` and is left untouched — never repaired, because a fix
+  round is only ever dispatched at the head whose review failed;
+- the instruction is DERIVED from the recorded verdict: the certified head, the
+  observed integration base and the checks the reviewer marked `failed` (a
+  passing check is never quoted), plus the run's own feature branch. The engine
+  records nothing on the leg's behalf, so the leg itself has to commit and push
+  for the reviewed head to move;
+- the delivery is PROVEN through the same role-bound adapter the rest of the
+  spine uses. A spawn the substrate refused is `refusal.fix.spawn` and a prompt
+  it did not take is `refusal.fix.prompt`, each carrying the substrate's own
+  refusal code in the message — an undispatchable handoff is a typed refusal,
+  never a silent park, and a round whose delivery was never proven is never
+  counted against the bound;
+- the round is BOUNDED by `mutation::FIX_ROUNDS_MAX`, the doctrine's own
+  `engine::NORMAL_REVIEW_ROUNDS` (one fact, two readers). The bound is enforced
+  BEFORE any effect: the next round on a head the budget cannot cover refuses
+  `refusal.fix.bound_exhausted`, whose message names the failures the reviewer
+  recorded and the bound it spent. An exhausted budget escalates; it never
+  parks silently and never dispatches an unbounded number of repair rounds;
+- the engine's OWN record (`<session>-<step>.fix-round.json`, `hf-fix-round/v1`,
+  in the daemon-owned review root, beside the verdict and delivery artifacts) is
+  keyed by the certified head. A re-dispatch of the SAME review attempt
+  therefore REUSES the round that head was already handed to (the leg is never
+  re-prompted and the bound is never burnt twice), while a MOVED head opens the
+  next round of the same budget.
+
+`supervision status` reports the handoff's recorded disposition instead of a
+bare FAIL: `supervision.fix_round_dispatched` (class `waiting-workers`, detail:
+the fix leg's lane) while the repair leg works, `supervision.fix_round_refused`
+with the fix round's OWN engine code as detail when the handoff was refused,
+and `supervision.fix_rounds_exhausted` when the budget is spent. `run status`
+carries the same code, because the refusal IS the review step's recorded
+outcome (`last_failure`). A FAIL recorded before this handoff existed — or by a
+plan that presents its own review facts and dispatches no leg — keeps
+`supervision.review_failed` with the review step named as its detail.
