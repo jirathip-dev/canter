@@ -125,7 +125,7 @@ report_lane() { printf '%s' "${HF_FAKE_HERDR_REPORT_LANE:-$(read_state lane '')}
 report_generation() { printf '%s' "${HF_FAKE_HERDR_REPORT_GENERATION:-$(read_state generation '')}"; }
 agent_doc() {
   printf '{"name":"%s","pane_id":"%s","cwd":"%s","agent_status":"%s","state_change_seq":%s,"tokens":{"canter_lane":"%s","canter_generation":"%s"}%s}' \
-    "$(read_state name '')" "$(read_state pane 'w1:p1')" "$(read_state cwd '')" "$(read_state state 'idle')" \
+    "$(read_state name '')" "$(read_state pane 'w1:p1')" "$(read_state cwd '')" "${2:-$(read_state state 'idle')}" \
     "$(read_state seq '0')" \
     "$(report_lane)" "$(report_generation)" "${1:-}"
 }
@@ -212,8 +212,21 @@ case "$1 $2" in
     ;;
   "agent list")
     log "$*"
+    list_reads=0
+    [ -f "$STATE/agent_list_reads" ] && list_reads=$(sed -n 1p "$STATE/agent_list_reads")
+    list_reads=$((list_reads + 1))
+    printf '%s' "$list_reads" > "$STATE/agent_list_reads"
+    list_state="$(read_state state 'idle')"
+    # Issue #224 control: a lane whose agent is still iterating SETTLES on its
+    # own after N read-backs — the worker outliving its own publish. Off
+    # unless the fixture asks for it; the read count is recorded so a witness
+    # can prove the bounded wait actually polled.
+    if [ -n "${HF_FAKE_HERDR_SETTLE_AFTER_LIST_READS:-}" ] \
+      && [ "$list_reads" -gt "$HF_FAKE_HERDR_SETTLE_AFTER_LIST_READS" ]; then
+      list_state="idle"
+    fi
     if [ -f "$STATE/name" ] && [ ! -f "$STATE/no_agent" ]; then
-      printf '{"id":"cli:agent:list","result":{"agents":[%s],"type":"agent_list"}}\n' "$(agent_doc)"
+      printf '{"id":"cli:agent:list","result":{"agents":[%s],"type":"agent_list"}}\n' "$(agent_doc '' "$list_state")"
     else
       printf '{"id":"cli:agent:list","result":{"agents":[],"type":"agent_list"}}\n'
     fi
@@ -459,6 +472,15 @@ impl Fixture {
     /// The pane content the fake recorded for the delivered prompt.
     fn pane_content(&self) -> String {
         fs::read_to_string(self.state.join("pane_content")).unwrap_or_default()
+    }
+
+    /// The number of `agent list` read-backs the fake has answered (the lane's
+    /// own identity/state read-back): proves a bounded wait actually polled.
+    fn agent_list_reads(&self) -> i64 {
+        fs::read_to_string(self.state.join("agent_list_reads"))
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+            .unwrap_or(0)
     }
 
     /// Seed the state the fake answers its read-backs from.
@@ -879,6 +901,9 @@ fn p8_preserves_dirty_live_and_stale_lanes_then_closes_the_owned_workspace() {
     let params = object(vec![
         ("worktree", string("issues-5")),
         ("branch", string("issue-5")),
+        // The step's own declared bound: the live-lane leg below waits exactly
+        // this long before it parks typed (issue #224).
+        ("deadline_secs", integer(1)),
     ]);
     let start_params = object(vec![
         ("harness_key", string("lane-role")),
@@ -922,16 +947,51 @@ fn p8_preserves_dirty_live_and_stale_lanes_then_closes_the_owned_workspace() {
             .any(|row| row.starts_with("workspace close"))
     );
     fs::remove_file(dirty).unwrap();
+    // The lane is ALIVE with its delivery already verified landed (the
+    // fixture's branch is merged into the integration ref): issue #224 — the
+    // step waits, bounded by its own effective deadline, for the settled turn
+    // the worker produces on its own, instead of refusing into the retry
+    // budget. Here the worker never settles, so the wait expires TYPED with
+    // its bound recorded and the workspace preserved.
     fixture.seed("state", "working");
+    let parked = execute_step(&ctx);
+    assert_eq!(parked.status, "ambiguous", "{:?}", parked.message);
     assert_eq!(
-        execute_step(&ctx).code.as_deref(),
-        Some(CODE_STALE_GENERATION)
+        parked.code.as_deref(),
+        Some("effect.lane_timeout"),
+        "{:?}",
+        parked.message
+    );
+    let message = parked.message.clone().unwrap_or_default();
+    assert!(
+        message.contains("still working") && message.contains("bounded wait of 1s"),
+        "the park names the live lane and states its bound: {message}"
+    );
+    assert_eq!(
+        parked.result.get("deadline_secs").and_then(Val::as_int),
+        Some(1),
+        "the recorded outcome states the step's bound"
+    );
+    assert!(
+        fixture.worktree.exists(),
+        "the live lane's checkout is preserved"
+    );
+    assert!(
+        fixture.state.join("pane").exists(),
+        "the live lane's workspace is PRESERVED (nothing is closed)"
+    );
+    assert!(
+        !fixture
+            .rows()
+            .iter()
+            .any(|row| row.starts_with("workspace close"))
     );
     fixture.seed("state", "idle");
     fixture.seed("generation", "2");
     assert_eq!(
         execute_step(&ctx).code.as_deref(),
-        Some(CODE_STALE_GENERATION)
+        Some(CODE_STALE_GENERATION),
+        "a superseded generation is never waited on"
     );
     assert!(fixture.worktree.exists());
     assert!(
@@ -952,6 +1012,232 @@ fn p8_preserves_dirty_live_and_stale_lanes_then_closes_the_owned_workspace() {
             .filter(|row| row.starts_with("workspace close"))
             .count(),
         1
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #224: p8 must not spend retries on a lane that is ALIVE and whose
+// delivery is ALREADY published. The landing proof precedes the workspace
+// close, so a live lane found there is the worker outliving its own publish —
+// a timing condition the step waits out (bounded by its own effective
+// deadline) instead of refusing. A live lane whose delivery is NOT published
+// is still refused typed, with its checkout and workspace preserved.
+// ---------------------------------------------------------------------------
+
+/// Commit one lane-only file in the fixture's lane worktree (the delivery p8
+/// must find published) and return its head.
+fn lane_delivery_commit(fixture: &Fixture) -> String {
+    fs::write(
+        fixture.worktree.join("delivery.txt"),
+        "the worker's unfinished turn\n",
+    )
+    .unwrap();
+    for args in [
+        vec!["add", "delivery.txt"],
+        vec!["commit", "-m", "the lane delivery"],
+    ] {
+        let mut argv = vec![
+            "-C",
+            fixture.worktree.to_str().unwrap(),
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        ];
+        argv.extend(args);
+        let out = std::process::Command::new("git")
+            .args(argv)
+            .output()
+            .expect("git fixture");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    lane_git(&fixture.worktree, &["rev-parse", "HEAD"])
+}
+
+/// Run one git row in the given fixture checkout and return its trimmed stdout.
+fn lane_git(repo: &Path, args: &[&str]) -> String {
+    let mut argv = vec!["-C", repo.to_str().unwrap()];
+    argv.extend(args);
+    let out = std::process::Command::new("git")
+        .args(argv)
+        .output()
+        .expect("git fixture");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Publish the lane's head into the fixture's integration ref with a
+/// fast-forward landing: the delivery p8 must find already verified.
+fn publish_lane_delivery(fixture: &Fixture) {
+    let integration = fixture.dir.path("integration");
+    lane_git(&integration, &["merge", "--ff-only", "issue-5"]);
+}
+
+/// Issue #224 witness, both halves.
+///
+/// (a) AC2 — the lane is alive and its delivery is unpublished: p8 refuses the
+///     typed `refusal.cleanup.unmerged` and preserves the lane, without even
+///     probing the workspace (so the live-lane protection never became a wait).
+/// (b) AC1 — the delivery IS published and the worker outlives its publish:
+///     p8 waits, bounded by the step's own declared deadline, for the settled
+///     turn the worker produces by itself, closes the workspace once and
+///     completes in a SINGLE attempt (no retry is ever consumed).
+#[test]
+fn p8_waits_bounded_for_a_published_live_lane_and_still_refuses_an_unpublished_one() {
+    let fixture = Fixture::new("p8-live-published");
+    fixture.install(FAKE_HERDR);
+    let env = fixture.env(&[]);
+    let session = lane_session(1);
+    let profile = lane_profile(ExecutionMode::HerdrPane);
+    assert_eq!(
+        execute_op_in_worktree(&profile, &start_request(&session), &env, &fixture.worktree).status,
+        "succeeded"
+    );
+    let head = lane_delivery_commit(&fixture);
+    let params = object(vec![
+        ("worktree", string("issues-5")),
+        ("branch", string("issue-5")),
+        ("deadline_secs", integer(30)),
+    ]);
+    let start_params = object(vec![
+        ("harness_key", string("lane-role")),
+        ("kind", string("hermes")),
+    ]);
+    let plan = bound_plan(vec![
+        plan_step("p3", "harness_start", start_params),
+        plan_step("p8-5", "cleanup", params.clone()),
+    ]);
+    let root = fixture.dir.path("worktrees");
+    let integration = fixture.dir.path("integration");
+    let ctx = EffectContext {
+        plan: &plan,
+        step_id: "p8-5",
+        kind: "cleanup",
+        params: Some(&params),
+        repository: "example-org/widgets",
+        integration_branch: "staging",
+        production_branches: &[],
+        publish_route: "push",
+        worktrees_root: &root,
+        integration_repo: &integration,
+        observed_feature_head: None,
+        observed_integration_base: None,
+        env: &env,
+        role: None,
+        session: Some(&session),
+        archive_root: None,
+        review_root: None,
+        retired_run_ids: &[],
+    };
+
+    // (a) The lane's own commit exists nowhere but its branch: the live lane is
+    // never reclaimed and the refusal is not a wait at all.
+    fixture.seed("state", "working");
+    let rows_before = fixture.rows().len();
+    let unpublished = execute_step(&ctx);
+    assert_eq!(unpublished.status, "refused", "{:?}", unpublished.message);
+    assert_eq!(
+        unpublished.code.as_deref(),
+        Some("refusal.cleanup.unmerged"),
+        "a live, unpublished lane is refused typed and never reclaimed: {:?}",
+        unpublished.message
+    );
+    assert!(
+        unpublished
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains(&head),
+        "the refusal names the unverified branch head: {:?}",
+        unpublished.message
+    );
+    assert!(
+        fixture.worktree.exists(),
+        "the live lane's checkout is preserved"
+    );
+    assert_eq!(
+        fixture.rows().len(),
+        rows_before,
+        "an unpublished lane never reaches the workspace probe: {:?}",
+        fixture.rows()
+    );
+
+    // (b) The delivery is published (fast-forwarded into the integration ref)
+    // and the worker is still iterating when p8 arrives; it settles on its own
+    // one read-back later.
+    publish_lane_delivery(&fixture);
+    assert_eq!(
+        lane_git(&integration, &["rev-parse", "staging"]),
+        head,
+        "the delivery IS published when p8 arrives"
+    );
+    let settles_after = fixture.agent_list_reads() + 1;
+    let settle_env = fixture.env(&[(
+        "HF_FAKE_HERDR_SETTLE_AFTER_LIST_READS",
+        settles_after.to_string(),
+    )]);
+    fixture.seed("state", "working");
+    let cleaned = execute_step(&EffectContext {
+        env: &settle_env,
+        ..ctx
+    });
+    assert_eq!(cleaned.status, "succeeded", "{:?}", cleaned.message);
+    let wait =
+        cleaned.result.get("lane_wait").cloned().unwrap_or_else(|| {
+            panic!("the bounded wait is part of the recorded outcome: {cleaned:?}")
+        });
+    assert_eq!(
+        wait.get("bound_secs").and_then(Val::as_int),
+        Some(30),
+        "the recorded outcome states the wait's own bound: {wait:?}"
+    );
+    assert_eq!(
+        cleaned.result.get("deadline_secs").and_then(Val::as_int),
+        Some(30),
+        "the recorded outcome states the step's effective bound"
+    );
+    assert!(
+        wait.get("waited_ms").and_then(Val::as_int).unwrap_or(0) >= 100,
+        "the wait costs at least one bounded poll interval: {wait:?}"
+    );
+    assert!(
+        fixture.agent_list_reads() > settles_after,
+        "the wait polled the lane's own read-back until the settled turn arrived: {} reads",
+        fixture.agent_list_reads()
+    );
+    assert!(
+        !fixture.worktree.exists(),
+        "the settled lane's checkout is reclaimed"
+    );
+    assert!(!fixture.state.join("pane").exists());
+    assert_eq!(
+        fixture
+            .rows()
+            .iter()
+            .filter(|row| row.starts_with("workspace close"))
+            .count(),
+        1,
+        "the settled lane's workspace is closed exactly once: {:?}",
+        fixture.rows()
+    );
+    assert_eq!(
+        cleaned
+            .result
+            .get("salvage")
+            .and_then(|salvage| salvage.get("head"))
+            .and_then(Val::as_str),
+        Some(head.as_str()),
+        "the certified delivery is the lane's own published head"
     );
 }
 

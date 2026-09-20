@@ -829,6 +829,23 @@ clears a repository/fleet-level hold or bypasses a gate.
   observation exists yet; never the local branch. Missing objects are fetched
   without moving that frozen base. Existing lane directories refuse typed
   (`refusal.worktree.exists`); they are not reset or silently reused.
+- **Lane wait on p8 (issue #224)**: the cleanup step's landing proof runs
+  BEFORE its workspace retirement, so a lane that is still ALIVE when the
+  proof already holds is the worker outliving its own publish — a timing
+  condition, not an ownership problem. The step then WAITS, bounded by its own
+  effective deadline (the cleanup row of the per-kind table, or the plan's
+  declared `deadline_secs`), for the settled turn the worker produces on its
+  own (`refusal.lane.busy` names the live lane on every read-back), and closes
+  the workspace once the lane settles; the recorded outcome carries the wait
+  (`lane_wait`: `bound_secs`, `waited_ms`) alongside the step's own
+  `deadline_secs`. A wait that exhausts the bound records `effect.lane_timeout`
+  as `ambiguous` with the live lane's own message and the bound named, and the
+  frontier parks typed with the bounded retries UNSPENT — never a retry burned
+  on the timing, and never a workspace closed. A lane that is NOT published is
+  refused typed (`refusal.cleanup.unmerged`, see the lifecycle contract), and a
+  workspace that is a superseded generation's or another lane's is still
+  refused at once (`refusal.stale.generation`/`refusal.lane.name_collision`) —
+  neither is ever waited on, so the live-lane protection is unchanged.
 - **Diagnosed frontier (issue #148)**: the classification half of the same
   honesty. The frontier step's own LATEST recorded attempt is read from the
   run's claim/outcome material, and when it is not `succeeded` the run is

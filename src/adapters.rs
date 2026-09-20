@@ -153,6 +153,13 @@ pub const CODE_UNAVAILABLE_HERDR: &str = "refusal.unavailable.herdr";
 /// or to another worktree. The operation refuses instead of delivering work
 /// to a reused identity (no cross-lane prompt delivery).
 pub const CODE_STALE_GENERATION: &str = "refusal.stale.generation";
+/// The lane's OWN agent is still running (`working`, `blocked`, or an
+/// unclassifiable `unknown`): its workspace is preserved. Distinct from
+/// [`CODE_STALE_GENERATION`], which is a generation/ownership MISMATCH and is
+/// never waited on, this says "the right lane is alive, come back later" — a
+/// caller that has already certified the delivery waits bounded for the
+/// settled turn instead of spending a retry on the timing (issue #224).
+pub const CODE_LANE_BUSY: &str = "refusal.lane.busy";
 /// The kind has no documented pane row (issue #139): nothing is fabricated
 /// for it and no fallback is substituted.
 pub const CODE_EXECUTION_UNSUPPORTED: &str = "refusal.execution.unsupported";

@@ -293,9 +293,12 @@ runs control-plane effects:
   - `prompt`, `collect_outcome` and `review_evidence` 1800 s (the review
     step's own documented row, `REVIEW_DEADLINE_DEFAULT_SECS`: a reviewer's
     verdict round trip is a worker-turn-class wait and never the generic I/O
-    default — issue #217), `harness_start` 300 s, every other kind 60 s
-    (`EFFECT_DEADLINE_DEFAULT_SECS`), and the hard ceiling is 3600 s
-    (`EFFECT_DEADLINE_CEILING_SECS`);
+    default — issue #217), `cleanup` 1800 s (`CLEANUP_DEADLINE_DEFAULT_SECS`:
+    the step's bounded wait for a lane that outlived its own publish IS the
+    worker's round trip, so the generic 60 s row would park a run whose
+    publish already succeeded — issue #224), `harness_start` 300 s, every
+    other kind 60 s (`EFFECT_DEADLINE_DEFAULT_SECS`), and the hard ceiling is
+    3600 s (`EFFECT_DEADLINE_CEILING_SECS`);
   - for a pane `collect_outcome` the effective deadline is the wait's
     NO-PROGRESS WINDOW, not a wall: the wait extends past it while the lane
     records progress and is bounded above by its own kind ceiling

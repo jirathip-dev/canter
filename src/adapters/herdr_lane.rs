@@ -409,6 +409,12 @@ pub(super) fn start_with_env(
 
 /// Close only this lane generation's sole pane/workspace after p8's clean and
 /// merged checks. Unowned, multi-pane and active workspaces are never closed.
+///
+/// The lane's own agent must have SETTLED (`idle`/`done`); a still-running
+/// agent refuses [`CODE_LANE_BUSY`] with the workspace preserved — the caller's
+/// own bounded wait decides when to come back (issue #224), and a
+/// generation/ownership MISMATCH still refuses
+/// [`CODE_STALE_GENERATION`], which is never waited on.
 pub fn close_lane_workspace(
     session: &SessionHandle,
     worktree: &Path,
@@ -437,7 +443,7 @@ pub fn close_lane_workspace(
                 let binding = verify_lane_binding(row, session, Some(worktree))?;
                 if !matches!(binding.state.as_str(), "idle" | "done") {
                     return Err(refusal(
-                        CODE_STALE_GENERATION,
+                        CODE_LANE_BUSY,
                         format!(
                             "lane {} is still {}; preserve its workspace",
                             binding.agent, binding.state
