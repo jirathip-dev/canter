@@ -347,6 +347,61 @@ pub struct LaneFootprint {
     pub harness_key: String,
     /// Declared scope/lane path (e.g. `worktrees/issues/123`).
     pub scope: String,
+    /// Issue number the lane is working (`0` when the caller records none):
+    /// part of the identity a cap refusal names (#236).
+    pub issue_number: i64,
+    /// The lane's recorded run / instance id (empty when the caller records
+    /// none): the strongest identity a cap refusal names (#236).
+    pub identity: String,
+}
+
+/// How many occupying lanes one cap refusal names before the remainder is
+/// summarised. One window, one authority: this is also the window the queue
+/// preview's `concurrency.lanes` rendering uses (#236).
+pub const LANE_OCCUPANTS_MAX: usize = 32;
+
+/// The lanes that occupy a cap, rendered as `repository#issue (run on scope)`
+/// names (#236): a refusal names WHAT holds the slot instead of a bare count.
+/// Every producer of a cap refusal and every consumer that renders one shows
+/// this same string — the fact is rendered once, not re-derived per surface.
+/// Bounded by [`LANE_OCCUPANTS_MAX`] with an explicit remainder.
+pub fn lane_occupants<'a>(lanes: impl IntoIterator<Item = &'a LaneFootprint>) -> String {
+    let mut names: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    for lane in lanes {
+        total += 1;
+        if names.len() >= LANE_OCCUPANTS_MAX {
+            continue;
+        }
+        let mut name = lane.repository.clone();
+        if lane.issue_number > 0 {
+            name.push_str(&format!("#{}", lane.issue_number));
+        }
+        let detail = if lane.identity.is_empty() {
+            lane.scope.clone()
+        } else {
+            format!("{} on {}", lane.identity, lane.scope)
+        };
+        names.push(format!("{name} ({detail})"));
+    }
+    let rendered = names.join(", ");
+    let overflow = total.saturating_sub(LANE_OCCUPANTS_MAX);
+    if overflow == 0 {
+        rendered
+    } else {
+        format!("{rendered}, +{overflow} more")
+    }
+}
+
+/// The ` (N <noun>: names)` clause a cap refusal carries when lanes actually
+/// occupy the axis, and the empty string when none do — an axis no lane
+/// occupies keeps the refusal text it always had (#236).
+fn occupant_clause(counted: usize, noun: &str, names: String) -> String {
+    if counted == 0 {
+        String::new()
+    } else {
+        format!(" ({counted} {noun}: {names})")
+    }
 }
 
 /// Whether two declared lane paths overlap as path components (equal, or
@@ -505,34 +560,51 @@ pub fn check_fanout_admission(
         return Err(LifecycleError::new(
             code::CAP_GLOBAL,
             format!(
-                "the global concurrency cap ({}) is reached; refuse fan-out",
-                caps.global
+                "the global concurrency cap ({}) is reached{}; refuse fan-out",
+                caps.global,
+                occupant_clause(
+                    running.len(),
+                    "active lanes",
+                    lane_occupants(running.iter())
+                )
             ),
         ));
     }
-    let same_repository = running
+    let same_repository: Vec<&LaneFootprint> = running
         .iter()
         .filter(|lane| lane.repository == proposed.repository)
-        .count();
-    if same_repository >= caps.per_repository {
+        .collect();
+    if same_repository.len() >= caps.per_repository {
         return Err(LifecycleError::new(
             code::CAP_REPOSITORY,
             format!(
-                "the per-repository concurrency cap ({}) is reached for {}; refuse fan-out",
-                caps.per_repository, proposed.repository
+                "the per-repository concurrency cap ({}) is reached for {}{}; refuse fan-out",
+                caps.per_repository,
+                proposed.repository,
+                occupant_clause(
+                    same_repository.len(),
+                    "active lanes",
+                    lane_occupants(same_repository)
+                )
             ),
         ));
     }
-    let same_harness = running
+    let same_harness: Vec<&LaneFootprint> = running
         .iter()
         .filter(|lane| lane.harness_key == proposed.harness_key)
-        .count();
-    if same_harness >= caps.per_harness {
+        .collect();
+    if same_harness.len() >= caps.per_harness {
         return Err(LifecycleError::new(
             code::CAP_HARNESS,
             format!(
-                "the per-harness concurrency cap ({}) is reached for {:?}; refuse fan-out",
-                caps.per_harness, proposed.harness_key
+                "the per-harness concurrency cap ({}) is reached for {:?}{}; refuse fan-out",
+                caps.per_harness,
+                proposed.harness_key,
+                occupant_clause(
+                    same_harness.len(),
+                    "attested lanes",
+                    lane_occupants(same_harness)
+                )
             ),
         ));
     }
@@ -1079,6 +1151,26 @@ mod tests {
             repository: repository.to_string(),
             harness_key: harness_key.to_string(),
             scope: scope.to_string(),
+            // The anonymous footprint: identity facts the caller did not
+            // record are never invented (the refusal then names the scope).
+            issue_number: 0,
+            identity: String::new(),
+        }
+    }
+
+    /// One counted lane with the identity facts a caller records: the issue
+    /// it works and the run/instance id that owns the lane (#236).
+    fn named_lane(
+        repository: &str,
+        harness_key: &str,
+        scope: &str,
+        issue_number: i64,
+        identity: &str,
+    ) -> LaneFootprint {
+        LaneFootprint {
+            issue_number,
+            identity: identity.to_string(),
+            ..lane(repository, harness_key, scope)
         }
     }
 
@@ -1186,6 +1278,147 @@ mod tests {
             .code,
             code::CAP_HARNESS
         );
+    }
+
+    /// #236 AC2: a cap refusal NAMES what occupies the cap — the count, the
+    /// declared cap and the identities (issue, run id, declared worktree) of
+    /// the counted lanes — on every axis the same code path produces. Two
+    /// occupying lanes, so the naming cannot pass on a single lucky match.
+    #[test]
+    fn cap_refusals_name_the_count_the_cap_and_the_occupying_lanes() {
+        let now = anchor_secs();
+        let proof = Some(HostProof {
+            measured_at_unix: now,
+        });
+        let proposed = lane("example-org/widgets", "lane-1", "worktrees/issues/9");
+        let widgets = [
+            named_lane(
+                "example-org/widgets",
+                "lane-1",
+                "worktrees/issues/7",
+                7,
+                "run-0123456789abcdef",
+            ),
+            named_lane(
+                "example-org/widgets",
+                "lane-1",
+                "worktrees/issues/8",
+                8,
+                "run-fedcba9876543210",
+            ),
+        ];
+        let names = [
+            "example-org/widgets#7 (run-0123456789abcdef on worktrees/issues/7)",
+            "example-org/widgets#8 (run-fedcba9876543210 on worktrees/issues/8)",
+        ];
+        // Global axis: both counted lanes are named.
+        let caps = ConcurrencyCaps {
+            global: 2,
+            ..ConcurrencyCaps::default()
+        };
+        let err = check_fanout_admission(&proposed, &widgets, &caps, proof, now).unwrap_err();
+        assert_eq!(err.code, code::CAP_GLOBAL);
+        for needle in ["the global concurrency cap (2)", "2 active lanes"] {
+            assert!(err.message.contains(needle), "{}: {}", needle, err.message);
+        }
+        for name in names {
+            assert!(err.message.contains(name), "{name}: {}", err.message);
+        }
+        // Per-repository axis: both lanes of THIS repository are named.
+        let caps = ConcurrencyCaps {
+            per_repository: 2,
+            ..ConcurrencyCaps::default()
+        };
+        let err = check_fanout_admission(&proposed, &widgets, &caps, proof, now).unwrap_err();
+        assert_eq!(err.code, code::CAP_REPOSITORY);
+        for needle in [
+            "the per-repository concurrency cap (2)",
+            "example-org/widgets",
+            "2 active lanes",
+        ] {
+            assert!(err.message.contains(needle), "{}: {}", needle, err.message);
+        }
+        for name in names {
+            assert!(err.message.contains(name), "{name}: {}", err.message);
+        }
+        // Per-harness axis: both lanes on the harness key are named, and a
+        // lane on another harness is not attributed to it.
+        let caps = ConcurrencyCaps {
+            per_repository: 3,
+            per_harness: 2,
+            ..ConcurrencyCaps::default()
+        };
+        let occupants = [
+            widgets[0].clone(),
+            widgets[1].clone(),
+            named_lane(
+                "example-org/other",
+                "lane-2",
+                "worktrees/issues/3",
+                3,
+                "run-aaaaaaaaaaaaaaaa",
+            ),
+        ];
+        let err = check_fanout_admission(&proposed, &occupants, &caps, proof, now).unwrap_err();
+        assert_eq!(err.code, code::CAP_HARNESS);
+        for needle in [
+            "the per-harness concurrency cap (2)",
+            "\"lane-1\"",
+            "2 attested lanes",
+        ] {
+            assert!(err.message.contains(needle), "{}: {}", needle, err.message);
+        }
+        for name in names {
+            assert!(err.message.contains(name), "{name}: {}", err.message);
+        }
+        assert!(
+            !err.message.contains("run-aaaaaaaaaaaaaaaa"),
+            "a lane on another harness is not named by this axis: {}",
+            err.message
+        );
+    }
+
+    /// #236: with no lane occupying the repository, the same producer raises
+    /// the refusal it always raised — the occupant naming is additive, and a
+    /// lane-free repository never gets occupants invented for it.
+    #[test]
+    fn a_cap_refusal_is_unchanged_when_no_lane_occupies_the_repository() {
+        let now = anchor_secs();
+        let proof = Some(HostProof {
+            measured_at_unix: now,
+        });
+        let proposed = lane("example-org/widgets", "lane-1", "worktrees/issues/9");
+        let caps = ConcurrencyCaps {
+            per_repository: 0,
+            ..ConcurrencyCaps::default()
+        };
+        let err = check_fanout_admission(&proposed, &[], &caps, proof, now).unwrap_err();
+        assert_eq!(err.code, code::CAP_REPOSITORY);
+        assert_eq!(
+            err.message,
+            "the per-repository concurrency cap (0) is reached for example-org/widgets; \
+             refuse fan-out"
+        );
+        // Lanes of ANOTHER repository leave this repository's axis free: the
+        // same call is admitted (nothing is attributed across repositories).
+        let caps = ConcurrencyCaps {
+            per_repository: 1,
+            ..ConcurrencyCaps::default()
+        };
+        check_fanout_admission(
+            &proposed,
+            &[named_lane(
+                "example-org/other",
+                "lane-2",
+                "worktrees/issues/3",
+                3,
+                "run-aaaaaaaaaaaaaaaa",
+            )],
+            &caps,
+            proof,
+            now,
+        )
+        .expect("a lane-free repository is admitted on its own axis");
     }
 
     #[test]

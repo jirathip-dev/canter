@@ -5232,6 +5232,27 @@ fn execute_queue_preview(args: &QueuePreviewArgs, invocation: &Invocation) -> Cm
         "plan digest sha256 {}\nready {}\n",
         preview.digest, preview.ready
     ));
+    // #236: the named holds are rendered in the human text too — a cap hold
+    // names the count, the cap and the lanes holding it, so the operator sees
+    // who occupies the slot without parsing `--json`.
+    let holds = preview
+        .doc
+        .get("holds")
+        .and_then(Val::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !holds.is_empty() {
+        human.push_str(&format!("holds ({})\n", holds.len()));
+        for hold in &holds {
+            human.push_str(&format!(
+                "  {}: {}\n",
+                hold.get("code").and_then(Val::as_str).unwrap_or_default(),
+                hold.get("message")
+                    .and_then(Val::as_str)
+                    .unwrap_or_default()
+            ));
+        }
+    }
     human.push_str(&format!("steps ({})", steps.len()));
     for step in &steps {
         human.push_str(&format!(" {} {}", step.id, step.kind));

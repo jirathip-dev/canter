@@ -684,13 +684,53 @@ struct GrantBinding {
     status: String,
 }
 
+/// Every counted lane — the fan-out gate's own run-state set, across all
+/// repositories — as the admission gate's footprints (#236). The SAME rows
+/// the counted axes derive from, so a cap refusal names exactly the lanes it
+/// counted; the per-repository subset is derived from this one set. Ordered
+/// by run id, so one durable state renders one message.
+fn counted_lane_footprints(
+    tx: &rusqlite::Transaction<'_>,
+    label: &str,
+) -> Result<Vec<crate::lifecycle::LaneFootprint>, StateError> {
+    let mut statement = tx
+        .prepare(
+            "SELECT repository, issue_number, scope, instance_id FROM instances
+              WHERE status IN ('new', 'running', 'human_queue', 'blocked')
+              ORDER BY instance_id",
+        )
+        .map_err(|err| StateError::from_sqlite(label, err))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(crate::lifecycle::LaneFootprint {
+                repository: row.get::<_, String>(0)?,
+                harness_key: String::new(),
+                scope: row.get::<_, String>(2)?,
+                issue_number: row.get::<_, i64>(1)?,
+                identity: row.get::<_, String>(3)?,
+            })
+        })
+        .map_err(|err| StateError::from_sqlite(label, err))?;
+    let mut lanes = Vec::new();
+    for row in rows {
+        lanes.push(row.map_err(|err| StateError::from_sqlite(label, err))?);
+    }
+    Ok(lanes)
+}
+
 /// Running fan-out slot accounting for one submission transaction: the
 /// counted lanes (read under the guard) plus the runs admitted so far, in
 /// the preview's axis order.
 struct FanoutSlots<'a> {
     caps: &'a crate::lifecycle::ConcurrencyCaps,
-    counted_global: i64,
-    counted_repository: i64,
+    /// Repository this submission is for (the per-repository axis).
+    repository: &'a str,
+    /// Every counted lane (all repositories) as the admission gate's own
+    /// footprints: the global axis names them all, the per-repository axis
+    /// names the subset in `repository` — through the ONE authoritative
+    /// occupancy renderer (#236). Ordered by run id, so one durable state
+    /// renders one message.
+    counted_lanes: Vec<crate::lifecycle::LaneFootprint>,
     harness_lanes: Option<i64>,
     admitted_global: i64,
     admitted_repository: i64,
@@ -698,26 +738,42 @@ struct FanoutSlots<'a> {
 }
 
 impl FanoutSlots<'_> {
+    /// The counted lanes of this submission's repository — the same set the
+    /// per-repository axis counts, so a refusal names exactly it (#236).
+    fn repository_lanes(&self) -> Vec<&crate::lifecycle::LaneFootprint> {
+        self.counted_lanes
+            .iter()
+            .filter(|lane| lane.repository == self.repository)
+            .collect()
+    }
+
     /// The hold that parks the next eligible item, if one applies: capacity
     /// first (the preview's axis order), then the attestation gap.
     fn hold(&self) -> Option<(&'static str, String)> {
-        if self.counted_global + self.admitted_global >= self.caps.global as i64 {
+        if self.counted_lanes.len() as i64 + self.admitted_global >= self.caps.global as i64 {
             return Some((
                 crate::lifecycle::code::CAP_GLOBAL,
                 format!(
-                    "the global concurrency cap ({}) is reached ({} active lanes); the item \
+                    "the global concurrency cap ({}) is reached ({} active lanes: {}); the item \
                      waits",
-                    self.caps.global, self.counted_global
+                    self.caps.global,
+                    self.counted_lanes.len(),
+                    crate::lifecycle::lane_occupants(self.counted_lanes.iter())
                 ),
             ));
         }
-        if self.counted_repository + self.admitted_repository >= self.caps.per_repository as i64 {
+        let repository_lanes = self.repository_lanes();
+        if repository_lanes.len() as i64 + self.admitted_repository
+            >= self.caps.per_repository as i64
+        {
             return Some((
                 crate::lifecycle::code::CAP_REPOSITORY,
                 format!(
-                    "the per-repository concurrency cap ({}) is reached ({} active lanes); the \
-                     item waits",
-                    self.caps.per_repository, self.counted_repository
+                    "the per-repository concurrency cap ({}) is reached ({} active lanes: {}); \
+                     the item waits",
+                    self.caps.per_repository,
+                    repository_lanes.len(),
+                    crate::lifecycle::lane_occupants(repository_lanes)
                 ),
             ));
         }
@@ -760,7 +816,6 @@ struct QueueAdmission<'a> {
     workflow_id: &'a str,
     workflow_hash: &'a str,
     ownership: &'a BTreeMap<i64, OwnedRunSnapshot>,
-    repository_lanes: &'a [(i64, String)],
 }
 
 /// One membership item's admission inputs.
@@ -1074,8 +1129,9 @@ fn admit_queue_item_in_tx(
     if let Some((code, message)) = slots.hold() {
         return Ok(AdmissionDecision::Waiting { code, message });
     }
-    if ctx.repository_lanes.iter().any(|(lane_issue, lane_scope)| {
-        *lane_issue != item.issue_number && crate::lifecycle::paths_overlap(&scope, lane_scope)
+    if slots.repository_lanes().iter().any(|lane| {
+        lane.issue_number != item.issue_number
+            && crate::lifecycle::paths_overlap(&scope, &lane.scope)
     }) {
         return Ok(AdmissionDecision::Waiting {
             code: crate::lifecycle::code::MONOREPO_OVERLAP,
@@ -4362,41 +4418,13 @@ impl State {
             owned
         };
         // Counted lanes: the fan-out capacity axes plus the same-repository
-        // declared scopes for the overlap re-check.
-        let counted_global: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM instances
-                  WHERE status IN ('new', 'running', 'human_queue', 'blocked')",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|err| StateError::from_sqlite("submit_queue_run: counted", err))?;
-        let repository_lanes: Vec<(i64, String)> = {
-            let mut statement = tx
-                .prepare(
-                    "SELECT issue_number, scope FROM instances
-                      WHERE repository = ?1
-                        AND status IN ('new', 'running', 'human_queue', 'blocked')",
-                )
-                .map_err(|err| StateError::from_sqlite("submit_queue_run: lanes", err))?;
-            let rows = statement
-                .query_map(params![plan.repository], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                })
-                .map_err(|err| StateError::from_sqlite("submit_queue_run: lanes query", err))?;
-            let mut lanes = Vec::new();
-            for row in rows {
-                lanes.push(
-                    row.map_err(|err| StateError::from_sqlite("submit_queue_run: lanes row", err))?,
-                );
-            }
-            lanes
-        };
-        let counted_repository = repository_lanes.len() as i64;
+        // declared scopes for the overlap re-check — one set, read under the
+        // guard, that a refusal names.
+        let counted_lanes = counted_lane_footprints(&tx, "submit_queue_run: counted lanes")?;
         let mut slots = FanoutSlots {
             caps: &plan.admission_caps,
-            counted_global,
-            counted_repository,
+            repository: &plan.repository,
+            counted_lanes,
             harness_lanes: plan.harness_lanes,
             admitted_global: 0,
             admitted_repository: 0,
@@ -4427,7 +4455,6 @@ impl State {
                         workflow_id: &plan.workflow_id,
                         workflow_hash: &plan.workflow_hash,
                         ownership: &owned,
-                        repository_lanes: &repository_lanes,
                     };
                     let candidate = QueueAdmissionItem {
                         issue_number: item.issue_number,
@@ -12947,35 +12974,9 @@ fn advance_queue_in_tx(
                 // the SAME caps and occupancy attestation the submission
                 // committed under, and the SAME guard-verifying helper.
                 let epoch = current_epoch_locked(tx)?;
-                let counted_global: i64 = tx
-                    .query_row(
-                        "SELECT COUNT(*) FROM instances
-                          WHERE status IN ('new', 'running', 'human_queue', 'blocked')",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .map_err(|err| StateError::from_sqlite("queue_advance: counted", err))?;
-                let mut statement = tx
-                    .prepare(
-                        "SELECT issue_number, scope FROM instances
-                          WHERE repository = ?1
-                            AND status IN ('new', 'running', 'human_queue', 'blocked')",
-                    )
-                    .map_err(|err| StateError::from_sqlite("queue_advance: lanes", err))?;
-                let rows = statement
-                    .query_map(params![submission.repository], |row| {
-                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                    })
-                    .map_err(|err| StateError::from_sqlite("queue_advance: lanes query", err))?;
-                let mut repository_lanes: Vec<(i64, String)> = Vec::new();
-                for row in rows {
-                    repository_lanes.push(
-                        row.map_err(|err| {
-                            StateError::from_sqlite("queue_advance: lanes row", err)
-                        })?,
-                    );
-                }
-                drop(statement);
+                // The counted lanes: the SAME rows the capacity axes and the
+                // overlap re-check derive from, so a refusal names them.
+                let counted_lanes = counted_lane_footprints(tx, "queue_advance: counted lanes")?;
                 let mut owned: BTreeMap<i64, OwnedRunSnapshot> = BTreeMap::new();
                 let mut statement = tx
                     .prepare(
@@ -13012,8 +13013,8 @@ fn advance_queue_in_tx(
                 };
                 let mut slots = FanoutSlots {
                     caps: &caps,
-                    counted_global,
-                    counted_repository: repository_lanes.len() as i64,
+                    repository: &submission.repository,
+                    counted_lanes,
                     harness_lanes: submission.harness_lanes,
                     admitted_global: 0,
                     admitted_repository: 0,
@@ -13028,7 +13029,6 @@ fn advance_queue_in_tx(
                     workflow_id: &submission.workflow_id,
                     workflow_hash: &submission.workflow_hash,
                     ownership: &owned,
-                    repository_lanes: &repository_lanes,
                 };
                 let candidate_item = QueueAdmissionItem {
                     issue_number: candidate.issue_number,
@@ -14401,6 +14401,47 @@ mod tests {
         Retention {
             audit_rows: 4,
             event_rows: 4,
+        }
+    }
+
+    /// #236: the per-repository cap refusal names what occupies the slot — the
+    /// count, the cap and the holding lane identities — not a bare count.
+    #[test]
+    fn the_per_repository_cap_refusal_names_its_occupants() {
+        let caps = crate::lifecycle::ConcurrencyCaps {
+            global: 8,
+            per_repository: 1,
+            per_harness: 2,
+        };
+        let lanes = vec![crate::lifecycle::LaneFootprint {
+            repository: "example-org/widgets".to_string(),
+            harness_key: String::new(),
+            scope: "worktrees/issues/7".to_string(),
+            issue_number: 7,
+            identity: "run-0123456789abcdef".to_string(),
+        }];
+        let slots = FanoutSlots {
+            caps: &caps,
+            repository: "example-org/widgets",
+            counted_lanes: lanes,
+            harness_lanes: Some(0),
+            admitted_global: 0,
+            admitted_repository: 0,
+            admitted_harness: 0,
+        };
+        let (code, message) = slots.hold().expect("the per-repository cap holds");
+        assert_eq!(code, crate::lifecycle::code::CAP_REPOSITORY);
+        for needle in [
+            "the per-repository concurrency cap (1)",
+            "1 active lanes",
+            "example-org/widgets#7",
+            "run-0123456789abcdef",
+            "worktrees/issues/7",
+        ] {
+            assert!(
+                message.contains(needle),
+                "the refusal names {needle}: {message}"
+            );
         }
     }
 

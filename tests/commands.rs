@@ -647,6 +647,30 @@ fn queue_preview_renders_the_service_preview_document_and_its_holds() {
         Some(false),
         "the preview declares itself effect-free"
     );
+    // #236: the human-mode rendering shows the same named holds (the code and
+    // the producer's own message), so the CLI text — not only `--json` —
+    // carries the fact.
+    let host_hold = holds
+        .iter()
+        .find(|hold| hold.get("code").and_then(Val::as_str) == Some("preview.host_unavailable"))
+        .expect("the host hold");
+    let host_message = host_hold
+        .get("message")
+        .and_then(Val::as_str)
+        .expect("the hold carries its producer's message");
+    let human_args: Vec<&str> = held
+        .iter()
+        .filter(|value| value.as_str() != "--json")
+        .map(String::as_str)
+        .collect();
+    let (code, stdout, stderr) = fixture.cli(&human_args);
+    assert_eq!(code, 0, "human preview exit; stderr: {stderr}");
+    for needle in ["holds (", "preview.host_unavailable", host_message] {
+        assert!(
+            stdout.contains(needle),
+            "the human rendering must carry {needle:?}: {stdout}"
+        );
+    }
 }
 
 #[test]
