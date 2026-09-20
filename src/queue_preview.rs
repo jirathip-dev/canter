@@ -61,8 +61,9 @@ pub const SELECTED_MAX: usize = 64;
 pub const STEPS_MAX: usize = 32;
 
 /// Bound on the rendered same-repository running lanes (overflow is
-/// reported explicitly, never silently dropped).
-pub const RUNNING_LANES_MAX: usize = 32;
+/// reported explicitly, never silently dropped). The same window a cap
+/// refusal names occupants through — one authority (#236).
+pub const RUNNING_LANES_MAX: usize = crate::lifecycle::LANE_OCCUPANTS_MAX;
 
 /// Closed item statuses (the acceptance vocabulary).
 pub const ITEM_STATUSES: [&str; 3] = ["eligible", "blocked", "already_owned"];
@@ -1154,6 +1155,24 @@ fn digest_document(request: &Validated) -> Val {
     ])
 }
 
+/// The counted durable lanes as the admission gate's footprints (#236): the
+/// SAME rows the preview counts, so the one authoritative occupancy renderer
+/// (`crate::lifecycle::lane_occupants`) names exactly them. Harness occupancy
+/// is client-attested and not durable state, so the per-harness axis has no
+/// rows to convert.
+fn lane_footprints(lanes: &[&InstanceRow]) -> Vec<crate::lifecycle::LaneFootprint> {
+    lanes
+        .iter()
+        .map(|row| crate::lifecycle::LaneFootprint {
+            repository: row.repository.clone(),
+            harness_key: String::new(),
+            scope: row.scope.clone(),
+            issue_number: row.issue_number,
+            identity: row.instance_id.clone(),
+        })
+        .collect()
+}
+
 /// Render the deterministic, effect-free preview of one exact selected-issue
 /// run. The only read is the existing durable state read API; nothing is
 /// spawned, granted, written or unpaused.
@@ -1241,8 +1260,10 @@ pub fn preview_queue(state: &State, request: &QueueRequest) -> Result<QueuePrevi
             code: admission::CAP_GLOBAL,
             subject: "global".to_string(),
             message: format!(
-                "the global concurrency cap ({}) is reached ({} active lanes); fan-out refuses",
-                request.caps.global, running_total
+                "the global concurrency cap ({}) is reached ({} active lanes: {}); fan-out refuses",
+                request.caps.global,
+                running_total,
+                crate::lifecycle::lane_occupants(lane_footprints(&counted).iter())
             ),
         });
     }
@@ -1251,8 +1272,11 @@ pub fn preview_queue(state: &State, request: &QueueRequest) -> Result<QueuePrevi
             code: admission::CAP_REPOSITORY,
             subject: request.repository.clone(),
             message: format!(
-                "the per-repository concurrency cap ({}) is reached for {:?} ({} active lanes); fan-out refuses",
-                request.caps.per_repository, request.repository, running_repository
+                "the per-repository concurrency cap ({}) is reached for {:?} ({} active lanes: {}); fan-out refuses",
+                request.caps.per_repository,
+                request.repository,
+                running_repository,
+                crate::lifecycle::lane_occupants(lane_footprints(&same_repository).iter())
             ),
         });
     }
@@ -1263,8 +1287,8 @@ pub fn preview_queue(state: &State, request: &QueueRequest) -> Result<QueuePrevi
             code: admission::CAP_HARNESS,
             subject: request.harness_key.clone(),
             message: format!(
-                "the per-harness concurrency cap ({}) is reached ({} attested lanes on this harness); fan-out refuses",
-                request.caps.per_harness, lanes
+                "the per-harness concurrency cap ({}) is reached ({lanes} attested lanes on harness {:?}); fan-out refuses",
+                request.caps.per_harness, request.harness_key
             ),
         });
     }

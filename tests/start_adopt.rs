@@ -1187,9 +1187,53 @@ fn capacity_refusal_is_a_held_typed_refusal_with_a_bounded_retry() {
     );
     assert_eq!(code, "refusal.admission.cap_global", "{message}");
 
-    // The refusals were holds: the record is untouched, nothing was
-    // invoked, admission stayed enabled (the bounded retry is one explicit
-    // fresh request, no scheduler).
+    // #236 AC2: the refusal the gate raises NAMES the lanes that occupy the
+    // cap — the count, the cap and the identities (declared worktree here;
+    // the daemon's own durable path names the run id) — never a bare count.
+    let id = fresh_id(223);
+    let mut occupied = admission((2, 4, 4), &canter::time::rfc3339_now());
+    if let Val::Obj(map) = &mut occupied {
+        map.insert(
+            "running".to_string(),
+            Val::Arr(vec![
+                object(vec![
+                    ("repository", string("example-org/other")),
+                    ("harness_key", string("lane-1")),
+                    ("scope", string("worktrees/issues/71")),
+                ]),
+                object(vec![
+                    ("repository", string("example-org/other")),
+                    ("harness_key", string("lane-1")),
+                    ("scope", string("worktrees/issues/72")),
+                ]),
+            ]),
+        );
+    }
+    let (code, message) = rpc_err(
+        &fixture.socket,
+        &id,
+        "lane.start",
+        Some(start_params(
+            &id,
+            &replacement_id,
+            &digest,
+            "nonce-0001",
+            SUCCESSOR_SESSION,
+            occupied,
+        )),
+    );
+    assert_eq!(code, "refusal.admission.cap_global", "{message}");
+    for needle in [
+        "the global concurrency cap (2)",
+        "2 active lanes",
+        "example-org/other (worktrees/issues/71)",
+        "example-org/other (worktrees/issues/72)",
+    ] {
+        assert!(
+            message.contains(needle),
+            "the daemon's refusal must name {needle}: {message}"
+        );
+    }
     assert_eq!(
         fixture.invocations(),
         invocations_before,

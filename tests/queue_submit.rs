@@ -1140,6 +1140,30 @@ fn wire_submit_partially_admits_and_status_reads_back_the_same_document() {
             Some("refusal.admission.cap_repository".to_string())
         )
     );
+    // #236 AC2: the waiting verdict NAMES the lane that occupies the cap —
+    // the count, the cap and the holder's identity (issue, run id, declared
+    // worktree) — so `queue status` and the board show who holds the slot.
+    let waiting_message = result
+        .get("items")
+        .and_then(Val::as_array)
+        .expect("items")
+        .iter()
+        .find(|item| item.get("id").and_then(Val::as_str) == Some("example-org/widgets#8"))
+        .and_then(|item| item.get("message").and_then(Val::as_str))
+        .expect("the waiting verdict carries its producer's message")
+        .to_string();
+    for needle in [
+        "the per-repository concurrency cap (",
+        "1 active lanes",
+        "example-org/widgets#7",
+        "run-owned-wire-0001",
+        "worktrees/issues/7",
+    ] {
+        assert!(
+            waiting_message.contains(needle),
+            "the waiting verdict must name {needle}: {waiting_message}"
+        );
+    }
     let admission = result.get("admission").expect("admission");
     assert_eq!(admission.get("admitted").and_then(Val::as_int), Some(1));
     assert_eq!(admission.get("waiting").and_then(Val::as_int), Some(1));

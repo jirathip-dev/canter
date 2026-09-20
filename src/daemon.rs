@@ -1338,21 +1338,21 @@ fn admission_gate(
     };
     // Per-harness axis: the attested active-lane count on this harness key.
     let harness_lanes = admission.harness_lanes.unwrap_or(0);
+    let harness_key = params
+        .and_then(|p| p.get("harness_key"))
+        .and_then(Val::as_str)
+        .unwrap_or("");
     if usize::try_from(harness_lanes).unwrap_or(usize::MAX) >= caps.per_harness {
         return Err(err_response(
             &request.id,
             crate::lifecycle::code::CAP_HARNESS,
             format!(
-                "the per-harness concurrency cap ({}) is reached ({} attested lanes on this harness); refuse fan-out",
-                caps.per_harness, harness_lanes
+                "the per-harness concurrency cap ({}) is reached ({} attested lanes on harness {:?}); refuse fan-out",
+                caps.per_harness, harness_lanes, harness_key
             ),
         ));
     }
-    let harness_key = params
-        .and_then(|p| p.get("harness_key"))
-        .and_then(Val::as_str)
-        .unwrap_or("")
-        .to_string();
+    let harness_key = harness_key.to_string();
     // State-derived lanes + the proposed footprint.
     let state = match shared.lock_state() {
         Ok(state) => state,
@@ -1373,6 +1373,8 @@ fn admission_gate(
         repository: plan.repository.clone(),
         harness_key,
         scope: instance.scope.clone(),
+        issue_number: instance.issue_number,
+        identity: instance.instance_id.clone(),
     };
     let mut running = Vec::new();
     for row in state
@@ -1390,6 +1392,10 @@ fn admission_gate(
                 repository: row.repository.clone(),
                 harness_key: String::new(),
                 scope: row.scope.clone(),
+                // The durable identity of the holding lane: a cap refusal
+                // names the run and issue that occupy the slot (#236).
+                issue_number: row.issue_number,
+                identity: row.instance_id.clone(),
             });
         }
     }
@@ -7649,6 +7655,11 @@ fn successor_admission(
                     .unwrap_or("")
                     .to_string(),
                 scope: scope.to_string(),
+                // The caller-attested lanes record repository, harness key and
+                // declared scope (and nothing else): a cap refusal names what
+                // it actually has — the declared worktree (#236).
+                issue_number: 0,
+                identity: String::new(),
             });
         }
     }
@@ -7661,6 +7672,8 @@ fn successor_admission(
         repository,
         harness_key: harness_key.to_string(),
         scope: worktree.to_string(),
+        issue_number: 0,
+        identity: String::new(),
     };
     crate::lifecycle::check_fanout_admission(
         &proposed,
