@@ -12,7 +12,8 @@
 //!   `apply` mutation path, and the daemon's own reconciliation admits the
 //!   next issue with NO further client request and no conductor prompt.
 //!
-//! No fixed real sleeps: every wait is a bounded poll with a deadline.
+//! No fixed real sleeps in a wait: every wait on recorded canter state fails
+//! only after a documented no-progress ceiling (issue #232).
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -38,6 +39,22 @@ const POLICY_HASH: &str = "feedface01234567feedface01234567feedface01234567feedf
 const SECRET_DIGEST: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 const HEAD_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const BASE_A: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+/// The no-progress ceiling of a recorded-state wait, in seconds (issue #232).
+///
+/// Progress-driven, never a fixed wall-clock bound: the driver wakes
+/// semantically on each committed step and otherwise re-checks on its bounded
+/// timer fallback (`canter::supervision::DEFAULT_CHECK_INTERVAL_SECS`, 60 s),
+/// so one starved wake legitimately leaves the recorded frontier, the attempt
+/// ledger or a queue item's status unchanged for a little over a minute on a
+/// loaded host. Every wait below that observes one of those records therefore
+/// fails only after this much time with NO durable change — any new recorded
+/// attempt, committed check or frontier move resets the ceiling — and names
+/// the progress observed and the elapsed time. Two driver ticks, so a single
+/// starved wake can never fail a witness, and it stays inside the CI test
+/// driver's per-suite budget (`scripts/ci-test-driver.py`,
+/// `PER_SUITE_SECONDS = 300`).
+const NO_PROGRESS_SECS: u64 = 120;
 
 // ---------------------------------------------------------------------------
 // Builders (the #84/#85/#95 fixture shape)
@@ -1985,7 +2002,9 @@ fn the_real_daemon_advances_the_queue_to_the_next_issue_without_another_request(
 
     // NO further client request: the daemon's own reconciliation (event wake
     // or the bounded timer fallback) admits the next issue.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let started = Instant::now();
+    let mut last_progress = started;
+    let mut progress = String::new();
     let mut id = 100u64;
     let status = loop {
         id += 1;
@@ -1995,15 +2014,26 @@ fn the_real_daemon_advances_the_queue_to_the_next_issue_without_another_request(
             "queue.status",
             Some(object(vec![("submission_id", string(&submission_id))])),
         );
-        if live_item(&doc, 6).get("status").and_then(Val::as_str) == Some("admitted") {
+        let advanced = live_item(&doc, 6)
+            .get("status")
+            .and_then(Val::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if advanced == "admitted" {
             break doc;
         }
-        if Instant::now() >= deadline {
-            panic!(
-                "the queue never advanced to issue 6; last: {}",
-                canter::canonical::canonical_text(&doc)
-            );
+        if advanced != progress {
+            progress = advanced.clone();
+            last_progress = Instant::now();
         }
+        let stalled = last_progress.elapsed().as_secs();
+        assert!(
+            stalled < NO_PROGRESS_SECS,
+            "the queue never advanced to issue 6: no progress for {stalled}s of {}s waited \
+             (status {advanced:?}); last: {}",
+            started.elapsed().as_secs(),
+            canter::canonical::canonical_text(&doc)
+        );
         std::thread::sleep(Duration::from_millis(50));
     };
     let run6 = live_item(&status, 6)
@@ -2354,7 +2384,9 @@ fn the_supervisor_itself_drives_the_committed_merge_and_cleanup_to_the_last_step
     // not one transient cursor value — is what proves the progression.
     let mut timeline: Vec<String> = Vec::new();
     let mut id = 700u64;
-    let deadline = Instant::now() + Duration::from_secs(90);
+    let started = Instant::now();
+    let mut last_progress = started;
+    let mut progress = String::new();
     let (next_step, next_kind, attempts) = loop {
         id += 1;
         let (status, step, kind, attempts) = cursor_sample(&fixture.socket, &run5, id);
@@ -2365,9 +2397,17 @@ fn the_supervisor_itself_drives_the_committed_merge_and_cleanup_to_the_last_step
         if status == "done" {
             break (step, kind, attempts);
         }
+        let observed = format!("{status}/{step}/{kind}/{attempts:?}");
+        if observed != progress {
+            progress = observed;
+            last_progress = Instant::now();
+        }
+        let stalled = last_progress.elapsed().as_secs();
         assert!(
-            Instant::now() < deadline,
-            "the driver never drove the run's committed tail to its last step; observed: {timeline:?}"
+            stalled < NO_PROGRESS_SECS,
+            "the driver never drove the run's committed tail to its last step: no progress for \
+             {stalled}s of {}s waited; observed: {timeline:?}",
+            started.elapsed().as_secs()
         );
         std::thread::sleep(Duration::from_millis(250));
     };

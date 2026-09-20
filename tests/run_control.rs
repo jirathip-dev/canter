@@ -543,6 +543,78 @@ fn rpc_ok(socket: &Path, id: &str, method: &str, params: Option<Val>) -> Val {
     doc.get("result").expect("result").clone()
 }
 
+/// The no-progress ceiling of a recorded-state wait, in seconds (issue #232).
+///
+/// Progress-driven, never a fixed wall-clock bound: the driver wakes
+/// semantically on each committed step and otherwise re-checks on its bounded
+/// timer fallback (`canter::supervision::DEFAULT_CHECK_INTERVAL_SECS`, 60 s),
+/// so one starved wake legitimately leaves a run's recorded control/boundary
+/// state unchanged for a little over a minute on a loaded host. The wait below
+/// therefore fails only after this much time with NO durable change — any new
+/// recorded claim, control transition or boundary move resets the ceiling —
+/// and it names the progress observed and the elapsed time. Two driver ticks,
+/// so a single starved wake can never fail a witness, and it stays inside the
+/// CI test driver's per-suite budget (`scripts/ci-test-driver.py`,
+/// `PER_SUITE_SECONDS = 300`).
+const NO_PROGRESS_SECS: u64 = 120;
+
+/// The durable progress a recorded-state wait tracks: the run's control state
+/// and boundary, canonically rendered, so any recorded transition counts as
+/// progress while a re-read of an unchanged record does not.
+fn recorded_progress(status: &Val) -> String {
+    canonical_text(&object(vec![
+        (
+            "control",
+            status.get("control").cloned().unwrap_or(Val::Null),
+        ),
+        (
+            "boundary",
+            status.get("boundary").cloned().unwrap_or(Val::Null),
+        ),
+    ]))
+}
+
+/// Wait until the run's recorded boundary names `step` as its in-flight step,
+/// failing only after `NO_PROGRESS_SECS` with no NEW recorded state (issue
+/// #232) and naming the progress observed and the elapsed time.
+fn wait_for_in_flight_step(fixture: &DaemonFixture, run: &str, step: &str) -> Val {
+    let started = Instant::now();
+    let mut last_progress = started;
+    let mut progress = String::new();
+    let mut seed = 0x200u32;
+    loop {
+        seed += 1;
+        let status = rpc_ok(
+            &fixture.socket,
+            &fresh_id(seed),
+            "run.status",
+            Some(canter::run_control::status_params(run)),
+        );
+        if status
+            .get("boundary")
+            .and_then(|boundary| boundary.get("in_flight_step"))
+            .and_then(Val::as_str)
+            == Some(step)
+        {
+            return status;
+        }
+        let observed = recorded_progress(&status);
+        if observed != progress {
+            progress = observed;
+            last_progress = Instant::now();
+        }
+        let stalled = last_progress.elapsed().as_secs();
+        assert!(
+            stalled < NO_PROGRESS_SECS,
+            "the step dispatch never became in flight: no progress for {stalled}s of {}s waited \
+             ({})",
+            started.elapsed().as_secs(),
+            canonical_text(&status)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn rpc_quiet(socket: &Path, id: &str, method: &str, params: Option<Val>) -> Option<Val> {
     let mut connection = Connection::open(socket).ok()?;
     connection.send_request(id, method, params.as_ref()).ok()?;
@@ -910,29 +982,7 @@ fn wire_pause_stops_dispatch_before_the_boundary_and_reaches_it_when_the_step_re
             )),
         )
     });
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let status = rpc_ok(
-            &fixture.socket,
-            &fresh_id(2),
-            "run.status",
-            Some(canter::run_control::status_params(&run)),
-        );
-        if status
-            .get("boundary")
-            .and_then(|b| b.get("in_flight_step"))
-            .and_then(Val::as_str)
-            == Some("p1")
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the step dispatch never became in flight: {}",
-            canonical_text(&status)
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_for_in_flight_step(&fixture, &run, "p1");
 
     // The pause request stops admitting IMMEDIATELY: it is durable as
     // `pause_requested` and the boundary is honestly not reached yet.
@@ -1499,29 +1549,7 @@ fn wire_pause_intent_survives_a_daemon_death_and_commits_on_restart() {
             )),
         )
     });
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let status = rpc_ok(
-            &fixture.socket,
-            &fresh_id(2),
-            "run.status",
-            Some(canter::run_control::status_params(&run)),
-        );
-        if status
-            .get("boundary")
-            .and_then(|b| b.get("in_flight_step"))
-            .and_then(Val::as_str)
-            == Some("p1")
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the step dispatch never became in flight: {}",
-            canonical_text(&status)
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_for_in_flight_step(&fixture, &run, "p1");
     let paused = rpc_ok(
         &fixture.socket,
         &fresh_id(3),
@@ -2114,29 +2142,7 @@ fn wire_release_refuses_a_run_with_a_step_in_flight_then_frees_it_once_settled()
             )),
         )
     });
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let status = rpc_ok(
-            &fixture.socket,
-            &fresh_id(2),
-            "run.status",
-            Some(canter::run_control::status_params(&run)),
-        );
-        if status
-            .get("boundary")
-            .and_then(|b| b.get("in_flight_step"))
-            .and_then(Val::as_str)
-            == Some("p1")
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the step dispatch never became in flight: {}",
-            canonical_text(&status)
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_for_in_flight_step(&fixture, &run, "p1");
 
     // A run with work in flight is genuinely live: the release refuses typed
     // and changes NOTHING (no ownership freed, no audit record, no kill).

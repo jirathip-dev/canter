@@ -68,6 +68,28 @@ fn frontier_progress(sup: &Val) -> String {
     canonical_text(field(sup, &["cursor"]))
 }
 
+/// The durable progress a recorded-CLASS wait tracks: the cursor plus the
+/// committed check ledger (count, last check, continuation) of the recorded
+/// evaluation, canonically rendered. A committed check, a settlement or a
+/// frontier move counts as progress; the read-time fields that change on
+/// every read (`freshness.age_secs`, `progress.age_secs`,
+/// `next_check.due_in_secs`) are deliberately excluded, so re-reading an
+/// unchanged record can never pass for progress.
+fn recorded_progress(sup: &Val) -> String {
+    canonical_text(&object(vec![
+        ("cursor", field(sup, &["cursor"]).clone()),
+        ("checks", field(sup, &["evaluation", "checks"]).clone()),
+        (
+            "last_check",
+            field(sup, &["evaluation", "last_check"]).clone(),
+        ),
+        (
+            "continuation",
+            field(sup, &["evaluation", "continuation"]).clone(),
+        ),
+    ]))
+}
+
 fn hold_codes(item: &Val) -> Vec<String> {
     field(item, &["holds"])
         .as_array()
@@ -449,7 +471,9 @@ impl Fixture {
         self.first(run);
         let sup = self.wait_for_frontier(run, "p5-5");
         assert_eq!(text(&sup, &["cursor", "next_step_kind"]), "collect_outcome");
-        let deadline = Instant::now() + Duration::from_secs(90);
+        let deadline_free_start = Instant::now();
+        let mut last_progress = deadline_free_start;
+        let mut progress = String::new();
         let mut stable = String::new();
         let mut reads = 0usize;
         loop {
@@ -471,12 +495,25 @@ impl Fixture {
                     return (sup, class);
                 }
             } else {
-                stable = class;
+                stable = class.clone();
                 reads = 1;
             }
-            if Instant::now() >= deadline {
-                panic!("the recorded class never settled at p5-5: {sup:?}");
+            let observed = recorded_progress(&sup);
+            if observed != progress {
+                progress = observed;
+                last_progress = Instant::now();
             }
+            let stalled = last_progress.elapsed().as_secs();
+            assert!(
+                stalled < FRONTIER_NO_PROGRESS_SECS,
+                "the recorded class never settled at p5-5: no progress for {stalled}s of {}s \
+                 waited (class {class:?}, frontier {:?}, {} recorded check(s)): {sup:?}",
+                deadline_free_start.elapsed().as_secs(),
+                text(&sup, &["cursor", "next_step"]),
+                field(&sup, &["evaluation", "checks"])
+                    .as_int()
+                    .unwrap_or(-1),
+            );
             std::thread::sleep(Duration::from_millis(700));
         }
     }
