@@ -6164,6 +6164,19 @@ enum LandedProof {
         /// The fork point the content proof compared from.
         merge_base: String,
     },
+    /// The landing is visible only on the PUBLISHED integration ref (issue
+    /// #132): the forge owns the repository's policy merge and a remote merge
+    /// never updates the checkout's own ref, so the proof was made against the
+    /// FETCHED, verified published head while the checkout's view was strictly
+    /// behind it.
+    Published {
+        /// The fetched, verified published head the proof was made against.
+        published_head: String,
+        /// The fork point the content proof compared from; `None` when the
+        /// branch head is an ancestor of `published_head` (an ff landing only
+        /// the published ref had received).
+        merge_base: Option<String>,
+    },
 }
 
 /// Prove `branch_head`'s work landed in the integration ref, or refuse the
@@ -6209,81 +6222,118 @@ fn landed_in_integration(
             ));
         }
     };
-    let changed = run_git(
+    let paths = changed_paths_between(ctx, &merge_base, branch_head, code::CLEANUP_UNMERGED)?;
+    let differing = differing_paths_between(
         ctx,
-        ctx.integration_repo,
-        &[
-            "diff",
-            "--name-only",
-            "--no-renames",
-            "--ignore-submodules=none",
-            "-z",
-            &merge_base,
-            branch_head,
-            "--",
-        ],
-    )?;
-    // NUL records preserve whitespace and avoid Git's C-quoting. Renames
-    // must contribute BOTH endpoints, including the deleted source path.
-    // ProcOut is lossy UTF-8: reject replacement characters (even a literal
-    // U+FFFD) rather than ever reusing a possibly altered path as a proof.
-    let paths: Vec<&str> = changed.stdout.split_terminator('\0').collect();
-    if changed.stdout.contains('\u{fffd}')
-        || (!changed.stdout.is_empty() && !changed.stdout.ends_with('\0'))
-        || paths.iter().any(|path| path.is_empty())
-    {
-        return Err(refusal(
-            code::CLEANUP_UNMERGED,
-            "cleanup cannot compare changed paths losslessly; refusing unverified deletion",
-        ));
-    }
-    if paths.is_empty() {
-        // Independently confirm the empty delta; never turn a missing path
-        // list into a vacuous proof or an unrestricted comparison by accident.
-        run_git(
-            ctx,
-            ctx.integration_repo,
-            &[
-                "diff",
-                "--quiet",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--ignore-submodules=none",
-                &merge_base,
-                branch_head,
-                "--",
-            ],
-        )?;
-        return Ok(LandedProof::Content { merge_base });
-    }
-    let mut args: Vec<&str> = vec![
-        "--literal-pathspecs",
-        "diff",
-        "--name-only",
-        "--no-renames",
-        "--ignore-submodules=none",
-        "-z",
         branch_head,
         ctx.integration_branch,
-        "--",
-    ];
-    args.extend(paths.iter().copied());
-    let differing = run_git(ctx, ctx.integration_repo, &args)?;
-    let missing: Vec<&str> = differing.stdout.split_terminator('\0').collect();
-    if !missing.is_empty() {
+        &paths,
+        code::CLEANUP_UNMERGED,
+    )?;
+    if !differing.is_empty() {
         // The refusal names the real cause (issue #132): the branch is not
         // ancestry-merged AND its changed content has not landed either.
         return Err(refusal(
             code::CLEANUP_UNMERGED,
             format!(
-                "branch {branch:?} head {branch_head} is not merged into {:?} and {} of the {} path(s) it changed relative to {merge_base} are not content-identical there (first {missing:?}); cleanup refuses unverified deletion",
+                "branch {branch:?} head {branch_head} is not merged into {:?} and {} of the {} path(s) it changed relative to {merge_base} are not content-identical there (first {:?}); cleanup refuses unverified deletion",
                 ctx.integration_branch,
-                missing.len(),
+                differing.len(),
                 paths.len(),
+                differing.first(),
             ),
         ));
     }
     Ok(LandedProof::Content { merge_base })
+}
+
+/// Prove a branch landed in the PUBLISHED integration ref (issue #132).
+///
+/// The forge owns the repository's policy merge and a remote landing never
+/// updates the checkout's own ref, so the run's own cleanup would refuse its
+/// sanctioned deletion forever once the delivery landed on the forge. The
+/// published head is read from the checkout's `origin` (`git ls-remote`),
+/// FETCHED into the checkout's remote-tracking ref and verified against that
+/// read (issues #156, #178). Only a checkout STRICTLY BEHIND the published ref
+/// may certify from this view: a checkout ahead of, or diverged from, it is an
+/// unpublished local move and this route refuses. The proof is the same
+/// fail-closed fact as the local one — ancestry against the fetched head, or,
+/// for the squash landing (which never is an ancestor), the branch's exact
+/// content on every path it changed relative to the fork point. An unreadable
+/// or unverifiable published view proves nothing and refuses.
+fn landed_in_published(
+    ctx: &EffectContext<'_>,
+    branch_head: &str,
+) -> Result<LandedProof, EffectOutcome> {
+    let local_head = run_git(
+        ctx,
+        ctx.integration_repo,
+        &["rev-parse", "--verify", ctx.integration_branch],
+    )?
+    .stdout
+    .trim()
+    .to_string();
+    let published = published_integration_head(ctx)?;
+    if published == local_head {
+        // The checkout's own ref IS the published view; its own refusal (the
+        // caller's) stands and nothing is re-proven against itself.
+        return Err(refusal(
+            code::CLEANUP_UNMERGED,
+            format!(
+                "branch head {branch_head} is not merged into {:?} and its changed content is not content-identical there; the checkout's own view is the published head {published}; cleanup refuses unverified deletion",
+                ctx.integration_branch
+            ),
+        ));
+    }
+    let fetched = fetched_published_head(ctx, &published)?;
+    if !is_commit_ancestor(ctx, &local_head, &fetched) {
+        return Err(refusal(
+            code::CLEANUP_UNMERGED,
+            format!(
+                "the checkout's integration ref {:?} is at {local_head}, which is not an ancestor of the published head {fetched}: an unpublished or diverged local view is never certified; cleanup refuses unverified deletion",
+                ctx.integration_branch
+            ),
+        ));
+    }
+    if is_commit_ancestor(ctx, branch_head, &fetched) {
+        return Ok(LandedProof::Published {
+            published_head: fetched,
+            merge_base: None,
+        });
+    }
+    let merge_base = match run_git(
+        ctx,
+        ctx.integration_repo,
+        &["merge-base", branch_head, &fetched],
+    ) {
+        Ok(out) => out.stdout.trim().to_string(),
+        Err(_) => {
+            return Err(refusal(
+                code::CLEANUP_UNMERGED,
+                format!(
+                    "branch head {branch_head} is not merged into the published integration ref {fetched} and shares no fork point with it; cleanup refuses unverified deletion"
+                ),
+            ));
+        }
+    };
+    let paths = changed_paths_between(ctx, &merge_base, branch_head, code::CLEANUP_UNMERGED)?;
+    let differing =
+        differing_paths_between(ctx, branch_head, &fetched, &paths, code::CLEANUP_UNMERGED)?;
+    if !differing.is_empty() {
+        return Err(refusal(
+            code::CLEANUP_UNMERGED,
+            format!(
+                "branch head {branch_head} is not merged into the published integration ref {fetched} and {} of the {} path(s) it changed relative to {merge_base} are not content-identical there (first {:?}); cleanup refuses unverified deletion",
+                differing.len(),
+                paths.len(),
+                differing.first(),
+            ),
+        ));
+    }
+    Ok(LandedProof::Published {
+        published_head: fetched,
+        merge_base: Some(merge_base),
+    })
 }
 
 /// `cleanup`: deterministic lane cleanup. Refuses dirty worktrees,
@@ -6291,7 +6341,9 @@ fn landed_in_integration(
 /// (AC8). The daemon journals the salvage evidence (`mutate.salvage`)
 /// before invoking this effect. The landed proof is ancestry or — for a
 /// policy SQUASH landing, which is never an ancestor — content-equivalence
-/// (issue #132).
+/// (issue #132); when the CHECKOUT's own view cannot see the landing, the
+/// same fact is proven against the FETCHED, verified PUBLISHED ref, which
+/// only a checkout strictly behind it may certify from (issue #132).
 fn effect_cleanup(ctx: &EffectContext<'_>) -> EffectOutcome {
     let inputs = match cleanup_inputs(ctx.params, &ctx.param_contract()) {
         Ok(inputs) => inputs,
@@ -6392,6 +6444,20 @@ fn effect_cleanup(ctx: &EffectContext<'_>) -> EffectOutcome {
     };
     let landed = match landed_in_integration(ctx, &branch, &branch_head) {
         Ok(landed) => landed,
+        Err(outcome) if outcome.code.as_deref() == Some(code::CLEANUP_UNMERGED) => {
+            // Issue #132: the sanctioned landing happens on the forge (the PR
+            // is squash-merged) and a remote landing never updates the
+            // checkout's own ref, so the checkout's view alone cannot certify
+            // a delivered lane and the run would refuse its own cleanup
+            // forever. Before refusing, prove the landing against the
+            // PUBLISHED ref (fetched and verified, issues #156/#178); the
+            // checkout's own refusal stands whenever that view cannot add a
+            // proof.
+            match landed_in_published(ctx, &branch_head) {
+                Ok(landed) => landed,
+                Err(_) => return outcome,
+            }
+        }
         Err(outcome) => return outcome,
     };
     let integration_head = match run_git(
@@ -6415,6 +6481,25 @@ fn effect_cleanup(ctx: &EffectContext<'_>) -> EffectOutcome {
         LandedProof::Content { merge_base } => {
             salvage_pairs.push(("landed_by", string("content")));
             salvage_pairs.push(("merge_base", string(merge_base)));
+        }
+        LandedProof::Published {
+            published_head,
+            merge_base,
+        } => {
+            // The checkout's own ref (recorded above as integration_head)
+            // could not see the landing: the proof is made against the
+            // FETCHED published head, which the record names.
+            salvage_pairs.push((
+                "landed_by",
+                string(match merge_base {
+                    Some(_) => "content",
+                    None => "ancestor",
+                }),
+            ));
+            if let Some(merge_base) = merge_base {
+                salvage_pairs.push(("merge_base", string(merge_base)));
+            }
+            salvage_pairs.push(("published_head", string(published_head)));
         }
     }
     let salvage = object(salvage_pairs);
@@ -6458,10 +6543,12 @@ fn effect_cleanup(ctx: &EffectContext<'_>) -> EffectOutcome {
     }
     // A squash landing is not an ancestor, so git's own merged check cannot
     // pass for it; there the effect already proved the landing above and
-    // deletes with `-D`. The ancestor route keeps git's own `-d` safety.
+    // deletes with `-D`. A proof made against the PUBLISHED head (issue
+    // #132) also cannot satisfy git's own merged check against the checkout's
+    // ref, which is behind it. The ancestor route keeps git's own `-d` safety.
     let delete_arg = match landed {
         LandedProof::Ancestor => "-d",
-        LandedProof::Content { .. } => "-D",
+        LandedProof::Content { .. } | LandedProof::Published { .. } => "-D",
     };
     match run_git(ctx, ctx.integration_repo, &["branch", delete_arg, &branch]) {
         Ok(_) => {}
