@@ -432,6 +432,15 @@ clears a repository/fleet-level hold or bypasses a gate.
   node-derived frontier preserves the pre-ledger run behavior. A diagnosed
   `ambiguous` or failed attempt therefore cannot be hidden by a stale or
   optimistically advanced node.
+- The rendered control document (`run.pause` / `run.resume` / `run.status`)
+  carries `last_failure`: the newest recorded NON-succeeded step attempt as
+  `{step, status, code, message}` — the durable outcome's own typed code and
+  its raw message (redacted like every other recorded text) — or `null` when
+  the run has no standing failure (its newest recorded attempt succeeded, or
+  the run has no recorded attempt). Issue #219: a failed effect's reason is
+  readable read-only, from the same document that reports the frontier, and
+  never only from a daemon log — an operator can tell a rejected publish from
+  a conflict from a bad credential without one.
 - `run.retry` requires `params.instance_id` and `params.step` (a plan step
   id). It refuses: a terminal run (`refusal.run.terminal`), a paused or
   pause-requested run (`refusal.run.paused` — resume first), a run without
@@ -564,7 +573,11 @@ clears a repository/fleet-level hold or bypasses a gate.
   as `observed`, and the `continuation` block is durable window state only
   (`state`/`since`/`reports`) — a read can therefore never launder a
   committed effect, and the surface never presents an observation as if it
-  were the record.
+  were the record. The status document carries top-level `last_failure`: the
+  newest recorded NON-succeeded step attempt with its raw message (`step`,
+  `status`, `code`, `message`; `null` when the run has no standing failure) —
+  issue #219: the frontier's diagnosis is readable WITH its reason, not as a
+  bare code.
 - A run with NO recorded progress observation yet (a fresh arm: `progress_at`
   empty, or an unreadable instant) is **held** — class `unknown`, reason
   `supervision.progress_unobserved`, `eligible:false` — never eligible: an

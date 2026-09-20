@@ -399,7 +399,7 @@ fn fresh_id(seed: u32) -> String {
 // ---------------------------------------------------------------------------
 
 const GRANT_ID: &str = "gr_abcdef0123456789";
-const INSTANCE_ID: &str = "run-1";
+const INSTANCE_ID: &str = "run-0123456789abcdef";
 const REVISION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const POLICY_HASH: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 const WORKFLOW_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -660,10 +660,20 @@ struct Scenario {
     fixture: Fixture,
     plan: Val,
     daemon: Option<GroupChild>,
+    /// The integration publish route this scenario's topology declares (issue
+    /// #219): `push` (the documented default) or `pull_request`.
+    publish_route: String,
 }
 
 impl Scenario {
     fn new(name: &str, expires_at: &str, steps: Vec<Val>) -> Scenario {
+        Scenario::new_routed(name, expires_at, steps, "push")
+    }
+
+    /// One scenario whose topology DECLARES the integration publish route
+    /// (issue #219). A route is declared, never inferred: the fixture presents
+    /// it in the same topology document that carries `integration_branch`.
+    fn new_routed(name: &str, expires_at: &str, steps: Vec<Val>, publish_route: &str) -> Scenario {
         let sandbox = Sandbox::new(name);
         let repos = make_repos(&sandbox);
         sandbox.write("fakebin/gh", FAKE_GH);
@@ -683,6 +693,7 @@ impl Scenario {
             fixture,
             plan: make_plan(steps),
             daemon: Some(daemon),
+            publish_route: publish_route.to_string(),
         }
     }
 
@@ -817,6 +828,7 @@ impl Scenario {
                 object(vec![
                     ("integration_branch", string("staging")),
                     ("production_branches", Val::Arr(vec![string("main")])),
+                    ("integration_publish", string(&self.publish_route)),
                     (
                         "worktrees_root",
                         string(&self.repos.worktrees_root.to_string_lossy()),
@@ -1393,11 +1405,24 @@ fn cycle2_merge_steps(policy: &str) -> Vec<Val> {
 }
 
 fn cycle2_reviewed_merge(policy: &str, squash_first: bool) -> (Scenario, String, String) {
+    cycle2_reviewed_merge_routed(policy, squash_first, "push")
+}
+
+/// One reviewed (verdict PASS at the bound head) delivery under a DECLARED
+/// integration publish route (issue #219). The route rides the topology, so
+/// both routes share the whole fixture.
+fn cycle2_reviewed_merge_routed(
+    policy: &str,
+    squash_first: bool,
+    route: &str,
+) -> (Scenario, String, String) {
     let steps = cycle2_merge_steps(policy);
-    let scenario = Scenario::new(
-        &format!("c2-{}{}", &policy[..1], u8::from(squash_first)),
+    let route_tag = if route == "pull_request" { "pr" } else { "pu" };
+    let scenario = Scenario::new_routed(
+        &format!("c2{}{route_tag}", &policy[..1]),
         "2999-01-01T00:00:00Z",
         steps,
+        route,
     );
     let base = scenario.integration_base();
     scenario.apply_ok(10, "w1", None, None);
@@ -1665,6 +1690,256 @@ fn cycle2_squash_merge_reports_already_landed_content_and_publishes_nothing() {
         result.get("result_tree").and_then(Val::as_str),
         Some(git.head("staging^{tree}").as_str())
     );
+}
+
+/// Witness (issue #219): a repository rule that REJECTS a direct push to its
+/// integration ref is its own typed outcome — never the generic
+/// `effect.merge.failed` — and the remote's own diagnostics behind it are
+/// readable READ-ONLY from the run's durable record, which is exactly what the
+/// live acceptance run could not do (both daemon logs were 0 bytes and every
+/// read-back carried the bare code).
+#[test]
+fn a_rejected_direct_push_records_its_own_code_and_reason_readably() {
+    let (scenario, feature, base) = cycle2_reviewed_merge("squash", false);
+    let origin = scenario.origin();
+    let origin_git = Git::new(&origin);
+    let published_before = origin_git.head("staging");
+    assert_eq!(published_before, base, "the fixture starts unpublished");
+    // The bare "remote" applies the repository rule: reads still work, the
+    // push is declined. This is the measured live shape (`push declined due
+    // to repository rule violations`).
+    reject_direct_pushes(&origin);
+
+    let (code, message) = scenario.apply_err(15, "m1", Some(&feature), Some(&base));
+    assert_eq!(code, "effect.merge.push_rejected", "{message}");
+    assert!(
+        message.contains("[remote rejected]") && message.contains("pre-receive hook declined"),
+        "the message keeps the remote's own rejection: {message}"
+    );
+    assert_eq!(
+        origin_git.head("staging"),
+        published_before,
+        "a rejected publish moves nothing"
+    );
+    assert_eq!(
+        Git::new(&scenario.repos.checkout).head("staging"),
+        published_before,
+        "the checkout was rolled back to the published head"
+    );
+
+    // AC3: the failed effect's own message is retrievable READ-ONLY from the
+    // durable record — the run's control read-back, no daemon log.
+    let status = rpc_ok(
+        &scenario.fixture.socket,
+        &fresh_id(30),
+        "run.status",
+        Some(object(vec![("instance_id", string(INSTANCE_ID))])),
+    );
+    let failure = status.get("last_failure").cloned().unwrap_or_else(null);
+    assert_eq!(failure.get("step").and_then(Val::as_str), Some("m1"));
+    assert_eq!(failure.get("status").and_then(Val::as_str), Some("failed"));
+    assert_eq!(
+        failure.get("code").and_then(Val::as_str),
+        Some("effect.merge.push_rejected")
+    );
+    let recorded = failure.get("message").and_then(Val::as_str).unwrap_or("");
+    assert!(
+        recorded.contains("[remote rejected]"),
+        "the durable record carries the remote's own rejection: {recorded}"
+    );
+}
+
+/// Witness (AC1, issue #219): the topology declares the `pull_request`
+/// publish route for a repository whose rules forbid a direct push. The merge
+/// step publishes the reviewed delivery THROUGH its own open pull request (the
+/// forge squash-merges it), reads the PUBLISHED ref back, proves the landed
+/// content by content and advances the integration checkout onto it — so the
+/// run's own `post_merge_verify` then proves the landed content by content
+/// too. A delivery the forge has not published as a pull request is refused
+/// typed and publishes nothing.
+#[test]
+fn a_declared_pull_request_route_publishes_and_post_merge_verify_proves_it() {
+    let (scenario, feature, base) = cycle2_reviewed_merge_routed("squash", false, "pull_request");
+    let origin = scenario.origin();
+    let origin_git = Git::new(&origin);
+    let published_before = origin_git.head("staging");
+    assert_eq!(published_before, base, "the fixture starts unpublished");
+    // The delivery is published as a pull request (the run's own delivery step
+    // does this): the branch is on the remote and an OPEN pull request names
+    // the certified head.
+    let checkout = Git::new(&scenario.repos.checkout);
+    checkout.run(&["push", "origin", "issue-123:refs/heads/issue-123"]);
+    std::fs::write(
+        scenario.sandbox.path("forge-pr-head.txt"),
+        format!("{feature}\n"),
+    )
+    .expect("pr head file");
+
+    // A delivery with NO open pull request is refused typed and publishes
+    // nothing (the forge reports none).
+    write_forge_without_pull_request(&scenario);
+    let (code, message) = scenario.apply_err(15, "m1", Some(&feature), Some(&base));
+    assert_eq!(code, "refusal.publish.pull_request_missing", "{message}");
+    assert!(
+        message.contains(&feature),
+        "the refusal names the certified head it needs: {message}"
+    );
+    assert_eq!(
+        origin_git.head("staging"),
+        published_before,
+        "a missing pull request publishes nothing"
+    );
+
+    // The forge now answers the delivery's own pull request: the step
+    // publishes THROUGH it (a real squash landing on the bare remote).
+    write_fixture_forge(&scenario);
+    let landed = scenario.apply_ok(16, "m1", Some(&feature), Some(&base));
+    assert_eq!(
+        landed.get("publish_route").and_then(Val::as_str),
+        Some("pull_request")
+    );
+    assert_eq!(landed.get("mode").and_then(Val::as_str), Some("landed"));
+    let published_after = origin_git.head("staging");
+    assert_ne!(
+        published_after, published_before,
+        "the forge published the landing"
+    );
+    assert_eq!(
+        landed.get("published_after").and_then(Val::as_str),
+        Some(published_after.as_str()),
+        "the recorded read-back names the ref the forge actually published"
+    );
+    assert_eq!(
+        landed.get("landed_head").and_then(Val::as_str),
+        Some(published_after.as_str())
+    );
+    // The landed content is on the PUBLISHED ref, by content.
+    assert_eq!(
+        origin_git.run(&["show", &format!("{published_after}:lane.txt")]),
+        "lane change\n",
+        "the reviewed content is on the published integration ref"
+    );
+    // The integration checkout followed the published head (a fast-forward),
+    // so the run's later steps do not read a stale local view.
+    assert_eq!(scenario.integration_base(), published_after);
+    // The run's OWN verifier then proves the landed content by content — the
+    // squash landing rewrites the reviewed commits, so ancestry cannot.
+    let verified = scenario.apply_ok(17, "v1", Some(&feature), Some(&base));
+    assert_eq!(verified.get("proof").and_then(Val::as_str), Some("content"));
+    assert_eq!(
+        verified.get("contains_feature").and_then(Val::as_bool),
+        Some(true)
+    );
+    // The forge was asked for the delivery's own open pull request, and the
+    // merge was matched against the EXACT certified head (the same
+    // exact-head discipline the push route lands under).
+    let recorded = std::fs::read_to_string(scenario.sandbox.path("forge-argv.txt"))
+        .expect("forge argv record");
+    let list = recorded
+        .lines()
+        .find(|line| line.starts_with("pr list"))
+        .unwrap_or_default();
+    assert!(
+        list.contains("--head issue-123")
+            && list.contains("--base staging")
+            && list.contains("--state open"),
+        "the delivery's own open pull request is what is read: {recorded}"
+    );
+    let merge = recorded
+        .lines()
+        .find(|line| line.starts_with("pr merge"))
+        .unwrap_or_default();
+    assert!(
+        merge.contains("--squash") && merge.contains(&format!("--match-head-commit {feature}")),
+        "the forge merge is bound to the certified head: {recorded}"
+    );
+}
+
+/// Fixture hook (issue #219): the bare "remote" applies a repository rule to
+/// its integration ref, so a direct push is REJECTED exactly as a
+/// pull-request-only ruleset rejects it. Reads (`ls-remote`) still work, so
+/// the failure is the publish and nothing else.
+fn reject_direct_pushes(origin: &Path) {
+    let hooks = origin.join("hooks");
+    std::fs::create_dir_all(&hooks).expect("hooks dir");
+    let path = hooks.join("pre-receive");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\n\
+         echo 'remote: error: GH013: Repository rule violations found for refs/heads/staging.' >&2\n\
+         echo 'remote: - Changes must be made through a pull request.' >&2\n\
+         exit 1\n",
+    )
+    .expect("pre-receive hook");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod +x");
+    }
+}
+
+/// The fixture forge (`gh`) that answers the delivery's open pull request and,
+/// when asked to merge it, performs the repository's SQUASH landing on the
+/// bare origin — a REAL publish through the forge path, not a claimed one.
+/// Every call's argv is appended to `<sandbox>/forge-argv.txt`, and the merge
+/// is refused unless `--match-head-commit` names the head recorded in
+/// `<sandbox>/forge-pr-head.txt` (the exact-head discipline, enforced by the
+/// forge itself).
+fn write_fixture_forge(scenario: &Scenario) {
+    let origin = scenario.origin().display().to_string();
+    let checkout = scenario.repos.checkout.display().to_string();
+    let head_file = scenario
+        .sandbox
+        .path("forge-pr-head.txt")
+        .display()
+        .to_string();
+    let record = scenario
+        .sandbox
+        .path("forge-argv.txt")
+        .display()
+        .to_string();
+    let script = format!(
+        "#!/bin/sh\n\
+         printf '%s\\n' \"$*\" >> '{record}'\n\
+         case \"$1\" in\n\
+         pr)\n\
+         case \"$2\" in\n\
+         list)\n\
+         printf '[{{\"number\": 183, \"headRefOid\": \"%s\"}}]' \"$(cat '{head_file}')\"\n\
+         exit 0 ;;\n\
+         merge)\n\
+         previous=''\n\
+         match=''\n\
+         for arg in \"$@\"; do\n\
+         if [ \"$previous\" = '--match-head-commit' ]; then match=\"$arg\"; fi\n\
+         previous=\"$arg\"\n\
+         done\n\
+         expected=$(cat '{head_file}')\n\
+         if [ \"$match\" != \"$expected\" ]; then\n\
+         printf 'the forge refuses a merge that does not match the reviewed head\\n' >&2\n\
+         exit 1\n\
+         fi\n\
+         published=$(git -C '{checkout}' rev-parse --verify refs/heads/staging)\n\
+         tree=$(git -C '{checkout}' rev-parse --verify \"issue-123^{{tree}}\")\n\
+         landing=$(git -C '{checkout}' -c user.name=forge -c user.email=forge@example.invalid commit-tree \"$tree\" -p \"$published\" -m 'squash merge the reviewed delivery (fixture forge)')\n\
+         git -C '{checkout}' push -q '{origin}' \"$landing:refs/heads/staging\" || exit 1\n\
+         printf 'Merged pull request #183 (squash)\\n'\n\
+         exit 0 ;;\n\
+         esac ;;\n\
+         esac\n\
+         exit 1\n"
+    );
+    scenario.sandbox.write("fakebin/gh", &script);
+    scenario.sandbox.chmod_x("fakebin/gh");
+}
+
+/// The fixture forge that reports NO open pull request for the delivery.
+fn write_forge_without_pull_request(scenario: &Scenario) {
+    scenario.sandbox.write(
+        "fakebin/gh",
+        "#!/bin/sh\ncase \"$1\" in\n  pr)\n    case \"$2\" in\n      list) printf '[]'; exit 0 ;;\n    esac ;;\nesac\nexit 1\n",
+    );
+    scenario.sandbox.chmod_x("fakebin/gh");
 }
 
 /// No false success (issue #176): a landing that cannot be PUBLISHED records a

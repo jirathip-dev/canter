@@ -1449,6 +1449,23 @@ pub fn status_doc(
                 ),
             ]),
         ),
+        // Issue #219: the newest recorded NON-succeeded attempt WITH its raw
+        // message. The measured defect was a failed effect whose reason existed
+        // nowhere a read-back could show it (`detail` above carries the code
+        // alone, and both daemon logs were 0 bytes), so the durable outcome's
+        // own message is surfaced here verbatim for an operator to read.
+        (
+            "last_failure",
+            match &evidence.last_failure {
+                Some(failure) => object(vec![
+                    ("step", string(&failure.step)),
+                    ("status", string(&failure.status)),
+                    ("code", string(&failure.code)),
+                    ("message", string(&failure.message)),
+                ]),
+                None => null(),
+            },
+        ),
         (
             "retries",
             object(vec![
@@ -1909,6 +1926,21 @@ pub fn render_human(doc: &Val) -> String {
                 .and_then(Val::as_bool)
                 .unwrap_or(false)
         ),
+    ];
+    // Issue #219: a standing failure is rendered WITH its raw message — the
+    // same reason the durable record carries, so a human read tells a rejected
+    // push from a refused merge without opening a daemon log.
+    let failure = doc.get("last_failure").cloned().unwrap_or_else(null);
+    if failure.get("code").and_then(Val::as_str).is_some() {
+        lines.push(format!(
+            "last failure {} {} ({}): {}",
+            text(&failure, "step"),
+            text(&failure, "status"),
+            text(&failure, "code"),
+            text(&failure, "message")
+        ));
+    }
+    lines.extend([
         format!(
             "last check {} ({}, {})",
             text(&last_check, "at"),
@@ -1939,7 +1971,7 @@ pub fn render_human(doc: &Val) -> String {
             ),
         ),
         text(doc, "statement"),
-    ];
+    ]);
     lines.push(String::new());
     lines.join("\n").trim_end().to_string()
 }
@@ -2063,6 +2095,7 @@ mod tests {
                     (step.to_string(), status.to_string(), code.to_string())
                 })
                 .collect(),
+            last_failure: None,
             retries: Vec::new(),
             verdicts: Vec::new(),
             in_flight: None,
@@ -3256,6 +3289,66 @@ mod tests {
             .commit_supervision_check(&plan(1_800_000_030, true, "continuation-eligible"))
             .expect("again");
         assert_eq!(again.continuation_reports, 2, "a new window reports once");
+    }
+
+    /// Issue #219: the rendered status surfaces the newest recorded
+    /// NON-succeeded attempt WITH its raw message, so an operator reads WHY a
+    /// frontier is parked (a rejected push, a refused merge, a missing
+    /// credential) from the same read that reports the class — never only
+    /// from a daemon log. A run with no standing failure renders `null`.
+    #[test]
+    fn the_rendered_status_carries_the_recorded_failure_with_its_reason() {
+        let state = temp_state("status-failure");
+        let digest = "d".repeat(64);
+        let run = "run-0123456789abcdef";
+        let policy = Policy {
+            check_interval_secs: 10,
+            progress_timeout_secs: 60,
+        };
+        state
+            .arm_supervision_for_test(
+                run,
+                "armed",
+                &digest,
+                "merge",
+                policy,
+                "2026-09-13T00:00:00Z",
+            )
+            .expect("arm");
+        let steps = [("merge", "merge")];
+        let now = 1_800_000_000;
+        // No standing failure: the field is present and null.
+        let clean = evidence_for(run_row(run), Some(&digest), &steps, &[], "");
+        let (row, _) = commit_for(&state, &clean, true, now);
+        let verdict = classify(&clean, &digest, &policy, now);
+        let doc = status_doc(&row, &clean, None, &verdict, now);
+        assert!(path(&doc, &["last_failure"]).is_null());
+        // One recorded NON-succeeded attempt: the durable code AND message are
+        // rendered verbatim.
+        let mut failed = evidence_for(run_row(run), Some(&digest), &steps, &[], "");
+        failed.last_failure = Some(crate::state::StepFailure {
+            step: "p7-1".to_string(),
+            status: "failed".to_string(),
+            code: crate::mutation::code::MERGE_PUSH_REJECTED.to_string(),
+            message: "the landing abcd was not published: [remote rejected] (push declined)"
+                .to_string(),
+        });
+        let doc = status_doc(&row, &failed, None, &verdict, now);
+        assert_eq!(path(&doc, &["last_failure", "step"]).as_str(), Some("p7-1"));
+        assert_eq!(
+            path(&doc, &["last_failure", "code"]).as_str(),
+            Some(crate::mutation::code::MERGE_PUSH_REJECTED)
+        );
+        assert_eq!(
+            path(&doc, &["last_failure", "message"]).as_str(),
+            Some("the landing abcd was not published: [remote rejected] (push declined)")
+        );
+        let human = render_human(&doc);
+        assert!(
+            human.contains("last failure p7-1 failed (effect.merge.push_rejected)"),
+            "{human}"
+        );
+        assert!(human.contains("[remote rejected]"), "{human}");
     }
 
     /// Walk one document path (`Val::get` per key), `null` when absent.

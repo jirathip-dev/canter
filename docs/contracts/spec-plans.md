@@ -105,6 +105,44 @@ Normative rules:
   deletion flags are in [the lifecycle contract](spec-lifecycle.md#5-cleanup-archivesalvage-and-canonical-target-classification-ac7).
   This permits complete squash landings without weakening the ancestry-only
   standalone `branch_delete` effect (Refs #132, #172, #176, #178).
+- The step PUBLISHES through the route the topology DECLARES (issue #219):
+  `topology.integration_publish`, closed `push | pull_request`, default
+  `push` when the topology declares none. `push` is the landing above —
+  fast-forwarded into the integration checkout, pushed to the same `origin`
+  the published ref was read from. `pull_request` is the route for a
+  repository whose own rules forbid a direct push to its integration ref
+  (a pull-request-only ruleset and/or a protected branch): there the reviewed
+  delivery is published through the repository's REAL integration path — the
+  OPEN pull request whose head branch is the delivery branch, whose base is
+  the integration ref, and whose head names the certified head — squash-merged
+  by the authenticated forge CLI with the certified head matched at merge time
+  (`gh pr merge --squash --match-head-commit <certified head>`). The published
+  ref is then read back and the landed content is proven by the SAME
+  fail-closed content fact the landing and `post_merge_verify` use; the
+  integration checkout is fast-forwarded onto the published head (fetch, verify
+  the fetched head against the published read, `merge --ff-only`), so no later
+  step of the run reads a stale local view. Nothing local moves before the
+  forge reports the landing, and a delivery the forge has not published as a
+  pull request refuses `refusal.publish.pull_request_missing` without
+  publishing anything. A route is DECLARED, never inferred from a refused
+  push: a silent fallback would hide the refusal and violate the plan-policy
+  discipline (issue #196). `pull_request` lands the forge's SQUASH merge and
+  therefore refuses a plan that declares `merge_policy:"ff"`
+  (`refusal.policy.publish`). The outcome records `publish_route` alongside the
+  heads above — identical in shape for both routes.
+- A publish that did not happen is never one opaque code (issue #219). The
+  remote REJECTING the update (repository rules, a protected ref) records
+  `effect.merge.push_rejected`; a credential that cannot be read records
+  `refusal.credential.missing`; a ref that moved under the landing records
+  `effect.merge.not_fast_forward`; a forge that refused the merge, or a
+  published ref that does not carry the reviewed content, records
+  `effect.merge.publish_rejected`; a delivery with no open pull request
+  records `refusal.publish.pull_request_missing`; a production-branch landing
+  refusal keeps `refusal.policy.push`. Only a genuinely unclassifiable local
+  failure keeps `effect.merge.failed`. Every one of them keeps the underlying
+  diagnostics in its message, and the daemon records that code + message in the
+  durable outcome, where the run's own read-backs surface it (see
+  [the daemon contract](spec-daemon.md)).
 
 ### Canonical serialization and digest
 
