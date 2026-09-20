@@ -14,7 +14,8 @@
 //! repo (`tests/run_control.rs`, `tests/queue_submit.rs`,
 //! `tests/restart_pause_continuity.rs`, `tests/queue_advance.rs`).
 //!
-//! No fixed real sleeps: every wait is a bounded poll with a deadline.
+//! No fixed real sleeps: every wait on recorded canter state is a poll that
+//! fails only after a documented no-progress ceiling (issue #232).
 #[path = "support/process_group.rs"]
 mod process_group;
 
@@ -696,28 +697,108 @@ fn request_repaired_frontier(
     request
 }
 
-/// Poll one `supervision.status` read until `predicate` holds (bounded).
+/// The no-progress ceiling of a recorded-state wait, in seconds (issue #232).
+///
+/// Progress-driven, never a fixed wall-clock bound: the driver wakes
+/// semantically on each committed step and otherwise re-checks on its bounded
+/// timer fallback (`canter::supervision::DEFAULT_CHECK_INTERVAL_SECS`, 60 s),
+/// so one starved wake legitimately leaves the recorded frontier, the attempt
+/// ledger or the committed check count unchanged for a little over a minute
+/// on a loaded host. Every wait below that observes one of those records
+/// therefore fails only after this much time with NO durable change — any new
+/// recorded attempt, committed check or frontier move resets the ceiling — and
+/// names the progress observed and the elapsed time. Two driver ticks, so a
+/// single starved wake can never fail a witness, and it stays inside the CI
+/// test driver's per-suite budget (`scripts/ci-test-driver.py`,
+/// `PER_SUITE_SECONDS = 300`).
+const NO_PROGRESS_SECS: u64 = 120;
+
+/// The durable progress a recorded-state wait tracks: the cursor plus the
+/// committed check ledger (count, last check, continuation) of the recorded
+/// evaluation, canonically rendered. A committed check, a settlement or a
+/// frontier move counts as progress; the read-time fields that change on every
+/// read (`freshness.age_secs`, `progress.age_secs`, `next_check.due_in_secs`)
+/// are excluded, so re-reading an unchanged record can never pass for progress.
+fn recorded_progress(doc: &Val) -> String {
+    canter::canonical::canonical_text(&object(vec![
+        ("cursor", path_of(doc, &["cursor"])),
+        ("checks", path_of(doc, &["evaluation", "checks"])),
+        ("last_check", path_of(doc, &["evaluation", "last_check"])),
+        (
+            "continuation",
+            path_of(doc, &["evaluation", "continuation"]),
+        ),
+    ]))
+}
+
+/// Poll the run's recorded attempt ledger until `step` has an attempt row,
+/// failing only after `NO_PROGRESS_SECS` with no NEW recorded attempt (issue
+/// #232) and naming the progress observed and the elapsed time.
+fn wait_for_step_attempt(fixture: &DaemonFixture, run: &str, step: &str) -> Vec<(String, String)> {
+    let started = Instant::now();
+    let mut last_progress = started;
+    let mut progress = String::new();
+    loop {
+        let attempts = fixture.seed().run_step_attempts(run).expect("attempts");
+        if attempts.iter().any(|(id, _)| id == step) {
+            return attempts;
+        }
+        let observed = format!("{attempts:?}");
+        if observed != progress {
+            progress = observed;
+            last_progress = Instant::now();
+        }
+        let stalled = last_progress.elapsed().as_secs();
+        assert!(
+            stalled < NO_PROGRESS_SECS,
+            "the driver never dispatched {step}: no progress for {stalled}s of {}s waited \
+             ({} recorded attempt(s)): {attempts:?}\n{}",
+            started.elapsed().as_secs(),
+            attempts.len(),
+            std::fs::read_to_string(fixture.daemon_log()).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Poll one `supervision.status` read until `predicate` holds, failing only
+/// after `NO_PROGRESS_SECS` with no NEW recorded state (issue #232, see
+/// `recorded_progress`) and naming the progress observed and the elapsed time.
 fn wait_for_status(
     fixture: &DaemonFixture,
     run: &str,
     label: &str,
     predicate: impl Fn(&Val) -> bool,
 ) -> Val {
-    let deadline = Instant::now() + Duration::from_secs(45);
+    let started = Instant::now();
+    let mut last_progress = started;
+    let mut progress = String::new();
     let mut seed = 0x1410u64;
-    let mut last = status_doc(&fixture.socket, &fresh_id(seed), run);
-    while Instant::now() < deadline {
+    loop {
         seed += 1;
-        last = status_doc(&fixture.socket, &fresh_id(seed), run);
+        let last = status_doc(&fixture.socket, &fresh_id(seed), run);
         if predicate(&last) {
             return last;
         }
+        let observed = recorded_progress(&last);
+        if observed != progress {
+            progress = observed;
+            last_progress = Instant::now();
+        }
+        let stalled = last_progress.elapsed().as_secs();
+        assert!(
+            stalled < NO_PROGRESS_SECS,
+            "{label} never held: no progress for {stalled}s of {}s waited (frontier {:?}, {} \
+             recorded check(s)): {}",
+            started.elapsed().as_secs(),
+            picked(&last, &["cursor", "next_step"]),
+            path_of(&last, &["evaluation", "checks"])
+                .as_int()
+                .unwrap_or(-1),
+            canter::canonical::canonical_text(&last)
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
-    panic!(
-        "{label} never held: {}",
-        canter::canonical::canonical_text(&last)
-    );
 }
 
 /// The recorded `supervision.dispatch_refused` journal records of one run
@@ -842,15 +923,7 @@ fn repaired_lane_scenario(
     );
 
     // The driver continues by itself and the duplicate lane diagnoses p2.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut attempts = Vec::new();
-    while Instant::now() < deadline {
-        attempts = fixture.seed().run_step_attempts(&run).expect("attempts");
-        if attempts.iter().any(|(step, _)| step == "p2") {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let attempts = wait_for_step_attempt(&fixture, &run, "p2");
     let p2 = attempts
         .iter()
         .find(|(step, _)| step == "p2")
@@ -960,19 +1033,32 @@ fn a_repaired_frontier_refused_by_the_engine_is_named_and_never_reported_eligibl
 
     // ...and the refusal the status names is on the run's own journal: the
     // operator can audit which engine gate refused the supervisor.
-    let refusal_deadline = Instant::now() + Duration::from_secs(45);
-    let mut refusals = Vec::new();
+    let started = Instant::now();
+    let mut last_progress = started;
+    let mut progress = 0usize;
     let frontier_refusal = format!("{run}:p3:refusal.admission.proof_stale");
-    while Instant::now() < refusal_deadline {
-        refusals = dispatch_refusals(&fixture, &run);
+    let refusals = loop {
+        let refusals = dispatch_refusals(&fixture, &run);
         if refusals
             .iter()
             .any(|(target, _)| target == &frontier_refusal)
         {
-            break;
+            break refusals;
         }
+        if refusals.len() != progress {
+            progress = refusals.len();
+            last_progress = Instant::now();
+        }
+        let stalled = last_progress.elapsed().as_secs();
+        assert!(
+            stalled < NO_PROGRESS_SECS,
+            "the supervisor's refused continuation is recorded against the run: no progress for \
+             {stalled}s of {}s waited ({} recorded dispatch refusal(s)): {refusals:?}",
+            started.elapsed().as_secs(),
+            refusals.len()
+        );
         std::thread::sleep(Duration::from_millis(100));
-    }
+    };
     assert!(
         refusals
             .iter()
@@ -1072,15 +1158,7 @@ fn a_repaired_frontier_is_dispatched_by_the_driver_without_any_operator_dispatch
 
     // Nothing else dispatches p3: the driver's own continuation reaches the
     // apply engine and runs.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut attempts = Vec::new();
-    while Instant::now() < deadline {
-        attempts = fixture.seed().run_step_attempts(&run).expect("attempts");
-        if attempts.iter().any(|(step, _)| step == "p3") {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let attempts = wait_for_step_attempt(&fixture, &run, "p3");
     let p3 = attempts
         .iter()
         .find(|(step, _)| step == "p3")
@@ -1154,15 +1232,27 @@ fn a_repeatedly_refused_continuation_is_not_redispatched_every_tick() {
     let code = "refusal.admission.proof_stale";
 
     // The driver's own dispatch of the frontier, refused by the engine.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut first = 0usize;
-    while Instant::now() < deadline {
-        first = refused_attempts(&fixture, "p3", code);
+    let started = Instant::now();
+    let mut last_progress = started;
+    let mut progress = 0usize;
+    let first = loop {
+        let first = refused_attempts(&fixture, "p3", code);
         if first > 0 {
-            break;
+            break first;
         }
+        if first != progress {
+            progress = first;
+            last_progress = Instant::now();
+        }
+        let stalled = last_progress.elapsed().as_secs();
+        assert!(
+            stalled < NO_PROGRESS_SECS,
+            "the driver attempted the frontier at least once: no progress for {stalled}s of {}s \
+             waited ({first} recorded refused attempt(s))",
+            started.elapsed().as_secs()
+        );
         std::thread::sleep(Duration::from_millis(100));
-    }
+    };
     assert!(first > 0, "the driver attempted the frontier at least once");
 
     // A measured window in which the driver KEEPS reconciling the armed run

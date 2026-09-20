@@ -15,6 +15,42 @@ static NEXT: AtomicUsize = AtomicUsize::new(0);
 const REV: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const REV_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
+/// The no-progress ceiling of a recorded-state wait, in seconds (issue #232).
+///
+/// Progress-driven, never a fixed wall-clock bound: the driver wakes
+/// semantically on each committed step and otherwise re-checks on its bounded
+/// timer fallback (`canter::supervision::DEFAULT_CHECK_INTERVAL_SECS`, 60 s),
+/// so one starved wake legitimately leaves the recorded frontier unchanged for
+/// a little over a minute on a loaded host. The wait below therefore fails
+/// only after this much time with NO durable change — any new recorded
+/// attempt, committed check or frontier move resets the ceiling — and it names
+/// the progress observed and the elapsed time. Two driver ticks, so a single
+/// starved wake can never fail a witness, and it stays inside the CI test
+/// driver's per-suite budget (`scripts/ci-test-driver.py`,
+/// `PER_SUITE_SECONDS = 300`).
+const NO_PROGRESS_SECS: u64 = 120;
+
+/// The durable progress a recorded-state wait tracks: the cursor plus the
+/// committed check ledger (count, last check, continuation), canonically
+/// rendered. A committed check, a settlement or a frontier move counts as
+/// progress; the read-time fields that change on every read
+/// (`freshness.age_secs`, `progress.age_secs`, `next_check.due_in_secs`) are
+/// excluded, so re-reading an unchanged record can never pass for progress.
+fn recorded_progress(status: &Val) -> String {
+    canonical_text(&object(vec![
+        ("cursor", field(status, &["cursor"]).clone()),
+        ("checks", field(status, &["evaluation", "checks"]).clone()),
+        (
+            "last_check",
+            field(status, &["evaluation", "last_check"]).clone(),
+        ),
+        (
+            "continuation",
+            field(status, &["evaluation", "continuation"]).clone(),
+        ),
+    ]))
+}
+
 struct Fixture {
     root: PathBuf,
     daemon: Option<GroupChild>,
@@ -409,7 +445,9 @@ fn cycle2_supervision_dispatches_the_authored_spine_through_collection() {
     // No `run dispatch` call occurs in this test. The daemon-owned supervisor
     // must use the topology/admission committed by `queue submit` and advance
     // each successful outcome on its own wake.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let started = Instant::now();
+    let mut last_progress = started;
+    let mut progress = String::new();
     let status = loop {
         let status = fixture.ok(&["supervision", "status", "--run", &run]);
         if text(&status, &["cursor", "next_step"]) == "p6-5"
@@ -417,7 +455,22 @@ fn cycle2_supervision_dispatches_the_authored_spine_through_collection() {
         {
             break status;
         }
-        assert!(Instant::now() < deadline, "supervisor stalled: {status:?}");
+        let observed = recorded_progress(&status);
+        if observed != progress {
+            progress = observed;
+            last_progress = Instant::now();
+        }
+        let stalled = last_progress.elapsed().as_secs();
+        assert!(
+            stalled < NO_PROGRESS_SECS,
+            "supervisor stalled: no progress for {stalled}s of {}s waited (frontier {:?}, {} \
+             recorded check(s)): {status:?}",
+            started.elapsed().as_secs(),
+            text(&status, &["cursor", "next_step"]),
+            field(&status, &["evaluation", "checks"])
+                .as_int()
+                .unwrap_or(-1)
+        );
         std::thread::sleep(Duration::from_millis(50));
     };
     let attempts = field(&status, &["cursor", "attempts"])

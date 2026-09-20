@@ -14,7 +14,8 @@
 //!   sleeps) for the same properties at the state boundary, including a check
 //!   whose progress window has fully elapsed.
 //!
-//! Every wait is a bounded poll with a deadline; there are no fixed real
+//! Every wait on recorded canter state is a poll that fails only after a
+//! documented no-progress ceiling (issue #232); there are no fixed real
 //! sleeps anywhere in this file.
 
 use std::os::unix::process::ExitStatusExt;
@@ -822,18 +823,26 @@ fn supervision_status(fixture: &DaemonFixture, run: &str, id: u64) -> Val {
     )
 }
 
-/// Poll `queue.status` until issue `number` reports `want` (bounded).
+/// Poll `queue.status` until issue `number` reports `want`.
+///
+/// `POLICY_BOUND_SECS` is the no-progress ceiling: the recorded policy
+/// interval (one driver tick) plus slack.
 fn wait_for_item_status(
     fixture: &DaemonFixture,
     submission_id: &str,
     number: i64,
     want: &str,
 ) -> Val {
-    wait_for_item_status_within(fixture, submission_id, number, want, 30)
+    wait_for_item_status_within(fixture, submission_id, number, want, POLICY_BOUND_SECS)
 }
 
-/// The same, with an explicit bound: the pause matrix allows the recorded
-/// policy interval (plus slack) for a continuation whose wake was delayed.
+/// The same, with an explicit NO-PROGRESS ceiling (issue #232): the wait is
+/// progress-driven, never a fixed wall-clock bound — the item's own status is
+/// the progress signature, so a status that keeps moving (however slowly on a
+/// loaded host) can never exhaust the ceiling, while a genuinely stuck item
+/// still fails, naming the progress observed and the elapsed time. The pause
+/// matrix passes the recorded policy interval (plus slack) for a continuation
+/// whose wake was delayed.
 fn wait_for_item_status_within(
     fixture: &DaemonFixture,
     submission_id: &str,
@@ -841,43 +850,69 @@ fn wait_for_item_status_within(
     want: &str,
     within_secs: u64,
 ) -> Val {
-    let deadline = Instant::now() + Duration::from_secs(within_secs);
+    let started = Instant::now();
+    let mut last_progress = started;
+    let mut progress = String::new();
     let mut id = 500u64;
     loop {
         id += 1;
         let doc = queue_status(fixture, submission_id, id);
-        if status_of(&doc, number) == want {
+        let status = status_of(&doc, number);
+        if status == want {
             return doc;
         }
+        if status != progress {
+            progress = status.clone();
+            last_progress = Instant::now();
+        }
+        let stalled = last_progress.elapsed().as_secs();
         assert!(
-            Instant::now() < deadline,
-            "issue {number} never reached {want}: {}",
+            stalled < within_secs,
+            "issue {number} never reached {want}: no progress for {stalled}s of {}s waited \
+             (status {status:?}): {}",
+            started.elapsed().as_secs(),
             canter::canonical::canonical_text(&doc)
         );
         std::thread::sleep(Duration::from_millis(25));
     }
 }
 
-/// Poll `supervision.status` until the run has committed `want` checks.
+/// Poll `supervision.status` until the run has committed `want` checks, with
+/// the same `POLICY_BOUND_SECS` no-progress ceiling as `wait_for_item_status`.
 fn wait_for_checks(fixture: &DaemonFixture, run: &str, want: i64) -> Val {
-    wait_for_checks_within(fixture, run, want, 20)
+    wait_for_checks_within(fixture, run, want, POLICY_BOUND_SECS)
 }
 
-/// The same, with an explicit bound (see `wait_for_item_status_within`).
+/// The same, with an explicit NO-PROGRESS ceiling (issue #232): the recorded
+/// check count is the progress signature, so a newly committed check resets
+/// the ceiling and a genuinely stalled driver still fails, naming the progress
+/// observed and the elapsed time.
 fn wait_for_checks_within(fixture: &DaemonFixture, run: &str, want: i64, within_secs: u64) -> Val {
-    let deadline = Instant::now() + Duration::from_secs(within_secs);
-    let mut last = String::new();
+    let started = Instant::now();
+    let mut last_progress = started;
+    let mut progress = -1i64;
     let mut id = 900u64;
-    while Instant::now() < deadline {
+    loop {
         id += 1;
         let doc = supervision_status(fixture, run, id);
-        if checks_of(&doc) >= want {
+        let checks = checks_of(&doc);
+        if checks >= want {
             return doc;
         }
-        last = canter::canonical::canonical_text(&doc);
+        if checks != progress {
+            progress = checks;
+            last_progress = Instant::now();
+        }
+        let last = canter::canonical::canonical_text(&doc);
+        let stalled = last_progress.elapsed().as_secs();
+        assert!(
+            stalled < within_secs,
+            "run {run} never reached {want} recorded check(s): no progress for {stalled}s of {}s \
+             waited (recorded {checks}); last: {last}",
+            started.elapsed().as_secs()
+        );
         std::thread::sleep(Duration::from_millis(25));
     }
-    panic!("run {run} never reached {want} recorded check(s); last: {last}");
 }
 
 /// The durable recorded check count of one run (read straight from the state,
