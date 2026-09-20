@@ -2159,6 +2159,8 @@ fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .args(args)
         .current_dir(dir)
+        // #226: copy nothing from the host's shared git templates.
+        .env("GIT_TEMPLATE_DIR", "")
         .env("GIT_AUTHOR_NAME", "canter test")
         .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
         .env("GIT_COMMITTER_NAME", "canter test")

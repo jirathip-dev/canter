@@ -186,6 +186,8 @@ impl Fixture {
             .args(args)
             .env("HOME", &self.root)
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            // #226: copy nothing from the host's shared git templates.
+            .env("GIT_TEMPLATE_DIR", "")
             .output()
             .unwrap();
         assert!(

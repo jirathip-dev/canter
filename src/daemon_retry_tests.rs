@@ -145,6 +145,8 @@ impl Fixture {
                 Command::new("git")
                     .args(args)
                     .current_dir(&repo)
+                    // #226: copy nothing from the host's shared git templates.
+                    .env("GIT_TEMPLATE_DIR", "")
                     .status()
                     .unwrap()
                     .success()
