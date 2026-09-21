@@ -537,9 +537,13 @@ pub fn check_fanout_admission(
     let proof = match host_proof {
         Some(proof) if proof.fresh_at(now_unix) => proof,
         Some(_) => {
+            // Issue #243: the stale precondition is named here and the
+            // reachable remedy is appended by the caller that knows the run
+            // and the step (the refusal is read back from the durable record,
+            // which is bounded at 300 characters — the remedy must fit).
             return Err(LifecycleError::new(
                 code::PROOF_STALE,
-                "the host-resource proof is stale; re-measure before fan-out",
+                "the host-resource proof is stale",
             ));
         }
         None => {

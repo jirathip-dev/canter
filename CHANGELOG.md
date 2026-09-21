@@ -889,6 +889,23 @@ release process activates (docs/RELEASING.md), then semver applies.
 
 ### Changed
 
+- The bounded check re-evaluation is reachable in the exact case it exists
+  for (issue #243). `run reevaluate` re-dispatches the run's own check
+  producer, so its inner dispatch is a fan-out like any other: the control
+  now PRODUCES the host-resource proof the gate requires, by running the SAME
+  dispatch-time renewal the supervisor already takes (audited
+  `host.proof.renewal`, measured at the run's lane root) on the
+  re-evaluation's own dispatch — a lapsed proof renews, an unmeasurable host
+  still refuses the recorded proof, and a proof that was never recorded is
+  never invented. The fan-out admission refusal names the failing
+  PRECONDITION and the reachable REMEDY (the exact commands that renew the
+  proof), never a bare code. The run's own armed supervision drives that same
+  bounded, attributed, journaled control when the recorded condition is the
+  engine's own — bounded by the control's own recorded bound — so a stranded
+  green delivery reaches its publish step with no operator action, while a
+  parked run is still never reported eligible, the tail behind an unverified
+  delivery is still never driven, and a normal dispatch with no proof still
+  refuses.
 - A transient check failure recorded inside the evidence of a step that
   succeeded no longer deadlocks the run (issue #230). The new
   `run.reevaluate` control re-runs the run's OWN `review_evidence` step

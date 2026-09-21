@@ -1039,16 +1039,20 @@ fn a_repaired_frontier_refused_by_the_engine_is_named_and_never_reported_eligibl
     let started = Instant::now();
     let mut last_progress = started;
     let mut progress = 0usize;
-    let frontier_refusal = format!(
-        "{run}:p3:refusal.admission.proof_stale:reason:the host-resource proof is stale; \
-         re-measure before fan-out"
-    );
+    // Issue #243: the refusal names the failing PRECONDITION and the remedy —
+    // the exact commands that renew the proof for THIS run and step — not a
+    // bare code.
+    let precondition =
+        format!("{run}:p3:refusal.admission.proof_stale:reason:the host-resource proof is stale");
+    let remedy = format!("canter run dispatch --run {run} --step p3 --admission FILE");
+    let recorded = |refusals: &[(String, String)]| {
+        refusals
+            .iter()
+            .any(|(target, _)| target.starts_with(&precondition) && target.contains(&remedy))
+    };
     let refusals = loop {
         let refusals = dispatch_refusals(&fixture, &run);
-        if refusals
-            .iter()
-            .any(|(target, _)| target == &frontier_refusal)
-        {
+        if recorded(&refusals) {
             break refusals;
         }
         if refusals.len() != progress {
@@ -1066,10 +1070,9 @@ fn a_repaired_frontier_refused_by_the_engine_is_named_and_never_reported_eligibl
         std::thread::sleep(Duration::from_millis(100));
     };
     assert!(
-        refusals
-            .iter()
-            .any(|(target, _)| target == &frontier_refusal),
-        "the supervisor's refused continuation is recorded against the run: {refusals:?}"
+        recorded(&refusals),
+        "the supervisor's refused continuation is recorded against the run, naming the \
+         precondition and the remedy: {refusals:?}"
     );
     assert_eq!(
         attempts_for(&fixture, &run, "p3"),

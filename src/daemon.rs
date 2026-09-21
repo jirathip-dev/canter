@@ -1290,6 +1290,34 @@ fn resolve_run_binding(
     Ok(RunBinding { role, session })
 }
 
+/// Issue #243: a fan-out admission refusal about the host-resource proof names
+/// the failing PRECONDITION and the reachable REMEDY, never a bare code.
+///
+/// Only the two proof codes carry a remedy clause; every other admission
+/// refusal (caps, occupancy, overlap) keeps the gate's own message verbatim —
+/// nothing else has a renewal path an operator has to be told about. The
+/// remedy names BOTH renewal paths for the exact run and step the gate is
+/// deciding for — the run's own bounded check re-evaluation, which re-measures
+/// the lane root at dispatch time when the step is its own terminal-success
+/// producer, and the operator's explicit attestation, which is the only path
+/// for every other step and for a proof that was never recorded at all — so an
+/// operator is never left with a bare code and no reachable action.
+fn fanout_refusal_message(code: &str, message: &str, run: &str, step: &str) -> String {
+    let remedy = match code {
+        crate::lifecycle::code::PROOF_STALE => format!(
+            "; renew with `canter run reevaluate --run {run} --step {step} --operator IDENTITY \
+             --reason TEXT` (the run's own check producer) or `canter run dispatch --run {run} \
+             --step {step} --admission FILE`"
+        ),
+        crate::lifecycle::code::PROOF_MISSING => format!(
+            "; present one with `canter run dispatch --run {run} --step {step} --admission FILE` \
+             (a proof that was never recorded is never invented by a renewal)"
+        ),
+        _ => return message.to_string(),
+    };
+    format!("{message}{remedy}")
+}
+
 /// `apply`: bind the plan digest, revalidate every binding freshly under
 /// the state lock, journal the intent, execute the typed effect, and
 /// resolve with a typed outcome + exact read-back (issue #8 AC1/AC2/AC4).
@@ -1316,7 +1344,12 @@ fn admission_gate(
         return Err(err_response(
             &request.id,
             crate::lifecycle::code::PROOF_MISSING,
-            "fan-out requires flags.admission with caps and a fresh host-resource proof (unknown measurements refuse new work)",
+            fanout_refusal_message(
+                crate::lifecycle::code::PROOF_MISSING,
+                "fan-out requires flags.admission with caps and a fresh host-resource proof (unknown measurements refuse new work)",
+                &parsed.instance_id,
+                &parsed.step,
+            ),
         ));
     };
     let caps = match (
@@ -1411,7 +1444,13 @@ fn admission_gate(
         host_proof,
         time::unix_now(),
     )
-    .map_err(|err| err_response(&request.id, err.code, err.message))
+    .map_err(|err| {
+        err_response(
+            &request.id,
+            err.code,
+            fanout_refusal_message(err.code, &err.message, &parsed.instance_id, &parsed.step),
+        )
+    })
 }
 
 /// The daemon-side dispatch hook of the supervision driver (issue #92 F4).
@@ -1507,6 +1546,12 @@ fn supervision_interval_secs(shared: &Arc<Shared>, instance_id: &str) -> i64 {
     }
 }
 
+/// The identity recorded when the DRIVER drives a run's own recovery control
+/// (issue #243): the act is the run's own armed supervision's, so the journal
+/// names it exactly where an operator identity is named — never a fabricated
+/// operator, and never a reason that carries a check status or a verdict.
+const SUPERVISION_OPERATOR: &str = "supervision";
+
 impl crate::supervision::SupervisedDispatch for DaemonDispatch {
     fn dispatch(&self, intent: &crate::supervision::DispatchIntent) -> Result<String, String> {
         self.dispatch_at(intent, time::unix_now())
@@ -1549,6 +1594,12 @@ impl DaemonDispatch {
             format!("{}-{}", intent.instance_id, intent.step_id),
             now_unix,
         );
+        // Issue #243: the driver's ONE recovery act runs through the engine's
+        // OWN control (the same `run.reevaluate` an operator invokes), never a
+        // plain re-dispatch of a succeeded step and never an adjudication.
+        if intent.reason == crate::supervision::codes::REEVALUATION {
+            return self.apply_reevaluation(shared, intent, &key, now_unix);
+        }
         let request = match build_dispatch_request(
             shared,
             &intent.instance_id,
@@ -1676,6 +1727,93 @@ impl DaemonDispatch {
         // against the run, so the run's own surfaces can classify it instead
         // of reporting the step eligible while nothing happens. A dispatch
         // that reached its claim already has a recorded attempt.
+        record_unclaimed_dispatch_refusal(
+            shared,
+            &intent.instance_id,
+            &intent.step_id,
+            code,
+            message,
+            key,
+        );
+        shared.log.write(
+            "warn",
+            "supervision.dispatch_refused",
+            &format!(
+                "run {} step {}: {code}: {message}",
+                intent.instance_id, intent.step_id
+            ),
+        );
+        self.note_refused(
+            &intent.instance_id,
+            &intent.step_id,
+            supervision_interval_secs(shared, &intent.instance_id),
+            now_unix,
+        );
+        Err(format!("{code}: {message}"))
+    }
+
+    /// Issue #243: the driver's ONE recovery act — the run's OWN check producer
+    /// re-evaluated through the engine's own bounded, attributed, journaled
+    /// control (`run.reevaluate`), with the driver's derived identity and
+    /// reason.
+    ///
+    /// The control re-derives every one of its own gates (the step must really
+    /// be the run's terminal-success check producer, the bound is read from the
+    /// durable journal, the attributed record is written BEFORE anything is
+    /// dispatched) and the re-run enters the ordinary dispatch path, so the
+    /// fan-out admission gate — including the dispatch-time renewal — decides
+    /// it exactly as any other dispatch. Nothing is adjudicated: the producer's
+    /// own fresh verdict is what the consumer reads next, and a recomputation
+    /// that comes back failing refuses the consumer exactly as before.
+    fn apply_reevaluation(
+        &self,
+        shared: &Arc<Shared>,
+        intent: &crate::supervision::DispatchIntent,
+        key: &str,
+        now_unix: i64,
+    ) -> Result<String, String> {
+        let params = crate::run_control::reevaluation_params(
+            key,
+            &intent.instance_id,
+            &intent.step_id,
+            SUPERVISION_OPERATOR,
+            &crate::supervision::reevaluation_reason(&intent.step_id),
+        );
+        let request = Request {
+            id: format!("reev_{}", intent.step_id),
+            method: "run.reevaluate".to_string(),
+            line: crate::canonical::canonical_text(&params),
+            params: Some(params),
+        };
+        let response = method_run_reevaluate(shared, &request);
+        let doc = Val::parse_json(response.trim())
+            .map_err(|message| format!("the re-evaluation response is unreadable ({message})"))?;
+        if doc.get("ok").and_then(Val::as_bool) == Some(true) {
+            self.note_dispatched(&intent.instance_id);
+            shared.log.write(
+                "info",
+                "supervision.dispatch",
+                &format!(
+                    "run {} re-evaluated step {} through the run's own bounded control ({})",
+                    intent.instance_id, intent.step_id, intent.reason
+                ),
+            );
+            return Ok(format!("re-evaluated {}", intent.step_id));
+        }
+        let code = doc
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Val::as_str)
+            .unwrap_or("error");
+        let message = doc
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Val::as_str)
+            .unwrap_or("the re-evaluation was refused");
+        // A refused recovery is recorded against the run exactly like a
+        // refused continuation dispatch (issue #141): the control's own
+        // outcome is durable either way, and the run's own surface names the
+        // engine's code and message instead of a silent park.
         record_unclaimed_dispatch_refusal(
             shared,
             &intent.instance_id,
@@ -5197,7 +5335,7 @@ fn run_dispatch(shared: &Arc<Shared>, request: &Request, reevaluation: Option<&s
         Ok(parsed) => parsed,
         Err(err) => return err_response(&request.id, err.code, err.message),
     };
-    let (material, kind, effective, integration_branch, production_branches, publish_route) = {
+    let (mut material, kind, effective, integration_branch, production_branches, publish_route) = {
         let state = match shared.lock_state() {
             Ok(state) => state,
             Err(message) => return err_response(&request.id, "state.unavailable", message),
@@ -5339,6 +5477,18 @@ fn run_dispatch(shared: &Arc<Shared>, request: &Request, reevaluation: Option<&s
             publish_route,
         )
     };
+    // Issue #243: the control that recomputes a recorded check is the RUN's own
+    // act, exactly like the supervisor's continuation dispatch (issue #198), so
+    // its inner re-dispatch presents a measurement taken at THIS dispatch when
+    // the run's recorded proof has actually lapsed — bounded, audited and
+    // recorded before it is presented (a host that cannot be measured renews
+    // nothing and the admission gate refuses the recorded proof unchanged).
+    // Nothing else moves: the control's own gates, the frontier authorization,
+    // the caps and the freshness bound are untouched, and only the authorized
+    // re-evaluation ever takes this path.
+    if reevaluation.is_some() {
+        renew_host_proof_for_dispatch(shared, &mut material, &parsed.step, &parsed.idempotency_key);
+    }
     // Fail closed BEFORE anything is journaled or claimed: a request that is
     // not well-formed enough to be attempted refuses typed here, so the
     // operator's single-use retry authorization survives for the correction.

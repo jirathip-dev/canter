@@ -128,6 +128,32 @@ submit-time attestation echoed back, and never a fabricated instant:
 The operator's own `run dispatch` presents its explicit admission
 attestation (`run_control::DispatchParams::admission`), exactly as before.
 
+### 4.2 The recovery control produces the same measurement (issue #243)
+
+A control that recomputes a recorded check (`run.reevaluate`) re-dispatches
+the run's own check producer, so its inner dispatch is a fan-out like any
+other and the proof requirement genuinely applies to its effect. The control
+therefore **produces** the proof instead of being exempted from it: the
+dispatch-time renewal of §4.1 runs on the re-evaluation's own dispatch too
+(same bound, same audit record, same fail-closed rule). An unmeasurable host
+renews nothing and the recorded proof is refused exactly as before, and a
+proof that was never recorded is never invented.
+
+The policy choice is deliberate: the alternative the issue offered —
+not applying the proof requirement to a read-and-recompute operation — was
+rejected, because the recompute starts the run's own reviewer lane, so the
+host resource the gate measures is exactly the resource the recompute
+consumes. Nothing else is relaxed: caps, occupancy, pacing, overlap and the
+freshness bound stay the gate's own decisions for this dispatch as for any
+other.
+
+The refusal names the failing precondition AND the remedy. `proof_stale`
+names the stale proof and the exact commands that renew it (`run reevaluate`
+for the run's own terminal-success check producer, `run dispatch --admission
+FILE` for a frontier step or for a proof that was never recorded);
+`proof_missing` names the attestation path. Every other admission refusal
+keeps the gate's own message verbatim.
+
 ## 5. Cleanup archive/salvage and canonical target classification (AC7)
 
 - Cleanup targets are canonicalized and must stay inside the worktrees

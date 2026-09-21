@@ -767,6 +767,15 @@ fn admission_refuses_missing_or_stale_proof_and_missing_caps_over_the_wire() {
         Some(scenario.apply_params(30, None)),
     );
     assert_eq!(code, "refusal.admission.proof_missing", "{message}");
+    // Issue #243: the refusal names the failing precondition AND the reachable
+    // remedy — the exact command that presents the missing measurement — and
+    // the gate itself is untouched (the attempt still refuses).
+    assert!(
+        message.contains(&format!(
+            "canter run dispatch --run {INSTANCE_ID} --step h1 --admission FILE"
+        )),
+        "the missing-proof refusal names the remedy: {message}"
+    );
 
     // Stale host-resource proof (measured an hour ago) refuses.
     let stale = admission_flags(
@@ -775,13 +784,24 @@ fn admission_refuses_missing_or_stale_proof_and_missing_caps_over_the_wire() {
         8,
         &canter::time::rfc3339_from_unix(canter::time::unix_now() - 3600),
     );
-    let (code, _) = rpc_err(
+    let (code, message) = rpc_err(
         &scenario.fixture.socket,
         &fresh_id(31),
         "apply",
         Some(scenario.apply_params(31, Some(stale))),
     );
     assert_eq!(code, "refusal.admission.proof_stale");
+    // Issue #243: the stale refusal names both renewal paths (the run's own
+    // bounded check re-evaluation, which re-measures at dispatch time, and the
+    // operator's explicit attestation) for THIS run and step.
+    assert!(
+        message.contains(&format!(
+            "canter run reevaluate --run {INSTANCE_ID} --step h1 --operator IDENTITY --reason TEXT"
+        )) && message.contains(&format!(
+            "canter run dispatch --run {INSTANCE_ID} --step h1 --admission FILE"
+        )),
+        "the stale-proof refusal names the remedies: {message}"
+    );
 
     // A fresh proof but no caps declared refuses (unknown measurements
     // refuse new work: every applicable axis must be bounded).
