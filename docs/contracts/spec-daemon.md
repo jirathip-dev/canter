@@ -642,6 +642,18 @@ clears a repository/fleet-level hold or bypasses a gate.
   continuation window. Only a recorded observation that is genuinely older
   than the explicit `progress_timeout_secs` policy is `continuation-eligible`
   with reason `supervision.progress_timeout`.
+- **What the continuation window counts (issue #170 N1, accepted limitation)**:
+  the durable window keys on the check's own eligibility, so an IN-FLIGHT
+  collection wait — classified `waiting-workers` / `supervision.waiting_workers`
+  with `eligible:true` (see "Pane collection" below: it is the one wait that is
+  legitimate long-running work with a live claim) — also refreshes
+  `continuation_reports`, and the operator surface renders the window OPEN with
+  its report count for such a run. The counter therefore means "the run's own
+  committed checks reported it eligible/healthy", not exclusively the absence
+  window it was introduced for; the recorded check reason still names WHICH one
+  (`supervision.progress_timeout` vs `supervision.waiting_workers`). No safety
+  consequence: the second-dispatch gate is `evidence.in_flight`, never this
+  counter.
 - **Armed continuation dispatch (issue #92 F4)**: an explicitly `armed`
   run whose authorization still matches its committed submission is
   advanced by the driver itself from its FIRST step onward — the check hands
@@ -698,21 +710,51 @@ clears a repository/fleet-level hold or bypasses a gate.
   with `supervision.dispatch.next_step` is exactly a dispatchable one.
 - **Pane collection (issue #147)**: a collection following a pane prompt
   polls that run's own Herdr agent, verifying lane token, generation and
-  worktree on every read. While it waits, its single claim remains in flight:
+  worktree on every read — and since issue #170 reading TWO views of that lane
+  per sample (its own `agent get` row AND its `agent list` status row) plus the
+  lane's own `state_change_seq` counter, so no stop is ever decided on one
+  status field. While it waits, its single claim remains in flight:
   `waiting-workers` / `supervision.waiting_workers`, eligible for continued
-  checks, not a second dispatch. Collection runs off the reconciliation
-  thread so other runs and timer checks continue. Only a CONFIRMED `idle`,
-  `done` or `blocked` (the same stop state read back twice) permits
-  certifying the delta; a delivery read while the worker is still live, like
-  an empty delta while the worker is still live, stays a wait/re-check
-  (issue #200 — a head read mid-turn can still move), and a stopped worker
-  with no delta still refuses `refusal.collect.empty_delta`. A collection
-  failure that is not emptiness (a refusal of the collection itself, e.g. a
-  diverged or mis-branched lane) certifies no head and stays actionable
-  without waiting for the stop. Exhausting the collection step's deadline
-  records `effect.worker_timeout` as ambiguous and parks as `worker-timeout`
-  / `supervision.worker_timeout`, ineligible. Neither a waiting claim nor a
-  timed-out attempt is re-dispatched by the supervisor.
+  checks, not a second dispatch. Collection runs off the reconciliation thread
+  (its own `canter-collect` thread) so other runs and timer checks continue;
+  the wait's sample cadence is bounded (`mutation::COLLECT_STOP_INTERVAL_SECS`,
+  5 s — two subprocess rows per sample instead of the pre-change ~100 ms loop,
+  issue #170 N3).
+- **A CONFIRMED stop (issue #170 N7)**: only `mutation::COLLECT_STOP_SAMPLES`
+  (3) consecutive samples — each separated by that real interval, in which
+  BOTH views report a non-working state (`idle`/`done`/`blocked`) and the
+  lane's own counter did NOT move — make the worker's turn a stop, and only a
+  confirmed stop permits certifying the delta. A status field that flaps to
+  `done`/`idle` mid-turn is not a stop (measured live: two read-backs ~100 ms
+  apart judged a working pane stopped four minutes into a 93-minute turn), and
+  `refusal.collect.empty_delta` is ONLY ever the outcome of a confirmed stop:
+  while the worker is working the collection keeps waiting. A delivery read
+  while the worker is still live, like an empty delta while the worker is still
+  live, stays a wait/re-check (issue #200 — a head read mid-turn can still
+  move), and a confirmed stopped worker with no delta still refuses
+  `refusal.collect.empty_delta`. A collection failure that is not emptiness (a
+  refusal of the collection itself, e.g. a diverged or mis-branched lane)
+  certifies no head and stays actionable without waiting for the stop. A row
+  that carries NO state on the second view corroborates nothing and blocks
+  nothing (the same convention a missing readiness signal gets), so an older
+  row shape is never weaker than the pre-change rule.
+- **The wait is bounded by RECORDED PROGRESS (issue #170 N8)**: the step's
+  effective deadline is the wait's NO-PROGRESS WINDOW, and the wait EXTENDS
+  past it while progress is recorded — the lane reports `working`, its
+  read-back moved (state changed, own counter advanced), or the delivery it
+  collected moved (a new certified head) — up to the hard overall ceiling
+  `mutation::COLLECT_CEILING_SECS` (6 h ≈ 4× the measured real turn, which ran
+  ≈93 minutes against the old 1800 s wall: the step was unconvergeable by
+  construction). A lane that records NO progress for the whole window parks as
+  `effect.worker_timeout`, ambiguous, `worker-timeout` /
+  `supervision.worker_timeout`, ineligible, and so does a lane still producing
+  progress at the ceiling; the message names the progress last observed and
+  the elapsed silence. The wait is never unbounded. Neither a waiting claim nor
+  a timed-out attempt is re-dispatched by the supervisor.
+- **Collection refusals widened, recorded (issue #170 N6)**: a
+  `collect_outcome` whose run never recorded a succeeded `harness_start`
+  refuses `refusal.incomplete.identity` BEFORE evaluating any delta. The
+  fail-closed direction is deliberate and this is the canonical record of it.
 - **Frozen certified delivery and the bound collection head (issue #202)**: a
   step consumes only the head the run's OWN collection certified. The run's
   `feature_head` is bound by its newest successful `collect_outcome` (branch +

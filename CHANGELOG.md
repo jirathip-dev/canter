@@ -948,3 +948,44 @@ release process activates (docs/RELEASING.md), then semver applies.
 
 - Private vulnerability reporting via GitHub's private advisory flow
   (SECURITY.md); no secrets in public issues.
+
+### Fixed (issue #170 — the pane-collection wait: a confirmed stop, and bounds driven by recorded progress)
+
+- **A stop is CONFIRMED, never inferred from a flapping status.** A pane
+  `collect_outcome` now reads TWO views of the run's own lane per sample (the
+  lane's `agent get` row and its `agent list` status row) plus the lane's own
+  `state_change_seq` counter, and only `COLLECT_STOP_SAMPLES` (3) consecutive
+  samples — each separated by the real `COLLECT_STOP_INTERVAL_SECS` (5 s)
+  interval, BOTH views non-working, the lane's own counter not moving — make
+  the worker's turn a stop. `refusal.collect.empty_delta` is therefore only
+  ever the outcome of a confirmed stop, and a live worker is never judged
+  empty: the measured live `p5-101` collection judged a working pane stopped
+  from two read-backs ~100 ms apart, refused the emptiness four minutes into a
+  93-minute turn and consumed the run's retry (issue #170 N7).
+- **The wait is bounded by recorded progress, not by a wall clock.** The
+  step's effective `deadline_secs` is now the wait's NO-PROGRESS WINDOW: while
+  the lane reports `working`, its read-back moves, or its collected delivery
+  head moves, the wait extends — up to the hard `COLLECT_CEILING_SECS` (6 h,
+  ≈4× the measured 93-minute real turn, against which the old 1800 s wall made
+  the step unconvergeable by construction). A lane that records no progress for
+  the window parks as the typed `effect.worker_timeout` naming the progress it
+  last saw and the elapsed silence; so does a lane still producing progress at
+  the ceiling. The wait is never unbounded (issue #170 N8).
+- The wait polls at a bounded documented cadence (`COLLECT_STOP_INTERVAL_SECS`,
+  5 s — two subprocess rows per sample, 12 samples/minute instead of the
+  pre-change ~100 ms loop; issue #170 N3); the in-memory collection reservation
+  is keyed by `(run, step)`, so a spine with two collection steps in one run
+  never has the second silently answered `awaiting <other step>` (issue #170
+  N5); and the daemon's shutdown invariant is restated EXACTLY — the
+  supervision driver is cancelled and joined before the lease is dropped, while
+  a bounded collection runs on its own thread and is deliberately never joined
+  (an interrupted collection is the already-modelled ambiguous claim, never a
+  second claim; issue #170 N4).
+- Contract surfaces updated and the remaining doc items recorded as accepted
+  limitations: `spec-daemon.md` (the confirmed stop, the progress bound, the
+  fail-closed `refusal.incomplete.identity` widening of the collection's
+  refusal surface — issue #170 N6 — and what the continuation-window counter
+  counts, since an in-flight collection wait is eligible and refreshes it —
+  issue #170 N1) and `spec-plans.md` (the collection's window semantics, and
+  the shared published-ref read's `effect.merge.failed` code on
+  `checkout`/`worktree_create` — issue #170 N2).

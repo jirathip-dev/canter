@@ -48,6 +48,18 @@ Normative rules:
   the integration clone points at later. A plan may explicitly declare
   `requires_delta:false` for a legitimate no-op prompt; collection then
   succeeds with equal base/head while still enforcing the bound output branch.
+  A collection whose run never recorded a succeeded `harness_start` refuses
+  `refusal.incomplete.identity` before it evaluates any delta (issue #170 N6 —
+  fail-closed, recorded in [spec-daemon.md](spec-daemon.md) as an accepted
+  limitation). A collection that cannot bind the head it observed still refuses
+  `refusal.collect.unbound` (issue #202).
+- The `checkout` and `worktree_create` steps resolve their base through the
+  SAME published-integration-ref read the merge step uses, so an `origin` the
+  integration checkout cannot read (absent, unreachable, unauthenticated)
+  refuses with that read's own code, `effect.merge.failed` — a merge-typed code
+  on a lane-creating step. It is fail-closed and names the read's diagnostics;
+  recorded here as an accepted limitation of the shared read (issue #170 N2),
+  never as the merge step's outcome.
 - The built-in `merge` step declares `merge_policy:"squash"`. `merge_policy`
   is a closed `squash | ff` input and the effect LANDS the certified delivery
   on the integration ref and PUBLISHES it to the integration remote — a
@@ -284,6 +296,12 @@ runs control-plane effects:
     default — issue #217), `harness_start` 300 s, every other kind 60 s
     (`EFFECT_DEADLINE_DEFAULT_SECS`), and the hard ceiling is 3600 s
     (`EFFECT_DEADLINE_CEILING_SECS`);
+  - for a pane `collect_outcome` the effective deadline is the wait's
+    NO-PROGRESS WINDOW, not a wall: the wait extends past it while the lane
+    records progress and is bounded above by its own kind ceiling
+    (`mutation::COLLECT_CEILING_SECS`, 6 h) — normative detail in
+    [spec-daemon.md](spec-daemon.md) ("The wait is bounded by RECORDED
+    PROGRESS");
   - a reviewed plan step may declare its own `deadline_secs` (policy, bound
     by the plan digest); a value outside `1..=ceiling` — or a non-integer —
     refuses `refusal.request.malformed` (`effect_deadline_secs` validates

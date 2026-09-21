@@ -2591,23 +2591,49 @@ fn prompt_undelivered(
     )
 }
 
+/// One read-back of a collection's pane worker (issue #170 N7), through the
+/// TWO views the substrate documents for the same lane: the lane's own row
+/// (`herdr agent get <lane>` — the view the pre-change wait read alone) and
+/// the lane's status row (`herdr agent list`, resolved by internal ownership).
+///
+/// Carrying both views is the point: a stop is never decided on one status
+/// field. The lane's own lifecycle counter (`state_change_seq`) travels with
+/// them, so a status field that flaps mid-turn is corroborated against the
+/// counter that moves when the agent's lifecycle moves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PaneSample {
+    /// The lane row's settled state (`idle|working|blocked|done|unknown`) —
+    /// empty when the row carries no state field at all.
+    pub(crate) lane_state: String,
+    /// The status row's state for the SAME lane: the independent second view.
+    pub(crate) status_state: String,
+    /// The lane row's own lifecycle counter, when it carries one.
+    pub(crate) seq: Option<i64>,
+}
+
 /// Read this run's pane worker under the remaining collection budget.
-/// Reuse the prompt path's lane, generation and worktree verification.
+/// Reuse the prompt path's lane, generation and worktree verification, so BOTH
+/// read-backs are verified against the same bound lane identity.
 pub(crate) fn observe_pane_worker(
     session: &SessionHandle,
     worktree: &Path,
     timeout: Duration,
     env: &BTreeMap<String, String>,
-) -> Result<String, ProcessFailure> {
+) -> Result<PaneSample, ProcessFailure> {
     let end = std::time::Instant::now() + timeout;
-    let lane = herdr_lane::agent_name(session, timeout, env, Some(worktree))?;
+    let status = herdr_lane::lane_row(session, timeout, env, Some(worktree))?;
     let row = herdr_agent_get_row(
-        &lane,
+        &status.agent,
         end.saturating_duration_since(std::time::Instant::now()),
         env,
         Some(worktree),
     )?;
-    Ok(verify_lane_binding(&row, session, Some(worktree))?.state)
+    let lane = verify_lane_binding(&row, session, Some(worktree))?;
+    Ok(PaneSample {
+        lane_state: lane.state,
+        status_state: status.state,
+        seq: lane.seq,
+    })
 }
 
 /// Observe, interrupt or collect the terminal outcome of one lane through the

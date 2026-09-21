@@ -150,6 +150,20 @@ pub(super) fn agent_name(
     env: &BTreeMap<String, String>,
     cwd: Option<&Path>,
 ) -> Result<String, ProcessFailure> {
+    Ok(lane_row(session, timeout, env, cwd)?.agent)
+}
+
+/// Resolve the ONE agent row this lane owns (`herdr agent list`), verified
+/// against the lane identity. The row's own reported state and lifecycle
+/// counter travel with it (issue #170 N7): the collection wait corroborates
+/// every read-back of a pane worker against a SECOND view of the same lane
+/// instead of deciding on one status field.
+pub(super) fn lane_row(
+    session: &SessionHandle,
+    timeout: Duration,
+    env: &BTreeMap<String, String>,
+    cwd: Option<&Path>,
+) -> Result<LaneBinding, ProcessFailure> {
     let list = herdr_call(&herdr_agent_list_args(), timeout, env, cwd)?;
     let owned: Vec<_> = herdr_items(&list, "agents")
         .iter()
@@ -165,7 +179,7 @@ pub(super) fn agent_name(
             ),
         ));
     }
-    Ok(verify_lane_binding(owned[0], session, cwd)?.agent)
+    verify_lane_binding(owned[0], session, cwd)
 }
 
 /// Register or reuse a worktree-backed workspace, never an anonymous cwd.

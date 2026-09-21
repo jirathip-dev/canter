@@ -3222,25 +3222,74 @@ case "$1 $2" in
   "agent get")
     log "$*"
     if [ -f "$HOME/collect-mode" ] && [ -f "$STATE/pane_content" ]; then
-      log "worker-poll $(read_state state idle)"
-      if [ -f "$HOME/allow-stop" ] && [ "$(read_state state idle)" = working ]; then
-        if [ "$(cat "$HOME/collect-mode")" = delta ]; then
+      mode=$(cat "$HOME/collect-mode")
+      # Issue #170 N7: the measured flap. While the harness holds `flap-now`
+      # armed, the lane's own status reports `done` for exactly TWO read-backs
+      # and then moves back to working — the live p5-101 collection read
+      # exactly this shape (two stop read-backs ~100 ms apart) as a stop while
+      # the worker was still mid-turn. Nothing is committed during the flap.
+      if [ "$mode" = flap ] && [ -f "$HOME/flap-now" ]; then
+        seen=$(read_state flap_reads 0)
+        seen=$((seen + 1))
+        printf '%s' "$seen" > "$STATE/flap_reads"
+        if [ "$seen" -le 2 ]; then
+          printf 'done' > "$STATE/state"
+        else
+          printf 'working' > "$STATE/state"
+          rm -f "$HOME/flap-now"
+        fi
+      fi
+      # Issue #170 N8: the `extend` mode withholds the delivery for longer than
+      # the step's declared no-progress window (20 s) while the lane keeps
+      # reporting it is working. The wait must EXTEND on recorded progress and
+      # certify the delivery afterwards, never park on the wall clock.
+      if [ "$mode" = extend ]; then
+        started=$(read_state extend_started '')
+        if [ -z "$started" ]; then
+          started=$(date +%s)
+          printf '%s' "$started" > "$STATE/extend_started"
+        fi
+        elapsed=$(( $(date +%s) - started ))
+        if [ "$elapsed" -ge 30 ]; then
           checkout=$(read_state cwd '')
           if [ ! -f "$checkout/delivery.txt" ]; then
             printf 'worker delivery\n' > "$checkout/delivery.txt"
             git -C "$checkout" add delivery.txt || exit 8
             git -C "$checkout" -c commit.gpgsign=false commit -qm delivery || exit 8
+            printf '%s' "$elapsed" > "$STATE/delivered_after_secs"
             log "worker-delivery-committed"
-            # Issue #200: the delivery lands MID-TURN — the worker stays
-            # working after the commit, so the head it read can still move.
           else
-            # ...and only NOW does the turn settle. A collection may read the
-            # delta only at this settled turn.
             printf done > "$STATE/state"
           fi
-        else
-          printf done > "$STATE/state"
         fi
+      fi
+      log "worker-poll $(read_state state idle)"
+      if [ -f "$HOME/allow-stop" ] && [ "$(read_state state idle)" = working ]; then
+        case "$mode" in
+          delta|flap)
+            checkout=$(read_state cwd '')
+            if [ ! -f "$checkout/delivery.txt" ]; then
+              printf 'worker delivery\n' > "$checkout/delivery.txt"
+              git -C "$checkout" add delivery.txt || exit 8
+              git -C "$checkout" -c commit.gpgsign=false commit -qm delivery || exit 8
+              log "worker-delivery-committed"
+              # Issue #200: the delivery lands MID-TURN — the worker stays
+              # working after the commit, so the head it read can still move.
+            else
+              # ...and only NOW does the turn settle. A collection may read the
+              # delta only at this settled turn — and only after the pinned
+              # number of non-working read-backs (issue #170 N7).
+              printf done > "$STATE/state"
+            fi
+            ;;
+          extend)
+            # Driven by its own elapsed timer above, never by `allow-stop`:
+            # the lane keeps reporting `working` past the declared window.
+            ;;
+          *)
+            printf done > "$STATE/state"
+            ;;
+        esac
       fi
     fi
     printf '{"id":"cli:agent:get","result":%s,"type":"agent_info"}\n' "$(agent_doc)"
@@ -3365,7 +3414,16 @@ fn supervised_collection(mode: &str) {
                 ("requires_delta", Val::Bool(true)),
                 (
                     "deadline_secs",
-                    integer(if mode == "timeout" { 1 } else { 30 }),
+                    // Issue #170 N8: `deadline_secs` is the wait's NO-PROGRESS
+                    // window. `timeout` declares a 1 s window (the lane parks);
+                    // `extend` declares a 20 s window while the fixture keeps
+                    // the worker demonstrably working past it, so the wait must
+                    // EXTEND instead of parking on a wall clock.
+                    integer(match mode {
+                        "timeout" => 1,
+                        "extend" => 20,
+                        _ => 30,
+                    }),
                 ),
             ])),
         });
@@ -3434,6 +3492,7 @@ fn supervised_collection(mode: &str) {
     let mut last_progress = started;
     let mut progress = String::new();
     let mut waiting_checks = None;
+    let mut flap_armed = false;
     loop {
         let doc = status_doc(&fixture.socket, &fresh_id(2), &run);
         let attempts = fixture
@@ -3459,11 +3518,27 @@ fn supervised_collection(mode: &str) {
                     "the lane uses the published base, not stale staging"
                 );
             }
+            // Issue #170 N7: the flap is armed only while THIS collection step
+            // holds the live claim, so the measured mid-turn flap lands on the
+            // collector's own read-backs — while the worker is genuinely
+            // unstopped and nothing is committed.
+            if mode == "flap"
+                && !flap_armed
+                && doc
+                    .get("cursor")
+                    .and_then(|cursor| cursor.get("in_flight"))
+                    .and_then(Val::as_str)
+                    == Some("collect")
+            {
+                std::fs::write(fixture.dir.join("flap-now"), "flap").unwrap();
+                flap_armed = true;
+            }
             let first = *waiting_checks.get_or_insert(checks_of(&doc));
             let reads = std::fs::read_to_string(fixture.dir.join("herdr-argv.txt")).unwrap();
             if mode != "timeout"
                 && checks_of(&doc) > first
                 && reads.matches("worker-poll working").count() >= 3
+                && !fixture.dir.join("flap-now").exists()
             {
                 std::fs::write(fixture.dir.join("allow-stop"), "stop").unwrap();
             }
@@ -3492,7 +3567,7 @@ fn supervised_collection(mode: &str) {
         .collect();
     assert_eq!(collected.len(), 1, "one collection attempt, never a retry");
     match mode {
-        "delta" => {
+        "delta" | "flap" | "extend" => {
             assert!(
                 waiting_checks.is_some(),
                 "the worker must WAIT before collection"
@@ -3510,6 +3585,44 @@ fn supervised_collection(mode: &str) {
             let landed = reads
                 .find("worker-delivery-committed")
                 .expect("the fixture delivery landed");
+            if mode == "flap" {
+                // Issue #170 N7 witness (a): the fixture flapped the lane's own
+                // status to `done` for two read-backs BEFORE any delivery
+                // existed — the pre-change wait judged exactly that a stopped
+                // worker and refused `refusal.collect.empty_delta` four minutes
+                // into a 93-minute turn. The flap is a wait now: the delivery
+                // lands afterwards and is certified.
+                assert!(
+                    reads[..landed].matches("worker-poll done").count() >= 2,
+                    "the flap must precede the delivery: {reads}"
+                );
+                assert!(
+                    !fixture.dir.join("flap-now").exists(),
+                    "the fixture flap was consumed by the collector's read-backs"
+                );
+            }
+            if mode == "extend" {
+                // Issue #170 N8 witness (c) end to end: the step declared a
+                // 20 s no-progress window and the fixture withheld the delivery
+                // for longer than that while the lane kept reporting it was
+                // working — the wait EXTENDED on recorded progress and
+                // certified the delivery; a wall clock would have parked the
+                // run at 20 s.
+                let delivered_after: u64 =
+                    std::fs::read_to_string(fixture.dir.join("herdr-state/delivered_after_secs"))
+                        .expect("the fixture records when it delivered")
+                        .trim()
+                        .parse()
+                        .expect("the delivery time in seconds");
+                assert!(
+                    delivered_after > 20,
+                    "the delivery must land past the declared 20 s window: {delivered_after}s"
+                );
+                assert!(
+                    reads.matches("worker-poll working").count() >= 4,
+                    "the wait must have sampled the working lane past the window: {reads}"
+                );
+            }
             assert!(
                 reads[landed..].matches("worker-poll working").count() >= 1,
                 "a delivery read while the worker is still live is a WAIT, not a \
@@ -3582,13 +3695,33 @@ fn supervised_collection(mode: &str) {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(keys.len(), 5, "one dispatch per spine step: {keys:?}");
+    // One dispatch per spine step — plus, for the mode whose collection is
+    // REFUSED (`empty`), at most one bounded retry per dispatch: a refused
+    // step that is not a wait/park is retryable, and the run's OWN supervision
+    // consumes the bounded retry (issue #241; the refused collect is re-driven
+    // with the retry budget `state::RUN_RETRY_MAX`). Every key is
+    // driver-issued either way.
+    assert!(
+        keys.len() >= 5 && keys.len() <= 5 + canter::state::RUN_RETRY_MAX as usize,
+        "one dispatch per spine step, plus at most the bounded retries of a refused step: {keys:?}"
+    );
     assert!(
         keys.iter()
             .all(|key| key.starts_with(&format!("ik_{run}-"))),
         "zero operator keys: {keys:?}"
     );
-    assert!(fixture.seed().run_retries(&run).unwrap().is_empty());
+    let retries = fixture.seed().run_retries(&run).unwrap();
+    if mode == "empty" {
+        assert!(
+            retries.len() <= canter::state::RUN_RETRY_MAX as usize,
+            "the refused collection is retried by the run's own supervision, bounded: {retries:?}"
+        );
+    } else {
+        assert!(
+            retries.is_empty(),
+            "a spine that never refuses consumes no retry: {retries:?}"
+        );
+    }
     shutdown(daemon);
 }
 
@@ -3738,6 +3871,28 @@ fn collection_stopped_without_delta_is_still_refused() {
 #[test]
 fn collection_deadline_parks_worker_timeout_without_redispatch() {
     supervised_collection("timeout");
+}
+
+/// Issue #170 N7 witness (a), end to end: a worker that is STILL WORKING but
+/// whose reported status flaps to `done` twice is not a stopped worker. The
+/// pre-change wait read exactly that flap as a stop and refused
+/// `refusal.collect.empty_delta` (the live `p5-101` refusal came four minutes
+/// into a 93-minute turn and consumed the run's retry); the delivered wait
+/// keeps reading, the delivery that lands later is certified, and no emptiness
+/// refusal exists for this run.
+#[test]
+fn collection_status_flap_mid_turn_is_never_an_empty_refusal() {
+    supervised_collection("flap");
+}
+
+/// Issue #170 N8 witness (c), end to end: the collection's `deadline_secs` is
+/// the wait's NO-PROGRESS WINDOW, not a wall. This step declares 10 s while
+/// the lane keeps reporting it is working (and commits its delivery) well past
+/// that — the wait EXTENDS and the run collects, instead of the pre-change
+/// `effect.worker_timeout` park at the declared wall.
+#[test]
+fn collection_still_working_past_the_declared_wall_is_not_parked() {
+    supervised_collection("extend");
 }
 
 #[test]
