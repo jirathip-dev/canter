@@ -9127,7 +9127,12 @@ impl State {
 
     /// Append an audit record inside an existing transaction. The caller
     /// decides the transaction boundary (intent + claim vs resolution).
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// ONE clock read for the record, bound here and handed to
+    /// [`Self::append_audit_at_locked`]: the stored `line` and the `at` column
+    /// must be the same instant, or the next open's chain verification refuses
+    /// the row (column/line mismatch) — two reads could straddle a second
+    /// boundary (issue #101).
     fn append_audit_locked(
         &self,
         conn: &rusqlite::Transaction<'_>,
@@ -9136,6 +9141,27 @@ impl State {
         key: &str,
         plan_hash: Option<&str>,
         grant_id: Option<&str>,
+    ) -> Result<AuditRow, StateError> {
+        let at = time::rfc3339_now();
+        self.append_audit_at_locked(conn, action, target, key, plan_hash, grant_id, &at)
+    }
+
+    /// [`Self::append_audit_locked`] with the record's instant supplied at the
+    /// call boundary: the SAME `at` builds the hashed canonical line and the
+    /// persisted column, so a second clock read anywhere in the append
+    /// disagrees with the row's own columns. Production passes one clock read;
+    /// the issue #101 regression test passes a fixed instant instead of
+    /// relying on a real second boundary.
+    #[allow(clippy::too_many_arguments)]
+    fn append_audit_at_locked(
+        &self,
+        conn: &rusqlite::Transaction<'_>,
+        action: &str,
+        target: &str,
+        key: &str,
+        plan_hash: Option<&str>,
+        grant_id: Option<&str>,
+        at: &str,
     ) -> Result<AuditRow, StateError> {
         let epoch: i64 = conn
             .query_row("SELECT COALESCE(MAX(epoch), 1) FROM epoch", [], |row| {
@@ -9156,11 +9182,6 @@ impl State {
             .optional()
             .map_err(|err| StateError::from_sqlite("append_audit: prev", err))?
             .unwrap_or_default();
-        // ONE clock read for the record: the stored `line` and the `at`
-        // column must be the same instant, or the next open's chain
-        // verification refuses the row (column/line mismatch) — two reads
-        // could straddle a second boundary.
-        let at = time::rfc3339_now();
         let doc = object(vec![
             ("schema", string("hf-audit/v1")),
             ("seq", integer(seq)),
@@ -9178,7 +9199,7 @@ impl State {
                 "recorded_before_mutation",
                 bool_(action.starts_with("mutate.")),
             ),
-            ("at", string(&at)),
+            ("at", string(at)),
         ]);
         let line = canonical_text(&doc);
         let record_hash = sha256_hex(&[line.as_bytes(), prev_hash.as_bytes()].concat());
@@ -15543,6 +15564,85 @@ mod tests {
         let reopened =
             State::open(&path, Retention::default()).expect_err("tamper must fail closed");
         assert_eq!(reopened.code, "state.audit_tampered");
+    }
+
+    /// Issue #101: `append_audit` binds ONE instant per record — the SAME value
+    /// builds the hashed canonical line and the persisted `at` column, so a
+    /// wall-clock tick between two reads can never leave a row whose own
+    /// columns disagree with its line (the reopen check the flake tripped:
+    /// `state.audit_tampered` / "column/line mismatch").
+    ///
+    /// The seam is the call boundary ([`State::append_audit_at_locked`]): the
+    /// instant supplied here is far from any wall-clock read, so a second read
+    /// anywhere in the append disagrees with the stored column. Mutation probe:
+    /// building the line's `at` from a fresh `time::rfc3339_now()` instead of
+    /// the bound value is RED on this test.
+    #[test]
+    fn audit_append_binds_one_instant_to_its_line_and_at_column() {
+        let path = temp_db("audit-one-instant.db");
+        let state = State::open(&path, Retention::default()).expect("open");
+        let instant = "2001-02-03T04:05:06Z";
+        let newest_row = || {
+            let conn = state.lock("test.audit.one-instant.row").expect("lock");
+            conn.query_row(
+                "SELECT at, line FROM audit ORDER BY seq DESC LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("stored row")
+        };
+        // The seam supplies the record's instant: both the column and the
+        // hashed line must carry it.
+        {
+            let mut conn = state.lock("test.audit.one-instant").expect("lock");
+            let tx = conn.transaction().expect("begin");
+            state
+                .append_audit_at_locked(
+                    &tx,
+                    "state.clock_probe",
+                    "example-org/widgets",
+                    "ik_one-instant-0001",
+                    None,
+                    None,
+                    instant,
+                )
+                .expect("append");
+            tx.commit().expect("commit");
+        }
+        let (column_at, line) = newest_row();
+        assert_eq!(column_at, instant, "the stored column is the bound instant");
+        let doc = Val::parse_json(&line).expect("the stored line parses");
+        assert_eq!(
+            doc.get("at").and_then(Val::as_str),
+            Some(instant),
+            "the hashed canonical line carries the same instant as the column"
+        );
+        // The production entry point binds one clock read the same way: its
+        // row's own column and line never disagree either.
+        state
+            .journal_intent(
+                "mutate.backup.create",
+                "example-org/widgets",
+                "ik_one-instant-0002",
+                &"a".repeat(16),
+                "backup.create",
+                None,
+                None,
+                &sample_request_line("ik_one-instant-0002"),
+            )
+            .expect("journal intent");
+        let (column_at, line) = newest_row();
+        let doc = Val::parse_json(&line).expect("the stored line parses");
+        assert_eq!(
+            doc.get("at").and_then(Val::as_str),
+            Some(column_at.as_str()),
+            "the production append's column and hashed line name the same instant"
+        );
+        // The reopen check rebuilds the document from the row's own columns and
+        // compares it to the stored line: it passes only if they agree.
+        drop(state);
+        let reopened = State::open(&path, Retention::default()).expect("reopen");
+        assert_eq!(reopened.verify_chain(), Ok(()));
     }
 
     #[test]
