@@ -316,6 +316,10 @@ pub enum QueueAction {
     Submit(QueueSubmitArgs),
     /// Read one committed submission (read-only): `queue status`.
     Status(QueueStatusArgs),
+    /// Re-evaluate ONE committed submission's parked items against the live
+    /// capacity (the bounded, audited operator re-drive, #236):
+    /// `queue redrive`.
+    Redrive(QueueRedriveArgs),
     /// Render the effect-free preview of one reviewed run and produce the
     /// bound-input document (read-only; the plan producer of the operator
     /// path, issue #91): `queue preview`.
@@ -413,6 +417,18 @@ pub struct QueueSubmitArgs {
 /// `queue status`: one exact submission read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueueStatusArgs {
+    /// Explicit submission id (`qs_` + 16 hex).
+    pub submission: String,
+    /// Explicit daemon socket override.
+    pub socket: Option<String>,
+}
+
+/// `queue redrive`: the bounded, audited operator re-drive of ONE committed
+/// submission (#236). It re-applies that submission's OWN approved admission
+/// inputs to its parked (`waiting`) items — no new approval, no widened cap
+/// and no lane is touched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueueRedriveArgs {
     /// Explicit submission id (`qs_` + 16 hex).
     pub submission: String,
     /// Explicit daemon socket override.
@@ -2139,6 +2155,7 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
     let command = match action.as_str() {
         "submit" => "queue submit",
         "status" => "queue status",
+        "redrive" => "queue redrive",
         "preview" => "queue preview",
         other => {
             return Err(ParseError::Usage(format!(
@@ -2495,6 +2512,34 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
             execution: execution.unwrap_or(ExecutionMode::HerdrPane),
             socket,
         })
+    } else if command == "queue redrive" {
+        if request_path.is_some()
+            || confirm_digest.is_some()
+            || epoch.is_some()
+            || !grants.is_empty()
+            || !resume.is_empty()
+            || host_available_set
+            || harness_lanes_set
+            || caps.is_some()
+            || idempotency_key.is_some()
+            || topology.is_some()
+            || preview_only
+            || supervise != "disabled"
+        {
+            return Err(ParseError::Usage(
+                "queue redrive: submission flags are not valid for a re-drive (it re-applies the \
+                 submission's own approved admission inputs)"
+                    .to_string(),
+            ));
+        }
+        let submission = submission.ok_or_else(|| {
+            ParseError::Usage(
+                "queue redrive: --submission QS_ID is required (the committed submission whose \
+                 parked items are re-evaluated)"
+                    .to_string(),
+            )
+        })?;
+        QueueAction::Redrive(QueueRedriveArgs { submission, socket })
     } else {
         if request_path.is_some()
             || confirm_digest.is_some()
@@ -4251,6 +4296,7 @@ fn execute_queue(action: QueueAction, invocation: &Invocation) -> CmdResult {
     match action {
         QueueAction::Submit(args) => execute_queue_submit(&args, invocation),
         QueueAction::Status(args) => execute_queue_status(&args, invocation),
+        QueueAction::Redrive(args) => execute_queue_redrive(&args, invocation),
         QueueAction::Preview(args) => execute_queue_preview(&args, invocation),
     }
 }
@@ -4977,6 +5023,45 @@ fn execute_queue_status(args: &QueueStatusArgs, invocation: &Invocation) -> CmdR
     }
 }
 
+/// `queue redrive` (#236): re-evaluate ONE committed submission's parked
+/// (`waiting`) items against the live capacity, through the submission's OWN
+/// approved admission inputs. This is the bounded, audited operator control
+/// that recovers a submission stranded by a transient cap: the queue cursor
+/// only moves on a verified delivery, so nothing else could re-drive it.
+/// Nothing is spawned or killed here — an admitted item is admitted exactly
+/// as a fresh submission would admit it, and a lane that is live is never
+/// touched (a submission with nothing parked refuses typed).
+fn execute_queue_redrive(args: &QueueRedriveArgs, invocation: &Invocation) -> CmdResult {
+    let config = match load_optional_config(invocation) {
+        Ok(config) => config,
+        Err(result) => return result,
+    };
+    let socket = effective_socket(args.socket.as_deref(), config.as_ref());
+    let paths = match derive_paths(socket) {
+        Ok(paths) => paths,
+        Err(result) => return result,
+    };
+    if let Err(result) = require_live_daemon(&paths) {
+        return *result;
+    }
+    let params = object(vec![
+        ("submission_id", string(&args.submission)),
+        // A fresh per-invocation key (the same shape `queue submit` mints): a
+        // re-run of the control is a fresh claim, and the daemon's claim
+        // fence keeps exactly one effect per key.
+        ("idempotency_key", string(&fresh_redrive_key())),
+    ]);
+    match client::call(&paths.socket_path, "queue.redrive", Some(&params)) {
+        Ok(result) => {
+            let human = crate::queue_executor::render_human(&result);
+            ok_result(result, human)
+        }
+        Err(RpcError { code, message }) => {
+            lane_error(&code, format!("queue redrive: {message}"), false)
+        }
+    }
+}
+
 /// `queue preview` (issue #91): render the effect-free preview of one
 /// reviewed run and produce its bound-input document — the plan producer
 /// the operator path consumes.
@@ -5349,6 +5434,16 @@ fn execute_run(action: RunAction, invocation: &Invocation) -> CmdResult {
         RunAction::Dispatch(args) => execute_run_dispatch(&args, invocation),
         RunAction::Status(args) => execute_run_status(&args, invocation),
     }
+}
+
+/// A fresh per-invocation idempotency key for one queue re-drive: a re-run is
+/// a fresh claim, and the daemon's claim fence keeps one effect per key.
+fn fresh_redrive_key() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    format!("ik_queue-redrive-{secs}-{}", client::fresh_id())
 }
 
 /// A fresh per-invocation idempotency key for one run control: a re-run is a
@@ -5999,7 +6094,7 @@ EXAMPLES:
 ";
 
 const QUEUE_USAGE: &str = "\
-canter queue <preview|submit|status> — the durable selected-run path
+canter queue <preview|submit|status|redrive> — the durable selected-run path
 
 USAGE:
     canter queue preview --repository KEY --harness KEY \
@@ -6015,6 +6110,16 @@ USAGE:
 [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter queue status --submission QS_ID [--socket PATH] [--config PATH] \
 [--json]
+    canter queue redrive --submission QS_ID [--socket PATH] [--config PATH] \
+[--json]
+
+redrive re-evaluates ONE committed submission's parked (`waiting`) items
+against the live fan-out capacity, through the SAME approved admission inputs
+the submission committed under: the bounded, audited operator control that
+recovers a submission stranded by a transient cap (the queue cursor otherwise
+moves only on a verified delivery). It admits nothing a fresh submission
+would have refused, never touches a lane whose run is live, and a submission
+with nothing parked refuses typed.
 
 preview renders the effect-free preview of ONE reviewed run through the real
 preview service and produces its bound-input document: the repository
@@ -6726,7 +6831,7 @@ fn per_command_usage(command: &str) -> &'static str {
             "usage: canter lane preview|request --lane ID --generation N --session S --process P --role R --worktree W --reason TEXT [--profile KEY]\n       canter lane status --replacement RP_ID | --lane ID --generation N"
         }
         "queue" => {
-            "usage: canter queue preview --repository KEY --harness KEY [--reviewer-harness KEY] --host HOST --issue N=HEX40... --caps G/R/H [--out FILE]\n       canter queue submit --request FILE --confirm-digest HEX64 --caps G/R/H [--epoch N]\n       canter queue status --submission QS_ID"
+            "usage: canter queue preview --repository KEY --harness KEY [--reviewer-harness KEY] --host HOST --issue N=HEX40... --caps G/R/H [--out FILE]\n       canter queue submit --request FILE --confirm-digest HEX64 --caps G/R/H [--epoch N]\n       canter queue status --submission QS_ID\n       canter queue redrive --submission QS_ID"
         }
         "grant" => {
             "usage: canter grant issue --request FILE --issue N --expires-in SECS [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]"

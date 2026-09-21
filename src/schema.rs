@@ -1198,8 +1198,10 @@ pub const SUPPORTED_FAMILIES: [Family; 18] = [
 /// grows by exactly the one method issuance needs); `run.release` is added
 /// by issue #146 (the explicit release of a run that can never progress);
 /// `run.reevaluate` is added by issue #230 (the bounded, audited re-evaluation
-/// of a run's own recorded checks by their producer).
-pub const RPC_METHODS: [&str; 41] = [
+/// of a run's own recorded checks by their producer); `queue.redrive` is added
+/// by issue #236 (the bounded, audited operator re-drive of ONE committed
+/// submission's parked items).
+pub const RPC_METHODS: [&str; 42] = [
     "capabilities",
     "doctor",
     "status",
@@ -1228,6 +1230,7 @@ pub const RPC_METHODS: [&str; 41] = [
     "state.epoch",
     "queue.submit",
     "queue.status",
+    "queue.redrive",
     "run.pause",
     "run.resume",
     "run.retry",

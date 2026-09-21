@@ -579,6 +579,22 @@ pub struct QueueSubmissionItemRow {
     pub grant_id: String,
 }
 
+/// The outcome of ONE operator re-drive of a committed submission (#236):
+/// what the re-drive admitted, what stayed parked and what it refused, with
+/// the run of every item it admitted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueueRedriveOutcome {
+    /// The submission that was re-driven.
+    pub submission_id: String,
+    /// Items admitted by this re-drive, in membership order:
+    /// `(ordinal, issue number, run id)`.
+    pub admitted: Vec<(i64, i64, String)>,
+    /// Items still parked afterwards: `(ordinal, issue number, code, message)`.
+    pub waiting: Vec<(i64, i64, String, String)>,
+    /// Items refused outright by this re-drive: `(ordinal, issue number, code)`.
+    pub refused: Vec<(i64, i64, String)>,
+}
+
 /// One durable queue-advance row (issue #96): ONE consumed verified delivery
 /// of one submission item. `(submission_id, delivered_ordinal)` is the
 /// idempotency key — the delivery event can be consumed exactly once, so a
@@ -773,6 +789,80 @@ fn counted_lane_footprints(
         lanes.push(row.map_err(|err| StateError::from_sqlite(label, err))?);
     }
     Ok(lanes)
+}
+
+/// One committed submission's membership items, in membership order, as the
+/// re-drive and the cursor read them (`#236`).
+fn submission_items_locked(
+    tx: &rusqlite::Transaction<'_>,
+    submission_id: &str,
+) -> Result<Vec<QueueSubmissionItemRow>, StateError> {
+    let mut statement = tx
+        .prepare(
+            "SELECT submission_id, ordinal, work_item, issue_number, issue_revision,
+                    status, reason, message, instance_id, grant_id
+               FROM queue_submission_items WHERE submission_id = ?1 ORDER BY ordinal",
+        )
+        .map_err(|err| StateError::from_sqlite("submission_items_locked: prepare", err))?;
+    let rows = statement
+        .query_map(params![submission_id], |row| {
+            Ok(QueueSubmissionItemRow {
+                submission_id: row.get(0)?,
+                ordinal: row.get(1)?,
+                work_item: row.get(2)?,
+                issue_number: row.get(3)?,
+                issue_revision: row.get(4)?,
+                status: row.get(5)?,
+                reason: row.get(6)?,
+                message: row.get(7)?,
+                instance_id: row.get(8)?,
+                grant_id: row.get(9)?,
+            })
+        })
+        .map_err(|err| StateError::from_sqlite("submission_items_locked: query", err))?;
+    let mut items = Vec::new();
+    for row in rows {
+        items
+            .push(row.map_err(|err| StateError::from_sqlite("submission_items_locked: row", err))?);
+    }
+    Ok(items)
+}
+
+/// Live ownership of one repository: every owned-status run, keyed by issue
+/// number (the snapshot the admission helper re-derives ownership from).
+fn owned_runs_locked(
+    tx: &rusqlite::Transaction<'_>,
+    repository: &str,
+) -> Result<BTreeMap<i64, OwnedRunSnapshot>, StateError> {
+    let mut statement = tx
+        .prepare(
+            "SELECT issue_number, instance_id, issue_revision, grant_id, paused, resume_digest
+               FROM instances
+              WHERE repository = ?1
+                AND status IN ('new', 'running', 'paused', 'human_queue', 'blocked')",
+        )
+        .map_err(|err| StateError::from_sqlite("owned_runs_locked: prepare", err))?;
+    let rows = statement
+        .query_map(params![repository], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                OwnedRunSnapshot {
+                    instance_id: row.get(1)?,
+                    issue_revision: row.get(2)?,
+                    grant_id: row.get(3)?,
+                    paused: row.get::<_, i64>(4)? != 0,
+                    resume_digest: row.get(5)?,
+                },
+            ))
+        })
+        .map_err(|err| StateError::from_sqlite("owned_runs_locked: query", err))?;
+    let mut owned = BTreeMap::new();
+    for row in rows {
+        let (issue_number, snapshot) =
+            row.map_err(|err| StateError::from_sqlite("owned_runs_locked: row", err))?;
+        owned.entry(issue_number).or_insert(snapshot);
+    }
+    Ok(owned)
 }
 
 /// Running fan-out slot accounting for one submission transaction: the
@@ -4741,6 +4831,228 @@ impl State {
             created_at: plan.at.clone(),
         };
         Ok((submission, items))
+    }
+
+    /// Re-drive ONE committed submission's parked (`waiting`) items against
+    /// the live fan-out capacity (#236).
+    ///
+    /// The #96 cursor only moves when a run verifies a delivery, so a
+    /// submission whose items were parked by a transient cap (the repository
+    /// slot was genuinely occupied at submit time) had no control that could
+    /// re-evaluate them once the slot freed: the queue accepted the
+    /// submission and then never admitted it. This is that control, bounded
+    /// to exactly ONE submission:
+    ///
+    /// - only this submission's own `waiting` items are re-evaluated, in
+    ///   membership order, through the SAME approved admission inputs the
+    ///   submission committed under (caps + occupancy attestation) and the
+    ///   SAME guard-verifying helper the submission and the advance use, so
+    ///   nothing is admitted that a fresh submission would have refused;
+    /// - an item already admitted — a live lane — is left exactly as it is:
+    ///   no lane is touched, re-created or retired by a re-drive, and a
+    ///   submission with nothing parked refuses typed
+    ///   (`refusal.queue.nothing_parked`);
+    /// - the whole re-drive is recorded in the hash-chained audit under the
+    ///   caller's idempotency `key` in the same transaction, and capacity is
+    ///   re-counted from live rows under the guard, so a re-drive can never
+    ///   manufacture a slot.
+    pub fn redrive_queue_submission(
+        &self,
+        submission_id: &str,
+        key: &str,
+        at: &str,
+    ) -> Result<QueueRedriveOutcome, StateError> {
+        self.ensure_writable()?;
+        let mut conn = self.lock("redrive_queue_submission")?;
+        let tx = conn
+            .transaction()
+            .map_err(|err| StateError::from_sqlite("redrive_queue_submission: begin", err))?;
+        let submission: Option<QueueSubmissionRow> = tx
+            .query_row(
+                format!("{} WHERE submission_id = ?1", queue_submission_select_sql()).as_str(),
+                params![submission_id],
+                queue_submission_row_from,
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("redrive_queue_submission: submission", err))?;
+        let Some(submission) = submission else {
+            return Err(state_error(
+                "state.not_found",
+                format!("no submission {submission_id:?} exists"),
+            ));
+        };
+        let items = submission_items_locked(&tx, submission_id)?;
+        if !items.iter().any(|item| item.status == "waiting") {
+            return Err(state_error(
+                "refusal.queue.nothing_parked",
+                format!(
+                    "submission {submission_id} has no parked (`waiting`) item; a re-drive \
+                     re-evaluates parked items only and never touches a lane whose run is live"
+                ),
+            ));
+        }
+        let epoch = current_epoch_locked(&tx)?;
+        let counted_lanes =
+            counted_lane_footprints(&tx, "redrive_queue_submission: counted lanes")?;
+        let owned = owned_runs_locked(&tx, &submission.repository)?;
+        let caps = crate::lifecycle::ConcurrencyCaps {
+            global: usize::try_from(submission.caps_global).unwrap_or(0),
+            per_repository: usize::try_from(submission.caps_per_repository).unwrap_or(0),
+            per_harness: usize::try_from(submission.caps_per_harness).unwrap_or(0),
+        };
+        let mut slots = FanoutSlots {
+            caps: &caps,
+            repository: &submission.repository,
+            counted_lanes,
+            harness_lanes: submission.harness_lanes,
+            admitted_global: 0,
+            admitted_repository: 0,
+            admitted_harness: 0,
+        };
+        let dependencies =
+            bound_selected_dependencies(&submission.request_line, &submission.repository);
+        let mut outcome = QueueRedriveOutcome {
+            submission_id: submission_id.to_string(),
+            admitted: Vec::new(),
+            waiting: Vec::new(),
+            refused: Vec::new(),
+        };
+        // Capacity exhausted: the remaining parked items keep the hold they
+        // have (their reason is a live fact, re-derived from the same
+        // counted rows on the next re-drive).
+        let mut exhausted = false;
+        for item in &items {
+            if item.status != "waiting" {
+                continue;
+            }
+            let requires = dependencies
+                .iter()
+                .find(|(number, _)| *number == item.issue_number)
+                .map(|(_, requires)| requires.clone())
+                .unwrap_or_default();
+            let mut unmet: Option<i64> = None;
+            for dependency in &requires {
+                if !dependency_met_locked(&tx, &items, *dependency)? {
+                    unmet = Some(*dependency);
+                    break;
+                }
+            }
+            if let Some(dependency) = unmet {
+                let in_set = items.iter().any(|item| item.issue_number == dependency);
+                let (code, message) = if in_set {
+                    (
+                        crate::queue_executor::advance::DEPENDENCY_UNSETTLED,
+                        format!(
+                            "issue {} declares the dependency #{dependency}, whose delivery is \
+                             not verified yet; the item stays held and is never dispatched or \
+                             marked done from an unmet dependency",
+                            item.issue_number
+                        ),
+                    )
+                } else {
+                    (
+                        crate::queue_executor::advance::DEPENDENCY_UNRESOLVED,
+                        format!(
+                            "issue {} declares the dependency #{dependency}, which is not part \
+                             of this submission's selected set; this queue can never settle it, \
+                             so the item stays held",
+                            item.issue_number
+                        ),
+                    )
+                };
+                tx.execute(
+                    "UPDATE queue_submission_items SET reason = ?3, message = ?4
+                      WHERE submission_id = ?1 AND ordinal = ?2",
+                    params![submission_id, item.ordinal, code, message],
+                )
+                .map_err(|err| {
+                    StateError::from_sqlite("redrive_queue_submission: dependency hold", err)
+                })?;
+                outcome
+                    .waiting
+                    .push((item.ordinal, item.issue_number, code.to_string(), message));
+                continue;
+            }
+            if exhausted {
+                continue;
+            }
+            let admission = QueueAdmission {
+                state: self,
+                repository: &submission.repository,
+                submission_id: &submission.submission_id,
+                epoch,
+                at,
+                workflow_id: &submission.workflow_id,
+                workflow_hash: &submission.workflow_hash,
+                ownership: &owned,
+            };
+            let candidate = QueueAdmissionItem {
+                issue_number: item.issue_number,
+                issue_revision: &item.issue_revision,
+                work_item: &item.work_item,
+                grant_id: Some(item.grant_id.as_str()).filter(|grant| !grant.is_empty()),
+                resume_digest: None,
+            };
+            match admit_queue_item_in_tx(&tx, &admission, &candidate, &mut slots)? {
+                AdmissionDecision::Admitted { instance_id } => {
+                    tx.execute(
+                        "UPDATE queue_submission_items
+                            SET status = 'admitted', reason = NULL, message = NULL,
+                                instance_id = ?3
+                          WHERE submission_id = ?1 AND ordinal = ?2",
+                        params![submission_id, item.ordinal, instance_id],
+                    )
+                    .map_err(|err| {
+                        StateError::from_sqlite("redrive_queue_submission: admit", err)
+                    })?;
+                    outcome
+                        .admitted
+                        .push((item.ordinal, item.issue_number, instance_id));
+                }
+                AdmissionDecision::Waiting { code, message } => {
+                    tx.execute(
+                        "UPDATE queue_submission_items SET reason = ?3, message = ?4
+                          WHERE submission_id = ?1 AND ordinal = ?2",
+                        params![submission_id, item.ordinal, code, message],
+                    )
+                    .map_err(|err| {
+                        StateError::from_sqlite("redrive_queue_submission: hold", err)
+                    })?;
+                    outcome.waiting.push((
+                        item.ordinal,
+                        item.issue_number,
+                        code.to_string(),
+                        message,
+                    ));
+                    exhausted = true;
+                }
+                AdmissionDecision::Refused { code, message } => {
+                    tx.execute(
+                        "UPDATE queue_submission_items
+                            SET status = 'refused', reason = ?3, message = ?4
+                          WHERE submission_id = ?1 AND ordinal = ?2",
+                        params![submission_id, item.ordinal, code, message],
+                    )
+                    .map_err(|err| {
+                        StateError::from_sqlite("redrive_queue_submission: refuse", err)
+                    })?;
+                    outcome
+                        .refused
+                        .push((item.ordinal, item.issue_number, code.to_string()));
+                }
+            }
+        }
+        let target = format!(
+            "submission:{submission_id}:repository:{}:admitted:{}:waiting:{}:refused:{}",
+            submission.repository,
+            outcome.admitted.len(),
+            outcome.waiting.len(),
+            outcome.refused.len()
+        );
+        self.append_audit_locked(&tx, "queue.redrive", &target, key, None, None)?;
+        tx.commit()
+            .map_err(|err| StateError::from_sqlite("redrive_queue_submission: commit", err))?;
+        Ok(outcome)
     }
 
     // ---------------------------------------------------------------------

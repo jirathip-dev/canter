@@ -1866,3 +1866,192 @@ fn wire_revoked_grant_refuses_the_item_before_any_effect() {
     );
     assert!(state.queue_ownership_rows().expect("ownership").is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Issue #236: the bounded, audited operator re-drive of ONE committed
+// submission — the control that recovers a submission parked by a transient
+// cap (the #96 cursor otherwise moves only on a verified delivery).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_parked_submission_is_re_driven_by_the_operators_bounded_control() {
+    let fixture = StateFixture::new("redrive");
+    let state = fixture.open();
+    for (grant, issue) in [
+        ("gr_0000000000000011", 11),
+        ("gr_0000000000000012", 12),
+        ("gr_0000000000000013", 13),
+        ("gr_0000000000000014", 14),
+    ] {
+        state
+            .issue_grant(&grant_doc(grant, issue, REV_A, &GRANT_CAPS))
+            .expect("issue grant");
+    }
+    // Two LIVE lanes fill the per-repository cap (2) the approval presents:
+    // this is the state the conductor's fan-out hit — capacity genuinely
+    // occupied at submit time.
+    let holders = plan_for(
+        &state,
+        "qs_0000000000000011",
+        &"a".repeat(64),
+        vec![
+            (
+                11,
+                REV_A,
+                Some("gr_0000000000000011"),
+                SubmissionVerdict::Approved,
+            ),
+            (
+                12,
+                REV_A,
+                Some("gr_0000000000000012"),
+                SubmissionVerdict::Approved,
+            ),
+        ],
+        Some(0),
+    );
+    let (_, holder_items) = state.submit_queue_run(&holders).expect("holders commit");
+    let holder_runs: Vec<String> = holder_items
+        .iter()
+        .filter_map(|item| item.instance_id.clone())
+        .collect();
+    assert_eq!(holder_runs.len(), 2, "both holding runs are live");
+
+    // The two-item fan-out the queue accepted and could not admit: both items
+    // park as `waiting` with the typed per-repository cap refusal.
+    let parked = plan_for(
+        &state,
+        "qs_0000000000000012",
+        &"b".repeat(64),
+        vec![
+            (
+                13,
+                REV_A,
+                Some("gr_0000000000000013"),
+                SubmissionVerdict::Approved,
+            ),
+            (
+                14,
+                REV_A,
+                Some("gr_0000000000000014"),
+                SubmissionVerdict::Approved,
+            ),
+        ],
+        Some(0),
+    );
+    let (_, parked_items) = state.submit_queue_run(&parked).expect("parked commits");
+    for item in &parked_items {
+        assert_eq!(
+            (
+                item.status.as_str(),
+                item.reason.as_deref(),
+                item.instance_id.as_deref()
+            ),
+            (
+                "waiting",
+                Some(canter::lifecycle::code::CAP_REPOSITORY),
+                None
+            ),
+            "an item with no capacity parks typed and creates no run"
+        );
+    }
+
+    // Nothing parked: the control refuses typed and touches no lane — the
+    // submission whose items run live is never re-driven, retired or altered.
+    let live_before = state
+        .instance_by_id(&holder_runs[0])
+        .expect("read")
+        .expect("the live run exists");
+    let err = state
+        .redrive_queue_submission(
+            "qs_0000000000000011",
+            "ik-redrive-holder",
+            "2026-09-06T02:05:00Z",
+        )
+        .expect_err("a submission with nothing parked refuses");
+    assert_eq!(err.code, "refusal.queue.nothing_parked", "{}", err.message);
+    let live_after = state
+        .instance_by_id(&holder_runs[0])
+        .expect("read")
+        .expect("the live run exists");
+    assert_eq!(live_before, live_after, "a live lane is never touched");
+
+    // The holders are released (the operator's own act), the cap frees, and
+    // the bounded, audited re-drive admits BOTH parked items — each with its
+    // own run.
+    for (index, run) in holder_runs.iter().enumerate() {
+        state
+            .release_run(
+                run,
+                "the transient holding run is freed",
+                &format!("ik-release-{index}"),
+                "2026-09-06T02:06:00Z",
+            )
+            .expect("release");
+    }
+    assert_eq!(
+        state
+            .list_instances()
+            .expect("instances")
+            .iter()
+            .filter(|row| matches!(
+                row.status.as_str(),
+                "new" | "running" | "human_queue" | "blocked"
+            ))
+            .count(),
+        0,
+        "the released holders no longer count against the cap"
+    );
+    let outcome = state
+        .redrive_queue_submission(
+            "qs_0000000000000012",
+            "ik-redrive-parked",
+            "2026-09-06T02:07:00Z",
+        )
+        .expect("the re-drive commits");
+    assert_eq!(outcome.submission_id, "qs_0000000000000012");
+    assert_eq!(
+        outcome.admitted.len(),
+        2,
+        "both parked items are admitted: {outcome:?}"
+    );
+    assert!(outcome.waiting.is_empty(), "{outcome:?}");
+    assert!(outcome.refused.is_empty(), "{outcome:?}");
+    let admitted_runs: Vec<&str> = outcome
+        .admitted
+        .iter()
+        .map(|(_, _, run)| run.as_str())
+        .collect();
+    assert_ne!(
+        admitted_runs[0], admitted_runs[1],
+        "each admitted item gets its own run"
+    );
+
+    // Durable readback: the item rows name their runs, and each re-driven run
+    // owns its issue.
+    let (_, reread) = state
+        .queue_submission_by_id("qs_0000000000000012")
+        .expect("read")
+        .expect("the submission exists");
+    for (index, item) in reread.iter().enumerate() {
+        assert_eq!(item.status, "admitted");
+        assert_eq!(
+            item.instance_id.as_deref(),
+            Some(admitted_runs[index]),
+            "the item names the run the re-drive created"
+        );
+    }
+    assert_eq!(
+        state.queue_ownership_rows().expect("ownership").len(),
+        2,
+        "each re-driven run owns its issue"
+    );
+
+    // Audited: the re-drive is a hash-chained journal record, exactly once.
+    let (_, lines) = state.journal_tail(0, 500).expect("journal");
+    let redrives = lines
+        .iter()
+        .filter(|line| line.contains("queue.redrive"))
+        .count();
+    assert_eq!(redrives, 1, "one audited re-drive record: {lines:?}");
+}
