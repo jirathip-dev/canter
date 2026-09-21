@@ -522,9 +522,9 @@ fn path_of(doc: &Val, keys: &[&str]) -> Val {
 /// recorded attempt, committed check or frontier move resets the ceiling.
 /// Two driver ticks, so a single starved wake can never fail a witness, and
 /// it leaves room inside the CI test driver's per-suite budget
-/// (`scripts/ci-test-driver.py`, `PER_SUITE_SECONDS = 300`) for the suite's
-/// own serialized baseline, so a genuinely stuck witness still reports itself
-/// instead of being killed by the driver.
+/// (`.github/workflows/ci.yml` runs each suite with `--per-suite-seconds
+/// 150`) for the suite's own serialized baseline, so a genuinely stuck witness
+/// still reports itself instead of being killed by the driver.
 const NO_PROGRESS_SECS: u64 = 120;
 
 /// Poll `supervision.status` until the recorded check count reaches `want`,
@@ -3240,7 +3240,7 @@ case "$1 $2" in
         fi
       fi
       # Issue #170 N8: the `extend` mode withholds the delivery for longer than
-      # the step's declared no-progress window (12 s) while the lane keeps
+      # the step's declared no-progress window (11 s) while the lane keeps
       # reporting it is working. The wait must EXTEND on recorded progress and
       # certify the delivery afterwards, never park on the wall clock.
       if [ "$mode" = extend ]; then
@@ -3250,7 +3250,7 @@ case "$1 $2" in
           printf '%s' "$started" > "$STATE/extend_started"
         fi
         elapsed=$(( $(date +%s) - started ))
-        if [ "$elapsed" -ge 15 ]; then
+        if [ "$elapsed" -ge 14 ]; then
           checkout=$(read_state cwd '')
           if [ ! -f "$checkout/delivery.txt" ]; then
             printf 'worker delivery\n' > "$checkout/delivery.txt"
@@ -3423,15 +3423,20 @@ fn supervised_collection(mode: &str) {
                 (
                     "deadline_secs",
                     // Issue #170 N8: `deadline_secs` is the wait's NO-PROGRESS
-                    // window. `timeout` declares a 1 s window (the lane parks);
-                    // `extend` declares a 12 s window while the fixture keeps
-                    // the worker demonstrably working past it and delivers
-                    // later still, so the wait must EXTEND on recorded progress
-                    // instead of parking on a wall clock.
+                    // window. `timeout` declares a 3 s window (the lane's
+                    // read-backs carry NO progress, so the wait parks — and 3 s
+                    // keeps the read itself above a slow runner's subprocess
+                    // cost); `extend` declares an 11 s window — just past the
+                    // (N-1) × interval confirmation span — while the fixture
+                    // keeps the worker demonstrably working past it and
+                    // delivers later still, so the wait must EXTEND on recorded
+                    // progress instead of parking on a wall clock. The other
+                    // modes' windows are failure-path headroom only: their
+                    // happy paths end at the confirmed stop, never at a window.
                     integer(match mode {
-                        "timeout" => 1,
-                        "extend" => 12,
-                        _ => 30,
+                        "timeout" => 3,
+                        "extend" => 11,
+                        _ => 20,
                     }),
                 ),
             ])),
@@ -3610,12 +3615,12 @@ fn supervised_collection(mode: &str) {
                 );
             }
             if mode == "extend" {
-                // Issue #170 N8 witness (c) end to end: the step declared a
-                // 12 s no-progress window and the fixture withheld the delivery
+                // Issue #170 N8 witness (c) end to end: the step declared an
+                // 11 s no-progress window and the fixture withheld the delivery
                 // for longer than that while the lane kept reporting it was
                 // working — the wait EXTENDED on recorded progress and
                 // certified the delivery; a wall clock would have parked the
-                // run at 12 s.
+                // run at 11 s.
                 let delivered_after: u64 =
                     std::fs::read_to_string(fixture.dir.join("herdr-state/delivered_after_secs"))
                         .expect("the fixture records when it delivered")
@@ -3623,8 +3628,8 @@ fn supervised_collection(mode: &str) {
                         .parse()
                         .expect("the delivery time in seconds");
                 assert!(
-                    delivered_after >= 12,
-                    "the delivery must land past the declared 12 s window: {delivered_after}s"
+                    delivered_after >= 11,
+                    "the delivery must land past the declared 11 s window: {delivered_after}s"
                 );
                 assert!(
                     reads.matches("worker-poll working").count() >= 4,

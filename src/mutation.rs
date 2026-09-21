@@ -3817,6 +3817,12 @@ fn poll_pane_worker(
                     None => (1, now),
                 };
                 stop_run = Some((samples, since));
+                // Issue #170 (N8): the confirmation outranks the window — a
+                // pinned, correct-by-construction confirmation (N consecutive
+                // corroborated samples across the real interval) may never be
+                // cut by the no-progress park that the confirmation itself is
+                // about to answer. The CEILING still bounds even this: a run
+                // that cannot settle within it was never convergeable.
                 if samples >= COLLECT_STOP_SAMPLES && now.saturating_sub(since) >= stop_run_span {
                     return Ok(outcome);
                 }
@@ -3834,7 +3840,11 @@ fn poll_pane_worker(
         // carries progress at the window's boundary is never parked past, while
         // a silent lane (or a substrate that cannot even answer) still fails
         // typed: no recorded progress for the window, and never past the
-        // overall ceiling.
+        // overall ceiling. A confirmation IN PROGRESS (at least one corroborated
+        // stop sample since the last recorded progress) defers the window park:
+        // the pinned confirmation is exactly what answers the "has it stopped?"
+        // question the window exists for, and it is bounded by its own shape
+        // (N samples across (N-1) intervals) plus the ceiling.
         if now >= ceiling {
             return Err(collection_park(
                 format!(
@@ -3849,7 +3859,7 @@ fn poll_pane_worker(
                 &last_progress,
             ));
         }
-        if now.saturating_sub(last_progress_at) >= window {
+        if now.saturating_sub(last_progress_at) >= window && stop_run.is_none() {
             return Err(collection_park(
                 format!(
                     "pane worker has no recorded progress for {}s of the {window_secs}s no-progress \
