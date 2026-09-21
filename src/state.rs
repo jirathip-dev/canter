@@ -4513,6 +4513,50 @@ impl State {
         Ok(())
     }
 
+    /// Record ONE host-resource proof produced on an audited operator's
+    /// behalf (issue #250) as an audited `host.proof.renewal.operator`
+    /// record.
+    ///
+    /// The operator authorized the daemon's own measurement of the host at
+    /// the run's lane root (the artifact every named remedy for a parked run
+    /// needed and no control emitted); this record makes the act
+    /// inspectable — the identity, the reason, the proof it superseded (or
+    /// its absence), the measurement it presents and what the host exposed —
+    /// without reading any daemon-internal log. It changes no durable row:
+    /// the proof is an observation the run's own dispatch presents, not a
+    /// mutation of control state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_operator_host_proof_renewal(
+        &self,
+        instance_id: &str,
+        key: &str,
+        operator: &str,
+        reason: &str,
+        superseded_at: &str,
+        measured_at: &str,
+        available_bytes: u64,
+    ) -> Result<(), StateError> {
+        self.ensure_writable()?;
+        let mut conn = self.lock("record_operator_host_proof_renewal")?;
+        let tx = conn.transaction().map_err(|err| {
+            StateError::from_sqlite("record_operator_host_proof_renewal: begin", err)
+        })?;
+        self.append_audit_locked(
+            &tx,
+            "host.proof.renewal.operator",
+            &format!(
+                "run:{instance_id}:operator:{operator}:reason:{reason}:superseded:{superseded_at}:replacement:{measured_at}:available_bytes:{available_bytes}"
+            ),
+            key,
+            None,
+            None,
+        )?;
+        tx.commit().map_err(|err| {
+            StateError::from_sqlite("record_operator_host_proof_renewal: commit", err)
+        })?;
+        Ok(())
+    }
+
     /// Advance a running instance: record the current node and review-round
     /// counters (AC4) plus blocker accounting (AC7). The caller computes the
     /// new values with the engine; this only persists them.

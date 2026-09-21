@@ -138,6 +138,19 @@ pub mod codes {
     pub const RESOLUTION_KIND: &str = "refusal.run.resolution_kind";
     /// Artifact evidence or recorder identity is malformed/incomplete.
     pub const RESOLUTION_EVIDENCE: &str = "refusal.run.resolution_evidence";
+    /// The audited operator measurement of a `run dispatch` must carry BOTH
+    /// the operator identity and the reason (issue #250): the daemon measures
+    /// the host on the operator's audited behalf and records the act, so an
+    /// identity without a reason (or the reverse) is refused before anything
+    /// is measured or dispatched.
+    pub const DISPATCH_OPERATOR: &str = "refusal.run.dispatch_operator";
+    /// TERMINAL, typed escalation of a parked run (issue #250): every exposed
+    /// control is inapplicable — the bounded-retry budget of the run's
+    /// diagnosed frontier step is spent, the step is not a re-evaluable check
+    /// producer, and no host-resource proof can be produced for it — so the
+    /// run is reported as an owner decision instead of an eligible-looking
+    /// park no command can move.
+    pub const ESCALATION: &str = "escalation.run.owner_decision";
     /// A claimed effect still exists; resolution cannot race it and a
     /// release never abandons it.
     pub const IN_FLIGHT: &str = "refusal.run.in_flight";
@@ -234,6 +247,14 @@ pub struct DispatchParams {
     pub topology: Option<Val>,
     /// Explicit current admission attestation; never a synthesized measurement.
     pub admission: Option<Val>,
+    /// The audited operator identity that authorizes the daemon's OWN
+    /// host-resource measurement for this dispatch (issue #250). `None` = the
+    /// ordinary path: the admission the run recorded (or the presented
+    /// `--admission` document) is presented verbatim.
+    pub operator: Option<String>,
+    /// The bounded operator reason recorded with that measurement (issue
+    /// #250). Presented with the identity or not at all.
+    pub reason: Option<String>,
 }
 
 /// `run.reevaluate` params (issue #230): ONE run, ONE check-producing step,
@@ -778,6 +799,8 @@ pub fn parse_dispatch_params(params: &Val) -> Result<DispatchParams, ControlErro
             "params",
             "topology",
             "admission",
+            "operator",
+            "reason",
         ],
         "run.dispatch",
     )?;
@@ -828,6 +851,55 @@ pub fn parse_dispatch_params(params: &Val) -> Result<DispatchParams, ControlErro
             format!("run.dispatch {name} must be an object"),
         )),
     };
+    // Issue #250: the audited operator measurement is a PAIR — the identity
+    // that authorizes the daemon's own host-resource measurement and the
+    // bounded reason recorded with it. One without the other is malformed,
+    // so the recorded audit can never be half an act.
+    let operator = match params.get("operator") {
+        None | Some(Val::Null) => None,
+        Some(value) => {
+            let identity = value.as_str().unwrap_or_default();
+            if identity.is_empty()
+                || identity.len() > 128
+                || identity.contains(':')
+                || identity.chars().any(char::is_control)
+            {
+                return Err(ControlError::new(
+                    codes::DISPATCH_OPERATOR,
+                    "run.dispatch params.operator must be 1-128 printable characters without ':' \
+                     (the recorded identity that authorized the measurement; the journal record it \
+                     is written into is colon-delimited)",
+                ));
+            }
+            Some(identity.to_string())
+        }
+    };
+    let reason = match params.get("reason") {
+        None | Some(Val::Null) => None,
+        Some(value) => {
+            let reason = value.as_str().unwrap_or_default();
+            if reason.is_empty()
+                || reason.len() > REASON_MAX
+                || reason.chars().any(char::is_control)
+            {
+                return Err(ControlError::new(
+                    codes::DISPATCH_OPERATOR,
+                    format!(
+                        "run.dispatch params.reason must be 1-{REASON_MAX} printable characters \
+                         (the audited reason)"
+                    ),
+                ));
+            }
+            Some(reason.to_string())
+        }
+    };
+    if operator.is_some() != reason.is_some() {
+        return Err(ControlError::new(
+            codes::DISPATCH_OPERATOR,
+            "run.dispatch takes the audited operator measurement as a pair: present BOTH \
+             params.operator (the identity) and params.reason, or neither",
+        ));
+    }
     Ok(DispatchParams {
         idempotency_key,
         instance_id,
@@ -835,6 +907,8 @@ pub fn parse_dispatch_params(params: &Val) -> Result<DispatchParams, ControlErro
         step_params,
         topology: context("topology")?,
         admission: context("admission")?,
+        operator,
+        reason,
     })
 }
 
@@ -912,8 +986,16 @@ pub fn resolution_params(
 
 /// The canonical `run.dispatch` params document: the run, the step and the
 /// operator's step inputs (omitted when the committed params are dispatched
-/// as reviewed).
-pub fn dispatch_params(key: &str, instance_id: &str, step: &str, step_params: Option<Val>) -> Val {
+/// as reviewed). `operator`/`reason` are the audited pair that authorizes the
+/// daemon's own host-resource measurement at dispatch time (issue #250);
+/// both are omitted on the ordinary path.
+pub fn dispatch_params(
+    key: &str,
+    instance_id: &str,
+    step: &str,
+    step_params: Option<Val>,
+    operator: Option<(&str, &str)>,
+) -> Val {
     let mut fields = vec![
         ("idempotency_key", string(key)),
         ("instance_id", string(instance_id)),
@@ -921,6 +1003,10 @@ pub fn dispatch_params(key: &str, instance_id: &str, step: &str, step_params: Op
     ];
     if let Some(inputs) = step_params {
         fields.push(("params", inputs));
+    }
+    if let Some((operator, reason)) = operator {
+        fields.push(("operator", string(operator)));
+        fields.push(("reason", string(reason)));
     }
     object(fields)
 }
@@ -1034,6 +1120,200 @@ fn run_block(run: &InstanceRow) -> Val {
     ])
 }
 
+/// The statement every remedy decision carries: the decision recomputes the
+/// durable facts each control's own gate reads and dispatches nothing.
+pub const REMEDY_STATEMENT: &str = "remedy decision only: it is derived read-only from the run's own durable attempts, bounded-retry and re-evaluation records and its recorded admission, so it names the ONE control whose own gate will accept the run's next step (and why the others do not apply) or the terminal escalation; it dispatches, measures, journals, pauses, resumes, releases or widens nothing";
+
+/// The durable facts ONE remedy decision is derived from (issue #250): the
+/// run's diagnosed frontier step, its recorded failure code, the bounded
+/// retry budget it already spent, whether a check re-evaluation applies to
+/// it, and whether a host-resource proof can be produced for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemedyFacts {
+    /// The run identity (`run-` + 16 hex).
+    pub run: String,
+    /// The run's diagnosed frontier step.
+    pub step: String,
+    /// The recorded failure code of that step (the admission gate's own
+    /// `refusal.admission.*` codes are what the proof branch is keyed on).
+    pub code: String,
+    /// Bounded retries this (run, step) already CONSUMED (a held,
+    /// unconsumed authorization is [`RemedyFacts::retry_held`], not budget).
+    pub retries_consumed: i64,
+    /// Whether the run already HOLDS an unconsumed bounded-retry
+    /// authorization for this step: minting another refuses
+    /// `refusal.run.retry_pending`, so the ONE re-dispatch that consumes the
+    /// held authorization is the applicable control.
+    pub retry_held: bool,
+    /// Whether `run.reevaluate` applies to this step: the run's OWN terminal-
+    /// success check producer whose newest recorded evidence names a
+    /// non-passing check.
+    pub reevaluation_applies: bool,
+    /// Whether a host-resource proof can be produced for this step at
+    /// dispatch time: the run recorded an admission document the daemon can
+    /// measure into (a proof that was never recorded is never invented, and a
+    /// host that cannot be observed produces nothing).
+    pub proof_producible: bool,
+}
+
+/// Issue #250: decide the SINGLE control that advances a run parked on a
+/// diagnosed step, or escalate it terminally.
+///
+/// The measured defect: a run parked by a refused dispatch reported three
+/// named remedies and none could be satisfied — the bounded-retry budget was
+/// spent, the re-evaluation does not address a diagnosed step, and the
+/// `--admission FILE` the dispatch asked for was emitted by no control. An
+/// operator had to spend three attempts to discover that. This is the
+/// decision, derived from the SAME durable facts each control's own gate
+/// reads, so it names exactly one control (with its documented command) and
+/// the reason the others do not apply — or, when no exposed control applies,
+/// the terminal typed escalation naming the owner decision instead of an
+/// eligible-looking park.
+pub fn remedy_doc(facts: &RemedyFacts) -> Val {
+    let run = &facts.run;
+    let step = &facts.step;
+    let proof_park = facts.code == crate::lifecycle::code::PROOF_STALE
+        || facts.code == crate::lifecycle::code::PROOF_MISSING;
+    // (1) The check producer: a re-evaluation is the ONE control that
+    // recomputes the recorded check. The bounded retry cannot address it (a
+    // terminal-success step is never re-dispatched) and the dispatch cannot
+    // either (the step is not the frontier).
+    if facts.reevaluation_applies {
+        return object(vec![
+            ("state", string("applicable")),
+            ("control", string("run.reevaluate")),
+            (
+                "command",
+                string(&format!(
+                    "canter run reevaluate --run {run} --step {step} --operator IDENTITY --reason TEXT"
+                )),
+            ),
+            ("code", null()),
+            (
+                "because",
+                string(&format!(
+                    "step {step} is the run's OWN terminal-success check producer and its newest \
+                     recorded evidence names a non-passing check, so the re-evaluation is the one \
+                     control that recomputes it (the bounded retry does not apply: the step \
+                     already succeeded, and its lapsed proof renews inside the re-dispatch itself)"
+                )),
+            ),
+            ("statement", string(REMEDY_STATEMENT)),
+        ]);
+    }
+    // (2a) The run already HOLDS an unconsumed authorization: the ONE
+    // re-dispatch that consumes it is the applicable control (minting another
+    // would refuse `refusal.run.retry_pending`).
+    if facts.retry_held {
+        let command = if proof_park {
+            format!(
+                "canter run dispatch --run {run} --step {step} --operator IDENTITY --reason TEXT"
+            )
+        } else {
+            format!("canter run dispatch --run {run} --step {step}")
+        };
+        return object(vec![
+            ("state", string("applicable")),
+            ("control", string("run.dispatch")),
+            ("command", string(&command)),
+            ("code", null()),
+            (
+                "because",
+                string(&format!(
+                    "step {step} already HOLDS an unconsumed bounded-retry authorization, and the \
+                     ONE re-dispatch of that exact step is what consumes it — minting another \
+                     refuses `refusal.run.retry_pending` (a check re-evaluation does not apply: \
+                     this step carries no re-evaluable terminal-success check)"
+                )),
+            ),
+            ("statement", string(REMEDY_STATEMENT)),
+        ]);
+    }
+    // (2b) A diagnosed step with retry budget left: the operator's own bounded
+    // retry is the ONE control, and its single re-dispatch presents the
+    // dispatch-time measurement.
+    if facts.retries_consumed < RUN_RETRY_MAX {
+        return object(vec![
+            ("state", string("applicable")),
+            ("control", string("run.retry")),
+            (
+                "command",
+                string(&format!(
+                    "canter run retry --run {run} --step {step} --operator IDENTITY --reason TEXT"
+                )),
+            ),
+            ("code", null()),
+            (
+                "because",
+                string(&format!(
+                    "step {step} is the run's diagnosed frontier step and its bounded-retry \
+                     budget is not spent ({} of {RUN_RETRY_MAX} used), so ONE bounded retry \
+                     authorizes the single re-dispatch that consumes it (a check re-evaluation \
+                     does not apply: this step carries no re-evaluable terminal-success check)",
+                    facts.retries_consumed
+                )),
+            ),
+            ("statement", string(REMEDY_STATEMENT)),
+        ]);
+    }
+    // (3) The retry budget is spent. If the dispatch is refused only for the
+    // host-resource proof AND the daemon can measure one for this run, the
+    // audited operator dispatch is the ONE control: it is executable by the
+    // party the remedy is addressed to.
+    if proof_park && facts.proof_producible {
+        return object(vec![
+            ("state", string("applicable")),
+            ("control", string("run.dispatch")),
+            (
+                "command",
+                string(&format!(
+                    "canter run dispatch --run {run} --step {step} --operator IDENTITY --reason TEXT"
+                )),
+            ),
+            ("code", null()),
+            (
+                "because",
+                string(&format!(
+                    "step {step} is a fan-out whose host-resource proof (measured {}, code {}) is \
+                     what its dispatch is refused for, and the retry budget is spent ({RUN_RETRY_MAX} \
+                     of {RUN_RETRY_MAX} used); the audited operator dispatch is the one control that \
+                     still reaches it, because the daemon measures the host on the recorded \
+                     operator's behalf and binds the measurement (a check re-evaluation does not \
+                     apply: this step carries no re-evaluable terminal-success check)",
+                    if facts.code == crate::lifecycle::code::PROOF_MISSING {
+                        "never recorded"
+                    } else {
+                        "before the freshness window"
+                    },
+                    facts.code
+                )),
+            ),
+            ("statement", string(REMEDY_STATEMENT)),
+        ]);
+    }
+    // (4) Nothing exposed can advance the run: the terminal typed escalation
+    // names the owner decision instead of parking indefinitely.
+    object(vec![
+        ("state", string("terminal-escalation")),
+        ("control", null()),
+        ("command", null()),
+        ("code", string(codes::ESCALATION)),
+        (
+            "because",
+            string(&format!(
+                "step {step} of run {run} is parked on {} and no exposed control applies: its \
+                 bounded-retry budget is spent ({RUN_RETRY_MAX} of {RUN_RETRY_MAX} used), it \
+                 carries no re-evaluable terminal-success check, and no host-resource proof can be \
+                 produced for it — the owner decides (re-admit the run under a fresh submission, \
+                 rotate the recorded admission, or release the run); the run is not an eligible \
+                 park",
+                facts.code
+            )),
+        ),
+        ("statement", string(REMEDY_STATEMENT)),
+    ])
+}
+
 /// Render the `hf-run-control/v1` projection of one run. `in_flight_step`
 /// is the step of the still-executing dispatch (probed live) and
 /// `resume_digest` is the pause authorization (printed so the operator can
@@ -1047,6 +1327,7 @@ pub fn control_doc(
     in_flight_step: Option<&str>,
     resume_digest: Option<&str>,
     last_failure: Option<&StepFailure>,
+    remedy: Option<&Val>,
 ) -> Val {
     let state = control_state(run);
     let reached = run.paused || (run.pause_requested && in_flight_step.is_none());
@@ -1096,6 +1377,17 @@ pub fn control_doc(
                     ("code", string(&failure.code)),
                     ("message", string(&failure.message)),
                 ]),
+                None => null(),
+            },
+        ),
+        // Issue #250: the SINGLE control that applies to the run's parked
+        // step (with the reason the others do not), or the terminal typed
+        // escalation when none does — so an operator never has to spend
+        // three attempts discovering which remedy is the executable one.
+        (
+            "remedy",
+            match remedy {
+                Some(remedy) => remedy.clone(),
                 None => null(),
             },
         ),

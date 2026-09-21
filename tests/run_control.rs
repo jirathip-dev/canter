@@ -3490,3 +3490,387 @@ fn a_recomputed_record_carries_the_run_to_its_publish_step() {
     assert_eq!(intent.step_id, "p7");
     assert_eq!(intent.kind, "merge");
 }
+
+// ---------------------------------------------------------------------------
+// Issue #250 — the audited operator's own host-resource measurement
+// ---------------------------------------------------------------------------
+
+/// Every `host.proof.renewal.operator` line of the fixture's durable journal,
+/// parsed (the audit record of the proof-producing control).
+fn recorded_operator_renewals(state: &State) -> Vec<Val> {
+    let (_, journal) = state.journal_tail(0, 2000).expect("journal read");
+    journal
+        .iter()
+        .filter(|line| line.contains("\"action\":\"host.proof.renewal.operator\""))
+        .filter_map(|line| Val::parse_json(line).ok())
+        .collect()
+}
+
+/// One recorded REFUSED attempt of (run, step) carrying `code`: the durable
+/// record `run.status` reads back. A live admission refusal happens before any
+/// intent is journaled, so a witness that must READ the park seeds the very
+/// outcome the engine records when its own continuation refusal lands.
+fn seed_refused_attempt(state: &State, instance_id: &str, step: &str, key: &str, code: &str) {
+    let line = apply_request_line(instance_id, step, key);
+    let request_id = fresh_id(9);
+    state
+        .journal_intent(
+            "mutate.checkout",
+            &format!("{REPO}:{instance_id}:{step}"),
+            key,
+            &request_id,
+            "apply",
+            None,
+            None,
+            &line,
+        )
+        .expect("claim the refused attempt");
+    let outcome_line = canonical_text(&object(vec![
+        ("schema", string("hf-outcome/v1")),
+        ("plan_id", string("hf_plan_0000000000000000")),
+        ("step_id", string(step)),
+        ("status", string("refused")),
+        ("idempotency_key", string(key)),
+        ("observed_at", string(AT)),
+        ("result", Val::Null),
+        (
+            "error",
+            object(vec![
+                ("code", string(code)),
+                ("message", string("the host-resource proof is stale")),
+            ]),
+        ),
+    ]));
+    state
+        .resolve_claim(key, "apply", "spent", &outcome_line, Some("{}"))
+        .expect("resolve the refused attempt");
+}
+
+/// Issue #250, the whole slice: the artifact every named remedy for a parked
+/// run needed is PRODUCED by an exposed control, the act is audited, and a
+/// park no control can move escalates terminally instead of looking eligible.
+///
+/// Three runs of ONE fixture daemon, each parked at the same fan-out frontier
+/// (`p6`, a review leg) with a proof measured before the freshness window:
+/// (A) the ordinary dispatch refuses `refusal.admission.proof_stale` — the
+/// measured defect; (B) the audited operator pair makes the daemon MEASURE the
+/// host at the run's lane root and bind the measurement, recording the
+/// identity, the reason and the superseded instant in the hash-chained journal
+/// BEFORE presenting it, so the gate no longer decides on the lapsed proof;
+/// (C) a host that cannot be measured (the lane root does not exist) produces
+/// NOTHING and the same refusal stays typed — and once the retry budget is
+/// spent with no re-evaluable producer, `run status` names the terminal
+/// `escalation.run.owner_decision` instead of an eligible-looking park.
+#[test]
+fn the_audited_operator_measurement_produces_the_proof_a_parked_run_needs() {
+    let head = "aa".repeat(20);
+    let base = "bb".repeat(20);
+    let fixture = DaemonFixture::new("operator250");
+    let state = fixture.seed();
+    let steps = |issue: i64| {
+        vec![
+            step("p1", "checkout"),
+            step("p5", "collect_outcome"),
+            review_leg_step("p6", &format!("issues/{issue}"), 1),
+            step("p7", "merge"),
+        ]
+    };
+    // TWO runs: the fixture's admission caps admit two per repository, and the
+    // second carries every refusal leg.
+    let runs: Vec<String> = [(6, GRANT_6), (7, GRANT_7)]
+        .iter()
+        .map(|(number, grant)| {
+            let items = submit_with_steps(
+                &state,
+                &format!("qs_000000000000{number:04}"),
+                &[(*number, grant)],
+                steps(*number),
+            );
+            items[0].instance_id.clone().expect("admitted")
+        })
+        .collect();
+    let (plain, unmeasurable) = (runs[0].clone(), runs[1].clone());
+    // The audited leg addresses the SAME run as the plain leg: the plain
+    // dispatch refuses BEFORE any intent is journaled, so nothing is burned.
+    let audited = plain.clone();
+    // The lane root the daemon measures: a REAL directory for (A) and (B); its
+    // path is never created for (C), so the host cannot be observed there.
+    let lane_root =
+        std::env::temp_dir().join(format!("hf-run-250-lane-root-{}", std::process::id()));
+    std::fs::create_dir_all(&lane_root).expect("lane root");
+    let missing_root = std::env::temp_dir().join(format!(
+        "hf-run-250-absent-lane-root-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&missing_root);
+    let stale = canter::time::rfc3339_from_unix(
+        canter::time::unix_now() - canter::lifecycle::HOST_PROOF_FRESHNESS_SECS - 1,
+    );
+    for (run, root) in [(&plain, &lane_root), (&unmeasurable, &missing_root)] {
+        let stem = run.trim_start_matches("run-");
+        seed_topology_with_admission(
+            &state,
+            run,
+            "p1",
+            &format!("ik_{stem}-p1-250"),
+            &stale,
+            root,
+        );
+        seed_collection(
+            &state,
+            run,
+            "p5",
+            &format!("ik_{stem}-p5-250"),
+            &head,
+            &base,
+            "issue-6",
+        );
+    }
+    let _daemon = fixture.spawn(None);
+    wait_ready(&fixture);
+
+    // (A) The measured defect: the frontier fan-out refuses the lapsed proof,
+    // and its remedy names an artifact no control emits.
+    let refused = rpc(
+        &fixture.socket,
+        &fresh_id(31),
+        "run.dispatch",
+        Some(canter::run_control::dispatch_params(
+            &idem_key("250-plain"),
+            &plain,
+            "p6",
+            None,
+            None,
+        )),
+    );
+    eprintln!(
+        "plain dispatch => {}",
+        canter::canonical::canonical_text(&refused)
+    );
+    let code = refused
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .and_then(Val::as_str)
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        code,
+        canter::lifecycle::code::PROOF_STALE,
+        "the ordinary dispatch refuses the lapsed proof: {}",
+        canter::canonical::canonical_text(&refused)
+    );
+
+    // (B) The audited operator pair: the proof is PRODUCED (measured at
+    // dispatch time at the run's lane root) and the act is recorded.
+    let operator = "operator-a";
+    let reason = "the named remedy needed a proof no control emitted";
+    let dispatch = rpc(
+        &fixture.socket,
+        &fresh_id(32),
+        "run.dispatch",
+        Some(canter::run_control::dispatch_params(
+            &idem_key("250-operator"),
+            &audited,
+            "p6",
+            None,
+            Some((operator, reason)),
+        )),
+    );
+    eprintln!(
+        "audited dispatch => {}",
+        canter::canonical::canonical_text(&dispatch)
+    );
+    let renewals = recorded_operator_renewals(&state);
+    assert_eq!(
+        renewals.len(),
+        1,
+        "exactly one operator-authorized measurement: {renewals:?}"
+    );
+    let target = renewals[0]
+        .get("target")
+        .and_then(Val::as_str)
+        .unwrap_or_default();
+    for needle in [
+        format!("operator:{operator}"),
+        format!("reason:{reason}"),
+        format!("superseded:{stale}"),
+    ] {
+        assert!(
+            target.contains(&needle),
+            "the audit names {needle:?} in {target}"
+        );
+    }
+    let key = renewals[0]
+        .get("idempotency_key")
+        .and_then(Val::as_str)
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        key,
+        idem_key("250-operator"),
+        "the measurement is attributed to the dispatch that authorized it"
+    );
+    let dispatch_code = dispatch
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .and_then(Val::as_str)
+        .unwrap_or_default();
+    assert_ne!(
+        dispatch_code,
+        canter::lifecycle::code::PROOF_STALE,
+        "the produced proof is what the gate decides on now: {}",
+        canter::canonical::canonical_text(&dispatch)
+    );
+
+    // (C) A host that cannot be measured produces nothing: the same refusal
+    // stays typed, and no measurement is invented.
+    let refused_unmeasurable = rpc(
+        &fixture.socket,
+        &fresh_id(33),
+        "run.dispatch",
+        Some(canter::run_control::dispatch_params(
+            &idem_key("250-unmeasurable"),
+            &unmeasurable,
+            "p6",
+            None,
+            Some(("operator-b", "the lane root is not there")),
+        )),
+    );
+    eprintln!(
+        "unmeasurable dispatch => {}",
+        canter::canonical::canonical_text(&refused_unmeasurable)
+    );
+    assert_eq!(
+        refused_unmeasurable
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Val::as_str)
+            .unwrap_or_default(),
+        canter::lifecycle::code::PROOF_STALE,
+        "an unmeasurable host keeps the typed refusal: {}",
+        canter::canonical::canonical_text(&refused_unmeasurable)
+    );
+    assert_eq!(
+        recorded_operator_renewals(&state).len(),
+        1,
+        "nothing was measured for the run whose lane root is absent"
+    );
+
+    // The decision: while the bounded-retry budget is unspent, `run status`
+    // names the retry — ONE control, with its command; once it is spent and
+    // nothing else applies, the same read escalates terminally.
+    seed_refused_attempt(
+        &state,
+        &unmeasurable,
+        "p6",
+        &idem_key("250-refused"),
+        canter::lifecycle::code::PROOF_STALE,
+    );
+    state
+        .record_run_retry(&unmeasurable, "p6", AT)
+        .expect("first bounded retry");
+    // A HELD authorization is itself the applicable control: minting another
+    // refuses, and the ONE re-dispatch consumes it.
+    let status = rpc(
+        &fixture.socket,
+        &fresh_id(34),
+        "run.status",
+        Some(canter::run_control::status_params(&unmeasurable)),
+    );
+    eprintln!(
+        "run.status (authorization held) => {}",
+        canter::canonical::canonical_text(&status)
+    );
+    let remedy = status
+        .get("result")
+        .and_then(|result| result.get("remedy"))
+        .cloned()
+        .expect("the control document carries the remedy decision");
+    assert_eq!(
+        remedy.get("control").and_then(Val::as_str),
+        Some("run.dispatch"),
+        "the held authorization is consumed by the dispatch: {remedy:?}"
+    );
+    assert!(
+        remedy
+            .get("because")
+            .and_then(Val::as_str)
+            .unwrap_or_default()
+            .contains("HOLDS an unconsumed bounded-retry authorization"),
+        "the decision names WHY the others do not apply: {remedy:?}"
+    );
+    // Consume it: with budget left and nothing held, the retry is the ONE
+    // control, carrying the documented command.
+    state
+        .claim_run_retry(&unmeasurable, "p6", &idem_key("250-consumed-1"), AT)
+        .expect("consume the authorization");
+    let status = rpc(
+        &fixture.socket,
+        &fresh_id(35),
+        "run.status",
+        Some(canter::run_control::status_params(&unmeasurable)),
+    );
+    let remedy = status
+        .get("result")
+        .and_then(|result| result.get("remedy"))
+        .cloned()
+        .expect("the control document carries the remedy decision");
+    assert_eq!(
+        remedy.get("state").and_then(Val::as_str),
+        Some("applicable"),
+        "{remedy:?}"
+    );
+    assert_eq!(
+        remedy.get("control").and_then(Val::as_str),
+        Some("run.retry"),
+        "{remedy:?}"
+    );
+    assert!(
+        remedy
+            .get("command")
+            .and_then(Val::as_str)
+            .unwrap_or_default()
+            .starts_with("canter run retry --run run-"),
+        "the decision carries the documented command: {remedy:?}"
+    );
+    // Spend the rest of the bound: each authorization is CONSUMED by the ONE
+    // re-dispatch it authorizes before the next can be minted.
+    state
+        .record_run_retry(&unmeasurable, "p6", AT)
+        .expect("second bounded retry");
+    state
+        .claim_run_retry(&unmeasurable, "p6", &idem_key("250-consumed-2"), AT)
+        .expect("consume the second authorization");
+    state
+        .record_run_retry(&unmeasurable, "p6", AT)
+        .expect("third bounded retry");
+    state
+        .claim_run_retry(&unmeasurable, "p6", &idem_key("250-consumed-3"), AT)
+        .expect("consume the last authorization");
+    let escalated = rpc(
+        &fixture.socket,
+        &fresh_id(36),
+        "run.status",
+        Some(canter::run_control::status_params(&unmeasurable)),
+    );
+    eprintln!(
+        "run.status (budget spent) => {}",
+        canter::canonical::canonical_text(&escalated)
+    );
+    let remedy = escalated
+        .get("result")
+        .and_then(|result| result.get("remedy"))
+        .cloned()
+        .expect("the control document carries the remedy decision");
+    assert_eq!(
+        remedy.get("state").and_then(Val::as_str),
+        Some("terminal-escalation"),
+        "no control applies: {remedy:?}"
+    );
+    assert_eq!(
+        remedy.get("code").and_then(Val::as_str),
+        Some(canter::run_control::codes::ESCALATION),
+        "the escalation is TYPED: {remedy:?}"
+    );
+    assert!(remedy.get("control").is_some_and(Val::is_null));
+}
