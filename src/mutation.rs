@@ -1160,6 +1160,17 @@ pub fn evidence_checks_passed(evidence: &EvidenceView) -> Result<bool, MutationE
     Ok(non_passing_checks(evidence)?.is_empty())
 }
 
+/// The engine's own refusal message for a record whose named checks are not all
+/// `passed` — ONE derivation (issue #230), so a read-time report of that same
+/// refusal (the supervision status of a frontier nothing ever dispatched) and
+/// the refusal itself can never drift apart.
+pub fn evidence_failed_message(evidence_id: &str, non_passing: &[String]) -> String {
+    format!(
+        "review evidence {evidence_id} has failed/pending checks: {}",
+        non_passing.join(", ")
+    )
+}
+
 /// The merge-gate evidence bundle: the instance must carry a latest
 /// evidence record whose bindings match the live heads/hashes, whose
 /// verdict is `pass`, and whose checks all passed (AC4 + issue merge
@@ -1197,11 +1208,7 @@ pub fn check_merge_evidence(
     if !evidence_checks_passed(evidence)? {
         return Err(MutationError::new(
             code::EVIDENCE_FAILED,
-            format!(
-                "review evidence {} has failed/pending checks: {}",
-                evidence.evidence_id,
-                non_passing_checks(evidence)?.join(", ")
-            ),
+            evidence_failed_message(&evidence.evidence_id, &non_passing_checks(evidence)?),
         ));
     }
     Ok(())

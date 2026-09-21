@@ -220,7 +220,14 @@ never adjudication:
 A continuation the engine refuses is also named: the recorded refusal now
 carries the engine's own message beside its code, and the supervision status
 renders both (`evaluation.refusal` / the human read), so a parked run states
-WHY its frontier never lands instead of reporting an idle fleet.
+WHY its frontier never lands instead of reporting an idle fleet. The same
+report covers the shape where NOTHING is ever dispatched — the run's own
+verified-delivery consumer behind a record whose checks are not all `passed`:
+the classification derives the engine's own refusal from these same recorded
+facts (`supervision.delivery_unverified` + `refusal.evidence.failed`, spec-daemon.md)
+rather than reporting the frontier an eligible continuation, and the dispatch
+gate itself is unchanged, so the tail is still never driven behind an
+unverified delivery.
 
 The certified delivery (issue #202): a step may only ever consume the head the
 run's OWN `collect_outcome` step certified. That binding is recorded and

@@ -404,6 +404,18 @@ pub mod codes {
     /// the engine's own refusal code. The step is never reported eligible
     /// while the dispatch the driver names is refused.
     pub const DISPATCH_REFUSED: &str = "supervision.dispatch_refused";
+    /// The next unachieved step is the run's own verified-delivery consumer
+    /// (a committed `merge` / `cleanup` tail step) and the driver may not
+    /// dispatch it because the run's newest recorded review evidence is a
+    /// `pass` bound to the run's pins at one exact head whose named checks are
+    /// NOT all `passed` (issue #230). Nothing is attempted in this shape, so
+    /// no dispatch refusal is ever recorded — the engine's own evidence gate
+    /// refuses before any dispatch, and reporting the frontier as an eligible
+    /// continuation that never lands is exactly the deadlock. `detail` carries
+    /// the engine's own refusal code and the read carries its reason, both
+    /// DERIVED from the same recorded facts the gate reads; a recomputation
+    /// that comes back failing keeps this refusal exactly as it was.
+    pub const DELIVERY_UNVERIFIED: &str = "supervision.delivery_unverified";
     /// The next unachieved step HAS been attempted and its own recorded
     /// outcome is not `succeeded` (issue #148): the work ran and diagnosed a
     /// concrete failure/refusal, and the driver never re-dispatches a
@@ -922,6 +934,124 @@ pub fn verified_delivery(evidence: &SupervisionEvidence) -> Option<VerifiedDeliv
     })
 }
 
+/// The engine's own refusal of the run's verified-delivery consumer, derived
+/// from the SAME recorded facts the dispatch gate reads (issue #230).
+///
+/// `Some` only in the ONE recorded shape the deadlock is made of: the frontier
+/// is a committed TAIL step (`merge` / `cleanup`) the run's own caps
+/// authorize, it comes AFTER the run's reviewed-evidence step in the committed
+/// spine, and the run's newest recorded review evidence is a `pass` bound to
+/// the run's own pins at one exact head whose named checks are NOT all
+/// `passed`. Every OTHER reason a tail cannot be driven (no committed
+/// membership, no capability, no recorded evidence, a moved pin, a verdict
+/// that is not `pass`) is a different fact and is never named here.
+///
+/// Nothing is dispatched in this shape, so no dispatch refusal is ever
+/// recorded against the run: the refusal an operator has to act on is DERIVED
+/// here from the same facts, with the SAME code and the SAME message the
+/// engine's own evidence gate refuses with
+/// ([`crate::mutation::evidence_failed_message`]). It presents no check
+/// status, waives nothing and adjudicates nothing — a recomputation that comes
+/// back failing derives the identical refusal.
+fn unverified_delivery_refusal(
+    evidence: &SupervisionEvidence,
+    step: &str,
+    kind: &str,
+) -> Option<UnverifiedDelivery> {
+    if !COMMITTED_TAIL_STEP_KINDS.contains(&kind) {
+        return None;
+    }
+    evidence.item.as_ref()?;
+    let capability = crate::mutation::required_capability(kind)?;
+    if !run_caps(evidence).iter().any(|cap| cap == capability) {
+        return None;
+    }
+    if !after_delivery_step(evidence, step) {
+        return None;
+    }
+    let run = &evidence.run;
+    let newest = evidence.newest_evidence.as_ref()?;
+    if newest.verdict != "pass"
+        || newest.workflow_hash != run.workflow_hash
+        || newest.policy_hash != run.policy_hash
+        || !crate::formats::is_hex40(&newest.feature_head)
+    {
+        return None;
+    }
+    let view = crate::mutation::EvidenceView {
+        evidence_id: newest.evidence_id.clone(),
+        feature_head: newest.feature_head.clone(),
+        integration_base: newest.integration_base.clone(),
+        workflow_hash: newest.workflow_hash.clone(),
+        policy_hash: newest.policy_hash.clone(),
+        verdict: newest.verdict.clone(),
+        reviewer: newest.reviewer.clone(),
+        checks: newest.checks.clone(),
+        created_at: newest.created_at.clone(),
+    };
+    let non_passing = crate::mutation::non_passing_checks(&view).ok()?;
+    if non_passing.is_empty() {
+        return None;
+    }
+    Some(UnverifiedDelivery {
+        step: step.to_string(),
+        code: crate::mutation::code::EVIDENCE_FAILED.to_string(),
+        reason: crate::mutation::evidence_failed_message(&newest.evidence_id, &non_passing),
+    })
+}
+
+/// ONE derived refusal of a frontier the driver may not dispatch (issue #230):
+/// the engine's own code and message, exactly as the recorded facts imply
+/// them. Read-time only — nothing about it is written down.
+struct UnverifiedDelivery {
+    /// The frontier step the refusal is about.
+    step: String,
+    /// The engine's own typed refusal code.
+    code: String,
+    /// The engine's own refusal message.
+    reason: String,
+}
+
+/// The `evaluation.refusal` block of one status read (issue #230): the engine's
+/// own refusal of this frontier's continuation, or `null` when the read-time
+/// classification is not itself a refusal. Two sources share the ONE shape —
+/// the durable record of a refused dispatch (issue #141), and the refusal
+/// DERIVED from the recorded facts for the shape nothing ever dispatched.
+/// Paired with the read-time class, so a superseded refusal is never presented
+/// as current.
+fn refusal_doc(
+    evidence: &SupervisionEvidence,
+    verdict: &Verdict,
+    next_step: &str,
+    next_kind: &str,
+) -> Val {
+    if verdict.reason == codes::DISPATCH_REFUSED {
+        return match &evidence.dispatch_refusal {
+            Some(refusal) => object(vec![
+                ("step", string(&refusal.step)),
+                ("code", string(&refusal.code)),
+                ("reason", string(&refusal.reason)),
+                ("at", string(&refusal.at)),
+            ]),
+            None => null(),
+        };
+    }
+    if verdict.reason == codes::DELIVERY_UNVERIFIED {
+        return match unverified_delivery_refusal(evidence, next_step, next_kind) {
+            // No instant: this refusal is read-time, derived from the recorded
+            // facts the gate reads, and nothing about it was written down.
+            Some(refusal) => object(vec![
+                ("step", string(&refusal.step)),
+                ("code", string(&refusal.code)),
+                ("reason", string(&refusal.reason)),
+                ("at", null()),
+            ]),
+            None => null(),
+        };
+    }
+    null()
+}
+
 /// The next step's latest recorded outcome, or `None` when the step has
 /// never been attempted.
 fn latest_attempt_for<'a>(
@@ -1075,6 +1205,28 @@ pub fn classify(
         return Verdict::new(
             "needs-attention",
             codes::DISPATCH_REFUSED,
+            false,
+            &refusal.code,
+        );
+    }
+    // Issue #230: the frontier is the run's own verified-delivery consumer and
+    // the driver may not dispatch it because the run's newest recorded review
+    // evidence carries a non-passing check. NOTHING is attempted in this shape
+    // — the evidence gate refuses the tail before any dispatch exists — so no
+    // dispatch refusal is ever recorded, and the run would otherwise fall
+    // through to the progress-timeout branch and be reported as an eligible
+    // continuation that never lands: the measured deadlock, where supervision
+    // said `continuation-eligible` while `daemon.log` held zero dispatch
+    // events for the frontier. The engine's own refusal is named instead, with
+    // the code and the reason DERIVED from the same recorded facts the gate
+    // reads. This is a report, never a relaxation: `driver_dispatchable_kind`
+    // is untouched, so the tail is still never driven behind an unverified
+    // delivery, and a recomputation that comes back failing derives exactly
+    // the same refusal.
+    if let Some(refusal) = unverified_delivery_refusal(evidence, &next_step, &next_kind) {
+        return Verdict::new(
+            "needs-attention",
+            codes::DELIVERY_UNVERIFIED,
             false,
             &refusal.code,
         );
@@ -1446,7 +1598,11 @@ pub fn status_doc(
                     ]),
                 ),
                 // Issue #230: the ENGINE's own refusal of this frontier's
-                // continuation, named with BOTH its code and its reason. The
+                // continuation, named with BOTH its code and its reason. Two
+                // sources, ONE shape: the durable record left by a refused
+                // dispatch (issue #141), and — for the shape where the
+                // evidence gate refuses the tail BEFORE any dispatch exists —
+                // the refusal DERIVED from the same recorded facts. The
                 // classification already refuses to report such a frontier
                 // eligible; without this block the operator still saw only a
                 // class, never the engine's own words for why nothing landed.
@@ -1454,15 +1610,7 @@ pub fn status_doc(
                 // superseded refusal is never presented as current.
                 (
                     "refusal",
-                    match &evidence.dispatch_refusal {
-                        Some(refusal) if verdict.reason == codes::DISPATCH_REFUSED => object(vec![
-                            ("step", string(&refusal.step)),
-                            ("code", string(&refusal.code)),
-                            ("reason", string(&refusal.reason)),
-                            ("at", string(&refusal.at)),
-                        ]),
-                        _ => null(),
-                    },
+                    refusal_doc(evidence, verdict, &next_step, &next_kind),
                 ),
                 (
                     "continuation",
@@ -2954,6 +3102,169 @@ mod tests {
                 .is_some_and(Val::is_null),
             "a superseded refusal is not presented as current"
         );
+    }
+
+    /// Issue #230, the deadlock half. The run's frontier is its OWN
+    /// verified-delivery consumer (a committed `merge` tail step) and the
+    /// driver may not dispatch it because the newest recorded review evidence
+    /// carries a non-passing check. NOTHING is attempted in that shape — the
+    /// evidence gate refuses the tail before any dispatch exists — so no
+    /// dispatch refusal is ever recorded, and before this the run fell through
+    /// to the progress-timeout branch and was reported `continuation-eligible`
+    /// while nothing could ever land. The read names the engine's own refusal
+    /// instead, with the code and the reason DERIVED from the same recorded
+    /// facts the gate reads.
+    #[test]
+    fn an_unverified_delivery_tail_is_named_and_never_reported_eligible() {
+        let policy = Policy {
+            check_interval_secs: 10,
+            progress_timeout_secs: 60,
+        };
+        let digest = "d".repeat(64);
+        let at = "2026-09-15T11:52:12Z";
+        let now_unix = time::unix_from_rfc3339("2026-09-15T11:53:12Z").expect("instant");
+        let steps = [
+            ("p1", "checkout"),
+            ("p2", "prompt"),
+            ("p6", "review_evidence"),
+            ("p7", "merge"),
+        ];
+        let evidence_id = "ev_f791aff0247293eb";
+        let passed = r#"[{"name":"hosted_ci_at_exact_head","status":"passed"}]"#;
+        let one_failed = r#"[{"name":"hosted_ci_at_exact_head","status":"passed"},{"name":"local_full_suite_raw_101","status":"failed"}]"#;
+        // The recorded shape of the measured deadlock: every step up to the
+        // review SUCCEEDED (so the frontier IS the tail), and the newest
+        // evidence is a `pass` bound to the run's own pins at one exact head.
+        let deliver = |checks: &str, caps: &str| -> SupervisionEvidence {
+            let mut run = run_row("run-0123456789abcdef");
+            run.caps = caps.to_string();
+            let mut evidence = evidence_for(
+                run,
+                Some(&digest),
+                &steps,
+                &[
+                    ("p1", "succeeded", ""),
+                    ("p2", "succeeded", ""),
+                    ("p6", "succeeded", ""),
+                ],
+                at,
+            );
+            evidence.item = Some(crate::state::QueueItemRef {
+                submission_id: "qs_0123456789abcdef".to_string(),
+                ordinal: 1,
+                work_item: "#7".to_string(),
+                issue_number: 7,
+                status: "admitted".to_string(),
+            });
+            evidence.newest_evidence = Some(crate::state::EvidenceRow {
+                evidence_id: evidence_id.to_string(),
+                instance_id: "run-0123456789abcdef".to_string(),
+                repository: "example-org/widgets".to_string(),
+                feature_head: "e".repeat(40),
+                integration_base: "b".repeat(40),
+                workflow_hash: "a".repeat(64),
+                policy_hash: "b".repeat(64),
+                verdict: "pass".to_string(),
+                reviewer: "lane-reviewer".to_string(),
+                checks: checks.to_string(),
+                created_at: at.to_string(),
+            });
+            evidence
+        };
+        let row = supervision_row_for("run-0123456789abcdef", at);
+
+        // (1) The non-passing check: the refusal is NAMED, never eligible.
+        let unverified = deliver(one_failed, "[\"read\",\"merge\"]");
+        let verdict = classify(&unverified, &digest, &policy, now_unix);
+        assert_eq!(verdict.class, "needs-attention");
+        assert_eq!(verdict.reason, codes::DELIVERY_UNVERIFIED);
+        assert_eq!(verdict.detail, crate::mutation::code::EVIDENCE_FAILED);
+        assert!(
+            !verdict.eligible,
+            "a tail whose delivery is unverified is never an eligible continuation"
+        );
+        let doc = status_doc(&row, &unverified, None, &verdict, now_unix);
+        let refusal = doc
+            .get("evaluation")
+            .and_then(|evaluation| evaluation.get("refusal"))
+            .cloned()
+            .unwrap_or_else(null);
+        assert_eq!(
+            refusal.get("step").and_then(Val::as_str),
+            Some("p7"),
+            "the refusal names the frontier it is about"
+        );
+        assert_eq!(
+            refusal.get("code").and_then(Val::as_str),
+            Some(crate::mutation::code::EVIDENCE_FAILED),
+            "the status names the engine's own code"
+        );
+        assert_eq!(
+            refusal.get("reason").and_then(Val::as_str),
+            Some(
+                "review evidence ev_f791aff0247293eb has failed/pending checks: \
+                 local_full_suite_raw_101=failed"
+            ),
+            "the status names the engine's own reason"
+        );
+        let human = render_human(&doc);
+        assert!(
+            human.contains(
+                "refused continuation p7 (refusal.evidence.failed): review evidence \
+                 ev_f791aff0247293eb has failed/pending checks: local_full_suite_raw_101=failed"
+            ),
+            "the human read names the code and the reason: {human}"
+        );
+
+        // (2) The positive control: the SAME recorded shape with every check
+        //     `passed` IS a verified delivery, so the tail is dispatchable and
+        //     the run is reported an eligible continuation. The derivation is
+        //     keyed on the checks and on nothing else.
+        let verified = deliver(passed, "[\"read\",\"merge\"]");
+        let verdict = classify(&verified, &digest, &policy, now_unix);
+        assert_eq!(verdict.class, "healthy");
+        assert_eq!(verdict.reason, codes::DISPATCH);
+        assert!(verdict.eligible, "a verified delivery IS dispatchable");
+        let doc = status_doc(&row, &verified, None, &verdict, now_unix);
+        assert!(
+            doc.get("evaluation")
+                .and_then(|evaluation| evaluation.get("refusal"))
+                .is_some_and(Val::is_null),
+            "an eligible frontier carries no refusal block"
+        );
+
+        // (2b) ...and the driver's OWN intent for the tail exists exactly then:
+        //      the piece the deadlock was missing. With the recomputed passing
+        //      record the driver dispatches the publish step; with the
+        //      non-passing one it produces NO intent at all — which is why the
+        //      status has to name the refusal, instead of calling the frontier
+        //      an eligible continuation that never lands.
+        let intent = dispatch_intent(&row, &verified).expect("the verified tail is dispatched");
+        assert_eq!(intent.step_id, "p7");
+        assert_eq!(intent.kind, "merge");
+        assert!(
+            dispatch_intent(&row, &unverified).is_none(),
+            "an unverified delivery is never driven"
+        );
+
+        // (3) The derivation is the GATE's own: a run whose committed caps do
+        //     not authorize the tail kind (or whose frontier is not the tail at
+        //     all) is never given this refusal — the same non-passing check
+        //     would refuse a `merge` the run was never granted.
+        let uncapped = deliver(one_failed, "[\"read\"]");
+        let verdict = classify(&uncapped, &digest, &policy, now_unix);
+        assert_ne!(verdict.reason, codes::DELIVERY_UNVERIFIED);
+
+        // (4) AC2 in read-time form: a recomputation that comes back FAILING
+        //     derives the IDENTICAL refusal — nothing was upgraded or waived.
+        let recomputed = deliver(
+            r#"[{"name":"local_full_suite_raw_101","status":"failed"}]"#,
+            "[\"read\",\"merge\"]",
+        );
+        let verdict = classify(&recomputed, &digest, &policy, now_unix);
+        assert_eq!(verdict.reason, codes::DELIVERY_UNVERIFIED);
+        assert_eq!(verdict.detail, crate::mutation::code::EVIDENCE_FAILED);
+        assert!(!verdict.eligible);
     }
 
     /// The durable supervision row of one run, as the status read builds it.

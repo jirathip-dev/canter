@@ -773,8 +773,11 @@ clears a repository/fleet-level hold or bypasses a gate.
   admission refusal such as `refusal.admission.proof_stale`, a derived
   request the pre-screen rejects), the refusal leaves no attempt row, no pane
   and no intent of its own. It is therefore journaled against the run as
-  `supervision.dispatch_refused` with the engine's own code (the target is
-  `<run>:<step>:<code>`), and the classification reports it — class
+  `supervision.dispatch_refused` with the engine's own code and the engine's
+  own message (the target is `<run>:<step>:<code>`, with the message recorded
+  LAST as `:reason:<message>`, bounded at the recording site — issue #230; a
+  refusal recorded with an empty message keeps the bare
+  `<run>:<step>:<code>` target), and the classification reports it — class
   `needs-attention`, reason `supervision.dispatch_refused`, the engine's code
   as the detail, `eligible:false` — for as long as that refusal is the newest
   recorded evidence of the run. A frontier whose dispatch is refused is never
@@ -785,6 +788,21 @@ clears a repository/fleet-level hold or bypasses a gate.
   environment (a refreshed admission attestation) is admitted as soon as the
   apply gate accepts it, and any recorded progress supersedes the reported
   refusal.
+- **Refused continuation dispatch, never attempted (issue #230)**: the same
+  report is produced when the engine's own gate refuses the frontier *before
+  any dispatch exists* — the run's next unachieved step is its
+  verified-delivery consumer (a committed `merge` / `cleanup` tail step its
+  own caps authorize, after the reviewed-evidence step) and the run's newest
+  recorded review evidence is a `pass` bound to the run's pins at one exact
+  head whose named checks are NOT all `passed`. Nothing is attempted in that
+  shape, so no `supervision.dispatch_refused` record can exist; the
+  classification DERIVES the engine's refusal from the same recorded facts the
+  gate reads and reports class `needs-attention`, reason
+  `supervision.delivery_unverified`, the engine's own code
+  (`refusal.evidence.failed`) as the detail and the engine's own message as
+  the read's reason, `eligible:false`. The gate itself is untouched: the tail
+  is still never driven behind an unverified delivery, and a recomputation
+  that comes back failing derives the identical refusal.
 - `continuation-eligible` remains a REPORT (the classification half), and
   an idle/done agent alone is neither completion (a `done` run without
   passing review evidence stays unknown) nor permission to resume (a paused

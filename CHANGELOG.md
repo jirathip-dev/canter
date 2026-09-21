@@ -902,7 +902,12 @@ release process activates (docs/RELEASING.md), then semver applies.
   recomputed fact, never a frozen one). `refusal.evidence.failed` now names
   the non-passing checks, and a continuation the engine refuses is reported
   by supervision with the engine's own code AND reason
-  (`evaluation.refusal`).
+  (`evaluation.refusal`). A tail frontier the engine refuses *before any
+  dispatch exists* — the run's own verified-delivery consumer behind a record
+  whose checks are not all `passed` — is named too (`supervision.delivery_unverified`
+  with `refusal.evidence.failed` and the engine's own message derived from the
+  same recorded facts), instead of being reported `continuation-eligible`
+  while nothing can land.
 - Documentation polish (issue #12, PR #13): security recipe doc line fix
   and dark-preview renderer note; `docs/` claims kept in step with the
   shipped surface.

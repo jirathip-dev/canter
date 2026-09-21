@@ -8789,10 +8789,11 @@ impl State {
     }
 }
 
-/// Parse one recorded dispatch-refusal target (`<run>:<step>:<code>`) into
-/// its typed record. A target that does not belong to `instance_id` or does
-/// not carry all three parts is not readable evidence and yields `None`
-/// (never a guessed step or code).
+/// Parse one recorded dispatch-refusal target (`<run>:<step>:<code>`, with the
+/// engine's own message appended as `:reason:<message>` when one was recorded —
+/// issue #230) into its typed record. A target that does not belong to
+/// `instance_id` or does not carry all three parts is not readable evidence and
+/// yields `None` (never a guessed step, code or reason).
 pub(crate) fn dispatch_refusal_of(
     instance_id: &str,
     target: &str,

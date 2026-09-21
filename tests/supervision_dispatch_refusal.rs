@@ -1032,11 +1032,17 @@ fn a_repaired_frontier_refused_by_the_engine_is_named_and_never_reported_eligibl
     assert_eq!(picked(&doc, &["cursor", "next_step"]), "p3");
 
     // ...and the refusal the status names is on the run's own journal: the
-    // operator can audit which engine gate refused the supervisor.
+    // operator can audit which engine gate refused the supervisor, WITH the
+    // engine's own reason (issue #230). The reason is recorded LAST, after the
+    // identity `<run>:<step>:<code>`, bounded at the recording site — the
+    // engine's own message, never a re-worded one.
     let started = Instant::now();
     let mut last_progress = started;
     let mut progress = 0usize;
-    let frontier_refusal = format!("{run}:p3:refusal.admission.proof_stale");
+    let frontier_refusal = format!(
+        "{run}:p3:refusal.admission.proof_stale:reason:the host-resource proof is stale; \
+         re-measure before fan-out"
+    );
     let refusals = loop {
         let refusals = dispatch_refusals(&fixture, &run);
         if refusals
