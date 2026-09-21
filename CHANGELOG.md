@@ -970,7 +970,10 @@ release process activates (docs/RELEASING.md), then semver applies.
   the step unconvergeable by construction). A lane that records no progress for
   the window parks as the typed `effect.worker_timeout` naming the progress it
   last saw and the elapsed silence; so does a lane still producing progress at
-  the ceiling. The wait is never unbounded (issue #170 N8).
+  the ceiling. The window is decided on what each SAMPLE recorded, so a
+  read-back that carries progress at the window's boundary is never parked
+  past, while every read gets a real budget (what the window has left, floored
+  at one second). The wait is never unbounded (issue #170 N8).
 - The wait polls at a bounded documented cadence (`COLLECT_STOP_INTERVAL_SECS`,
   5 s — two subprocess rows per sample, 12 samples/minute instead of the
   pre-change ~100 ms loop; issue #170 N3); the in-memory collection reservation

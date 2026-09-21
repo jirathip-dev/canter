@@ -3722,6 +3722,119 @@ fn poll_pane_worker(
     let mut last_progress = "no read-back yet".to_string();
     loop {
         let now = elapsed();
+        // Issue #170 (N8): the ceiling is the hard bound on ONE collection
+        // wait and is not a progress judgment, so it is decided before any
+        // further read-back is attempted.
+        if now >= ceiling {
+            return Err(collection_park(
+                format!(
+                    "pane worker was still producing progress at the {ceiling_secs}s overall \
+                     collection ceiling (waited {}s)",
+                    now.as_secs()
+                ),
+                window_secs,
+                ceiling_secs,
+                now,
+                now.saturating_sub(last_progress_at),
+                &last_progress,
+            ));
+        }
+        // Issue #170 (N8): the read-back is evidence for the no-progress
+        // window, so it may never outlive it: the row's own budget is what the
+        // window has left, floored at one second so a read is always given a
+        // real chance, and capped by what the overall ceiling has left.
+        let budget = window
+            .saturating_sub(now.saturating_sub(last_progress_at))
+            .max(Duration::from_secs(1))
+            .min(ceiling.saturating_sub(now));
+        let sample = match observe(budget) {
+            Ok(sample) => Some(sample),
+            Err(err) if err.code == crate::adapters::CODE_TIMEOUT => {
+                // A read-back that timed out carries no evidence at all: the
+                // stop run breaks, and the wait decides on its bounds below and
+                // re-reads at its own cadence.
+                stop_run = None;
+                None
+            }
+            Err(err) => {
+                return Err(EffectOutcome {
+                    status: err.status(),
+                    code: Some(err.code.to_string()),
+                    message: Some(format!("{}: {}", err.message, err.detail)),
+                    result: null(),
+                });
+            }
+        };
+        if let Some(sample) = &sample {
+            let outcome = collect();
+            // Issue #170 (N8): the recorded progress this sample carries, in
+            // priority order — a lane that reports it is working is working, a
+            // read-back that moved is a lane that moved, and a delivery head
+            // that moved is committed work.
+            let delivery = certified_delivery(&outcome);
+            let mut progress: Option<String> = None;
+            if sample.lane_state == PANE_WORKING_STATE {
+                progress = Some(format!("the lane reports {:?}", sample.lane_state));
+            }
+            if let Some(previous) = &previous {
+                if previous.lane_state != sample.lane_state {
+                    progress = Some(format!(
+                        "the lane read-back moved {:?} -> {:?}",
+                        previous.lane_state, sample.lane_state
+                    ));
+                } else if previous.seq != sample.seq {
+                    progress = Some(format!(
+                        "the lane's own state counter advanced {:?} -> {:?}",
+                        previous.seq, sample.seq
+                    ));
+                }
+            }
+            if let (Some(before), Some(after)) = (&previous_delivery, &delivery)
+                && before != after
+            {
+                progress = Some(format!("the collected delivery moved {before} -> {after}"));
+            }
+            if let Some(evidence) = progress {
+                last_progress_at = now;
+                last_progress = evidence;
+            }
+            let counter_moved = previous
+                .as_ref()
+                .map(|previous| previous.seq != sample.seq)
+                .unwrap_or(false);
+            previous = Some(sample.clone());
+            previous_delivery = delivery;
+            // Issue #170 (N7): a stop sample needs the lane's own row AND its
+            // independent second view (the status row) to report a non-working
+            // state — a single status field is never enough — and a lane whose
+            // own counter moved is not a settled one.
+            let stop = pane_stop_state(&sample.lane_state)
+                && status_corroborates_stop(&sample.status_state)
+                && !counter_moved;
+            if stop {
+                let (samples, since) = match stop_run {
+                    Some((samples, since)) => (samples + 1, since),
+                    None => (1, now),
+                };
+                stop_run = Some((samples, since));
+                if samples >= COLLECT_STOP_SAMPLES && now.saturating_sub(since) >= stop_run_span {
+                    return Ok(outcome);
+                }
+            } else {
+                stop_run = None;
+            }
+            if outcome.status != "succeeded"
+                && outcome.code.as_deref() != Some(code::COLLECT_EMPTY_DELTA)
+            {
+                return Ok(outcome);
+            }
+        }
+        // Issue #170 (N8): the bounds are decided on the progress RECORDED by
+        // the samples — after this sample's own evidence — so a read-back that
+        // carries progress at the window's boundary is never parked past, while
+        // a silent lane (or a substrate that cannot even answer) still fails
+        // typed: no recorded progress for the window, and never past the
+        // overall ceiling.
         if now >= ceiling {
             return Err(collection_park(
                 format!(
@@ -3750,90 +3863,6 @@ fn poll_pane_worker(
                 now.saturating_sub(last_progress_at),
                 &last_progress,
             ));
-        }
-        // Issue #170 (N8): the read-back is evidence for the no-progress
-        // window, so it may never outlive it: the row's own budget is what the
-        // window has left (and the loop's bounds cap the wait itself).
-        let budget = window.saturating_sub(now.saturating_sub(last_progress_at));
-        let sample = match observe(budget) {
-            Ok(sample) => sample,
-            Err(err) if err.code == crate::adapters::CODE_TIMEOUT => {
-                // A read-back that timed out is no evidence at all: the stop
-                // run breaks, and the wait re-reads at its own cadence.
-                stop_run = None;
-                sleep(interval.min(ceiling.saturating_sub(elapsed())));
-                continue;
-            }
-            Err(err) => {
-                return Err(EffectOutcome {
-                    status: err.status(),
-                    code: Some(err.code.to_string()),
-                    message: Some(format!("{}: {}", err.message, err.detail)),
-                    result: null(),
-                });
-            }
-        };
-        let outcome = collect();
-        // Issue #170 (N8): the recorded progress this sample carries, in
-        // priority order — a lane that reports it is working is working, a
-        // read-back that moved is a lane that moved, and a delivery head that
-        // moved is committed work.
-        let delivery = certified_delivery(&outcome);
-        let mut progress: Option<String> = None;
-        if sample.lane_state == PANE_WORKING_STATE {
-            progress = Some(format!("the lane reports {:?}", sample.lane_state));
-        }
-        if let Some(previous) = &previous {
-            if previous.lane_state != sample.lane_state {
-                progress = Some(format!(
-                    "the lane read-back moved {:?} -> {:?}",
-                    previous.lane_state, sample.lane_state
-                ));
-            } else if previous.seq != sample.seq {
-                progress = Some(format!(
-                    "the lane's own state counter advanced {:?} -> {:?}",
-                    previous.seq, sample.seq
-                ));
-            }
-        }
-        if let (Some(before), Some(after)) = (&previous_delivery, &delivery)
-            && before != after
-        {
-            progress = Some(format!("the collected delivery moved {before} -> {after}"));
-        }
-        if let Some(evidence) = progress {
-            last_progress_at = now;
-            last_progress = evidence;
-        }
-        let counter_moved = previous
-            .as_ref()
-            .map(|previous| previous.seq != sample.seq)
-            .unwrap_or(false);
-        previous = Some(sample.clone());
-        previous_delivery = delivery;
-        // Issue #170 (N7): a stop sample needs the lane's own row AND its
-        // independent second view (the status row) to report a non-working
-        // state — a single status field is never enough — and a lane whose own
-        // counter moved is not a settled one.
-        let stop = pane_stop_state(&sample.lane_state)
-            && status_corroborates_stop(&sample.status_state)
-            && !counter_moved;
-        if stop {
-            let (samples, since) = match stop_run {
-                Some((samples, since)) => (samples + 1, since),
-                None => (1, now),
-            };
-            stop_run = Some((samples, since));
-            if samples >= COLLECT_STOP_SAMPLES && now.saturating_sub(since) >= stop_run_span {
-                return Ok(outcome);
-            }
-        } else {
-            stop_run = None;
-        }
-        if outcome.status != "succeeded"
-            && outcome.code.as_deref() != Some(code::COLLECT_EMPTY_DELTA)
-        {
-            return Ok(outcome);
         }
         sleep(interval.min(ceiling.saturating_sub(elapsed())));
     }
@@ -8371,15 +8400,17 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             reads,
-            [6, 5, 4, 3, 2, 1],
-            "consult live state until the worker stops"
+            [6, 5, 4, 3, 2, 1, 1],
+            "consult live state until the worker stops; the read at the window's \
+             edge is still given a real (1s) budget before the wait parks"
         );
         assert_eq!(elapsed.get(), Duration::from_secs(6));
         assert_eq!(outcome.status, "ambiguous");
         assert_eq!(outcome.code.as_deref(), Some(code::WORKER_TIMEOUT));
 
         // A lane that never stops is still BOUNDED: the hard ceiling ends the
-        // wait, and the last read-back budget is what the window has left.
+        // wait, and each read-back budget is what the window has left, floored
+        // at one second and never more than the ceiling has left.
         reads.clear();
         elapsed.set(Duration::ZERO);
         let outcome = poll_pane_worker(
@@ -8396,7 +8427,7 @@ mod tests {
             |wait| elapsed.set(elapsed.get() + wait),
         )
         .unwrap_err();
-        assert_eq!(reads, [5, 3]);
+        assert_eq!(reads, [3, 1]);
         assert_eq!(elapsed.get(), Duration::from_secs(3), "last wait is capped");
         assert_eq!(outcome.status, "ambiguous");
         assert_eq!(outcome.code.as_deref(), Some(code::WORKER_TIMEOUT));

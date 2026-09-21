@@ -745,8 +745,11 @@ clears a repository/fleet-level hold or bypasses a gate.
   collected moved (a new certified head) — up to the hard overall ceiling
   `mutation::COLLECT_CEILING_SECS` (6 h ≈ 4× the measured real turn, which ran
   ≈93 minutes against the old 1800 s wall: the step was unconvergeable by
-  construction). A lane that records NO progress for the whole window parks as
-  `effect.worker_timeout`, ambiguous, `worker-timeout` /
+  construction). The window is decided on the progress each SAMPLE recorded —
+  a read-back that carries progress at the window's boundary is never parked
+  past, while the read itself is always given a real budget (what the window
+  has left, floored at one second). A lane that records NO progress for the
+  whole window parks as `effect.worker_timeout`, ambiguous, `worker-timeout` /
   `supervision.worker_timeout`, ineligible, and so does a lane still producing
   progress at the ceiling; the message names the progress last observed and
   the elapsed silence. The wait is never unbounded. Neither a waiting claim nor

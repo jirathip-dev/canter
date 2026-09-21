@@ -3240,7 +3240,7 @@ case "$1 $2" in
         fi
       fi
       # Issue #170 N8: the `extend` mode withholds the delivery for longer than
-      # the step's declared no-progress window (20 s) while the lane keeps
+      # the step's declared no-progress window (12 s) while the lane keeps
       # reporting it is working. The wait must EXTEND on recorded progress and
       # certify the delivery afterwards, never park on the wall clock.
       if [ "$mode" = extend ]; then
@@ -3250,7 +3250,7 @@ case "$1 $2" in
           printf '%s' "$started" > "$STATE/extend_started"
         fi
         elapsed=$(( $(date +%s) - started ))
-        if [ "$elapsed" -ge 30 ]; then
+        if [ "$elapsed" -ge 15 ]; then
           checkout=$(read_state cwd '')
           if [ ! -f "$checkout/delivery.txt" ]; then
             printf 'worker delivery\n' > "$checkout/delivery.txt"
@@ -3262,6 +3262,14 @@ case "$1 $2" in
             printf done > "$STATE/state"
           fi
         fi
+      fi
+      # Issue #170 N8: the `timeout` mode's read-backs carry NO progress at all
+      # (a lane whose own state cannot be read): the wait must park on its
+      # no-progress window with a typed timeout instead of running forever — a
+      # lane that keeps REPORTING it is working is never parked on the window
+      # (that is the `extend` mode, end to end).
+      if [ "$mode" = timeout ]; then
+        printf unknown > "$STATE/state"
       fi
       log "worker-poll $(read_state state idle)"
       if [ -f "$HOME/allow-stop" ] && [ "$(read_state state idle)" = working ]; then
@@ -3416,12 +3424,13 @@ fn supervised_collection(mode: &str) {
                     "deadline_secs",
                     // Issue #170 N8: `deadline_secs` is the wait's NO-PROGRESS
                     // window. `timeout` declares a 1 s window (the lane parks);
-                    // `extend` declares a 20 s window while the fixture keeps
-                    // the worker demonstrably working past it, so the wait must
-                    // EXTEND instead of parking on a wall clock.
+                    // `extend` declares a 12 s window while the fixture keeps
+                    // the worker demonstrably working past it and delivers
+                    // later still, so the wait must EXTEND on recorded progress
+                    // instead of parking on a wall clock.
                     integer(match mode {
                         "timeout" => 1,
-                        "extend" => 20,
+                        "extend" => 12,
                         _ => 30,
                     }),
                 ),
@@ -3533,13 +3542,12 @@ fn supervised_collection(mode: &str) {
                 std::fs::write(fixture.dir.join("flap-now"), "flap").unwrap();
                 flap_armed = true;
             }
-            let first = *waiting_checks.get_or_insert(checks_of(&doc));
-            let reads = std::fs::read_to_string(fixture.dir.join("herdr-argv.txt")).unwrap();
-            if mode != "timeout"
-                && checks_of(&doc) > first
-                && reads.matches("worker-poll working").count() >= 3
-                && !fixture.dir.join("flap-now").exists()
-            {
+            waiting_checks.get_or_insert(checks_of(&doc));
+            // Issue #170: the stop is marked as soon as the collection step
+            // holds its live claim — the wait is what the witnesses prove, and
+            // the collector's own 5 s sample cadence is the clock this suite
+            // must fit inside (the CI driver allows it 150 s per suite).
+            if mode != "timeout" && !fixture.dir.join("flap-now").exists() {
                 std::fs::write(fixture.dir.join("allow-stop"), "stop").unwrap();
             }
         }
@@ -3603,11 +3611,11 @@ fn supervised_collection(mode: &str) {
             }
             if mode == "extend" {
                 // Issue #170 N8 witness (c) end to end: the step declared a
-                // 20 s no-progress window and the fixture withheld the delivery
+                // 12 s no-progress window and the fixture withheld the delivery
                 // for longer than that while the lane kept reporting it was
                 // working — the wait EXTENDED on recorded progress and
                 // certified the delivery; a wall clock would have parked the
-                // run at 20 s.
+                // run at 12 s.
                 let delivered_after: u64 =
                     std::fs::read_to_string(fixture.dir.join("herdr-state/delivered_after_secs"))
                         .expect("the fixture records when it delivered")
@@ -3615,8 +3623,8 @@ fn supervised_collection(mode: &str) {
                         .parse()
                         .expect("the delivery time in seconds");
                 assert!(
-                    delivered_after > 20,
-                    "the delivery must land past the declared 20 s window: {delivered_after}s"
+                    delivered_after >= 12,
+                    "the delivery must land past the declared 12 s window: {delivered_after}s"
                 );
                 assert!(
                     reads.matches("worker-poll working").count() >= 4,
@@ -3745,7 +3753,7 @@ fn collection_invalid_base_refuses_before_any_worker_poll() {
         ("cwd", lane.to_string_lossy().to_string()),
         ("lane", session.session_id.clone()),
         ("generation", session.identity.generation.to_string()),
-        ("state", "working".to_string()),
+        ("state", "unknown".to_string()),
     ] {
         std::fs::write(worker.join(name), value).unwrap();
     }
@@ -3782,7 +3790,10 @@ fn collection_invalid_base_refuses_before_any_worker_poll() {
     let collect = |base: Option<&str>| {
         let mut params = object(vec![
             ("worktree", string("issues-5")),
-            ("deadline_secs", integer(1)),
+            // A 3 s no-progress window: short enough to park the positive
+            // control fast, long enough that the fake live worker's own row is
+            // never racing a one-second subprocess budget under load.
+            ("deadline_secs", integer(3)),
         ]);
         if let (Some(base), Val::Obj(fields)) = (base, &mut params) {
             fields.insert("base_head".to_string(), string(base));
@@ -3845,7 +3856,8 @@ fn collection_invalid_base_refuses_before_any_worker_poll() {
         }
         if layout == "no-origin" {
             // Positive control: identical binding, valid base -> the fake live
-            // worker IS read, and the injected one-second deadline parks it.
+            // worker IS read, and the injected three-second no-progress window
+            // parks it (the lane reads back no progress at all).
             let outcome = collect(Some(&base));
             assert_eq!(outcome.code.as_deref(), Some("effect.worker_timeout"));
             assert!(
