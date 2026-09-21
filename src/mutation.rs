@@ -1131,6 +1131,15 @@ pub fn evidence_matches_live(
 /// The named checks of one evidence record that are NOT `passed`, rendered
 /// `name=status` (issue #230): the exact fact the consumer refuses on and the
 /// exact set a re-evaluation recomputes. Order is the recorded order.
+///
+/// The recorded STATUS decides, first and alone. The predicate is the base one
+/// — a check passes only when its status is exactly `passed`, so every item
+/// that is not `passed` (for any reason, including a missing status) makes the
+/// record non-passing — and `name` is PRESENTATION, never a precondition: a
+/// non-passing check whose name is absent, null or not a string is rendered
+/// with the fallback [`UNNAMED_CHECK`] instead of being dropped. Dropping it
+/// would let a nameless `failed` check PASS a gate the base refused (fix round
+/// F1, finding B1).
 pub fn non_passing_checks(evidence: &EvidenceView) -> Result<Vec<String>, MutationError> {
     let checks = Val::parse_json(&evidence.checks).map_err(|err| {
         MutationError::new(
@@ -1144,15 +1153,26 @@ pub fn non_passing_checks(evidence: &EvidenceView) -> Result<Vec<String>, Mutati
     Ok(items
         .iter()
         .filter_map(|item| {
-            let name = item.get("name").and_then(Val::as_str)?;
-            let status = item
-                .get("status")
+            // The status decision comes FIRST and depends on nothing else.
+            let status = match item.get("status") {
+                Some(Val::Str(status)) if status == "passed" => return None,
+                Some(Val::Str(status)) => status.as_str(),
+                _ => "unknown",
+            };
+            let name = item
+                .get("name")
                 .and_then(Val::as_str)
-                .unwrap_or("unknown");
-            (status != "passed").then(|| format!("{name}={status}"))
+                .filter(|name| !name.is_empty())
+                .unwrap_or(UNNAMED_CHECK);
+            Some(format!("{name}={status}"))
         })
         .collect())
 }
+
+/// The rendering fallback for a non-passing check that carries no usable name
+/// (fix round F1, finding B1): presentation only — it never changes whether a
+/// check is non-passing.
+pub const UNNAMED_CHECK: &str = "unnamed";
 
 /// Whether every named check in the evidence record passed. One derivation
 /// with [`non_passing_checks`]: a record whose failing set is empty passed.
@@ -8896,6 +8916,86 @@ mod tests {
             .expect_err("still failing")
             .code,
             code::EVIDENCE_FAILED
+        );
+    }
+
+    /// B1 (fix round F1): the evidence predicate must decide on the recorded
+    /// STATUS alone. The base predicate was a total `all(status == "passed")`,
+    /// so EVERY item that was not exactly `passed` made the record
+    /// non-passing; a `?` on the presentation field `name` silently DROPS such
+    /// an item and lets a nameless `failed` check PASS the publish gate the
+    /// base refused. The matrix is the reviewer's probe verbatim, adjudicated
+    /// in ONE aggregate assert so a regression names every leg it flipped.
+    #[test]
+    fn a_nameless_failed_check_never_passes_the_evidence_gate() {
+        let view_of = |checks: &str| EvidenceView {
+            evidence_id: "ev_0123456789abcdef".to_string(),
+            feature_head: "a".repeat(40),
+            integration_base: "b".repeat(40),
+            workflow_hash: "0".repeat(64),
+            policy_hash: "f".repeat(64),
+            verdict: "pass".to_string(),
+            reviewer: "reviewer-1".to_string(),
+            checks: checks.to_string(),
+            created_at: "2026-09-06T00:00:00Z".to_string(),
+        };
+        let matrix = [
+            ("named_failed", r#"[{"name":"local","status":"failed"}]"#),
+            ("NO_NAME_failed", r#"[{"status":"failed"}]"#),
+            ("NONSTRING_NAME_failed", r#"[{"name":7,"status":"failed"}]"#),
+            ("NULL_NAME_failed", r#"[{"name":null,"status":"failed"}]"#),
+            (
+                "mixed_passed_plus_nameless_failed",
+                r#"[{"name":"hosted-ci","status":"passed"},{"status":"failed"}]"#,
+            ),
+            ("named_no_status", r#"[{"name":"local"}]"#),
+        ];
+        let mut flipped = Vec::new();
+        for (label, checks) in matrix {
+            let view = view_of(checks);
+            let passed = evidence_checks_passed(&view).expect("predicate");
+            let gate = check_merge_evidence(
+                Some(&view),
+                &"a".repeat(40),
+                &"b".repeat(40),
+                &"0".repeat(64),
+                &"f".repeat(64),
+            )
+            .err()
+            .map(|err| err.code);
+            if passed || gate != Some(code::EVIDENCE_FAILED) {
+                flipped.push(format!(
+                    "{label}: evidence_checks_passed={passed:?} merge_gate={gate:?}"
+                ));
+            }
+        }
+        assert!(
+            flipped.is_empty(),
+            "a non-passing check whose name is absent, null or not a string must still \
+             refuse — the base predicate refused it: {flipped:?}"
+        );
+        // The rendering half: a nameless non-passing check is still NAMED (a
+        // fallback), so the refusal stays actionable for an operator.
+        assert_eq!(
+            non_passing_checks(&view_of(r#"[{"status":"failed"}]"#)).expect("failing set"),
+            vec!["unnamed=failed".to_string()],
+            "a nameless non-passing check is rendered with a fallback name"
+        );
+        // ...and the fallback is presentation only: a record whose checks are
+        // ALL `passed` still passes, with or without names (no relaxation in
+        // the other direction).
+        assert!(
+            check_merge_evidence(
+                Some(&view_of(
+                    r#"[{"name":"hosted-ci","status":"passed"},{"status":"passed"}]"#
+                )),
+                &"a".repeat(40),
+                &"b".repeat(40),
+                &"0".repeat(64),
+                &"f".repeat(64),
+            )
+            .is_ok(),
+            "an all-`passed` record still passes, nameless or not"
         );
     }
 

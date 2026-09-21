@@ -2700,11 +2700,20 @@ fn a_recorded_check_failure_is_re_evaluated_by_its_producer_never_adjudicated() 
 
     // 3. The recorded deadlock IS re-evaluable: the control passes its own
     //    gates, records the operator's act, and re-dispatches the producer.
-    //    The re-dispatch then meets the run's OWN remaining gates (here the
-    //    fan-out admission proof a synthetic fixture must never fabricate),
-    //    whose typed refusal is carried verbatim — never a control-level one.
+    //    The re-dispatch then meets the run's OWN remaining gates, whose typed
+    //    refusal is carried verbatim — never a control-level one.
+    //
+    //    This fixture cannot go further, and the assertion NAMES where it
+    //    stops: the re-dispatched review step is a fan-out step, so the run's
+    //    own admission gate refuses for want of a fresh host-resource proof,
+    //    and a synthetic fixture must never fabricate that measurement. The
+    //    observed code is therefore EXACTLY `refusal.admission.proof_missing`
+    //    (fix round F1, finding B3: ruling out the control's own codes is not
+    //    AC1 evidence). The publish-step half is witnessed over the run's own
+    //    durable rows by
+    //    `a_recomputed_record_carries_the_run_to_its_publish_step`.
     let reason = "the local aggregate hit the transient scratch-repo failure filed as #226";
-    let (code, _) = rpc_err(
+    let (code, message) = rpc_err(
         &fixture.socket,
         &fresh_id(13),
         "run.reevaluate",
@@ -2716,10 +2725,10 @@ fn a_recorded_check_failure_is_re_evaluated_by_its_producer_never_adjudicated() 
             reason,
         )),
     );
-    assert!(
-        !code.starts_with("refusal.run.reevaluation"),
-        "the control authorized the re-evaluation (the refusal is the run's own later gate): \
-         {code}"
+    assert_eq!(
+        code, "refusal.admission.proof_missing",
+        "the control authorized the re-evaluation and the re-dispatch stopped at the run's OWN \
+         fan-out admission gate, never at a control-level code: {message}"
     );
 
     // The durable records the control left: the attributed journal record
@@ -2762,4 +2771,185 @@ fn a_recorded_check_failure_is_re_evaluated_by_its_producer_never_adjudicated() 
     );
 
     shutdown(daemon);
+}
+
+/// B3 (fix round F1): AC1's LINK, witnessed over the run's OWN durable rows
+/// rather than a hand-built `EvidenceView`. A run whose newest recorded
+/// evidence carries a non-passing check is REFUSED and NAMED — never reported
+/// an eligible continuation, and never dispatched — and once the cause is gone
+/// (a RECOMPUTED record at the SAME certified head, written by the production
+/// writer) the run's frontier IS its publish step and the driver's own
+/// producer yields the dispatch intent for it.
+///
+/// What this does NOT prove, and the round report states plainly: the publish
+/// EFFECT itself (the unchanged #240 slice, proven by
+/// `tests/mutation_engine.rs::p7_computes_hosted_ci_at_the_certified_head_and_
+/// never_publishes_over_red`) and a live reviewer leg (human-gated).
+#[test]
+fn a_recomputed_record_carries_the_run_to_its_publish_step() {
+    let fixture = StateFixture::new("reevaluate-durable-230");
+    let state = fixture.open();
+    let head = "aa".repeat(20);
+    let base = "bb".repeat(20);
+    let steps = vec![
+        step("p1", "checkout"),
+        step("p5", "collect_outcome"),
+        review_leg_step("p6", "issues/6", 1),
+        step("p7", "merge"),
+    ];
+    // The digest the run is authorized under IS the committed submission's own
+    // bound-input digest, so the armed authorization is the real one.
+    let (_, digest) = render_bound(
+        &state,
+        &request_with_steps(vec![selected("#6", REV_A)], steps.clone()),
+    );
+    let items = submit_with_steps(&state, "qs_0000000000000301", &[(6, GRANT_6)], steps);
+    let run = items[0].instance_id.clone().expect("admitted");
+    state
+        .arm_supervision(
+            &run,
+            &canter::state::SupervisionAuthorizationPlan {
+                desired: "armed".to_string(),
+                check_interval_secs: 10,
+                progress_timeout_secs: 60,
+            },
+            &digest,
+            "merge",
+            1,
+            AT,
+        )
+        .expect("arm");
+    // The run reached its review frontier: the review step SUCCEEDED, the run's
+    // own dispatch context is recorded, and its collection certified the
+    // delivery head.
+    seed_attempt(
+        &state,
+        &run,
+        "p6",
+        &idem_key("230-durable-p6"),
+        Some("succeeded"),
+    );
+    seed_topology(&state, &run, "p1", &idem_key("230-durable-p1"));
+    seed_collection(
+        &state,
+        &run,
+        "p5",
+        &idem_key("230-durable-p5"),
+        &head,
+        &base,
+        "issue-6",
+    );
+    // The recorded deadlock, exactly as the live run recorded it: a `pass`
+    // verdict whose own check list names the transient failure.
+    let failed = state
+        .record_evidence(
+            &run,
+            REPO,
+            &head,
+            &base,
+            WORKFLOW_HASH,
+            POLICY_HASH,
+            "pass",
+            "rev-6-r1",
+            &checks(&[
+                ("hosted-ci", "passed"),
+                ("local_full_suite_raw_101", "failed"),
+            ]),
+        )
+        .expect("deadlocked evidence");
+    let row = state
+        .supervision_rows()
+        .expect("rows")
+        .into_iter()
+        .find(|row| row.instance_id == run)
+        .expect("the armed row");
+    let policy = canter::supervision::Policy {
+        check_interval_secs: row.check_interval_secs,
+        progress_timeout_secs: row.progress_timeout_secs,
+    };
+    let now_unix = canter::time::unix_now();
+
+    // (1) The deadlock is NAMED from the run's own rows — never an eligible
+    //     continuation, and never dispatched.
+    let evidence = state
+        .supervision_evidence(&run)
+        .expect("evidence read")
+        .expect("supervised run");
+    let verdict = canter::supervision::classify(&evidence, &digest, &policy, now_unix);
+    assert_eq!(verdict.class, "needs-attention");
+    assert_eq!(
+        verdict.reason,
+        canter::supervision::codes::DELIVERY_UNVERIFIED
+    );
+    assert_eq!(verdict.detail, canter::mutation::code::EVIDENCE_FAILED);
+    assert!(
+        !verdict.eligible,
+        "a run whose checks are not all passed is never eligible"
+    );
+    assert!(
+        canter::supervision::dispatch_intent(&row, &evidence).is_none(),
+        "an unverified delivery is never driven"
+    );
+
+    // (2) The cause is gone: the producer's RECOMPUTED record at the SAME
+    //     certified head, written by the production writer. A re-evaluation
+    //     ADDS a record; it never edits the frozen one.
+    //
+    //     Two records written inside the SAME wall-clock second share a
+    //     `created_at`, and the read path breaks that tie on the (random)
+    //     `evidence_id`, so the fixture waits for the next second before
+    //     writing the recomputation: the ordering this witness asserts on is
+    //     then a total order on write time. The tie itself is disclosed as a
+    //     residual uncertainty in the round report (in production the
+    //     recomputation is a reviewer leg, minutes later).
+    let wrote_at = failed.created_at.clone();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while canter::time::rfc3339_now() == wrote_at {
+        assert!(
+            Instant::now() < deadline,
+            "the fixture clock never left {wrote_at}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let recomputed = state
+        .record_evidence(
+            &run,
+            REPO,
+            &head,
+            &base,
+            WORKFLOW_HASH,
+            POLICY_HASH,
+            "pass",
+            "rev-6-r2",
+            &checks(&[
+                ("hosted-ci", "passed"),
+                ("local_full_suite_raw_101", "passed"),
+            ]),
+        )
+        .expect("recomputed evidence");
+    assert_ne!(
+        recomputed.evidence_id, failed.evidence_id,
+        "the recomputation is a NEW record, never an edit of the frozen one"
+    );
+
+    // (3) ...and the run REACHES ITS PUBLISH STEP: the frontier is the merge
+    //     step and the driver's own producer yields its dispatch intent.
+    let evidence = state
+        .supervision_evidence(&run)
+        .expect("evidence read")
+        .expect("supervised run");
+    let verdict = canter::supervision::classify(&evidence, &digest, &policy, now_unix);
+    assert_eq!(
+        verdict.class, "healthy",
+        "class={} reason={} detail={} eligible={} — the recomputed record must be the \
+         NEWEST recorded one",
+        verdict.class, verdict.reason, verdict.detail, verdict.eligible
+    );
+    assert_eq!(verdict.reason, canter::supervision::codes::DISPATCH);
+    assert!(verdict.eligible);
+    assert_eq!(verdict.detail, "p7", "the frontier IS the publish step");
+    let intent = canter::supervision::dispatch_intent(&row, &evidence)
+        .expect("the publish step is dispatched by the driver");
+    assert_eq!(intent.step_id, "p7");
+    assert_eq!(intent.kind, "merge");
 }
