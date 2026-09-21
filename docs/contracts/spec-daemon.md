@@ -488,11 +488,20 @@ clears a repository/fleet-level hold or bypasses a gate.
   (`run.reevaluate`, target
   `run:<id>:step:<step>:evidence:<ev>:operator:<operator>:reason:<reason>`,
   the reason bounded and recorded LAST) and then re-dispatches that step
-  through the SAME `run.dispatch` path every other step uses, with only the
+  through the SAME `run.dispatch` path every other step uses, with the
   DERIVED next reviewer lane round merged over the committed params
   (`lane_round = recorded successful evaluations + 1`, so the re-run binds a
   fresh reviewer identity and a fresh verdict path and can never re-read the
-  verdict of the round it supersedes). The control presents no check status,
+  verdict of the round it supersedes), plus — for a reviewer leg whose plan
+  binds a lane checkout of ANOTHER step-visible round (issue #248) — that
+  round's OWN lane checkout (`issues-<N>-rev<R>`, merged over the committed
+  `worktree`): a leg the fix round advanced holds a binding for the round the
+  plan was rendered at, and ONE lane checkout belongs to exactly one leg, so
+  the control RE-BINDS the binding it is dispatching instead of presenting a
+  binding that can only refuse. Nothing else is ever reinterpreted: a
+  genuinely foreign checkout is still refused by the effect
+  (`refusal.lane.identity`), and the bare-subprocess fallback keeps its
+  binding byte for byte. The control presents no check status,
   no verdict and no head: the producer recomputes, its fresh verdict is
   recorded exactly like the first one, and a recomputation that comes back
   FAILING refuses the consumer with the same `refusal.evidence.failed`. A

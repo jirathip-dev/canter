@@ -931,7 +931,18 @@ release process activates (docs/RELEASING.md), then semver applies.
 
 ### Fixed
 
-- Nothing yet.
+- A fix round no longer strands the re-review it hands the leg to (issue
+  #248). A recorded review FAIL advances the run's reviewer leg to a new lane
+  round, so the plan's binding — the checkout of the round the plan was
+  rendered at — names a lane the step is dispatched at no longer, and every
+  re-dispatch refused `refusal.lane.identity` and parked. The bounded
+  re-evaluation control now RE-RENDERS the binding it dispatches: `run
+  reevaluate` merges the leg's OWN lane checkout for the round it is
+  dispatching (`issues-<N>-rev<R>`) over the committed params, exactly as it
+  already merged the derived round. ONE lane checkout still belongs to exactly
+  one leg — a genuinely foreign checkout (the run's own lane, a sibling leg's,
+  another issue's) is never reinterpreted and is refused typed exactly as
+  before, and the bare-subprocess fallback keeps its byte-for-byte binding.
 
 ### Security
 
