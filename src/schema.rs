@@ -1196,8 +1196,10 @@ pub const SUPPORTED_FAMILIES: [Family; 18] = [
 /// mint path for route grants: `params.grant` carries the exact
 /// `hf-grant/v1` document, issuance stays daemon-issued — the closed set
 /// grows by exactly the one method issuance needs); `run.release` is added
-/// by issue #146 (the explicit release of a run that can never progress).
-pub const RPC_METHODS: [&str; 40] = [
+/// by issue #146 (the explicit release of a run that can never progress);
+/// `run.reevaluate` is added by issue #230 (the bounded, audited re-evaluation
+/// of a run's own recorded checks by their producer).
+pub const RPC_METHODS: [&str; 41] = [
     "capabilities",
     "doctor",
     "status",
@@ -1229,6 +1231,7 @@ pub const RPC_METHODS: [&str; 40] = [
     "run.pause",
     "run.resume",
     "run.retry",
+    "run.reevaluate",
     "run.release",
     "run.resolve",
     "run.dispatch",

@@ -112,6 +112,23 @@ fn selected(id: &str, revision: &str) -> qp::SelectedIssue {
 }
 
 fn request_with(issues: Vec<qp::SelectedIssue>) -> qp::QueueRequest {
+    request_with_steps(issues, vec![step("p1", "checkout"), step("p2", "checkout")])
+}
+
+/// The same request over the caller's OWN reviewed steps: the bound document IS
+/// the run's spine, so a witness can commit a check-producing review step and
+/// the merge frontier that consumes it.
+fn request_with_steps(
+    issues: Vec<qp::SelectedIssue>,
+    steps: Vec<qp::PlannedStep>,
+) -> qp::QueueRequest {
+    let mut request = request_with_default_steps(issues);
+    request.steps = steps;
+    request
+}
+
+/// The base request (steps replaced by [`request_with_steps`]).
+fn request_with_default_steps(issues: Vec<qp::SelectedIssue>) -> qp::QueueRequest {
     qp::QueueRequest {
         repository: REPO.to_string(),
         host: HOST.to_string(),
@@ -2276,4 +2293,663 @@ fn wire_release_refuses_a_run_with_a_step_in_flight_then_frees_it_once_settled()
     assert_ne!(readmitted[0].instance_id.as_deref(), Some(run.as_str()));
 
     shutdown(daemon);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #230: the recorded check failure is RE-EVALUATED, never adjudicated
+// ---------------------------------------------------------------------------
+
+/// One committed submission over the caller's OWN reviewed steps (the run's
+/// spine IS the committed bound-input document).
+fn submit_with_steps(
+    state: &State,
+    submission_id: &str,
+    issues: &[(i64, &str)],
+    steps: Vec<qp::PlannedStep>,
+) -> Vec<QueueSubmissionItemRow> {
+    for (number, grant_id) in issues {
+        if state.grant_by_id(grant_id).expect("grant read").is_none() {
+            state
+                .issue_grant(&grant_with_review(grant_id, *number))
+                .expect("issue grant");
+        }
+    }
+    let request = request_with_steps(
+        issues
+            .iter()
+            .map(|(number, _)| selected(&format!("#{number}"), REV_A))
+            .collect(),
+        steps,
+    );
+    let (bound, digest) = render_bound(state, &request);
+    let epoch = state.current_epoch().expect("epoch");
+    let plan = QueueSubmissionPlan {
+        submission_id: submission_id.to_string(),
+        repository: REPO.to_string(),
+        state_epoch: epoch,
+        digest: digest.clone(),
+        role_key: HARNESS.to_string(),
+        role_revision: role_revision(),
+        workflow_id: DOCTRINE_WORKFLOW_ID.to_string(),
+        workflow_hash: WORKFLOW_HASH.to_string(),
+        boundary_phase: "merge".to_string(),
+        integration_branch: "staging".to_string(),
+        completion_branch: "staging".to_string(),
+        boundary_caps: vec![
+            "read".to_string(),
+            "review".to_string(),
+            "merge".to_string(),
+        ],
+        request_line: canonical_text(&bound),
+        admission_caps: ConcurrencyCaps {
+            global: 4,
+            per_repository: 2,
+            per_harness: 2,
+        },
+        harness_lanes: Some(0),
+        items: issues
+            .iter()
+            .enumerate()
+            .map(|(ordinal, (number, grant_id))| QueueSubmissionItemPlan {
+                ordinal: ordinal as i64,
+                work_item: work_item(*number),
+                issue_number: *number,
+                issue_revision: REV_A.to_string(),
+                grant_id: Some((*grant_id).to_string()),
+                resume_digest: None,
+                verdict: SubmissionVerdict::Approved,
+            })
+            .collect(),
+        supervision: None,
+        at: AT.to_string(),
+    };
+    let (_, items) = state.submit_queue_run(&plan).expect("submission commits");
+    items
+}
+
+/// [`grant_doc`] with the `review` capability the check-producing step needs.
+fn grant_with_review(grant_id: &str, number: i64) -> Val {
+    Val::parse_json(&format!(
+        r#"{{"schema":"hf-grant/v1","grant_id":"{grant_id}","repository":"{REPO}",
+            "issue":{{"number":{number},"revision":"{REV_A}"}},
+            "workflow_hash":"{WORKFLOW_HASH}","policy_hash":"{POLICY_HASH}",
+            "phase":"merge","scope":"worktrees/issues/{number}",
+            "caps":["read","worktree","spawn","review","merge"],
+            "expires_at":"2999-01-01T00:00:00Z","state_epoch":1,
+            "created_at":"2026-09-06T00:00:00Z"}}"#
+    ))
+    .expect("grant document")
+}
+
+/// One check-producing review step that declares its reviewer LEG (the only
+/// shape that computes checks; a presented-facts step is refused by the
+/// control because there is nothing to recompute).
+fn review_leg_step(id: &str, worktree: &str, deadline: i64) -> qp::PlannedStep {
+    qp::PlannedStep {
+        id: id.to_string(),
+        kind: "review_evidence".to_string(),
+        params: Some(object(vec![
+            ("execution", string("headless")),
+            ("harness_key", string(HARNESS)),
+            ("kind", string("pi")),
+            ("reviewer_profile", binding_doc()),
+            ("worktree", string(worktree)),
+            ("deadline_secs", integer(deadline)),
+        ])),
+    }
+}
+
+/// One `checks` array as a reviewer records it.
+fn checks(items: &[(&str, &str)]) -> Val {
+    Val::Arr(
+        items
+            .iter()
+            .map(|(name, status)| object(vec![("name", string(name)), ("status", string(status))]))
+            .collect(),
+    )
+}
+
+fn reevaluation_params(key: &str, run: &str, step: &str, operator: &str, reason: &str) -> Val {
+    canter::run_control::reevaluation_params(key, run, step, operator, reason)
+}
+
+/// Seed one recorded `apply` attempt of (run, step) that carries the run's
+/// dispatch TOPOLOGY (the immutable context a real first dispatch records, and
+/// the one a re-evaluation's own dispatch re-presents).
+fn seed_topology(state: &State, run: &str, step: &str, key: &str) {
+    let integration_repo = std::env::temp_dir().join("hf-run-86-integration-repo");
+    let worktrees_root = std::env::temp_dir().join("hf-run-86-worktrees");
+    std::fs::create_dir_all(&integration_repo).expect("integration repo dir");
+    std::fs::create_dir_all(&worktrees_root).expect("worktrees dir");
+    let line = canonical_text(&object(vec![
+        ("schema", string("hf-rpc-request/v1")),
+        ("id", string(&fresh_id(31))),
+        ("method", string("apply")),
+        (
+            "params",
+            object(vec![
+                ("idempotency_key", string(key)),
+                ("instance_id", string(run)),
+                ("step", string(step)),
+                (
+                    "topology",
+                    object(vec![
+                        ("integration_branch", string("staging")),
+                        ("production_branches", Val::Arr(Vec::new())),
+                        (
+                            "integration_repo",
+                            string(&integration_repo.display().to_string()),
+                        ),
+                        (
+                            "worktrees_root",
+                            string(&worktrees_root.display().to_string()),
+                        ),
+                    ]),
+                ),
+            ]),
+        ),
+    ]));
+    let request_id = fresh_id(32);
+    state
+        .journal_intent(
+            "mutate.checkout",
+            &format!("{REPO}:{run}:{step}"),
+            key,
+            &request_id,
+            "apply",
+            None,
+            None,
+            &line,
+        )
+        .expect("claim the topology-carrying attempt");
+    let outcome_line = canonical_text(&object(vec![
+        ("schema", string("hf-outcome/v1")),
+        ("plan_id", string("hf_plan_0000000000000000")),
+        ("step_id", string(step)),
+        ("status", string("succeeded")),
+        ("idempotency_key", string(key)),
+        ("observed_at", string(AT)),
+        ("result", Val::Null),
+        ("error", Val::Null),
+    ]));
+    state
+        .resolve_claim(key, "apply", "spent", &outcome_line, Some("{}"))
+        .expect("resolve the attempt");
+}
+
+/// Seed ONE succeeded `collect_outcome` attempt whose recorded RESPONSE
+/// certifies the run's delivery head (issue #202: the certificate is read
+/// from the `response` column, never the outcome's `result`).
+fn seed_collection(
+    state: &State,
+    run: &str,
+    step: &str,
+    key: &str,
+    head: &str,
+    base: &str,
+    branch: &str,
+) {
+    let plan = object(vec![
+        ("schema", string("hf-plan/v1")),
+        ("plan_id", string("hf_plan_0000000000000000")),
+        ("workflow_id", string(DOCTRINE_WORKFLOW_ID)),
+        ("workflow_hash", string(WORKFLOW_HASH)),
+        ("state_epoch", integer(1)),
+        ("repository", string(REPO)),
+        (
+            "issue",
+            object(vec![("number", integer(6)), ("revision", string(REV_A))]),
+        ),
+        (
+            "steps",
+            Val::Arr(vec![object(vec![
+                ("id", string(step)),
+                ("kind", string("collect_outcome")),
+                (
+                    "params",
+                    object(vec![
+                        ("worktree", string("issues/6")),
+                        ("branch", string(branch)),
+                        ("requires_delta", Val::Bool(true)),
+                    ]),
+                ),
+            ])]),
+        ),
+    ]);
+    let line = canonical_text(&object(vec![
+        ("schema", string("hf-rpc-request/v1")),
+        ("id", string(&fresh_id(41))),
+        ("method", string("apply")),
+        (
+            "params",
+            object(vec![
+                ("idempotency_key", string(key)),
+                ("instance_id", string(run)),
+                ("step", string(step)),
+                ("plan", plan),
+            ]),
+        ),
+    ]));
+    let request_id = fresh_id(42);
+    state
+        .journal_intent(
+            "mutate.collect_outcome",
+            &format!("{REPO}:{run}:{step}"),
+            key,
+            &request_id,
+            "apply",
+            None,
+            None,
+            &line,
+        )
+        .expect("claim the collection attempt");
+    let outcome_line = canonical_text(&object(vec![
+        ("schema", string("hf-outcome/v1")),
+        ("plan_id", string("hf_plan_0000000000000000")),
+        ("step_id", string(step)),
+        ("status", string("succeeded")),
+        ("idempotency_key", string(key)),
+        ("observed_at", string(AT)),
+        ("result", Val::Null),
+        ("error", Val::Null),
+    ]));
+    let response = canonical_text(&object(vec![
+        ("ok", Val::Bool(true)),
+        (
+            "result",
+            object(vec![
+                ("head", string(head)),
+                ("branch", string(branch)),
+                // The collection also records the integration base it observed:
+                // the run's dispatch context reads it back for the steps that
+                // consume an exact-head/base binding.
+                ("integration_base", string(base)),
+            ]),
+        ),
+    ]));
+    state
+        .resolve_claim(key, "apply", "spent", &outcome_line, Some(&response))
+        .expect("resolve the collection attempt");
+}
+
+/// Issue #230: a check recorded non-`passed` inside the evidence of a step
+/// that SUCCEEDED is re-evaluated by that step's OWN producer — never
+/// adjudicated. The witness drives the shipped RPC over a real daemon and
+/// reads the durable records the control leaves behind: the attributed journal
+/// record and the re-dispatched attempt at a FRESH lane round. What it does
+/// NOT do is run a reviewer leg to a written verdict (the lane's disclosed
+/// gap): the recomputation's own verdict is recorded by the ordinary review
+/// path either way.
+#[test]
+fn a_recorded_check_failure_is_re_evaluated_by_its_producer_never_adjudicated() {
+    let head = "aa".repeat(20);
+    let base = "bb".repeat(20);
+    let fixture = DaemonFixture::new("reevaluate230");
+    let state = fixture.seed();
+    let items = submit_with_steps(
+        &state,
+        "qs_0000000000000230",
+        &[(5, GRANT_5), (6, GRANT_6)],
+        vec![
+            step("p1", "checkout"),
+            step("p5", "collect_outcome"),
+            review_leg_step("p6", "issues/5", 1),
+            step("p7", "merge"),
+        ],
+    );
+    assert_eq!(items.len(), 2, "two runs in membership order");
+    let clean = items[0].instance_id.clone().expect("admitted");
+    let deadlocked = items[1].instance_id.clone().expect("admitted");
+    for run in [&clean, &deadlocked] {
+        seed_attempt(
+            &state,
+            run,
+            "p6",
+            &idem_key(&format!("230-p6-{}", &run[4..12])),
+            Some("succeeded"),
+        );
+        // The run's recorded dispatch context (the topology its own first
+        // dispatch presented): the re-evaluation re-dispatches through the
+        // SAME derived path, so it presents the same immutable context.
+        seed_topology(
+            &state,
+            run,
+            "p1",
+            &idem_key(&format!("230-p1-{}", &run[4..12])),
+        );
+        // The run's own collection certified its delivery head (issue #202).
+        seed_collection(
+            &state,
+            run,
+            "p5",
+            &idem_key(&format!("230-p5-{}", &run[4..12])),
+            &head,
+            &base,
+            &format!("issue-{}", if run == &clean { 5 } else { 6 }),
+        );
+    }
+    // The clean run's newest evidence passes every check...
+    state
+        .record_evidence(
+            &clean,
+            REPO,
+            &head,
+            &base,
+            WORKFLOW_HASH,
+            POLICY_HASH,
+            "pass",
+            "rev-5-r1",
+            &checks(&[("hosted-ci", "passed")]),
+        )
+        .expect("clean evidence");
+    // ...while the deadlocked run carries the transient failure the live run
+    // hit: a `pass` verdict whose own check list names the blocker.
+    let failed = state
+        .record_evidence(
+            &deadlocked,
+            REPO,
+            &head,
+            &base,
+            WORKFLOW_HASH,
+            POLICY_HASH,
+            "pass",
+            "rev-6-r1",
+            &checks(&[
+                ("hosted-ci", "passed"),
+                ("local_cargo_test_aggregate", "failed"),
+            ]),
+        )
+        .expect("deadlocked evidence");
+    let daemon = fixture.spawn(None);
+    wait_ready(&fixture);
+
+    // 1. A step that produces no check refuses: the merge frontier is not the
+    //    producer, so nothing about it can be re-evaluated.
+    let (code, message) = rpc_err(
+        &fixture.socket,
+        &fresh_id(11),
+        "run.reevaluate",
+        Some(reevaluation_params(
+            &idem_key("230-merge-step"),
+            &deadlocked,
+            "p7",
+            "operator-a",
+            "the aggregate hit a transient harness failure",
+        )),
+    );
+    assert_eq!(code, "refusal.run.reevaluation_step");
+    assert!(
+        message.contains("review_evidence"),
+        "the refusal names the producer kind: {message}"
+    );
+
+    // 2. A record whose checks all passed has nothing to recompute.
+    let (code, _) = rpc_err(
+        &fixture.socket,
+        &fresh_id(12),
+        "run.reevaluate",
+        Some(reevaluation_params(
+            &idem_key("230-clean-record"),
+            &clean,
+            "p6",
+            "operator-a",
+            "the aggregate hit a transient harness failure",
+        )),
+    );
+    assert_eq!(code, "refusal.run.reevaluation_shape");
+
+    // 3. The recorded deadlock IS re-evaluable: the control passes its own
+    //    gates, records the operator's act, and re-dispatches the producer.
+    //    The re-dispatch then meets the run's OWN remaining gates, whose typed
+    //    refusal is carried verbatim — never a control-level one.
+    //
+    //    This fixture cannot go further, and the assertion NAMES where it
+    //    stops: the re-dispatched review step is a fan-out step, so the run's
+    //    own admission gate refuses for want of a fresh host-resource proof,
+    //    and a synthetic fixture must never fabricate that measurement. The
+    //    observed code is therefore EXACTLY `refusal.admission.proof_missing`
+    //    (fix round F1, finding B3: ruling out the control's own codes is not
+    //    AC1 evidence). The publish-step half is witnessed over the run's own
+    //    durable rows by
+    //    `a_recomputed_record_carries_the_run_to_its_publish_step`.
+    let reason = "the local aggregate hit the transient scratch-repo failure filed as #226";
+    let (code, message) = rpc_err(
+        &fixture.socket,
+        &fresh_id(13),
+        "run.reevaluate",
+        Some(reevaluation_params(
+            &idem_key("230-deadlock"),
+            &deadlocked,
+            "p6",
+            "operator-a",
+            reason,
+        )),
+    );
+    assert_eq!(
+        code, "refusal.admission.proof_missing",
+        "the control authorized the re-evaluation and the re-dispatch stopped at the run's OWN \
+         fan-out admission gate, never at a control-level code: {message}"
+    );
+
+    // The durable records the control left: the attributed journal record
+    // (AC4) naming the operator, the reason and the evidence whose checks are
+    // recomputed.
+    let state = fixture.seed();
+    let records = state
+        .run_reevaluations(&deadlocked, "p6")
+        .expect("journal read");
+    assert_eq!(records.len(), 1, "one record per authorized re-evaluation");
+    assert_eq!(records[0].operator, "operator-a");
+    assert_eq!(records[0].reason, reason);
+    assert_eq!(records[0].evidence_id, failed.evidence_id);
+    assert!(
+        !records[0].at.is_empty(),
+        "the record carries its own instant"
+    );
+    // The documented derivation the re-dispatch binds: the NEXT reviewer lane
+    // round after the evaluations already recorded successful (the fresh round
+    // is what makes a re-run a real recomputation — the superseded verdict
+    // path is never re-read).
+    assert_eq!(
+        canter::run_control::reevaluation_lane_round(1),
+        2,
+        "the first re-evaluation of a succeeded producer binds lane round 2"
+    );
+    // Nothing was adjudicated: the recorded check statuses are untouched, and
+    // the run's newest evidence still carries the non-passing check.
+    let newest = state
+        .evidence_for_instance(&deadlocked)
+        .expect("evidence read")
+        .into_iter()
+        .next()
+        .expect("the recorded evidence");
+    assert_eq!(newest.evidence_id, failed.evidence_id);
+    assert!(
+        newest.checks.contains("local_cargo_test_aggregate"),
+        "the record the control recomputes is still the recorded one: {}",
+        newest.checks
+    );
+
+    shutdown(daemon);
+}
+
+/// B3 (fix round F1): AC1's LINK, witnessed over the run's OWN durable rows
+/// rather than a hand-built `EvidenceView`. A run whose newest recorded
+/// evidence carries a non-passing check is REFUSED and NAMED — never reported
+/// an eligible continuation, and never dispatched — and once the cause is gone
+/// (a RECOMPUTED record at the SAME certified head, written by the production
+/// writer) the run's frontier IS its publish step and the driver's own
+/// producer yields the dispatch intent for it.
+///
+/// What this does NOT prove, and the round report states plainly: the publish
+/// EFFECT itself (the unchanged #240 slice, proven by
+/// `tests/mutation_engine.rs::p7_computes_hosted_ci_at_the_certified_head_and_
+/// never_publishes_over_red`) and a live reviewer leg (human-gated).
+#[test]
+fn a_recomputed_record_carries_the_run_to_its_publish_step() {
+    let fixture = StateFixture::new("reevaluate-durable-230");
+    let state = fixture.open();
+    let head = "aa".repeat(20);
+    let base = "bb".repeat(20);
+    let steps = vec![
+        step("p1", "checkout"),
+        step("p5", "collect_outcome"),
+        review_leg_step("p6", "issues/6", 1),
+        step("p7", "merge"),
+    ];
+    // The digest the run is authorized under IS the committed submission's own
+    // bound-input digest, so the armed authorization is the real one.
+    let (_, digest) = render_bound(
+        &state,
+        &request_with_steps(vec![selected("#6", REV_A)], steps.clone()),
+    );
+    let items = submit_with_steps(&state, "qs_0000000000000301", &[(6, GRANT_6)], steps);
+    let run = items[0].instance_id.clone().expect("admitted");
+    state
+        .arm_supervision(
+            &run,
+            &canter::state::SupervisionAuthorizationPlan {
+                desired: "armed".to_string(),
+                check_interval_secs: 10,
+                progress_timeout_secs: 60,
+            },
+            &digest,
+            "merge",
+            1,
+            AT,
+        )
+        .expect("arm");
+    // The run reached its review frontier: the review step SUCCEEDED, the run's
+    // own dispatch context is recorded, and its collection certified the
+    // delivery head.
+    seed_attempt(
+        &state,
+        &run,
+        "p6",
+        &idem_key("230-durable-p6"),
+        Some("succeeded"),
+    );
+    seed_topology(&state, &run, "p1", &idem_key("230-durable-p1"));
+    seed_collection(
+        &state,
+        &run,
+        "p5",
+        &idem_key("230-durable-p5"),
+        &head,
+        &base,
+        "issue-6",
+    );
+    // The recorded deadlock, exactly as the live run recorded it: a `pass`
+    // verdict whose own check list names the transient failure.
+    let failed = state
+        .record_evidence(
+            &run,
+            REPO,
+            &head,
+            &base,
+            WORKFLOW_HASH,
+            POLICY_HASH,
+            "pass",
+            "rev-6-r1",
+            &checks(&[
+                ("hosted-ci", "passed"),
+                ("local_full_suite_raw_101", "failed"),
+            ]),
+        )
+        .expect("deadlocked evidence");
+    let row = state
+        .supervision_rows()
+        .expect("rows")
+        .into_iter()
+        .find(|row| row.instance_id == run)
+        .expect("the armed row");
+    let policy = canter::supervision::Policy {
+        check_interval_secs: row.check_interval_secs,
+        progress_timeout_secs: row.progress_timeout_secs,
+    };
+    let now_unix = canter::time::unix_now();
+
+    // (1) The deadlock is NAMED from the run's own rows — never an eligible
+    //     continuation, and never dispatched.
+    let evidence = state
+        .supervision_evidence(&run)
+        .expect("evidence read")
+        .expect("supervised run");
+    let verdict = canter::supervision::classify(&evidence, &digest, &policy, now_unix);
+    assert_eq!(verdict.class, "needs-attention");
+    assert_eq!(
+        verdict.reason,
+        canter::supervision::codes::DELIVERY_UNVERIFIED
+    );
+    assert_eq!(verdict.detail, canter::mutation::code::EVIDENCE_FAILED);
+    assert!(
+        !verdict.eligible,
+        "a run whose checks are not all passed is never eligible"
+    );
+    assert!(
+        canter::supervision::dispatch_intent(&row, &evidence).is_none(),
+        "an unverified delivery is never driven"
+    );
+
+    // (2) The cause is gone: the producer's RECOMPUTED record at the SAME
+    //     certified head, written by the production writer. A re-evaluation
+    //     ADDS a record; it never edits the frozen one.
+    //
+    //     Two records written inside the SAME wall-clock second share a
+    //     `created_at`, and the read path breaks that tie on the (random)
+    //     `evidence_id`, so the fixture waits for the next second before
+    //     writing the recomputation: the ordering this witness asserts on is
+    //     then a total order on write time. The tie itself is disclosed as a
+    //     residual uncertainty in the round report (in production the
+    //     recomputation is a reviewer leg, minutes later).
+    let wrote_at = failed.created_at.clone();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while canter::time::rfc3339_now() == wrote_at {
+        assert!(
+            Instant::now() < deadline,
+            "the fixture clock never left {wrote_at}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let recomputed = state
+        .record_evidence(
+            &run,
+            REPO,
+            &head,
+            &base,
+            WORKFLOW_HASH,
+            POLICY_HASH,
+            "pass",
+            "rev-6-r2",
+            &checks(&[
+                ("hosted-ci", "passed"),
+                ("local_full_suite_raw_101", "passed"),
+            ]),
+        )
+        .expect("recomputed evidence");
+    assert_ne!(
+        recomputed.evidence_id, failed.evidence_id,
+        "the recomputation is a NEW record, never an edit of the frozen one"
+    );
+
+    // (3) ...and the run REACHES ITS PUBLISH STEP: the frontier is the merge
+    //     step and the driver's own producer yields its dispatch intent.
+    let evidence = state
+        .supervision_evidence(&run)
+        .expect("evidence read")
+        .expect("supervised run");
+    let verdict = canter::supervision::classify(&evidence, &digest, &policy, now_unix);
+    assert_eq!(
+        verdict.class, "healthy",
+        "class={} reason={} detail={} eligible={} — the recomputed record must be the \
+         NEWEST recorded one",
+        verdict.class, verdict.reason, verdict.detail, verdict.eligible
+    );
+    assert_eq!(verdict.reason, canter::supervision::codes::DISPATCH);
+    assert!(verdict.eligible);
+    assert_eq!(verdict.detail, "p7", "the frontier IS the publish step");
+    let intent = canter::supervision::dispatch_intent(&row, &evidence)
+        .expect("the publish step is dispatched by the driver");
+    assert_eq!(intent.step_id, "p7");
+    assert_eq!(intent.kind, "merge");
 }

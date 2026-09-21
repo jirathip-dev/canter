@@ -31,7 +31,8 @@ remain usable without it; SQLite owns state; no network control API).
   `lane.checkpoint.create`, `lane.checkpoint.status`, `lane.retire`,
   `lane.start`, `lane.adopt`, `lane.successor.consume`,
   `state.epoch`, `queue.submit`, `queue.status`, `run.pause`,
-  `run.resume`, `run.retry`, `run.resolve`, `run.dispatch`, `run.status`,
+  `run.resume`, `run.retry`, `run.reevaluate`, `run.resolve`, `run.dispatch`,
+  `run.status`,
   `supervision.status`,
   `backup.create`, `restore.begin`, `journal.tail`,
   `events.subscribe` (issue #77 adds no method: the target-profile plan
@@ -375,14 +376,15 @@ outcome after the effect transaction commits.
 
 ## Run-scoped control methods (issue #86 + issue #146)
 
-Safe-boundary pause, resume, bounded retry, evidence resolution, one supported step dispatch
+Safe-boundary pause, resume, bounded retry, bounded check re-evaluation, evidence resolution, one supported step dispatch
 and the explicit release of a run that can never progress over exactly ONE run — the
 `run-` instance row the queue executor commits for every admitted issue
-(spec-state.md "Run control additions"). All seven methods address one
+(spec-state.md "Run control additions"). All eight methods address one
 exact run identity, journal through the same claim machinery as every
 daemon mutation (`params.idempotency_key` required on the mutating paths;
 a same-key retry replays the recorded response) and render a module-local
 document (`hf-run-control/v1` / `hf-run-retry/v1` /
+`hf-run-reevaluation/v1` /
 `hf-run-resolution/v1` / `hf-run-dispatch/v1` / `hf-run-release/v1`,
 deliberately outside the closed `hf-*` family set like the #84 preview and
 the #85 submission).
@@ -391,7 +393,7 @@ the #85 submission).
 
 | level | identity | methods | effect of a control |
 | --- | --- | --- | --- |
-| run | one `run-` + 16 hex instance id | `run.pause` / `run.resume` / `run.retry` / `run.release` / `run.resolve` / `run.dispatch` / `run.status` | exactly this run: stop admitting new steps, lift THIS run's pause, authorize one bounded re-dispatch of one diagnosed step (authorization only), release a run that can never progress — its issue ownership and the occupancy it held are freed and it goes terminal (bookkeeping only), resolve one diagnosed prompt from recorder-attributed evidence without an effect, or dispatch ONE committed-spine step with the caller's own step inputs |
+| run | one `run-` + 16 hex instance id | `run.pause` / `run.resume` / `run.retry` / `run.reevaluate` / `run.release` / `run.resolve` / `run.dispatch` / `run.status` | exactly this run: stop admitting new steps, lift THIS run's pause, authorize one bounded re-dispatch of one diagnosed step (authorization only), re-evaluate the run's own recorded checks by re-running its check producer at the same certified head (bounded, attributed, journaled; recomputation only), release a run that can never progress — its issue ownership and the occupancy it held are freed and it goes terminal (bookkeeping only), resolve one diagnosed prompt from recorder-attributed evidence without an effect, or dispatch ONE committed-spine step with the caller's own step inputs |
 | fleet | the whole run population | NONE — there is no `fleet.*` method in the closed set | a fleet-level hold is an operator policy expressed as the set of paused runs; every resume is fenced on the exact instance id, so no run control ever lifts another run's pause or anything fleet-wide |
 | lane | one handoff lane generation (`rp_` records) | `lane.*` only | run controls never touch lane records; a non-run identity refuses `refusal.run.target` |
 
@@ -460,6 +462,42 @@ clears a repository/fleet-level hold or bypasses a gate.
   who supplies the corrected step inputs (see `run.dispatch`). A
   re-dispatch of a diagnosed failed step without an unconsumed
   authorization refuses `refusal.run.retry_required` before any effect.
+- `run.reevaluate` (issue #230) requires `params.instance_id`,
+  `params.step` (a plan step id), `params.operator` (1-128 printable
+  characters, no `:`) and `params.reason` (1-300 printable characters). It
+  exists for exactly ONE recorded deadlock: a check recorded non-`passed`
+  inside the evidence of a step that already SUCCEEDED, whose consumer
+  therefore refuses (`refusal.evidence.failed`) while the producer can never
+  be re-run (`refusal.run.step_done`). It refuses: a terminal run
+  (`refusal.run.terminal`), a paused or pause-requested run
+  (`refusal.run.paused`), a run without a committed submission spine
+  (`refusal.run.scope`), a step outside the bound spine
+  (`refusal.run.step_unknown`), a step that is not the run's own
+  `review_evidence` step or that presents STATIC review facts instead of a
+  reviewer leg (`refusal.run.reevaluation_step` — a step with no check
+  producer computes nothing, and no check status is ever presented,
+  adjudicated or waived), a step whose latest recorded attempt is not a
+  terminal success (`refusal.run.reevaluation_step`; a DIAGNOSED step is the
+  bounded-retry control's subject), a run whose newest recorded evidence
+  carries no non-passing check (`refusal.run.reevaluation_shape` — there is
+  nothing to recompute), an exhausted bound
+  (`refusal.run.reevaluation_bound`, three re-evaluations per `(run, step)`,
+  counted from the durable journal), a moved epoch (`refusal.state.epoch`)
+  and an inactive or absent grant (`refusal.grant.inactive`). On success it
+  writes ONE hash-chained audit record BEFORE dispatching anything
+  (`run.reevaluate`, target
+  `run:<id>:step:<step>:evidence:<ev>:operator:<operator>:reason:<reason>`,
+  the reason bounded and recorded LAST) and then re-dispatches that step
+  through the SAME `run.dispatch` path every other step uses, with only the
+  DERIVED next reviewer lane round merged over the committed params
+  (`lane_round = recorded successful evaluations + 1`, so the re-run binds a
+  fresh reviewer identity and a fresh verdict path and can never re-read the
+  verdict of the round it supersedes). The control presents no check status,
+  no verdict and no head: the producer recomputes, its fresh verdict is
+  recorded exactly like the first one, and a recomputation that comes back
+  FAILING refuses the consumer with the same `refusal.evidence.failed`. A
+  refused re-dispatch still leaves the attributed record (the operator's act
+  is durable) and carries the inner typed refusal VERBATIM.
 - `run.release` (issue #146) requires `params.instance_id`,
   `params.reason` (1-300 printable characters) and
   `params.idempotency_key`. It releases exactly ONE run that can never
@@ -735,8 +773,11 @@ clears a repository/fleet-level hold or bypasses a gate.
   admission refusal such as `refusal.admission.proof_stale`, a derived
   request the pre-screen rejects), the refusal leaves no attempt row, no pane
   and no intent of its own. It is therefore journaled against the run as
-  `supervision.dispatch_refused` with the engine's own code (the target is
-  `<run>:<step>:<code>`), and the classification reports it — class
+  `supervision.dispatch_refused` with the engine's own code and the engine's
+  own message (the target is `<run>:<step>:<code>`, with the message recorded
+  LAST as `:reason:<message>`, bounded at the recording site — issue #230; a
+  refusal recorded with an empty message keeps the bare
+  `<run>:<step>:<code>` target), and the classification reports it — class
   `needs-attention`, reason `supervision.dispatch_refused`, the engine's code
   as the detail, `eligible:false` — for as long as that refusal is the newest
   recorded evidence of the run. A frontier whose dispatch is refused is never
@@ -747,6 +788,21 @@ clears a repository/fleet-level hold or bypasses a gate.
   environment (a refreshed admission attestation) is admitted as soon as the
   apply gate accepts it, and any recorded progress supersedes the reported
   refusal.
+- **Refused continuation dispatch, never attempted (issue #230)**: the same
+  report is produced when the engine's own gate refuses the frontier *before
+  any dispatch exists* — the run's next unachieved step is its
+  verified-delivery consumer (a committed `merge` / `cleanup` tail step its
+  own caps authorize, after the reviewed-evidence step) and the run's newest
+  recorded review evidence is a `pass` bound to the run's pins at one exact
+  head whose named checks are NOT all `passed`. Nothing is attempted in that
+  shape, so no `supervision.dispatch_refused` record can exist; the
+  classification DERIVES the engine's refusal from the same recorded facts the
+  gate reads and reports class `needs-attention`, reason
+  `supervision.delivery_unverified`, the engine's own code
+  (`refusal.evidence.failed`) as the detail and the engine's own message as
+  the read's reason, `eligible:false`. The gate itself is untouched: the tail
+  is still never driven behind an unverified delivery, and a recomputation
+  that comes back failing derives the identical refusal.
 - `continuation-eligible` remains a REPORT (the classification half), and
   an idle/done agent alone is neither completion (a `done` run without
   passing review evidence stays unknown) nor permission to resume (a paused

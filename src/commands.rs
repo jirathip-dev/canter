@@ -71,6 +71,7 @@ USAGE:
     canter run pause --run RUN_ID --reason TEXT [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run resume --run RUN_ID --digest HEX64 [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run retry --run RUN_ID --step STEP [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
+    canter run reevaluate --run RUN_ID --step STEP --operator IDENTITY --reason TEXT [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run release --run RUN_ID --reason TEXT [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run resolve --run RUN_ID --step STEP --recorder IDENTITY --evidence FILE [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run dispatch --run RUN_ID --step STEP [--param KEY=VALUE]... [--topology FILE] [--admission FILE] [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
@@ -171,6 +172,10 @@ pub enum RunAction {
     /// Authorize ONE bounded re-dispatch of ONE diagnosed step:
     /// `run retry`.
     Retry(RunRetryArgs),
+    /// Re-evaluate ONE terminal-success check producer's own recorded checks
+    /// at the same certified head, bounded and audited: `run reevaluate`
+    /// (issue #230).
+    Reevaluate(RunReevaluateArgs),
     /// Release ONE run that can never progress, freeing its issue ownership
     /// and the occupancy it held: `run release` (issue #146).
     Release(RunReleaseArgs),
@@ -231,6 +236,25 @@ pub struct RunRetryArgs {
     pub run: String,
     /// The exact plan step id being retried.
     pub step: String,
+    /// `--idempotency-key`: replay-safe automation key.
+    pub idempotency_key: Option<String>,
+    /// Explicit daemon socket override.
+    pub socket: Option<String>,
+}
+
+/// `run reevaluate`: the exact target, the check-producing step, the operator
+/// identity and the audited reason (issue #230). Everything else — the head,
+/// the checks and the fresh lane round — is derived daemon-side.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunReevaluateArgs {
+    /// Explicit run id (`run-` + 16 hex).
+    pub run: String,
+    /// The exact plan step id whose own recorded checks are re-evaluated.
+    pub step: String,
+    /// The operator identity recorded as the authorizer (1-128 printable).
+    pub operator: String,
+    /// The audited reason (1-300 printable characters).
+    pub reason: String,
     /// `--idempotency-key`: replay-safe automation key.
     pub idempotency_key: Option<String>,
     /// Explicit daemon socket override.
@@ -1543,6 +1567,7 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
         "pause" => "run pause",
         "resume" => "run resume",
         "retry" => "run retry",
+        "reevaluate" => "run reevaluate",
         "release" => "run release",
         "resolve" => "run resolve",
         "dispatch" => "run dispatch",
@@ -1566,6 +1591,7 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
     let mut topology = None;
     let mut admission = None;
     let mut recorder: Option<String> = None;
+    let mut operator: Option<String> = None;
     let mut evidence: Option<PathBuf> = None;
     let rest = &args[1..];
     let mut index = 0;
@@ -1637,6 +1663,20 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
                     ));
                 }
                 recorder = Some(value);
+            }
+            "--operator" if action.as_str() == "reevaluate" => {
+                let value = flag_value(rest, &mut index, command, "--operator")?;
+                if value.is_empty()
+                    || value.len() > 128
+                    || value.contains(':')
+                    || value.chars().any(char::is_control)
+                {
+                    return Err(ParseError::Usage(
+                        "run reevaluate: --operator must be 1-128 printable characters without ':'"
+                            .to_string(),
+                    ));
+                }
+                operator = Some(value);
             }
             "--evidence" if action.as_str() == "resolve" => {
                 evidence = Some(PathBuf::from(flag_value(
@@ -1740,6 +1780,38 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
             RunAction::Retry(RunRetryArgs {
                 run,
                 step,
+                idempotency_key,
+                socket,
+            })
+        }
+        "reevaluate" => {
+            if digest.is_some() || !step_params.is_empty() {
+                return Err(ParseError::Usage(
+                    "run reevaluate takes --run, --step, --operator and --reason only".to_string(),
+                ));
+            }
+            let Some(step) = step else {
+                return Err(ParseError::Usage(
+                    "run reevaluate: --step STEP is required (the check-producing step)"
+                        .to_string(),
+                ));
+            };
+            let Some(operator) = operator else {
+                return Err(ParseError::Usage(
+                    "run reevaluate: --operator IDENTITY is required (the recorded authorizer)"
+                        .to_string(),
+                ));
+            };
+            let Some(reason) = reason else {
+                return Err(ParseError::Usage(
+                    "run reevaluate: --reason TEXT is required (the audited reason)".to_string(),
+                ));
+            };
+            RunAction::Reevaluate(RunReevaluateArgs {
+                run,
+                step,
+                operator,
+                reason,
                 idempotency_key,
                 socket,
             })
@@ -5271,6 +5343,7 @@ fn execute_run(action: RunAction, invocation: &Invocation) -> CmdResult {
         RunAction::Pause(args) => execute_run_pause(&args, invocation),
         RunAction::Resume(args) => execute_run_resume(&args, invocation),
         RunAction::Retry(args) => execute_run_retry(&args, invocation),
+        RunAction::Reevaluate(args) => execute_run_reevaluate(&args, invocation),
         RunAction::Release(args) => execute_run_release(&args, invocation),
         RunAction::Resolve(args) => execute_run_resolve(&args, invocation),
         RunAction::Dispatch(args) => execute_run_dispatch(&args, invocation),
@@ -5358,6 +5431,32 @@ fn execute_run_retry(args: &RunRetryArgs, invocation: &Invocation) -> CmdResult 
         }
         Err(RpcError { code, message }) => {
             lane_error(&code, format!("run retry: {message}"), false)
+        }
+    }
+}
+
+/// `run reevaluate`: re-run ONE terminal-success check producer's checks at
+/// the same certified head (issue #230), bounded, attributed and journaled.
+fn execute_run_reevaluate(args: &RunReevaluateArgs, invocation: &Invocation) -> CmdResult {
+    let paths = match run_control_paths(args.socket.as_deref(), invocation) {
+        Ok(paths) => paths,
+        Err(result) => return result,
+    };
+    let key = args.idempotency_key.clone().unwrap_or_else(fresh_run_key);
+    let params = crate::run_control::reevaluation_params(
+        &key,
+        &args.run,
+        &args.step,
+        &args.operator,
+        &args.reason,
+    );
+    match client::call(&paths.socket_path, "run.reevaluate", Some(&params)) {
+        Ok(result) => {
+            let human = crate::run_control::render_human(&result);
+            ok_result(result, human)
+        }
+        Err(RpcError { code, message }) => {
+            lane_error(&code, format!("run reevaluate: {message}"), false)
         }
     }
 }
@@ -5966,7 +6065,7 @@ state.not_found) · 5 config error.
 ";
 
 const RUN_USAGE: &str = "\
-canter run <pause|resume|retry|release|resolve|dispatch|status> — run-scoped controls for ONE run
+canter run <pause|resume|retry|reevaluate|release|resolve|dispatch|status> — run-scoped controls for ONE run
 
 USAGE:
     canter run pause --run RUN_ID --reason TEXT [--idempotency-key IK] \
@@ -5975,6 +6074,8 @@ USAGE:
 [--socket PATH] [--config PATH] [--json]
     canter run retry --run RUN_ID --step STEP [--idempotency-key IK] \
 [--socket PATH] [--config PATH] [--json]
+    canter run reevaluate --run RUN_ID --step STEP --operator IDENTITY --reason TEXT \
+[--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run release --run RUN_ID --reason TEXT [--idempotency-key IK] \
 [--socket PATH] [--config PATH] [--json]
     canter run resolve --run RUN_ID --step STEP --recorder IDENTITY \
@@ -6015,6 +6116,20 @@ exhausted (bounded attempts used) retries refuse. The authorization is the
 WHOLE effect: nothing is dispatched, spawned or consumed by this command —
 the operator's own corrected dispatch of that exact step consumes it
 exactly once (single use).
+
+reevaluate recomputes the checks a terminal-success producer already recorded
+(daemon `run.reevaluate`, issue #230): a check recorded `failed` inside the
+evidence of a step that SUCCEEDED otherwise strands its consumer forever —
+the producer can never be re-dispatched and the consumer refuses the frozen
+result. The command names that exact step (it must be the run's own check
+producer, with its own recorded success and a non-passing check in the run's
+newest evidence) plus the operator identity and the audited reason, and the
+daemon re-dispatches it at the SAME certified head on a FRESH reviewer lane
+round, so the checks are really recomputed by their producer. It is bounded
+per (run, step) from the durable journal, the record is written to the
+hash-chained audit before anything is dispatched, and no check status is ever
+presented or waived: a recomputation that comes back failing refuses the
+consumer exactly as the first one did.
 
 resolve records an explicit, recorder-attributed artifact for ONE diagnosed
 prompt (daemon `run.resolve`): a closed JSON object binds the delivered feature

@@ -889,6 +889,25 @@ release process activates (docs/RELEASING.md), then semver applies.
 
 ### Changed
 
+- A transient check failure recorded inside the evidence of a step that
+  succeeded no longer deadlocks the run (issue #230). The new
+  `run.reevaluate` control re-runs the run's OWN `review_evidence` step
+  (reviewer leg only) at the SAME certified head on a fresh derived lane
+  round, so the checks are RECOMPUTED by their producer instead of being
+  trusted forever: bounded per `(run, step)` from the durable journal,
+  attributed (operator identity + reason) in the hash-chained audit before
+  anything is dispatched, and never adjudicated — a recomputation that comes
+  back failing refuses the consumer with the same `refusal.evidence.failed`
+  (the merge gate reads the newest recorded evidence, so it consumes the
+  recomputed fact, never a frozen one). `refusal.evidence.failed` now names
+  the non-passing checks, and a continuation the engine refuses is reported
+  by supervision with the engine's own code AND reason
+  (`evaluation.refusal`). A tail frontier the engine refuses *before any
+  dispatch exists* — the run's own verified-delivery consumer behind a record
+  whose checks are not all `passed` — is named too (`supervision.delivery_unverified`
+  with `refusal.evidence.failed` and the engine's own message derived from the
+  same recorded facts), instead of being reported `continuation-eligible`
+  while nothing can land.
 - Documentation polish (issue #12, PR #13): security recipe doc line fix
   and dark-preview renderer note; `docs/` claims kept in step with the
   shipped surface.
