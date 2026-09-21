@@ -286,6 +286,17 @@ pub mod code {
     /// #219): a missing/expired credential is its own class, never a policy
     /// refusal and never an opaque git-level failure.
     pub const CREDENTIAL_MISSING: &str = "refusal.credential.missing";
+    /// The EXACT certified head carries a RED hosted check run (issue #225):
+    /// the publish path COMPUTES the hosted CI conclusion for the head the
+    /// verdict names (never a judgement, never the branch tip) and never
+    /// publishes over a red check. The message names the workflow run, the
+    /// job and the step that concluded red.
+    pub const MERGE_CI_RED: &str = "effect.merge.ci_red";
+    /// The hosted check runs of the EXACT certified head were still
+    /// queued/in_progress when the step's bounded wait expired (issue #225):
+    /// a still-running check is waited for, bounded, then refused typed —
+    /// never silently treated as green.
+    pub const MERGE_CI_PENDING: &str = "effect.merge.ci_pending";
     /// The declared pull-request publish route has nothing to publish (issue
     /// #219): no open pull request names the certified head for the
     /// integration branch. The reviewed delivery must be published as a pull
@@ -6219,6 +6230,269 @@ fn advance_checkout_to_published(
     Ok(())
 }
 
+/// Documented poll cadence (seconds) of the publish path's hosted-CI wait
+/// (issue #225): one read per cadence while any check run of the exact
+/// certified head is still queued/in_progress, bounded by the step's own
+/// effective deadline ([`effect_deadline_secs`]).
+pub const HOSTED_CI_POLL_INTERVAL_SECS: u64 = 5;
+
+/// How many workflow runs ONE hosted-CI read asks the forge for (issue #225):
+/// the read is the forge's own list of the runs carrying one exact commit.
+pub const HOSTED_CI_RUNS_LIMIT: u64 = 100;
+
+/// The conclusions of a COMPLETED hosted check run that are RED (issue #225).
+/// `success`, `skipped` and `neutral` are not red; a run that has not
+/// completed carries no conclusion yet.
+const HOSTED_CI_RED_CONCLUSIONS: [&str; 5] = [
+    "failure",
+    "cancelled",
+    "timed_out",
+    "startup_failure",
+    "action_required",
+];
+
+/// One hosted check run the forge reported for ONE exact commit (issue #225).
+#[derive(Clone, Debug)]
+struct HostedCiRun {
+    /// Forge run identity (`databaseId`).
+    id: i64,
+    /// Workflow name (`workflowName`).
+    workflow: String,
+    /// Forge status (`queued` | `in_progress` | `completed` | ...).
+    status: String,
+    /// Forge conclusion (`success` | `failure` | ...; `''` until completed).
+    conclusion: String,
+}
+
+/// The COMPUTED hosted-CI state of one exact commit (issue #225).
+enum HostedCiState {
+    /// Every check run the forge reported completed, and none is red.
+    Green,
+    /// At least one check run is still queued/in_progress (never green yet).
+    Pending(Vec<String>),
+    /// At least one completed check run concluded red.
+    Red(Vec<HostedCiRun>),
+}
+
+/// Parse one `gh run list --json databaseId,workflowName,status,conclusion`
+/// read (issue #225). Anything else is refused typed rather than guessed at.
+fn parse_hosted_ci_runs(text: &str) -> Result<Vec<HostedCiRun>, EffectOutcome> {
+    let unreadable = |detail: &str| {
+        failed(
+            code::MALFORMED_OUTPUT,
+            format!(
+                "the forge's hosted-check read is not the documented JSON (`gh run list --json databaseId,workflowName,status,conclusion`): {detail}"
+            ),
+        )
+    };
+    let doc = Val::parse_json(text).map_err(|_| unreadable(text))?;
+    let Some(items) = doc.as_array() else {
+        return Err(unreadable(text));
+    };
+    let mut runs = Vec::new();
+    for item in items {
+        let id = item.get("databaseId").and_then(Val::as_int).unwrap_or(0);
+        let workflow = item
+            .get("workflowName")
+            .and_then(Val::as_str)
+            .unwrap_or("")
+            .to_string();
+        let status = item
+            .get("status")
+            .and_then(Val::as_str)
+            .unwrap_or("")
+            .to_string();
+        let conclusion = item
+            .get("conclusion")
+            .and_then(Val::as_str)
+            .unwrap_or("")
+            .to_string();
+        if id <= 0 || workflow.is_empty() || status.is_empty() {
+            return Err(unreadable(&format!("{item:?}")));
+        }
+        runs.push(HostedCiRun {
+            id,
+            workflow,
+            status,
+            conclusion,
+        });
+    }
+    Ok(runs)
+}
+
+/// Classify one hosted-CI read (issue #225). Purely computed: a completed red
+/// run decides the state on its own, a still-running run is never green, and
+/// only a read whose every run completed and none red is green.
+fn hosted_ci_state(runs: &[HostedCiRun]) -> HostedCiState {
+    let red: Vec<HostedCiRun> = runs
+        .iter()
+        .filter(|run| {
+            run.status == "completed"
+                && HOSTED_CI_RED_CONCLUSIONS.contains(&run.conclusion.as_str())
+        })
+        .cloned()
+        .collect();
+    if !red.is_empty() {
+        return HostedCiState::Red(red);
+    }
+    let pending: Vec<String> = runs
+        .iter()
+        .filter(|run| run.status != "completed")
+        .map(|run| {
+            format!(
+                "workflow {:?} (run {}) is {}",
+                run.workflow, run.id, run.status
+            )
+        })
+        .collect();
+    if !pending.is_empty() {
+        return HostedCiState::Pending(pending);
+    }
+    HostedCiState::Green
+}
+
+/// ONE hosted-CI read of ONE exact commit (issue #225): the forge's own
+/// workflow runs carrying that commit, read-only.
+fn hosted_ci_runs(ctx: &EffectContext<'_>, head: &str) -> Result<Vec<HostedCiRun>, EffectOutcome> {
+    let args = vec![
+        "run".to_string(),
+        "list".to_string(),
+        "--repo".to_string(),
+        ctx.repository.to_string(),
+        "--commit".to_string(),
+        head.to_string(),
+        "--limit".to_string(),
+        HOSTED_CI_RUNS_LIMIT.to_string(),
+        "--json".to_string(),
+        "databaseId,workflowName,status,conclusion".to_string(),
+    ];
+    let out = run_forge(ctx, &args, code::MERGE_FAILED)?;
+    let text = crate::redact::redact(out.stdout.trim()).to_string();
+    parse_hosted_ci_runs(&text)
+}
+
+/// The failing job(s) and step(s) of one red check run (issue #225): the
+/// refusal NAMES what is red, so the durable record is readable without a
+/// second lookup. This read only ENRICHES the refusal — a forge that answers
+/// nothing here leaves the run-level naming, and never turns red into green.
+fn hosted_ci_red_detail(ctx: &EffectContext<'_>, run: &HostedCiRun) -> String {
+    let args = vec![
+        "run".to_string(),
+        "view".to_string(),
+        run.id.to_string(),
+        "--repo".to_string(),
+        ctx.repository.to_string(),
+        "--json".to_string(),
+        "jobs".to_string(),
+    ];
+    let Ok(out) = run_forge(ctx, &args, code::MERGE_FAILED) else {
+        return String::new();
+    };
+    let text = crate::redact::redact(out.stdout.trim()).to_string();
+    let Ok(doc) = Val::parse_json(&text) else {
+        return String::new();
+    };
+    let Some(jobs) = doc.get("jobs").and_then(Val::as_array) else {
+        return String::new();
+    };
+    let mut named: Vec<String> = Vec::new();
+    for job in jobs {
+        let conclusion = job.get("conclusion").and_then(Val::as_str).unwrap_or("");
+        if !HOSTED_CI_RED_CONCLUSIONS.contains(&conclusion) {
+            continue;
+        }
+        let name = job.get("name").and_then(Val::as_str).unwrap_or("");
+        let mut steps: Vec<String> = Vec::new();
+        if let Some(items) = job.get("steps").and_then(Val::as_array) {
+            for item in items {
+                let step_conclusion = item.get("conclusion").and_then(Val::as_str).unwrap_or("");
+                if !HOSTED_CI_RED_CONCLUSIONS.contains(&step_conclusion) {
+                    continue;
+                }
+                if let Some(step_name) = item.get("name").and_then(Val::as_str) {
+                    steps.push(format!("{step_name:?}"));
+                }
+            }
+        }
+        if steps.is_empty() {
+            named.push(format!("job {name:?} concluded {conclusion:?}"));
+        } else {
+            named.push(format!(
+                "job {name:?} concluded {conclusion:?} at step {}",
+                steps.join(", ")
+            ));
+        }
+    }
+    named.join("; ")
+}
+
+/// COMPUTE the hosted CI conclusion at the exact certified head (issue #225).
+///
+/// The publish path never lands a delivery on a judgement: it asks the forge
+/// itself which workflow runs carry the certified head (`gh run list --commit
+/// <certified head>` — never the branch tip), waits while any of them is
+/// still queued/in_progress (bounded by the step's own effective deadline and
+/// [`HOSTED_CI_POLL_INTERVAL_SECS`]), and refuses typed when one concluded
+/// red ([`code::MERGE_CI_RED`], naming the run, its job and its step) or when
+/// the bounded wait expired with a check still running
+/// ([`code::MERGE_CI_PENDING`]). An unreadable read is its own typed refusal,
+/// so no check is ever silently treated as green; a commit the forge reports
+/// no workflow runs for has no hosted check to conclude on.
+fn hosted_ci_gate(ctx: &EffectContext<'_>, head: &str) -> Result<(), EffectOutcome> {
+    if !is_hex40(head) {
+        // No exact head to compute for: the daemon's own merge gate refuses a
+        // merge that names no observed certified head before this effect runs
+        // (`merge requires observed.feature_head`).
+        return Ok(());
+    }
+    let secs = effect_deadline_secs(ctx.kind, ctx.params)?;
+    let window = Duration::from_secs(secs);
+    let cadence = Duration::from_secs(HOSTED_CI_POLL_INTERVAL_SECS);
+    let started = Instant::now();
+    loop {
+        let runs = hosted_ci_runs(ctx, head)?;
+        match hosted_ci_state(&runs) {
+            HostedCiState::Green => return Ok(()),
+            HostedCiState::Red(red) => {
+                let named: Vec<String> = red
+                    .iter()
+                    .map(|run| {
+                        let detail = hosted_ci_red_detail(ctx, run);
+                        if detail.is_empty() {
+                            format!(
+                                "workflow {:?} (run {}) concluded {:?}",
+                                run.workflow, run.id, run.conclusion
+                            )
+                        } else {
+                            format!("workflow {:?} (run {}) {detail}", run.workflow, run.id)
+                        }
+                    })
+                    .collect();
+                return Err(refusal(
+                    code::MERGE_CI_RED,
+                    format!(
+                        "the exact certified head {head} carries a RED hosted check run and the publish path never lands it: {}; a fixed head must re-run the check and a new verdict must name it before any step consumes it",
+                        named.join("; ")
+                    ),
+                ));
+            }
+            HostedCiState::Pending(checks) => {
+                let elapsed = started.elapsed();
+                if elapsed >= window {
+                    return Err(refusal(
+                        code::MERGE_CI_PENDING,
+                        format!(
+                            "the hosted checks of the exact certified head {head} were still running when the bounded wait of {secs}s expired, and a check still running is never treated as green: {}; the plan may declare its own `deadline_secs`, and a re-dispatch re-reads the same exact head",
+                            checks.join("; ")
+                        ),
+                    ));
+                }
+                std::thread::sleep(cadence.min(window - elapsed));
+            }
+        }
+    }
+}
+
 /// PUBLISH a certified delivery through the repository's own integration path
 /// (issue #219): the open pull request whose head names the certified head,
 /// squash-merged by the authenticated forge CLI.
@@ -6535,6 +6809,15 @@ fn effect_merge(ctx: &EffectContext<'_>) -> EffectOutcome {
                 inputs.branch
             ),
         );
+    }
+    // Issue #225: the publish path COMPUTES the hosted CI conclusion for the
+    // EXACT head the verdict names — never a judgement recorded elsewhere and
+    // never the branch tip. A red or still-running required check refuses
+    // typed here, BEFORE any route publishes anything: the measured incident
+    // was `p7` publishing a delivery whose hosted CI had already concluded
+    // red because the gate adjudicated CI instead of computing it.
+    if let Err(outcome) = hosted_ci_gate(ctx, &certified_head) {
+        return outcome;
     }
     // Issue #219: the topology-declared publish route chooses HOW the
     // certified delivery is published. Every check above (the published ref,

@@ -134,6 +134,27 @@ Normative rules:
   therefore refuses a plan that declares `merge_policy:"ff"`
   (`refusal.policy.publish`). The outcome records `publish_route` alongside the
   heads above — identical in shape for both routes.
+- The publish path COMPUTES the hosted CI conclusion for the EXACT certified
+  head before either route publishes anything (issue #225). The step reads the
+  forge's own workflow runs carrying that exact commit (`gh run list --commit
+  <certified head> --json databaseId,workflowName,status,conclusion` — the head
+  the recorded verdict names, never the branch tip) and holds while any run is
+  still `queued`/`in_progress`, on a documented poll cadence
+  (`HOSTED_CI_POLL_INTERVAL_SECS`) bounded by the step's own effective deadline
+  (`deadline_secs`, else the per-kind default). A run that concluded red
+  (`failure`, `cancelled`, `timed_out`, `startup_failure`, `action_required`)
+  refuses typed with its own code (`effect.merge.ci_red`) naming the workflow
+  run, the JOB and the STEP that failed, so the durable outcome is readable
+  without a second lookup; a bounded wait that expires with a run still
+  running refuses typed (`effect.merge.ci_pending`) — a still-running check is
+  never treated as green. Nothing is published on either refusal. CI status is
+  COMPUTED, not adjudicated: a recorded review-evidence check (including one
+  that explains a failing CI job) may explain a state, but it never overrides
+  this computation, and the conclusion is read for the certified sha, so a
+  moved head can never inherit another commit's green. An unreadable forge
+  read is its own typed refusal rather than an absent check, and a commit the
+  forge reports no workflow runs for has no hosted check to conclude on. The
+  gate is route-independent: both `push` and `pull_request` publish through it.
 - A publish that did not happen is never one opaque code (issue #219). The
   remote REJECTING the update (repository rules, a protected ref) records
   `effect.merge.push_rejected`; a credential that cannot be read records

@@ -215,6 +215,12 @@ case "$1" in
         exit 0 ;;
       comment) printf '%s' '{"id": 77}'; exit 0 ;;
     esac ;;
+  run)
+    case "$2" in
+      list)
+        printf '%s' '[{"databaseId":4242,"workflowName":"ci","status":"completed","conclusion":"success"}]'
+        exit 0 ;;
+    esac ;;
   issue)
     case "$2" in
       comment) printf '%s' '{"id": 88}'; exit 0 ;;
@@ -1904,6 +1910,12 @@ fn write_fixture_forge(scenario: &Scenario) {
         "#!/bin/sh\n\
          printf '%s\\n' \"$*\" >> '{record}'\n\
          case \"$1\" in\n\
+         run)\n\
+         case \"$2\" in\n\
+         list)\n\
+         printf '[{{\"databaseId\":4242,\"workflowName\":\"ci\",\"status\":\"completed\",\"conclusion\":\"success\"}}]'\n\
+         exit 0 ;;\n\
+         esac ;;\n\
          pr)\n\
          case \"$2\" in\n\
          list)\n\
@@ -1939,9 +1951,250 @@ fn write_fixture_forge(scenario: &Scenario) {
 fn write_forge_without_pull_request(scenario: &Scenario) {
     scenario.sandbox.write(
         "fakebin/gh",
-        "#!/bin/sh\ncase \"$1\" in\n  pr)\n    case \"$2\" in\n      list) printf '[]'; exit 0 ;;\n    esac ;;\nesac\nexit 1\n",
+        "#!/bin/sh\ncase \"$1\" in\n  run)\n    case \"$2\" in\n      list) printf '[{\"databaseId\":4242,\"workflowName\":\"ci\",\"status\":\"completed\",\"conclusion\":\"success\"}]'; exit 0 ;;\n    esac ;;\n  pr)\n    case \"$2\" in\n      list) printf '[]'; exit 0 ;;\n    esac ;;\nesac\nexit 1\n",
     );
     scenario.sandbox.chmod_x("fakebin/gh");
+}
+
+/// Every `gh` argv line the fixture forge recorded (issue #225).
+fn forge_argv(scenario: &Scenario) -> String {
+    std::fs::read_to_string(scenario.sandbox.path("forge-argv.txt")).unwrap_or_default()
+}
+
+/// Fixture forge (issue #225) whose hosted-check answer is driven by the
+/// marker file `<sandbox>/ci-mode` (`red` | `pending` | else green): it
+/// answers `gh run list` for ANY commit with that state, names the red job
+/// and step for `gh run view`, records every call's argv, and — when asked to
+/// merge — performs the repository's squash landing on the bare origin (the
+/// same real publish `write_fixture_forge` performs).
+fn write_hosted_ci_forge(scenario: &Scenario) {
+    let origin = scenario.origin().display().to_string();
+    let checkout = scenario.repos.checkout.display().to_string();
+    let record = scenario
+        .sandbox
+        .path("forge-argv.txt")
+        .display()
+        .to_string();
+    let mode = scenario.sandbox.path("ci-mode").display().to_string();
+    let head_file = scenario
+        .sandbox
+        .path("forge-pr-head.txt")
+        .display()
+        .to_string();
+    let script = format!(
+        "#!/bin/sh\n\
+         printf '%s\\n' \"$*\" >> '{record}'\n\
+         case \"$1\" in\n\
+         run)\n\
+         case \"$2\" in\n\
+         list)\n\
+         ci_mode=$(cat '{mode}' 2>/dev/null || printf 'green')\n\
+         if [ \"$ci_mode\" = 'red' ]; then\n\
+         printf '%s' '[{{\"databaseId\":35486368250,\"workflowName\":\"ci\",\"status\":\"completed\",\"conclusion\":\"failure\"}}]'\n\
+         exit 0\n\
+         fi\n\
+         if [ \"$ci_mode\" = 'pending' ]; then\n\
+         printf '%s' '[{{\"databaseId\":35486368251,\"workflowName\":\"ci\",\"status\":\"in_progress\",\"conclusion\":\"\"}}]'\n\
+         exit 0\n\
+         fi\n\
+         printf '%s' '[{{\"databaseId\":35486368252,\"workflowName\":\"ci\",\"status\":\"completed\",\"conclusion\":\"success\"}}]'\n\
+         exit 0 ;;\n\
+         view)\n\
+         printf '%s' '{{\"jobs\":[{{\"name\":\"rust-macos\",\"status\":\"completed\",\"conclusion\":\"failure\",\"steps\":[{{\"name\":\"Set up job\",\"status\":\"completed\",\"conclusion\":\"success\"}},{{\"name\":\"Locked tests\",\"status\":\"completed\",\"conclusion\":\"failure\"}}]}}]}}'\n\
+         exit 0 ;;\n\
+         esac ;;\n\
+         pr)\n\
+         case \"$2\" in\n\
+         list)\n\
+         printf '[{{\"number\": 223, \"headRefOid\": \"%s\"}}]' \"$(cat '{head_file}')\"\n\
+         exit 0 ;;\n\
+         merge)\n\
+         previous=''\n\
+         match=''\n\
+         for arg in \"$@\"; do\n\
+         if [ \"$previous\" = '--match-head-commit' ]; then match=\"$arg\"; fi\n\
+         previous=\"$arg\"\n\
+         done\n\
+         expected=$(cat '{head_file}')\n\
+         if [ \"$match\" != \"$expected\" ]; then\n\
+         printf 'the forge refuses a merge that does not match the reviewed head\\n' >&2\n\
+         exit 1\n\
+         fi\n\
+         published=$(git -C '{checkout}' rev-parse --verify refs/heads/staging)\n\
+         tree=$(git -C '{checkout}' rev-parse --verify \"issue-123^{{tree}}\")\n\
+         landing=$(git -C '{checkout}' -c user.name=forge -c user.email=forge@example.invalid commit-tree \"$tree\" -p \"$published\" -m 'squash merge the reviewed delivery (fixture forge)')\n\
+         git -C '{checkout}' push -q '{origin}' \"$landing:refs/heads/staging\" || exit 1\n\
+         printf 'Merged pull request #223 (squash)\\n'\n\
+         exit 0 ;;\n\
+         esac ;;\n\
+         esac\n\
+         exit 1\n"
+    );
+    scenario.sandbox.write("fakebin/gh", &script);
+    scenario.sandbox.chmod_x("fakebin/gh");
+    scenario.sandbox.write("ci-mode", "green");
+}
+
+/// The reviewed merge spine (issue #225) whose merge step declares its OWN
+/// bounded wait: the shortest window that still lets the hosted-check read
+/// run twice when a check is still running.
+fn cycle2_merge_steps_with_wait(policy: &str, deadline_secs: i64) -> Vec<Val> {
+    let mut steps = cycle2_merge_steps(policy);
+    steps[5] = step(
+        "m1",
+        "merge",
+        Some(object(vec![
+            ("branch", string("issue-123")),
+            ("merge_policy", string(policy)),
+            ("deadline_secs", integer(deadline_secs)),
+        ])),
+    );
+    steps
+}
+
+/// One reviewed delivery (verdict PASS at the bound head) under the DECLARED
+/// `pull_request` publish route whose merge step carries a declared bounded
+/// wait (issue #225).
+fn cycle2_reviewed_merge_with_wait(deadline_secs: i64) -> (Scenario, String, String) {
+    let scenario = Scenario::new_routed(
+        "c2ci",
+        "2999-01-01T00:00:00Z",
+        cycle2_merge_steps_with_wait("squash", deadline_secs),
+        "pull_request",
+    );
+    let base = scenario.integration_base();
+    scenario.apply_ok(10, "w1", None, None);
+    scenario.apply_ok(11, "h1", None, None);
+    scenario.apply_ok(12, "p1", None, None);
+    let collected = scenario.apply_ok(13, "o1", None, Some(&base));
+    let feature = collected
+        .get("head")
+        .and_then(Val::as_str)
+        .expect("lane head")
+        .to_string();
+    let base = scenario.integration_base();
+    scenario.apply_ok(14, "r1", Some(&feature), Some(&base));
+    (scenario, feature, base)
+}
+
+/// Witness (AC1-AC4, issue #225): the publish path COMPUTES the hosted CI
+/// conclusion at the EXACT certified head the recorded verdict names — never a
+/// judgement recorded elsewhere and never the branch tip — before any route
+/// publishes anything. A RED check refuses typed (its own code), names the
+/// failing job and step READABLY from the durable record, and publishes
+/// nothing; a check still RUNNING is waited for, bounded by the step's own
+/// declared deadline, then refused typed instead of being read as green; with
+/// every check completed and green the SAME step publishes the delivery
+/// through the declared `pull_request` route.
+#[test]
+fn p7_computes_hosted_ci_at_the_certified_head_and_never_publishes_over_red() {
+    let (scenario, feature, base) = cycle2_reviewed_merge_with_wait(3);
+    let origin = scenario.origin();
+    let origin_git = Git::new(&origin);
+    let published_before = origin_git.head("staging");
+    assert_eq!(published_before, base, "the fixture starts unpublished");
+    // The delivery IS published as a pull request (the run's own delivery step
+    // does this), so the green leg can consume it.
+    Git::new(&scenario.repos.checkout).run(&["push", "origin", "issue-123:refs/heads/issue-123"]);
+    std::fs::write(
+        scenario.sandbox.path("forge-pr-head.txt"),
+        format!("{feature}\n"),
+    )
+    .expect("pr head file");
+    write_hosted_ci_forge(&scenario);
+
+    // AC1 + AC4: the hosted check at the certified head is RED.
+    scenario.sandbox.write("ci-mode", "red");
+    let (code, message) = scenario.apply_err(15, "m1", Some(&feature), Some(&base));
+    assert_eq!(code, "effect.merge.ci_red", "{message}");
+    assert!(
+        message.contains("rust-macos"),
+        "the refusal names the failing JOB: {message}"
+    );
+    assert!(
+        message.contains("Locked tests"),
+        "the refusal names the failing STEP: {message}"
+    );
+    assert_eq!(
+        origin_git.head("staging"),
+        published_before,
+        "a red check publishes nothing"
+    );
+    // AC3 (exact head): the conclusion is read for the sha the verdict names,
+    // never for the branch tip.
+    let recorded = forge_argv(&scenario);
+    assert!(
+        recorded
+            .lines()
+            .any(|line| line.starts_with("run list")
+                && line.contains(&format!("--commit {feature}"))),
+        "the hosted checks are read for the certified head: {recorded}"
+    );
+    // AC4: the SAME refusal is readable read-only from the durable record.
+    let status = rpc_ok(
+        &scenario.fixture.socket,
+        &fresh_id(30),
+        "run.status",
+        Some(object(vec![("instance_id", string(INSTANCE_ID))])),
+    );
+    let failure = status.get("last_failure").cloned().unwrap_or_else(null);
+    assert_eq!(
+        failure.get("code").and_then(Val::as_str),
+        Some("effect.merge.ci_red")
+    );
+    let durable = failure.get("message").and_then(Val::as_str).unwrap_or("");
+    assert!(
+        durable.contains("rust-macos") && durable.contains("Locked tests"),
+        "the durable record names the red job and step: {durable}"
+    );
+
+    // AC3: a check still running is WAITED for, bounded by the step's own
+    // declared deadline, and then refused typed — never read as green.
+    scenario.sandbox.write("ci-mode", "pending");
+    let reads_before = forge_argv(&scenario)
+        .lines()
+        .filter(|line| line.starts_with("run list"))
+        .count();
+    let started = Instant::now();
+    let (code, message) = scenario.apply_err(16, "m1", Some(&feature), Some(&base));
+    let waited = started.elapsed();
+    assert_eq!(code, "effect.merge.ci_pending", "{message}");
+    assert!(
+        waited >= Duration::from_secs(1) && waited < Duration::from_secs(120),
+        "the wait is bounded by the step's own deadline: {waited:?}"
+    );
+    let reads_after = forge_argv(&scenario)
+        .lines()
+        .filter(|line| line.starts_with("run list"))
+        .count();
+    assert!(
+        reads_after > reads_before + 1,
+        "a running check is waited for and re-read, never read once: {reads_before} -> {reads_after}"
+    );
+    assert_eq!(
+        origin_git.head("staging"),
+        published_before,
+        "a still-running check publishes nothing"
+    );
+
+    // AC2: every check completed and green — the SAME step publishes through
+    // the declared route (existing behaviour preserved).
+    scenario.sandbox.write("ci-mode", "green");
+    let landed = scenario.apply_ok(17, "m1", Some(&feature), Some(&base));
+    assert_eq!(
+        landed.get("publish_route").and_then(Val::as_str),
+        Some("pull_request")
+    );
+    assert_eq!(landed.get("mode").and_then(Val::as_str), Some("landed"));
+    let published_after = origin_git.head("staging");
+    assert_ne!(
+        published_after, published_before,
+        "the green check publishes the delivery through the forge"
+    );
+    assert_eq!(
+        landed.get("published_after").and_then(Val::as_str),
+        Some(published_after.as_str())
+    );
 }
 
 /// No false success (issue #176): a landing that cannot be PUBLISHED records a
