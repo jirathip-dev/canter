@@ -5032,6 +5032,9 @@ type ReevaluationGate = Result<
         String,
         Vec<String>,
         Option<String>,
+        // The reviewer lane checkout the re-dispatch re-binds for the round it
+        // dispatches (issue #248); `None` leaves the committed binding alone.
+        Option<String>,
     ),
     (&'static str, String),
 >;
@@ -5173,12 +5176,21 @@ fn method_run_reevaluate(shared: &Arc<Shared>, request: &Request) -> String {
                     ),
                 )
             })?;
-        // The step's OWN recorded kind, from the run's committed spine (the
-        // same documents the dispatch path derives its plan from).
-        let kind = state
+        // The step's own committed document (params included), from the run's
+        // committed spine — the same documents the dispatch path derives its
+        // plan from. ONE read: the kind, the declared shape and the lane
+        // binding the re-dispatch re-binds all come from it.
+        let documents = state
             .run_step_documents(&parsed.instance_id)
             .map_err(|err| (err.code, err.message))?
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let committed_params = documents
+            .iter()
+            .find(|step| step.get("id").and_then(Val::as_str) == Some(parsed.step.as_str()))
+            .and_then(|step| step.get("params"))
+            .cloned();
+        // The step's OWN recorded kind.
+        let kind = documents
             .iter()
             .find(|step| step.get("id").and_then(Val::as_str) == Some(parsed.step.as_str()))
             .and_then(|step| crate::mutation::step_kind(step).ok())
@@ -5187,13 +5199,8 @@ fn method_run_reevaluate(shared: &Arc<Shared>, request: &Request) -> String {
             .run_step_attempts(&parsed.instance_id)
             .map_err(|err| (err.code, err.message))?;
         // The step's own declared shape: only a reviewer LEG computes checks.
-        let declares_reviewer_leg = state
-            .run_step_documents(&parsed.instance_id)
-            .map_err(|err| (err.code, err.message))?
-            .unwrap_or_default()
-            .iter()
-            .find(|step| step.get("id").and_then(Val::as_str) == Some(parsed.step.as_str()))
-            .and_then(|step| step.get("params"))
+        let declares_reviewer_leg = committed_params
+            .as_ref()
             .is_some_and(|params| crate::mutation::declares_reviewer_leg(Some(params)));
         let latest_attempt = attempts
             .iter()
@@ -5259,9 +5266,28 @@ fn method_run_reevaluate(shared: &Arc<Shared>, request: &Request) -> String {
                 &key,
             )
             .map_err(|err| (err.code, err.message))?;
-        Ok((run, spine, plan, evidence_id, failing, next_step))
+        // The lane checkout the re-dispatch RE-BINDS for the round it
+        // dispatches (issue #248): the leg advanced to the plan's lane round
+        // `plan.lane_round`, so the round the plan was rendered at is no
+        // longer the checkout this dispatch may bind. `None` (a foreign
+        // binding, the run's own lane, the bare-subprocess fallback) leaves
+        // the committed params untouched and the effect's own refusal stands.
+        let rebound_lane = crate::mutation::rebound_reviewer_lane(
+            run.issue_number.max(0) as u64,
+            committed_params.as_ref(),
+            plan.lane_round.max(1) as u64,
+        );
+        Ok((
+            run,
+            spine,
+            plan,
+            evidence_id,
+            failing,
+            next_step,
+            rebound_lane,
+        ))
     })();
-    let (run, spine, plan, evidence_id, failing, next_step) = match gated {
+    let (run, spine, plan, evidence_id, failing, next_step, rebound_lane) = match gated {
         Ok(gated) => gated,
         Err((code, message)) => {
             return finish_mutation(
@@ -5277,8 +5303,14 @@ fn method_run_reevaluate(shared: &Arc<Shared>, request: &Request) -> String {
     };
     // The re-dispatch itself: the SAME dispatch path every other step uses,
     // with the fresh lane round the control derived merged over the step's
-    // committed params and nothing else — the control presents no check
-    // status, no verdict and no head.
+    // committed params — plus, for a reviewer leg whose plan binds a lane
+    // checkout of an EARLIER round, that round's own checkout (issue #248):
+    // the leg advanced past the round the plan was rendered at, and ONE lane
+    // checkout belongs to exactly one leg, so binding the stale one would
+    // refuse (`refusal.lane.identity`) forever. The control re-renders/
+    // RE-BINDS the binding it dispatches; a genuinely foreign checkout is
+    // never re-bound and is still refused by the effect. The control presents
+    // no check status, no verdict and no head.
     let inner_key = {
         let mut inner = format!(
             "ik_{}-{}-r{}",
@@ -5289,7 +5321,13 @@ fn method_run_reevaluate(shared: &Arc<Shared>, request: &Request) -> String {
         inner.truncate(64);
         inner
     };
-    let step_params = object(vec![("lane_round", integer(plan.lane_round))]);
+    let step_params = match &rebound_lane {
+        Some(lane) => object(vec![
+            ("lane_round", integer(plan.lane_round)),
+            ("worktree", string(lane)),
+        ]),
+        None => object(vec![("lane_round", integer(plan.lane_round))]),
+    };
     let dispatch_params = crate::run_control::dispatch_params(
         &inner_key,
         &parsed.instance_id,

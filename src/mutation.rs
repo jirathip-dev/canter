@@ -4241,6 +4241,61 @@ fn retire_lane_checkout_doc(
     doc
 }
 
+/// The reviewer lane checkout ONE re-dispatch of a reviewer-leg step binds for
+/// the round it is dispatching (issue #248).
+///
+/// The reviewed plan binds the reviewer leg's own checkout for the round the
+/// plan was rendered at (`issues-<N>-rev<R>`, `crate::lane`). A leg that
+/// ADVANCES to a new round — the re-review a fix round hands the leg to, driven
+/// by the run's own bounded re-evaluation control — therefore holds a binding
+/// for a round the step is dispatched at no longer, and a dispatch presenting
+/// that binding unchanged refuses (`refusal.lane.identity`: ONE lane checkout
+/// belongs to exactly one leg). The control that advances the round is the ONE
+/// place allowed to RE-BIND that checkout, so this derives the leg's own
+/// checkout for the round being dispatched.
+///
+/// `None` whenever the step's binding is not this issue's reviewer checkout
+/// for another round: a genuinely foreign checkout is never reinterpreted, it
+/// is refused exactly as before (`None` leaves the bound params untouched).
+/// Only the pane substrate derives a per-round reviewer checkout; the
+/// bare-subprocess fallback runs in the run's own lane checkout and keeps the
+/// binding it was rendered with, byte for byte.
+pub fn rebound_reviewer_lane(issue: u64, params: Option<&Val>, round: u64) -> Option<String> {
+    let params = params?;
+    if !declares_reviewer_leg(Some(params)) {
+        return None;
+    }
+    // The plan's own substrate rule (`queue_preview::step_is_pane_substrate`):
+    // absent or `herdr` is the pane substrate; anything else keeps its binding.
+    let pane = matches!(
+        params.get("execution").and_then(Val::as_str),
+        None | Some("herdr")
+    );
+    if !pane {
+        return None;
+    }
+    let declared = params.get("worktree").and_then(Val::as_str)?;
+    if reviewer_checkout_round(issue, declared)? == round {
+        return None;
+    }
+    Some(crate::lane::lane_checkout(issue, "reviewer", round))
+}
+
+/// The round of ONE of this issue's reviewer lane checkouts — `Some` only when
+/// the declared value really is one (`issues-<N>-rev<R>` for a positive `R`,
+/// byte-equal to the derivation itself). Anything else is no round of this
+/// leg's, so it is never re-bound.
+fn reviewer_checkout_round(issue: u64, checkout: &str) -> Option<u64> {
+    let round: u64 = checkout
+        .strip_prefix(&format!("issues-{issue}-rev"))?
+        .parse()
+        .ok()?;
+    if round == 0 || crate::lane::lane_checkout(issue, "reviewer", round) != checkout {
+        return None;
+    }
+    Some(round)
+}
+
 /// Materialize the reviewer leg's OWN lane checkout at the certified head
 /// (issue #210), reclaiming the retired generations' reviewer lanes of that
 /// identity first (#190/#173 direction).
@@ -7924,6 +7979,71 @@ fn harness_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #248: a leg that advanced to a new round holds a lane binding for
+    /// the round the plan was rendered at; the ONE control allowed to advance
+    /// the round (the bounded re-evaluation) re-binds the leg's OWN checkout
+    /// for the round it dispatches, and nothing else is ever reinterpreted.
+    #[test]
+    fn a_reviewer_leg_re_binds_the_lane_checkout_of_the_round_it_dispatches() {
+        let pane = |worktree: &str| {
+            object(vec![
+                ("execution", string("herdr")),
+                ("harness_key", string("lane-role")),
+                (
+                    "reviewer_profile",
+                    object(vec![("key", string("lane-role"))]),
+                ),
+                ("worktree", string(worktree)),
+            ])
+        };
+        // The plan bound round 1; the dispatch is round 2 (the re-review a fix
+        // round hands the leg to) — the binding is re-rendered for that round.
+        assert_eq!(
+            rebound_reviewer_lane(5, Some(&pane("issues-5-rev1")), 2),
+            Some("issues-5-rev2".to_string())
+        );
+        // Already the dispatching round: nothing to re-render.
+        assert_eq!(
+            rebound_reviewer_lane(5, Some(&pane("issues-5-rev2")), 2),
+            None
+        );
+        // A genuinely FOREIGN checkout is never reinterpreted — the effect's
+        // own `refusal.lane.identity` stands.
+        for foreign in [
+            "issues-5",
+            "issues-5-impl2",
+            "issues-6-rev1",
+            "issues-5-rev01",
+            "worktrees/issues-5-rev1",
+        ] {
+            assert_eq!(
+                rebound_reviewer_lane(5, Some(&pane(foreign)), 2),
+                None,
+                "{foreign} is not this leg's own checkout and is never re-bound"
+            );
+        }
+        // The bare-subprocess fallback runs in the run's own lane checkout and
+        // keeps the binding it was rendered with, byte for byte.
+        let headless = object(vec![
+            ("execution", string("headless")),
+            ("harness_key", string("lane-role")),
+            (
+                "reviewer_profile",
+                object(vec![("key", string("lane-role"))]),
+            ),
+            ("worktree", string("issues-5")),
+        ]);
+        assert_eq!(rebound_reviewer_lane(5, Some(&headless), 2), None);
+        // A step that presents its own review facts declares no leg (it
+        // computes nothing a re-evaluation could recompute): never re-bound.
+        let presented = object(vec![
+            ("execution", string("herdr")),
+            ("worktree", string("issues-5-rev1")),
+        ]);
+        assert_eq!(rebound_reviewer_lane(5, Some(&presented), 2), None);
+        assert_eq!(rebound_reviewer_lane(5, None, 2), None);
+    }
 
     #[test]
     fn collection_live_mid_turn_at_deadline_is_worker_timeout() {
