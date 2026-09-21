@@ -6217,10 +6217,12 @@ retry authorizes exactly ONE bounded re-dispatch of ONE diagnosed step
 spine, its current unachieved frontier step, and must carry a recorded
 terminal non-success attempt. Invalid (unknown/undiagnosed/out-of-order),
 revoked (inactive grant), stale (moved epoch), already-succeeded and
-exhausted (bounded attempts used) retries refuse. The authorization is the
-WHOLE effect: nothing is dispatched, spawned or consumed by this command —
-the operator's own corrected dispatch of that exact step consumes it
-exactly once (single use).
+exhausted (bounded attempts used) retries refuse. The request dispatches
+nothing and spawns nothing by itself: the authorization is consumed by the
+ONE re-dispatch of that exact step — the run's own armed supervision
+performs it (issue #241), or the operator's own corrected dispatch of that
+exact step consumes it when it arrives first (single use: a second attempt
+needs its own authorization).
 
 reevaluate recomputes the checks a terminal-success producer already recorded
 (daemon `run.reevaluate`, issue #230): a check recorded `failed` inside the

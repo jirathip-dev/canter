@@ -889,6 +889,30 @@ release process activates (docs/RELEASING.md), then semver applies.
 
 ### Changed
 
+- An authorized bounded retry is consumed by the run's own supervision
+  (issue #241). `run retry` records the single-use authorization; the very
+  re-dispatch it authorizes now spends it — the armed driver derives the
+  continuation of that exact diagnosed step (including the ambiguous effects
+  and worker/review timeouts the class vocabulary names) and the daemon's
+  supervised apply path consumes the HELD row with the dispatch's own
+  journaled idempotency key, instead of refusing it `refusal.run.retry_pending`
+  and parking the frontier until an operator dispatched by hand. The
+  consumption is exactly once (a second attempt still needs its own
+  authorization), the bounded budget is unchanged (a spent bound parks typed),
+  a re-dispatch without an authorization still refuses
+  `refusal.run.retry_required` before any effect, and `run release` still
+  never burns an authorization — its refusal now names the remedy precisely.
+  `supervision status` reads the frontier's retry disposition back
+  (`evaluation.retry`: `awaiting-authorization` / `authorized-awaiting-dispatch`
+  / `driver-dispatch` / `exhausted`), so "awaiting an operator authorization",
+  "authorized, awaiting dispatch" and a refused continuation are three
+  distinct reads. The ONE exception is the risk-classed committed TAIL
+  (`merge` / `cleanup`): an ATTEMPTED tail keeps issue #152's rule (it stays
+  the operator's) and a held authorization over it is consumed by the
+  operator's own `run dispatch`. The operator's own corrected `run dispatch`
+  still consumes
+  the authorization when it arrives first (and is the only consumer for a run
+  whose supervision is not armed).
 - The bounded check re-evaluation is reachable in the exact case it exists
   for (issue #243). `run reevaluate` re-dispatches the run's own check
   producer, so its inner dispatch is a fan-out like any other: the control

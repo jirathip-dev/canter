@@ -2978,7 +2978,11 @@ impl State {
                 "refusal.run.retry_pending",
                 format!(
                     "run {instance_id} still holds the unconsumed retry authorization {retry_id} \
-                     for step {step_id:?}; a release never burns an authorization"
+                     for step {step_id:?}; a release never burns an authorization — the \
+                     authorization is spent by the ONE re-dispatch of that exact step, so the \
+                     run's own armed supervision consumes it at its next check, or `run dispatch \
+                     --run {instance_id} --step {step_id}` consumes it, and the release succeeds \
+                     once it is spent"
                 ),
             ));
         }
@@ -4005,8 +4009,15 @@ impl State {
         self.record_run_retry_inner(instance_id, step_id, at, "")
     }
 
-    /// Reserve and consume supervision's own retry in one write. A pending
-    /// operator retry refuses here, never becoming the automatic claim.
+    /// Reserve and consume the run's bounded retry in one write, under the
+    /// dispatching claim's own key (issue #86, issue #241).
+    ///
+    /// An authorization the run already HOLDS is the one consumed: a
+    /// `run.retry` authorization is spent by the very re-dispatch it
+    /// authorized, recorded with that dispatch's idempotency key — the row is
+    /// single use, so a second attempt still needs its own authorization. With
+    /// no authorization held, supervision mints its own in the same write (the
+    /// bounded automatic retry, issue #179).
     pub(crate) fn consume_supervised_retry(
         &self,
         instance_id: &str,
@@ -4014,7 +4025,51 @@ impl State {
         at: &str,
         claim_key: &str,
     ) -> Result<RunRetryRow, StateError> {
-        self.record_run_retry_inner(instance_id, step_id, at, claim_key)
+        self.ensure_writable()?;
+        let pending: Option<(String, i64, String)> = {
+            let conn = self.lock("consume_supervised_retry")?;
+            conn.query_row(
+                "SELECT retry_id, attempt, authorized_at FROM run_retries
+                  WHERE instance_id = ?1 AND step_id = ?2 AND consumed_at = ''
+                  ORDER BY attempt LIMIT 1",
+                params![instance_id, step_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("consume_supervised_retry: pending", err))?
+        };
+        let Some((retry_id, attempt, authorized_at)) = pending else {
+            return self.record_run_retry_inner(instance_id, step_id, at, claim_key);
+        };
+        let consumed = {
+            let conn = self.lock("consume_supervised_retry")?;
+            conn.execute(
+                "UPDATE run_retries SET consumed_at = ?3, consumed_key = ?4
+                  WHERE retry_id = ?1 AND instance_id = ?2 AND consumed_at = ''",
+                params![retry_id, instance_id, at, claim_key],
+            )
+            .map_err(|err| StateError::from_sqlite("consume_supervised_retry: consume", err))?
+        };
+        if consumed == 0 {
+            // Exactly one dispatch ever consumes one authorization: a
+            // concurrent (or reclaimed) consume already spent it.
+            return Err(state_error(
+                "refusal.run.retry_pending",
+                format!(
+                    "run {instance_id} already spent the bounded retry authorization {retry_id} \
+                     for step {step_id:?}; a second attempt needs its own authorization"
+                ),
+            ));
+        }
+        Ok(RunRetryRow {
+            retry_id,
+            instance_id: instance_id.to_string(),
+            step_id: step_id.to_string(),
+            attempt,
+            authorized_at,
+            consumed_at: at.to_string(),
+            consumed_key: claim_key.to_string(),
+        })
     }
 
     fn record_run_retry_inner(

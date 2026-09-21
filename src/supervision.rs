@@ -13,8 +13,10 @@
 //! - The driver **evaluates and reports** and dispatches an armed run's first
 //!   and next unattempted autonomous step through the daemon's existing apply
 //!   engine. That preserves the committed grant, capability, admission,
-//!   ownership, topology, journal and idempotency gates; diagnosed steps still
-//!   require the operator's explicit corrected retry dispatch.
+//!   ownership, topology, journal and idempotency gates; a diagnosed step is
+//!   re-dispatched only within the shared bounded retry budget (issue #179),
+//!   and an authorization the run already holds is consumed by that
+//!   re-dispatch, exactly once (issue #241).
 //! - It also drives the risk-classed TAIL of a run whose own committed queue
 //!   submission declares it (issue #152: the merge of its reviewed head, then
 //!   the cleanup of its lane worktree), so the spine that produced a verified
@@ -38,7 +40,8 @@
 //!   already-authorized queue cursor — once per delivered issue — and admits
 //!   the next eligible approved issue of the SAME committed submission under
 //!   the existing admission and ownership checks. It never resumes a pause,
-//!   authorizes a retry, retries a diagnosed step or clears a hold.
+//!   never retries a diagnosed step past the shared bounded retry budget and
+//!   never clears a hold.
 //! - A duplicate delivery event, a replayed check or a crash/restart never
 //!   duplicates a dispatch: the advance is keyed to the delivered issue
 //!   (one consumption per submission item, ever) and the cursor is derived
@@ -135,7 +138,7 @@ pub const TRIGGERS: [&str; 7] = [
 
 /// The statement every supervision document carries: what this surface does
 /// and provably does NOT do.
-pub const STATEMENT: &str = "an explicitly armed run is classified from recorded evidence and each unattempted autonomous next step — plus the risk-classed merge then cleanup tail of a run whose own committed queue submission declares it after that run's verified delivery — is dispatched through the existing apply engine with the committed grant, capability, admission, ownership, topology, journal and idempotency gates; a continuation the engine refuses before any effect is reported with the engine's own code and is never presented as an eligible next step; a fresh verified reviewed-and-CI-green delivery advances its authorized queue cursor exactly once under the same admission and ownership checks; when the run's own newest recorded review evidence carries a non-passing check the driver drives the run's OWN bounded, attributed and journaled check re-evaluation — the producer is re-run on a fresh lane round, never adjudicated, and the tail behind the unverified delivery stays undriven; supervision never resumes a pause, authorizes or consumes a retry, retries a diagnosed step, invents missing inputs or clears a hold";
+pub const STATEMENT: &str = "an explicitly armed run is classified from recorded evidence and each unattempted autonomous next step — plus the risk-classed merge then cleanup tail of a run whose own committed queue submission declares it after that run's verified delivery — is dispatched through the existing apply engine with the committed grant, capability, admission, ownership, topology, journal and idempotency gates; a continuation the engine refuses before any effect is reported with the engine's own code and is never presented as an eligible next step; a fresh verified reviewed-and-CI-green delivery advances its authorized queue cursor exactly once under the same admission and ownership checks; when the run's own newest recorded review evidence carries a non-passing check the driver drives the run's OWN bounded, attributed and journaled check re-evaluation — the producer is re-run on a fresh lane round, never adjudicated, and the tail behind the unverified delivery stays undriven; supervision never resumes a pause, never retries a diagnosed step past the shared bounded retry budget (an authorization the run already holds is consumed by that re-dispatch, exactly once), invents missing inputs or clears a hold";
 
 /// Default bounded timer fallback cadence (seconds).
 pub const DEFAULT_CHECK_INTERVAL_SECS: i64 = 60;
@@ -765,11 +768,17 @@ pub trait SupervisedDispatch: Send + Sync {
 ///   declares it — so the delivering run's own merge and cleanup are driven
 ///   to the end of its committed spine (issue #152).
 ///
-/// A diagnosed step may retry within the shared bounded budget. A pending
-/// operator authorization reserves the step for the operator's corrected
-/// dispatch: supervision never consumes it. The daemon backs off attempts
-/// and atomically records its own consumed authorization through the apply
-/// path, without bypassing any effect gate.
+/// A diagnosed step may retry within the shared bounded budget. An
+/// authorization the run ALREADY holds — the operator's `run.retry` row — is
+/// consumed by this very dispatch (issue #241): the intent is derived for the
+/// exact step it authorizes, the daemon's supervised apply path consumes it
+/// with the dispatch's own idempotency key, and the engine's fence sees the
+/// authorization spent by its own claim. It therefore never parks the
+/// frontier, and a second attempt still needs its own authorization. The ONE
+/// exception is the risk-classed committed TAIL (`merge` / `cleanup`), which
+/// keeps issue #152's rule verbatim: an ATTEMPTED tail stays the operator's,
+/// and a held authorization over it is spent by that operator's own
+/// `run.dispatch` — the release refusal names exactly that remedy.
 ///
 /// Non-armed/unknown supervision keeps its zero-effect guarantee: this
 /// function returns `None` for every row that is not explicitly armed.
@@ -806,6 +815,23 @@ pub fn dispatch_intent(
         // nothing else about the park changes.
         return reevaluation_intent(evidence, &step_id, &kind);
     }
+    let step_retries: Vec<&crate::state::RunRetryRow> = evidence
+        .retries
+        .iter()
+        .filter(|retry| retry.step_id == step_id)
+        .collect();
+    // Issue #241: the ONE authorization the run already holds is spent by the
+    // re-dispatch it authorizes, so it is not a park. The park codes below
+    // fence only the retries supervision MINTS for itself (a worker timeout,
+    // a moved certificate and a moved/unbound delivery are never
+    // re-dispatched on supervision's own initiative) — an explicit operator
+    // authorization is exactly the act that asks for one bounded re-dispatch
+    // of this diagnosed step.
+    let authorized = step_retries
+        .iter()
+        .any(|retry| retry.consumed_at.is_empty());
+    // The risk-classed committed TAIL keeps issue #152's own rule (see below).
+    let tail = COMMITTED_TAIL_STEP_KINDS.contains(&kind.as_str());
     match latest_attempt_for(evidence, &step_id) {
         // Never dispatched: the plain continuation of an armed run.
         None => {}
@@ -821,9 +847,7 @@ pub fn dispatch_intent(
             }
         }
         Some((_, status, code))
-            if matches!(status.as_str(), "failed" | "refused" | "ambiguous")
-                // A worker timeout is a wait/park, never a retryable failure.
-                && code != crate::mutation::code::WORKER_TIMEOUT
+            if crate::state::step_attempt_diagnosed(status, code)
                 // Issue #200: a review step whose recorded diagnosis is
                 // `refusal.evidence.verdict_stale` refuses because a head
                 // binding MOVED (the lane checkout is no longer the certified
@@ -833,7 +857,6 @@ pub fn dispatch_intent(
                 // It parks the frontier typed (the recorded code) with the
                 // bounded retries UNSPENT, instead of burning them on a step
                 // that can never succeed.
-                && code != crate::mutation::code::VERDICT_STALE
                 // Issue #202 (AC1): the same discipline for a delivery that
                 // moved past the head its recorded verdict names. The verdict
                 // is a recorded fact and the delivery branch's movement is
@@ -842,19 +865,22 @@ pub fn dispatch_intent(
                 // the moved head: the frontier parks typed with the bounded
                 // retries UNSPENT, and the run is never presented as a step
                 // that could still be retried into consumption.
-                && code != crate::mutation::code::DELIVERY_MOVED
-                && code != crate::mutation::code::DELIVERY_UNBOUND
                 && newest_verdict(evidence) != "fail"
-                && evidence
-                    .retries
-                    .iter()
-                    .filter(|retry| retry.step_id == step_id)
-                    .count()
-                    < crate::state::RUN_RETRY_MAX as usize
-                && !evidence
-                    .retries
-                    .iter()
-                    .any(|retry| retry.step_id == step_id && retry.consumed_at.is_empty()) => {}
+                // Issue #241: a held authorization is spent by the ONE
+                // re-dispatch it authorizes, so it is dispatchable — for the
+                // steps the driver already re-dispatches on its own within
+                // the bounded budget. The risk-classed committed TAIL
+                // (`merge` / `cleanup`) keeps issue #152's rule verbatim: an
+                // ATTEMPTED tail stays the operator's, and a held
+                // authorization over it is consumed by that operator's own
+                // `run.dispatch` (the release refusal names that remedy).
+                && ((authorized && !tail)
+                    || (!authorized
+                        && code != crate::mutation::code::WORKER_TIMEOUT
+                        && code != crate::mutation::code::VERDICT_STALE
+                        && code != crate::mutation::code::DELIVERY_MOVED
+                        && code != crate::mutation::code::DELIVERY_UNBOUND
+                        && step_retries.len() < crate::state::RUN_RETRY_MAX as usize)) => {}
         Some(_) => return None,
     }
     Some(DispatchIntent {
@@ -1540,6 +1566,50 @@ pub fn status_doc(
     } else {
         step_kind(evidence, &next_step).to_string()
     };
+    // Issue #241: the retry disposition of the frontier step, read from the
+    // SAME durable rows the engine's own fence reads. It is what tells
+    // `awaiting an operator authorization` (nothing is authorized and the
+    // driver derives no dispatch) from `authorized, awaiting dispatch` (the
+    // run holds an unconsumed `run.retry` authorization, spent by the ONE
+    // re-dispatch it authorizes) from `driver dispatch` (no authorization is
+    // held yet: supervision mints and consumes its own on this check) from an
+    // exhausted bound — and a recorded dispatch refusal is already named by
+    // the block below, never confused with a held authorization.
+    let retry = {
+        let step_retries: Vec<&crate::state::RunRetryRow> = evidence
+            .retries
+            .iter()
+            .filter(|retry| retry.step_id == next_step)
+            .collect();
+        let consumed = step_retries
+            .iter()
+            .filter(|retry| !retry.consumed_at.is_empty())
+            .count();
+        let held = step_retries
+            .iter()
+            .any(|retry| retry.consumed_at.is_empty());
+        let diagnosed =
+            latest_attempt_for(evidence, &next_step).is_some_and(|(_, status, code)| {
+                status != "succeeded" && crate::state::step_attempt_diagnosed(status, code)
+            });
+        let state = if !diagnosed {
+            "none"
+        } else if held {
+            "authorized-awaiting-dispatch"
+        } else if dispatch_intent(row, evidence).is_some_and(|intent| intent.step_id == next_step) {
+            "driver-dispatch"
+        } else if step_retries.len() >= crate::state::RUN_RETRY_MAX as usize {
+            "exhausted"
+        } else {
+            "awaiting-authorization"
+        };
+        object(vec![
+            ("step", string(&next_step)),
+            ("state", string(state)),
+            ("consumed", integer(consumed as i64)),
+            ("bound", integer(crate::state::RUN_RETRY_MAX)),
+        ])
+    };
     let steps: Vec<Val> = evidence
         .steps
         .iter()
@@ -1729,6 +1799,9 @@ pub fn status_doc(
                     "refusal",
                     refusal_doc(evidence, verdict, &next_step, &next_kind),
                 ),
+                // Issue #241: the retry disposition of this frontier (see
+                // `retry` above). Read-time only, exactly like `refusal`.
+                ("retry", retry),
                 (
                     "continuation",
                     object(vec![
@@ -2306,6 +2379,25 @@ pub fn render_human(doc: &Val) -> String {
             text(&refusal, "reason")
         ));
     }
+    // Issue #241: the frontier's retry disposition in words — `awaiting an
+    // operator authorization` and `authorized, awaiting dispatch` are never
+    // the same read, and neither is a refused continuation.
+    let retry = evaluation.get("retry").cloned().unwrap_or_else(null);
+    let retry_label = match retry.get("state").and_then(Val::as_str).unwrap_or("") {
+        "awaiting-authorization" => "awaiting an operator authorization",
+        "authorized-awaiting-dispatch" => "authorized, awaiting dispatch",
+        "driver-dispatch" => "the driver's own bounded retry",
+        "exhausted" => "bound exhausted",
+        _ => "",
+    };
+    if !retry_label.is_empty() {
+        lines.push(format!(
+            "retry {retry_label}: step {} ({}/{} consumed)",
+            text(&retry, "step"),
+            number(&retry, "consumed"),
+            number(&retry, "bound")
+        ));
+    }
     lines.extend([
         format!(
             "last check {} ({}, {})",
@@ -2773,10 +2865,15 @@ mod tests {
         assert!(verdict.eligible);
     }
 
-    /// A diagnosed frontier may retry within the budget, but an operator
-    /// reservation fences it even when a continuation refusal is also recorded.
+    /// Issue #241: a diagnosed frontier retries within the budget, and an
+    /// operator authorization is the act that authorizes exactly that
+    /// re-dispatch — the intent is derived for the authorized step, so the
+    /// held row is consumed by the dispatch it pays for instead of parking the
+    /// frontier. Every recorded non-success status, with or without a
+    /// continuation refusal on record. A SPENT bound is the one park that
+    /// stays: it escalates typed, never as a silent wait.
     #[test]
-    fn a_diagnosed_frontier_retries_unless_reserved_by_the_operator() {
+    fn a_diagnosed_frontier_retries_with_a_held_authorization() {
         let state = temp_state("diagnosed-fence-refusal");
         let digest = "d".repeat(64);
         let run = "run-0123456789abcdef";
@@ -2830,14 +2927,36 @@ mod tests {
                 consumed_at: String::new(),
                 consumed_key: String::new(),
             });
-            assert!(
-                dispatch_intent(&row, &evidence).is_none(),
-                "operator reservation wins"
-            );
+            let intent = dispatch_intent(&row, &evidence)
+                .expect("a held authorization is consumed by its own re-dispatch");
+            assert_eq!(intent.step_id, "p2", "the intent is the authorized step");
             assert!(
                 !classify(&evidence, &digest, &policy, now_unix).eligible,
                 "a diagnosed frontier is never reported eligible"
             );
+            // The budget is still the budget: a spent bound parks typed.
+            let held = evidence.retries.last_mut().expect("the held row");
+            held.consumed_at = at.to_string();
+            held.consumed_key = "ik_spent-1".to_string();
+            for attempt in 2..=crate::state::RUN_RETRY_MAX {
+                evidence.retries.push(crate::state::RunRetryRow {
+                    retry_id: format!("rt_0123456789abcde{attempt}"),
+                    instance_id: run.into(),
+                    step_id: "p2".into(),
+                    attempt,
+                    authorized_at: at.into(),
+                    consumed_at: at.into(),
+                    consumed_key: format!("ik_spent-{attempt}"),
+                });
+            }
+            assert!(
+                dispatch_intent(&row, &evidence).is_none(),
+                "a spent bound is a park"
+            );
+            let verdict = classify(&evidence, &digest, &policy, now_unix);
+            assert_eq!(verdict.class, "needs-attention");
+            assert_eq!(verdict.reason, codes::STEP_DIAGNOSED);
+            assert!(!verdict.eligible);
         }
     }
 

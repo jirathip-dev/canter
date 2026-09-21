@@ -227,9 +227,10 @@ impl Fixture {
             .unwrap()
     }
 
-    /// Record one further TERMINAL attempt of (run, step) with an outcome code
-    /// (the shape the driver's evidence reads as the step's own diagnosis).
-    fn seed_attempt(&self, step: &str, code: &str) {
+    /// Record one further TERMINAL attempt of (run, step) with an outcome
+    /// status and code (the shape the driver's evidence reads as the step's
+    /// own diagnosis).
+    fn seed_attempt(&self, step: &str, status: &str, code: &str) {
         let key = format!("ik_seed-{step}-{}", code.rsplit('.').next().unwrap());
         let request_id = "f00dfeed".to_string();
         let line = canonical_text(&object(vec![
@@ -262,7 +263,7 @@ impl Fixture {
             ("schema", string("hf-outcome/v1")),
             ("plan_id", string("hf_plan_0000000000000000")),
             ("step_id", string(step)),
-            ("status", string("refused")),
+            ("status", string(status)),
             ("idempotency_key", string(&key)),
             ("observed_at", string("2026-09-18T13:04:41Z")),
             ("result", Val::Null),
@@ -388,13 +389,21 @@ fn repeated_refusal_exhausts_three_retries_and_fences_the_frontier() {
     );
 }
 
+/// Issue #241: an authorization the run already HOLDS is not a park. The
+/// armed driver derives its dispatch for that exact step, and the FIRST
+/// dispatch to reach the engine spends it — exactly once, recorded under the
+/// automatic dispatch's own journaled key. (Before the change the reservation
+/// blocked the driver: the run stayed parked until an operator dispatched by
+/// hand.)
 #[test]
-fn operator_reservation_wins_even_over_a_stale_automatic_intent() {
-    let fixture = Fixture::new("operator");
+fn a_held_authorization_is_consumed_by_supervision_exactly_once() {
+    let fixture = Fixture::new("held-consumed");
     let now = time::unix_now();
+    // One real dispatch records the diagnosis (the obstructed worktree).
     assert!(fixture.tick(now).is_err());
-    let stale = fixture.intent().unwrap();
-    let params = crate::run_control::retry_params("ik_fixture-operator-retry", &fixture.run, "p2");
+    // The operator authorizes ONE bounded retry — the issue's exact control —
+    // and nothing else.
+    let params = crate::run_control::retry_params("ik_fixture-held-retry", &fixture.run, "p2");
     let request = Request {
         id: "01234567".into(),
         method: "run.retry".into(),
@@ -412,17 +421,73 @@ fn operator_reservation_wins_even_over_a_stale_automatic_intent() {
     );
     let reserved = fixture.retries();
     assert_eq!(reserved.len(), 1);
-    assert!(reserved[0].consumed_key.is_empty());
-    assert!(fixture.intent().is_none());
-    assert!(fixture.driver.dispatch_at(&stale, now + 5).is_err());
-    assert_eq!(fixture.retries(), reserved);
-    assert_eq!(fixture.attempts().len(), 2);
-    std::fs::remove_dir(fixture.root.join("worktrees/lane")).unwrap();
+    assert!(
+        reserved[0].consumed_key.is_empty(),
+        "minting the authorization consumes nothing"
+    );
+    // The held authorization IS dispatchable: the driver derives the
+    // continuation of exactly that step.
+    let held = fixture
+        .intent()
+        .expect("a held authorization is not a park");
+    assert_eq!(held.step_id, "p2");
+    // The re-dispatch the authorization pays for reaches the engine (the
+    // obstruction still refuses the effect) and spends it exactly once.
+    assert!(
+        fixture
+            .driver
+            .dispatch_at(&held, now + 5)
+            .unwrap_err()
+            .contains("refusal.worktree.exists")
+    );
+    let spent = fixture.retries();
+    assert_eq!(spent.len(), 1, "one authorization, never a second row");
+    assert_eq!(spent[0].attempt, 1);
+    assert!(!spent[0].consumed_at.is_empty());
+    assert!(spent[0].consumed_key.starts_with("ik_run-"), "{spent:?}");
+    let state = fixture.shared.lock_state().unwrap();
+    let claim = state.claim(&spent[0].consumed_key).unwrap().unwrap();
+    assert_eq!(claim.method, "apply");
+    assert!(claim.request_line.contains("p2"));
+    drop(state);
+    // A SECOND re-dispatch of the same step, with no fresh authorization,
+    // refuses the engine's own typed code before any effect — and spends
+    // nothing: a consumed authorization is never spent twice.
     let material =
         read_dispatch_material(&fixture.shared.lock_state().unwrap(), &fixture.run, None).unwrap();
-    let dispatch =
-        dispatch_request_from(&material, "p2", None, "ik_fixture-operator-dispatch").unwrap();
-    let response = method_apply(&fixture.shared, &dispatch);
+    let second =
+        dispatch_request_from(&material, "p2", None, "ik_fixture-second-dispatch").unwrap();
+    let response = method_apply(&fixture.shared, &second);
+    assert!(
+        response.contains(crate::mutation::code::RETRY_REQUIRED),
+        "{response}"
+    );
+    assert_eq!(
+        fixture.retries(),
+        spent,
+        "a consumed authorization is never spent twice"
+    );
+}
+
+/// Issue #241 (AC1) in the issue's OWN shape: a recorded AMBIGUOUS effect
+/// (`effect.review_timeout`) plus an authorized bounded retry. The held
+/// authorization is consumed by supervision's own re-dispatch — no operator
+/// dispatch exists anywhere — and the run advances.
+#[test]
+fn an_authorized_retry_advances_an_ambiguous_review_timeout_without_an_operator() {
+    let fixture = Fixture::new("ambiguous-held");
+    let now = time::unix_now();
+    assert!(fixture.tick(now).is_err());
+    fixture.seed_attempt("p2", "ambiguous", crate::mutation::code::REVIEW_TIMEOUT);
+    // The operator authorizes the bounded retry (and dispatches nothing).
+    let params = crate::run_control::retry_params("ik_fixture-ambiguous-retry", &fixture.run, "p2");
+    let request = Request {
+        id: "01234567".into(),
+        method: "run.retry".into(),
+        params: Some(params),
+        line: String::new(),
+    };
+    let response = method_run_retry(&fixture.shared, &request);
     assert_eq!(
         Val::parse_json(&response)
             .unwrap()
@@ -431,10 +496,85 @@ fn operator_reservation_wins_even_over_a_stale_automatic_intent() {
         Some(true),
         "{response}"
     );
-    assert_eq!(
-        fixture.retries()[0].consumed_key,
-        "ik_fixture-operator-dispatch"
+    // Supervision consumes the authorization itself, and the step lands.
+    let intent = fixture
+        .intent()
+        .expect("the held authorization is dispatchable");
+    assert_eq!(intent.step_id, "p2");
+    std::fs::remove_dir(fixture.root.join("worktrees/lane")).unwrap();
+    fixture
+        .driver
+        .dispatch_at(&intent, now + 5)
+        .expect("the authorized re-dispatch lands the step");
+    let retries = fixture.retries();
+    assert_eq!(retries.len(), 1, "the HELD authorization was the one spent");
+    assert!(
+        retries[0].consumed_key.starts_with("ik_run-"),
+        "{retries:?}"
     );
+    assert_eq!(
+        fixture.intent().unwrap().step_id,
+        "p3",
+        "the frontier moved on"
+    );
+    // Zero operator dispatch: the run's own supervision performed the act.
+    let state = fixture.shared.lock_state().unwrap();
+    let (_, journal) = state.journal_tail(0, 1000).unwrap();
+    assert!(
+        !journal
+            .iter()
+            .any(|line| line.contains("mutate.run.dispatch")),
+        "no operator dispatch exists"
+    );
+}
+
+/// Issue #241: the SAME act for the class the issue names — a worker timeout
+/// is a park for supervision's own retries, and an explicitly authorized
+/// bounded retry is exactly the act that unparks it.
+#[test]
+fn an_authorized_retry_unparks_a_worker_timeout_frontier() {
+    let fixture = Fixture::new("worker-timeout-held");
+    let now = time::unix_now();
+    assert!(fixture.tick(now).is_err());
+    fixture.seed_attempt("p2", "ambiguous", crate::mutation::code::WORKER_TIMEOUT);
+    assert!(
+        fixture.intent().is_none(),
+        "a worker timeout is a park for supervision's own retries"
+    );
+    let params = crate::run_control::retry_params("ik_fixture-timeout-retry", &fixture.run, "p2");
+    let request = Request {
+        id: "01234567".into(),
+        method: "run.retry".into(),
+        params: Some(params),
+        line: String::new(),
+    };
+    let response = method_run_retry(&fixture.shared, &request);
+    assert_eq!(
+        Val::parse_json(&response)
+            .unwrap()
+            .get("ok")
+            .and_then(Val::as_bool),
+        Some(true),
+        "{response}"
+    );
+    // The authorization is the act that makes the frontier dispatchable...
+    let intent = fixture
+        .intent()
+        .expect("the held authorization is dispatchable");
+    assert_eq!(intent.step_id, "p2");
+    // ...and the re-dispatch it pays for spends it exactly once.
+    std::fs::remove_dir(fixture.root.join("worktrees/lane")).unwrap();
+    fixture
+        .driver
+        .dispatch_at(&intent, now + 5)
+        .expect("the authorized re-dispatch lands the step");
+    let retries = fixture.retries();
+    assert_eq!(retries.len(), 1);
+    assert!(
+        retries[0].consumed_key.starts_with("ik_run-"),
+        "{retries:?}"
+    );
+    assert_eq!(fixture.intent().unwrap().step_id, "p3");
 }
 
 /// Issue #200 (AC2): a frontier whose recorded diagnosis is a MOVED certified
@@ -449,7 +589,7 @@ fn a_moved_head_diagnosis_never_spends_a_bounded_retry() {
     // One real dispatch records the run's own dispatch context (topology).
     assert!(fixture.tick(now).is_err());
     let before_tick = fixture.attempts();
-    fixture.seed_attempt("p2", crate::mutation::code::VERDICT_STALE);
+    fixture.seed_attempt("p2", "refused", crate::mutation::code::VERDICT_STALE);
     assert!(
         fixture.intent().is_none(),
         "the recorded moved-head refusal parks the frontier"
