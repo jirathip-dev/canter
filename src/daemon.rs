@@ -2780,9 +2780,17 @@ fn method_apply_from(shared: &Arc<Shared>, request: &Request, supervised: bool) 
                 // consumes supervision's own bounded retry. A recorded
                 // refusal of the run's OWN lapsed window is not a step
                 // diagnosis (the step never ran), so a lapse burns nothing.
+                // Issue #241: an authorization the run already HOLDS — the
+                // operator's `run.retry` — is consumed by this dispatch, the
+                // re-dispatch it authorized, instead of refusing it
+                // `refusal.run.retry_pending`; a consumed authorization is
+                // spent exactly once (the row is single use).
                 automatic_retry = evidence.attempts.iter().any(|(step, status, code)| {
                     step == &parsed.step && crate::state::step_attempt_diagnosed(status, code)
-                });
+                }) || evidence
+                    .retries
+                    .iter()
+                    .any(|retry| retry.step_id == parsed.step && retry.consumed_at.is_empty());
                 Ok(crate::supervision::dispatch_intent(&row, &evidence)
                     .is_some_and(|intent| intent.step_id == parsed.step))
             })();

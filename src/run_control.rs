@@ -66,7 +66,7 @@ pub const CONTROL_STATEMENT: &str = "run-scoped control only: exactly one run is
 /// The statement every retry document carries: minting the authorization is
 /// the WHOLE effect — nothing is dispatched, spawned or consumed by it; the
 /// operator's own (corrected) dispatch of that step consumes it exactly once.
-pub const RETRY_STATEMENT: &str = "bounded retry only: exactly ONE diagnosed step of this run is authorized for ONE re-dispatch; minting the authorization dispatches nothing by itself, spawns nothing and consumes nothing — the operator's own corrected dispatch of that exact step consumes it exactly once (single use), and the retry never repeats the plan or widens the reviewed boundary";
+pub const RETRY_STATEMENT: &str = "bounded retry only: exactly ONE diagnosed step of this run is authorized for ONE re-dispatch; minting the authorization dispatches nothing by itself and spawns nothing — the authorization is consumed by the ONE re-dispatch of that exact step, whether the run's own armed supervision performs it or the operator's corrected dispatch arrives first (single use: a second attempt needs its own authorization) — and the retry never repeats the plan or widens the reviewed boundary";
 
 /// The statement every dispatch document carries: what the supported
 /// dispatch surface did and did NOT do.

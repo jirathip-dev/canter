@@ -376,7 +376,14 @@ to journal fails closed — the mutation does not start.
   dispatch-side fence: a first dispatch of a step is never fenced, a
   re-dispatch of a step with a recorded terminal non-success attempt
   consumes one unconsumed authorization, and `Missing` refuses the dispatch
-  (`refusal.run.retry_required`) before any effect. The diagnosis input
+  (`refusal.run.retry_required`) before any effect. A SUPERVISED dispatch
+  resolves the same fence earlier and in one write
+  (`consume_supervised_retry`): an authorization the run already HOLDS is the
+  one consumed (recorded with the dispatching claim's own idempotency key, so
+  it is spent exactly once and a second attempt still needs its own
+  authorization — issue #241), and with none held supervision mints its own
+  bounded row in the same write (the automatic retry of issue #179). The
+  diagnosis input
   (`run_step_attempts`) and the bound spine (`run_step_spine`) are read
   back from the durable apply claims and the committed submission's
   bound-input line — never from a caller.
