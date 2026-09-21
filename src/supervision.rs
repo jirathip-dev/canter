@@ -135,7 +135,7 @@ pub const TRIGGERS: [&str; 7] = [
 
 /// The statement every supervision document carries: what this surface does
 /// and provably does NOT do.
-pub const STATEMENT: &str = "an explicitly armed run is classified from recorded evidence and each unattempted autonomous next step — plus the risk-classed merge then cleanup tail of a run whose own committed queue submission declares it after that run's verified delivery — is dispatched through the existing apply engine with the committed grant, capability, admission, ownership, topology, journal and idempotency gates; a continuation the engine refuses before any effect is reported with the engine's own code and is never presented as an eligible next step; a fresh verified reviewed-and-CI-green delivery advances its authorized queue cursor exactly once under the same admission and ownership checks; supervision never resumes a pause, authorizes or consumes a retry, retries a diagnosed step, invents missing inputs or clears a hold";
+pub const STATEMENT: &str = "an explicitly armed run is classified from recorded evidence and each unattempted autonomous next step — plus the risk-classed merge then cleanup tail of a run whose own committed queue submission declares it after that run's verified delivery — is dispatched through the existing apply engine with the committed grant, capability, admission, ownership, topology, journal and idempotency gates; a continuation the engine refuses before any effect is reported with the engine's own code and is never presented as an eligible next step; a fresh verified reviewed-and-CI-green delivery advances its authorized queue cursor exactly once under the same admission and ownership checks; when the run's own newest recorded review evidence carries a non-passing check the driver drives the run's OWN bounded, attributed and journaled check re-evaluation — the producer is re-run on a fresh lane round, never adjudicated, and the tail behind the unverified delivery stays undriven; supervision never resumes a pause, authorizes or consumes a retry, retries a diagnosed step, invents missing inputs or clears a hold";
 
 /// Default bounded timer fallback cadence (seconds).
 pub const DEFAULT_CHECK_INTERVAL_SECS: i64 = 60;
@@ -404,6 +404,13 @@ pub mod codes {
     /// the engine's own refusal code. The step is never reported eligible
     /// while the dispatch the driver names is refused.
     pub const DISPATCH_REFUSED: &str = "supervision.dispatch_refused";
+    /// The run's own newest recorded review evidence carries a non-passing
+    /// check, so its verified-delivery consumer is refused (issue #230) and
+    /// the driver drives the run's OWN bounded, audited recovery control —
+    /// the check producer re-evaluated on a fresh lane round (issue #243).
+    /// The tail behind the unverified delivery is still never driven and the
+    /// run is still never reported eligible.
+    pub const REEVALUATION: &str = "supervision.reevaluation.next_round";
     /// The next unachieved step is the run's own verified-delivery consumer
     /// (a committed `merge` / `cleanup` tail step) and the driver may not
     /// dispatch it because the run's newest recorded review evidence is a
@@ -790,7 +797,14 @@ pub fn dispatch_intent(
     }
     let (step_id, kind) = next_unachieved_step(evidence)?;
     if !driver_dispatchable_kind(evidence, &step_id, &kind) {
-        return None;
+        // Issue #243: the driver may not drive THIS frontier, but when the
+        // recorded condition is the engine's own typed recovery control's
+        // precondition, the run's own check PRODUCER is re-evaluated through
+        // that control — bounded, attributed and journaled — instead of the
+        // run being parked for an operator. The frontier itself is untouched:
+        // the tail behind an unverified delivery is still never driven, and
+        // nothing else about the park changes.
+        return reevaluation_intent(evidence, &step_id, &kind);
     }
     match latest_attempt_for(evidence, &step_id) {
         // Never dispatched: the plain continuation of an armed run.
@@ -848,6 +862,89 @@ pub fn dispatch_intent(
         step_id,
         kind,
         reason: codes::DISPATCH,
+    })
+}
+
+/// The audited reason the DRIVER records when it drives the run's own recovery
+/// control (issue #243).
+///
+/// It names the recorded facts that made the act necessary and nothing else:
+/// no check status, no verdict and no head are ever presented, exactly as an
+/// operator's own reason is bounded and recorded. The presentation is bounded
+/// to the control's own [`crate::run_control::REASON_MAX`] (a committed step id
+/// may be a 64-character slug, and the driver never presents a reason the
+/// control would refuse for its shape — that would put the recovery back
+/// behind an operator for the longest step ids).
+pub fn reevaluation_reason(step: &str) -> String {
+    let reason = format!(
+        "supervision derived this bounded re-evaluation of {step}: the newest recorded review \
+         evidence carries a non-passing check, so its consumer is refused while the producer \
+         cannot be re-run; recompute the checks by their own producer at the same certified \
+         head (issue #243)"
+    );
+    reason
+        .chars()
+        .take(crate::run_control::REASON_MAX)
+        .collect()
+}
+
+/// The driver's ONE recovery intent (issue #243): the run's own check PRODUCER
+/// re-evaluated through the engine's own bounded, audited, recorded control.
+///
+/// `Some` only in the exact recorded shape the deadlock is made of — the
+/// frontier is a committed tail step the run's own caps authorize, after the
+/// run's reviewed-evidence step, and the run's newest recorded review evidence
+/// is a `pass` bound to the run's own pins at one exact head whose named checks
+/// are NOT all `passed` ([`unverified_delivery_refusal`], the SAME derivation
+/// the classification reads) — and only while the recorded bound
+/// ([`crate::run_control::RUN_REEVALUATION_MAX`], counted from the durable
+/// journal) has NOT been spent.
+///
+/// Everything else stays exactly as parked as it was: the intent is the run's
+/// own control (the producer is re-run, never adjudicated), the tail behind
+/// the unverified delivery is still never driven, the run is still never
+/// reported eligible, and a spent bound is never re-minted as an intent that
+/// is guaranteed to refuse.
+fn reevaluation_intent(
+    evidence: &SupervisionEvidence,
+    frontier: &str,
+    frontier_kind: &str,
+) -> Option<DispatchIntent> {
+    unverified_delivery_refusal(evidence, frontier, frontier_kind)?;
+    // The producer: the run's own check-producing step — the reviewed-evidence
+    // step of the committed spine that declares its reviewer LEG (the only
+    // shape that computes checks) and whose latest recorded attempt SUCCEEDED
+    // (a diagnosed step belongs to the bounded-retry control, and a step that
+    // never ran has no recorded check result to re-evaluate).
+    let (producer, producer_kind) = evidence
+        .steps
+        .iter()
+        .position(|(step, _)| step == frontier)
+        .and_then(|frontier_index| {
+            evidence.steps[..frontier_index]
+                .iter()
+                .rev()
+                .find(|(step, kind)| {
+                    kind == crate::run_control::REEVALUATION_KIND
+                        && evidence.reviewer_leg_steps.contains(step)
+                        && latest_attempt_for(evidence, step).map(|(_, status, _)| status.as_str())
+                            == Some("succeeded")
+                })
+        })?;
+    let recorded = evidence
+        .reevaluations
+        .iter()
+        .find(|(step, _)| step == producer)
+        .map(|(_, count)| *count)
+        .unwrap_or(0);
+    if recorded >= crate::run_control::RUN_REEVALUATION_MAX {
+        return None;
+    }
+    Some(DispatchIntent {
+        instance_id: evidence.run.instance_id.clone(),
+        step_id: producer.clone(),
+        kind: producer_kind.clone(),
+        reason: codes::REEVALUATION,
     })
 }
 
@@ -2373,6 +2470,7 @@ mod tests {
             newest_evidence: None,
             dispatch_refusal: None,
             fix_round: None,
+            reevaluations: Vec::new(),
         }
     }
 

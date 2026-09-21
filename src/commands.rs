@@ -6129,7 +6129,12 @@ round, so the checks are really recomputed by their producer. It is bounded
 per (run, step) from the durable journal, the record is written to the
 hash-chained audit before anything is dispatched, and no check status is ever
 presented or waived: a recomputation that comes back failing refuses the
-consumer exactly as the first one did.
+consumer exactly as the first one did. The re-dispatched step is a fan-out,
+so the control renews the run's OWN lapsed host-resource proof at dispatch
+time exactly as the supervisor's continuation does (audited
+`host.proof.renewal`, measured at the run's lane root); a host that cannot be
+measured renews nothing and the admission refusal names the precondition and
+the remedy.
 
 resolve records an explicit, recorder-attributed artifact for ONE diagnosed
 prompt (daemon `run.resolve`): a closed JSON object binds the delivered feature

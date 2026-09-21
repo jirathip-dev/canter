@@ -296,6 +296,52 @@ fn reevaluation_of(
     })
 }
 
+/// Every recorded check re-evaluation of one RUN as `(step, count)` on an
+/// already-held connection (issue #243).
+///
+/// The step is read back from the record's own target
+/// (`run:<id>:step:<step>:evidence:<...>`): the prefix is fixed, the step ends
+/// at the `:evidence:` marker the control's own writer always appends, and a
+/// target that does not carry both (or a step that is not a plan slug) is
+/// skipped — a re-evaluation is never counted from a guess.
+fn run_reevaluation_counts_locked(
+    conn: &Connection,
+    instance_id: &str,
+) -> Result<Vec<(String, i64)>, StateError> {
+    let prefix = format!("run:{instance_id}:step:");
+    let mut statement = conn
+        .prepare(
+            "SELECT target FROM audit
+                  WHERE action = ?2 AND target LIKE ?1
+                  ORDER BY seq",
+        )
+        .map_err(|err| StateError::from_sqlite("run_reevaluation_counts: prepare", err))?;
+    let rows = statement
+        .query_map(params![format!("{prefix}%"), REEVALUATION_ACTION], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|err| StateError::from_sqlite("run_reevaluation_counts: query", err))?;
+    let mut counts: Vec<(String, i64)> = Vec::new();
+    for row in rows {
+        let target =
+            row.map_err(|err| StateError::from_sqlite("run_reevaluation_counts: row", err))?;
+        let Some(rest) = target.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some((step, _)) = rest.split_once(":evidence:") else {
+            continue;
+        };
+        if !crate::formats::is_slug(step) {
+            continue;
+        }
+        match counts.iter_mut().find(|(candidate, _)| candidate == step) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((step.to_string(), 1)),
+        }
+    }
+    Ok(counts)
+}
+
 /// The recorded outcome of ONE explicit run release (issue #146): the run
 /// row as it stands AFTER the release commit, whether the release removed the
 /// unique ownership row that named this run, and the authorization window the
@@ -4095,6 +4141,19 @@ impl State {
             }
         }
         Ok(out)
+    }
+
+    /// Every recorded check re-evaluation of one RUN as `(step, count)`, in
+    /// first-recorded step order (issue #243) — the durable bound the driver
+    /// reads before it drives the run's own bounded recovery control. Counted
+    /// from the same hash-chained journal records the control itself writes;
+    /// an unreadable target is skipped, never guessed.
+    pub fn run_reevaluation_counts(
+        &self,
+        instance_id: &str,
+    ) -> Result<Vec<(String, i64)>, StateError> {
+        let conn = self.lock("run_reevaluation_counts")?;
+        run_reevaluation_counts_locked(&conn, instance_id)
     }
 
     /// Renew the OWN lapsed authorization window of one live run (issue
@@ -12277,6 +12336,11 @@ pub struct SupervisionEvidence {
     /// (issue #238), when one exists: the round of the automatic bound the
     /// recorded FAIL was handed to.
     pub fix_round: Option<SupervisionFixRound>,
+    /// Every recorded check re-evaluation of this run as `(step, count)`
+    /// (issue #243): the durable bound the driver reads before it drives the
+    /// run's own bounded recovery control. Counted from the hash-chained
+    /// journal, never from a second bookkeeping row.
+    pub reevaluations: Vec<(String, i64)>,
 }
 
 /// One recorded refusal of a supervised continuation dispatch (issue #141).
@@ -13828,6 +13892,10 @@ impl State {
         // classification reads the FAIL handoff from the same records it
         // classifies the step from — never from a second bookkeeping row.
         let fix_round = newest_fix_round_locked(&conn, instance_id)?;
+        // Issue #243: every recorded check re-evaluation of this run, so the
+        // driver reads the SAME durable bound the control itself enforces
+        // before it derives a recovery intent.
+        let reevaluations = run_reevaluation_counts_locked(&conn, instance_id)?;
         Ok(Some(SupervisionEvidence {
             run,
             has_dispatch_context,
@@ -13846,6 +13914,7 @@ impl State {
             newest_evidence,
             dispatch_refusal,
             fix_round,
+            reevaluations,
         }))
     }
 

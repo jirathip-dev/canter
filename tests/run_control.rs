@@ -2773,6 +2773,535 @@ fn a_recorded_check_failure_is_re_evaluated_by_its_producer_never_adjudicated() 
     shutdown(daemon);
 }
 
+/// [`seed_topology`] with the run's recorded ADMISSION: the dispatch context a
+/// real first dispatch records carries the occupancy attestation AND the
+/// host-resource proof the run presented, so a later dispatch re-presents
+/// exactly that (issue #198) — and a LAPSED one is renewed at dispatch time
+/// (issue #243). `worktrees_root` is the lane root the daemon measures.
+fn seed_topology_with_admission(
+    state: &State,
+    run: &str,
+    step: &str,
+    key: &str,
+    proof_at: &str,
+    worktrees_root: &Path,
+) {
+    let integration_repo = std::env::temp_dir().join("hf-run-86-integration-repo");
+    std::fs::create_dir_all(&integration_repo).expect("integration repo dir");
+    let line = canonical_text(&object(vec![
+        ("schema", string("hf-rpc-request/v1")),
+        ("id", string(&fresh_id(41))),
+        ("method", string("apply")),
+        (
+            "params",
+            object(vec![
+                ("idempotency_key", string(key)),
+                ("instance_id", string(run)),
+                ("step", string(step)),
+                (
+                    "topology",
+                    object(vec![
+                        ("integration_branch", string("staging")),
+                        ("production_branches", Val::Arr(Vec::new())),
+                        (
+                            "integration_repo",
+                            string(&integration_repo.display().to_string()),
+                        ),
+                        (
+                            "worktrees_root",
+                            string(&worktrees_root.display().to_string()),
+                        ),
+                    ]),
+                ),
+                (
+                    "flags",
+                    object(vec![(
+                        "admission",
+                        object(vec![
+                            (
+                                "caps",
+                                object(vec![
+                                    ("global", integer(4)),
+                                    ("repository", integer(2)),
+                                    ("harness", integer(2)),
+                                ]),
+                            ),
+                            ("harness_lanes", integer(0)),
+                            (
+                                "host_proof",
+                                object(vec![("measured_at", string(proof_at))]),
+                            ),
+                        ]),
+                    )]),
+                ),
+            ]),
+        ),
+    ]));
+    let request_id = fresh_id(42);
+    state
+        .journal_intent(
+            "mutate.checkout",
+            &format!("{REPO}:{run}:{step}"),
+            key,
+            &request_id,
+            "apply",
+            None,
+            None,
+            &line,
+        )
+        .expect("claim the topology-carrying attempt");
+    let outcome_line = canonical_text(&object(vec![
+        ("schema", string("hf-outcome/v1")),
+        ("plan_id", string("hf_plan_0000000000000000")),
+        ("step_id", string(step)),
+        ("status", string("succeeded")),
+        ("idempotency_key", string(key)),
+        ("observed_at", string(AT)),
+        ("result", Val::Null),
+        ("error", Val::Null),
+    ]));
+    state
+        .resolve_claim(key, "apply", "spent", &outcome_line, Some("{}"))
+        .expect("resolve the attempt");
+}
+
+/// One recorded check re-evaluation of (run, step), as the durable journal
+/// keeps it.
+fn reevaluation_records(
+    state: &State,
+    run: &str,
+    step: &str,
+) -> Vec<canter::state::RunReevaluationRow> {
+    state.run_reevaluations(run, step).expect("journal read")
+}
+
+/// Every `host.proof.renewal` line of the fixture's durable journal, parsed.
+fn recorded_renewals(state: &State) -> Vec<Val> {
+    let (_, journal) = state.journal_tail(0, 2000).expect("journal read");
+    journal
+        .iter()
+        .filter(|line| line.contains("\"action\":\"host.proof.renewal\""))
+        .filter_map(|line| Val::parse_json(line).ok())
+        .collect()
+}
+
+/// Issue #243, witness (a): the control that recomputes a recorded check is
+/// REACHABLE in the case it exists for.
+///
+/// The measured shape: the run's own recorded admission carries a host-resource
+/// proof measured before the freshness window, the producer (`p6`) already
+/// SUCCEEDED and the run's newest recorded review evidence names a non-passing
+/// check — so the publish frontier refuses `refusal.evidence.failed` while the
+/// producer can never be re-run. Before this slice the operator's own
+/// `run reevaluate` was refused `refusal.admission.proof_stale` (the inner
+/// re-dispatch is a fan-out and only a DISPATCH renewed a proof), which is the
+/// deadlock: the one control that could recompute the leg could not obtain the
+/// admission it needs.
+///
+/// The witness: the control passes its own gates, the run's OWN lapsed proof is
+/// renewed at dispatch time (audited `host.proof.renewal`: the exact stale
+/// instant superseded, the dispatch-time replacement and the free bytes the
+/// host exposed at the lane root), and the producer is RE-DISPATCHED at the
+/// next reviewer lane round under the control's own inner key. What it does NOT
+/// do (the lane's disclosed gap, as in issue #230's witness): run a live
+/// reviewer leg to a written verdict — a synthetic fixture owns no harness.
+#[test]
+fn the_re_evaluation_renews_the_lapsed_proof_and_re_dispatches_the_producer() {
+    let head = "aa".repeat(20);
+    let base = "bb".repeat(20);
+    let fixture = DaemonFixture::new("reevaluate243");
+    let state = fixture.seed();
+    let items = submit_with_steps(
+        &state,
+        "qs_0000000000000243",
+        &[(6, GRANT_6)],
+        vec![
+            step("p1", "checkout"),
+            step("p5", "collect_outcome"),
+            review_leg_step("p6", "issues/6", 1),
+            step("p7", "merge"),
+        ],
+    );
+    let run = items[0].instance_id.clone().expect("admitted");
+    // The lane root the daemon measures: a REAL directory (the host exposes
+    // it), exactly as a live run's worktrees root is.
+    let lane_root =
+        std::env::temp_dir().join(format!("hf-run-243-lane-root-{}", std::process::id()));
+    std::fs::create_dir_all(&lane_root).expect("lane root");
+    let stale = canter::time::rfc3339_from_unix(
+        canter::time::unix_now() - canter::lifecycle::HOST_PROOF_FRESHNESS_SECS - 1,
+    );
+    seed_topology_with_admission(&state, &run, "p1", &idem_key("243-p1"), &stale, &lane_root);
+    seed_attempt(&state, &run, "p6", &idem_key("243-p6"), Some("succeeded"));
+    seed_collection(
+        &state,
+        &run,
+        "p5",
+        &idem_key("243-p5"),
+        &head,
+        &base,
+        "issue-6",
+    );
+    state
+        .record_evidence(
+            &run,
+            REPO,
+            &head,
+            &base,
+            WORKFLOW_HASH,
+            POLICY_HASH,
+            "pass",
+            "rev-6-r1",
+            &checks(&[
+                ("hosted-ci", "passed"),
+                ("local_full_suite_raw_101", "failed"),
+            ]),
+        )
+        .expect("deadlocked evidence");
+    let daemon = fixture.spawn(None);
+    wait_ready(&fixture);
+
+    // The control the deadlock was made of: the run's own check producer is
+    // re-evaluated by the operator's own attributed act.
+    let reason = "the local aggregate hit the transient scratch-repo failure";
+    let response = rpc(
+        &fixture.socket,
+        &fresh_id(21),
+        "run.reevaluate",
+        Some(reevaluation_params(
+            &idem_key("243-deadlock"),
+            &run,
+            "p6",
+            "operator-a",
+            reason,
+        )),
+    );
+    eprintln!(
+        "run.reevaluate => {}",
+        canter::canonical::canonical_text(&response)
+    );
+
+    // The control authorized the re-evaluation and left its attributed record
+    // in the durable journal (AC1's recovery).
+    let state = fixture.seed();
+    let records = reevaluation_records(&state, &run, "p6");
+    assert_eq!(records.len(), 1, "one record per authorized re-evaluation");
+    assert_eq!(records[0].operator, "operator-a");
+    assert_eq!(records[0].reason, reason);
+
+    // The run's OWN lapsed proof was renewed at dispatch time: the audit names
+    // the exact stale instant it superseded and the measurement it presented.
+    let renewals = recorded_renewals(&state);
+    assert_eq!(renewals.len(), 1, "exactly one renewal: {renewals:?}");
+    let target = renewals[0]
+        .get("target")
+        .and_then(Val::as_str)
+        .unwrap_or_default();
+    assert!(
+        target.contains(&format!("superseded:{stale}")),
+        "the superseded proof is the run's own recorded one: {target}"
+    );
+    let key = renewals[0]
+        .get("idempotency_key")
+        .and_then(Val::as_str)
+        .unwrap_or_default();
+    let inner_key = format!("ik_{}-p6-r2", run.trim_start_matches("run-"));
+    assert_eq!(
+        key, inner_key,
+        "the renewal rode the re-evaluation's own inner dispatch key: {target}"
+    );
+    let replacement = target
+        .split_once(":replacement:")
+        .and_then(|(_, rest)| rest.split_once(":available_bytes:"))
+        .map(|(at, _)| at)
+        .unwrap_or_else(|| panic!("a dispatch-time measurement: {target}"));
+    assert_ne!(
+        replacement, stale,
+        "the recorded attestation is never echoed back as a fresh measurement"
+    );
+    let replacement_unix = canter::time::unix_from_rfc3339(replacement).expect("rfc3339");
+    let stale_unix = canter::time::unix_from_rfc3339(&stale).expect("rfc3339");
+    assert!(
+        replacement_unix > stale_unix,
+        "the presented proof is a measurement taken at THIS dispatch ({replacement} vs {stale})"
+    );
+
+    // ...and the producer was really re-dispatched: the control's inner claim
+    // exists and carries the FRESH reviewer lane round.
+    let claim = state
+        .claim(&inner_key)
+        .expect("claim read")
+        .expect("the re-dispatched producer was claimed");
+    assert!(
+        claim.request_line.contains("\"lane_round\":2"),
+        "the re-run binds the next reviewer lane round: {}",
+        claim.request_line
+    );
+    assert!(
+        claim.request_line.contains("\"step\":\"p6\""),
+        "the re-run addresses the producer: {}",
+        claim.request_line
+    );
+    // The deadlock's own refusal is gone: whatever the reviewer-leg EFFECT then
+    // records in a synthetic fixture, the admission gate no longer refuses the
+    // recorded proof.
+    let code = response
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .and_then(Val::as_str)
+        .unwrap_or_default();
+    assert_ne!(
+        code, "refusal.admission.proof_stale",
+        "the control is never refused the stale proof it renews: {response:?}"
+    );
+    assert_ne!(code, "refusal.admission.proof_missing");
+
+    shutdown(daemon);
+    let _ = std::fs::remove_dir_all(&lane_root);
+}
+
+/// Issue #243, witness (b): when the proof is GENUINELY unsatisfiable (the host
+/// does not expose the lane root the run's topology names, so no measurement
+/// can be produced) the refusal names the failing precondition AND the remedy —
+/// the exact commands that renew a proof — instead of a bare code.
+#[test]
+fn an_unsatisfiable_proof_refusal_names_the_precondition_and_the_remedy() {
+    let head = "aa".repeat(20);
+    let base = "bb".repeat(20);
+    let fixture = DaemonFixture::new("reev243-b");
+    let state = fixture.seed();
+    let items = submit_with_steps(
+        &state,
+        "qs_0000000000000244",
+        &[(6, GRANT_6)],
+        vec![
+            step("p1", "checkout"),
+            step("p5", "collect_outcome"),
+            review_leg_step("p6", "issues/6", 1),
+            step("p7", "merge"),
+        ],
+    );
+    let run = items[0].instance_id.clone().expect("admitted");
+    // The lane root the topology names does not exist: the daemon cannot
+    // measure it, so no renewal is possible (`run.host_proof.unmeasurable`).
+    let missing_root = std::env::temp_dir().join(format!(
+        "hf-run-243-absent-lane-root-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&missing_root);
+    let stale = canter::time::rfc3339_from_unix(
+        canter::time::unix_now() - canter::lifecycle::HOST_PROOF_FRESHNESS_SECS - 1,
+    );
+    seed_topology_with_admission(
+        &state,
+        &run,
+        "p1",
+        &idem_key("244-p1"),
+        &stale,
+        &missing_root,
+    );
+    seed_attempt(&state, &run, "p6", &idem_key("244-p6"), Some("succeeded"));
+    seed_collection(
+        &state,
+        &run,
+        "p5",
+        &idem_key("244-p5"),
+        &head,
+        &base,
+        "issue-6",
+    );
+    state
+        .record_evidence(
+            &run,
+            REPO,
+            &head,
+            &base,
+            WORKFLOW_HASH,
+            POLICY_HASH,
+            "pass",
+            "rev-6-r1",
+            &checks(&[("hosted-ci", "passed"), ("local_suite", "failed")]),
+        )
+        .expect("deadlocked evidence");
+    let daemon = fixture.spawn(None);
+    wait_ready(&fixture);
+
+    let (code, message) = rpc_err(
+        &fixture.socket,
+        &fresh_id(22),
+        "run.reevaluate",
+        Some(reevaluation_params(
+            &idem_key("244-deadlock"),
+            &run,
+            "p6",
+            "operator-a",
+            "the local aggregate hit a transient failure",
+        )),
+    );
+    eprintln!("run.reevaluate (unmeasurable host) => {code}: {message}");
+    assert_eq!(
+        code, "refusal.admission.proof_stale",
+        "the unmeasurable host still refuses the recorded proof: {message}"
+    );
+    assert!(
+        message.contains("the host-resource proof is stale"),
+        "the refusal names the failing precondition: {message}"
+    );
+    assert!(
+        message.contains(&format!(
+            "canter run reevaluate --run {run} --step p6 --operator IDENTITY --reason TEXT"
+        )),
+        "the refusal names the renewal path: {message}"
+    );
+    assert!(
+        message.contains(&format!(
+            "canter run dispatch --run {run} --step p6 --admission FILE"
+        )),
+        "the refusal names the explicit attestation path: {message}"
+    );
+    // Nothing was fabricated: no renewal is recorded for an unmeasurable host.
+    let state = fixture.seed();
+    assert!(
+        recorded_renewals(&state).is_empty(),
+        "an unmeasurable host renews nothing"
+    );
+
+    shutdown(daemon);
+}
+
+/// Issue #243, requirement 2: the driver drives the run's OWN bounded,
+/// attributed recovery control — never the tail behind an unverified delivery,
+/// and never once the control's own recorded bound is spent.
+#[test]
+fn the_driver_drives_the_runs_own_bounded_recovery_control_never_the_tail() {
+    let fixture = StateFixture::new("reevaluate-driver-243");
+    let state = fixture.open();
+    let head = "aa".repeat(20);
+    let base = "bb".repeat(20);
+    let steps = vec![
+        step("p1", "checkout"),
+        step("p5", "collect_outcome"),
+        review_leg_step("p6", "issues/6", 1),
+        step("p7", "merge"),
+    ];
+    let (_, digest) = render_bound(
+        &state,
+        &request_with_steps(vec![selected("#6", REV_A)], steps.clone()),
+    );
+    let items = submit_with_steps(&state, "qs_0000000000000245", &[(6, GRANT_6)], steps);
+    let run = items[0].instance_id.clone().expect("admitted");
+    state
+        .arm_supervision(
+            &run,
+            &canter::state::SupervisionAuthorizationPlan {
+                desired: "armed".to_string(),
+                check_interval_secs: 10,
+                progress_timeout_secs: 60,
+            },
+            &digest,
+            "merge",
+            1,
+            AT,
+        )
+        .expect("arm");
+    seed_attempt(&state, &run, "p6", &idem_key("245-p6"), Some("succeeded"));
+    seed_topology(&state, &run, "p1", &idem_key("245-p1"));
+    seed_collection(
+        &state,
+        &run,
+        "p5",
+        &idem_key("245-p5"),
+        &head,
+        &base,
+        "issue-6",
+    );
+    state
+        .record_evidence(
+            &run,
+            REPO,
+            &head,
+            &base,
+            WORKFLOW_HASH,
+            POLICY_HASH,
+            "pass",
+            "rev-6-r1",
+            &checks(&[
+                ("hosted-ci", "passed"),
+                ("local_full_suite_raw_101", "failed"),
+            ]),
+        )
+        .expect("deadlocked evidence");
+    let row = state
+        .supervision_rows()
+        .expect("rows")
+        .into_iter()
+        .find(|row| row.instance_id == run)
+        .expect("the armed row");
+    let policy = canter::supervision::Policy {
+        check_interval_secs: row.check_interval_secs,
+        progress_timeout_secs: row.progress_timeout_secs,
+    };
+    let now_unix = canter::time::unix_now();
+    let evidence = state
+        .supervision_evidence(&run)
+        .expect("evidence read")
+        .expect("supervised run");
+
+    // The park is UNCHANGED: needs-attention, the engine's own code as the
+    // detail, never eligible — the tail is never driven behind an unverified
+    // delivery.
+    let verdict = canter::supervision::classify(&evidence, &digest, &policy, now_unix);
+    assert_eq!(verdict.class, "needs-attention");
+    assert_eq!(
+        verdict.reason,
+        canter::supervision::codes::DELIVERY_UNVERIFIED
+    );
+    assert!(!verdict.eligible);
+
+    // ...and the driver's ONE act is the run's own recovery control: the check
+    // PRODUCER, at the recovery reason, never the frontier.
+    let intent = canter::supervision::dispatch_intent(&row, &evidence)
+        .expect("the engine's own typed recovery control is driven");
+    assert_eq!(intent.step_id, "p6", "the producer, never the tail");
+    assert_eq!(intent.kind, "review_evidence");
+    assert_eq!(intent.reason, canter::supervision::codes::REEVALUATION);
+    assert_ne!(intent.step_id, "p7");
+
+    // The bound is the control's own, read from the durable journal: once it is
+    // spent, no intent is minted at all (a guaranteed refusal is never
+    // re-attempted forever).
+    for attempt in 1..=canter::run_control::RUN_REEVALUATION_MAX {
+        state
+            .record_run_reevaluation(
+                &run,
+                "p6",
+                "ev_0123456789abcdef",
+                "supervision",
+                "a bounded re-evaluation",
+                &idem_key(&format!("245-bound-{attempt}")),
+            )
+            .expect("record a spent re-evaluation");
+    }
+    let evidence = state
+        .supervision_evidence(&run)
+        .expect("evidence read")
+        .expect("supervised run");
+    assert_eq!(
+        evidence.reevaluations,
+        vec![("p6".to_string(), canter::run_control::RUN_REEVALUATION_MAX)],
+        "the durable bound is read back per step"
+    );
+    assert!(
+        canter::supervision::dispatch_intent(&row, &evidence).is_none(),
+        "a spent bound mints no intent"
+    );
+    // The classification is untouched by the spent bound: the run is still
+    // reported exactly as parked, never eligible.
+    let verdict = canter::supervision::classify(&evidence, &digest, &policy, now_unix);
+    assert_eq!(verdict.class, "needs-attention");
+    assert!(!verdict.eligible);
+}
+
 /// B3 (fix round F1): AC1's LINK, witnessed over the run's OWN durable rows
 /// rather than a hand-built `EvidenceView`. A run whose newest recorded
 /// evidence carries a non-passing check is REFUSED and NAMED — never reported
@@ -2886,8 +3415,16 @@ fn a_recomputed_record_carries_the_run_to_its_publish_step() {
         !verdict.eligible,
         "a run whose checks are not all passed is never eligible"
     );
-    assert!(
-        canter::supervision::dispatch_intent(&row, &evidence).is_none(),
+    // The unverified delivery is still never driven: the driver's ONE act in
+    // this shape is the run's own bounded, audited recovery control — the check
+    // PRODUCER re-evaluated on a fresh lane round (issue #243) — and never the
+    // tail behind it.
+    let intent = canter::supervision::dispatch_intent(&row, &evidence)
+        .expect("the engine's own typed recovery control is driven");
+    assert_eq!(intent.step_id, "p6", "the producer, never the tail");
+    assert_eq!(intent.reason, canter::supervision::codes::REEVALUATION);
+    assert_ne!(
+        intent.step_id, "p7",
         "an unverified delivery is never driven"
     );
 

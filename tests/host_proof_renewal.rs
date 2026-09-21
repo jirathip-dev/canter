@@ -4,8 +4,8 @@
 //! The measured defect (`run-85a856d6b9e9e7d0`, issue 132): the run's
 //! committed topology carried a host proof measured at SUBMISSION, the
 //! worker's turn outlived the freshness bound, and the supervisor's
-//! `p6-132` dispatch was refused `refusal.admission.proof_stale` forever
-//! ("re-measure before fan-out") with no re-measure path anywhere.
+//! `p6-132` dispatch was refused `refusal.admission.proof_stale` forever,
+//! with no re-measure path anywhere.
 //!
 //! Here the same shape runs end to end over a real daemon and real CLI
 //! calls: the submission's proof is measured BEFORE the freshness window,

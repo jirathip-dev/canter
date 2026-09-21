@@ -498,6 +498,16 @@ clears a repository/fleet-level hold or bypasses a gate.
   FAILING refuses the consumer with the same `refusal.evidence.failed`. A
   refused re-dispatch still leaves the attributed record (the operator's act
   is durable) and carries the inner typed refusal VERBATIM.
+  The re-dispatched step is a fan-out (it starts the run's own reviewer
+  lane), so the control PRODUCES the host-resource proof that gate requires
+  (issue #243): the dispatch-time renewal of the supervisor's own
+  continuation (spec-lifecycle.md §4.1 — measured at the run's lane root,
+  audited `host.proof.renewal`, bounded, fail closed) runs on the
+  re-evaluation's dispatch, so a lapsed proof no longer refuses the ONE
+  control that exists to recompute a stranded check. Nothing is exempted or
+  weakened: an unmeasurable host still refuses the recorded proof, a proof
+  that was never recorded is never invented, and the admission refusal now
+  names the failing precondition AND the exact commands that renew the proof.
 - `run.release` (issue #146) requires `params.instance_id`,
   `params.reason` (1-300 printable characters) and
   `params.idempotency_key`. It releases exactly ONE run that can never
@@ -803,6 +813,26 @@ clears a repository/fleet-level hold or bypasses a gate.
   the read's reason, `eligible:false`. The gate itself is untouched: the tail
   is still never driven behind an unverified delivery, and a recomputation
   that comes back failing derives the identical refusal.
+- **The driver drives the run's own recovery control (issue #243)**: in
+  exactly that recorded shape — the frontier is the run's committed
+  verified-delivery consumer and the run's newest recorded review evidence is
+  a `pass` at one exact head whose named checks are NOT all `passed` — the
+  driver's ONE intent is the run's OWN check producer, re-evaluated through
+  the engine's own bounded, attributed, journaled control (`run.reevaluate`):
+  a fresh derived lane round, the producer's own recomputation, the driver's
+  recorded identity (`supervision`) and a derived reason in the hash-chained
+  journal BEFORE anything is dispatched. The bound is the control's own
+  (three per `(run, step)`, counted from the durable journal), so a spent
+  bound mints no intent at all, and a refused recovery carries the engine's
+  own code and message (the control's own outcome row, plus a
+  `supervision.dispatch_refused` record when the refusal left no claim of its
+  own). Nothing else changes: the
+  run is still reported class `needs-attention`, reason
+  `supervision.delivery_unverified`, `eligible:false`; the tail behind the
+  unverified delivery is still never driven; a recomputation that comes back
+  failing derives the identical refusal; and the general rule that a parked
+  run stays parked is untouched — only the engine's own typed recovery
+  control is driven, exactly as an operator would drive it.
 - `continuation-eligible` remains a REPORT (the classification half), and
   an idle/done agent alone is neither completion (a `done` run without
   passing review evidence stays unknown) nor permission to resume (a paused
