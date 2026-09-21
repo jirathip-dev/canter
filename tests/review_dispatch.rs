@@ -94,10 +94,24 @@ fn write_fake_hermes(dir: &Path) -> PathBuf {
     let bin = dir.join("fakebin-hermes");
     std::fs::create_dir_all(&bin).expect("bin dir");
     let path = bin.join("hermes");
+    // The fake records the argv it was spawned with (in the directory the
+    // adapter ran it in) and plays the reviewer's role. Issue #238's witness
+    // needs ONE more knob: the fixture can make the FIX prompt fail (the
+    // marker file), so a refused fix-round delivery is exercised against the
+    // real effect path instead of being asserted from a stub.
     std::fs::write(
         &path,
         "#!/bin/sh\n\
+         printf 'run\\n' >> \"$HOME/fake-hermes-runs\"\n\
          printf '%s\\n' \"$@\" > argv.txt\n\
+         case \"$*\" in\n\
+           *\"Automatic fix round\"*)\n\
+             if [ -f \"$HOME/fix-prompt-fails\" ]; then\n\
+               printf 'the fix leg refused the instruction\\n' >&2\n\
+               exit 7\n\
+             fi\n\
+             ;;\n\
+         esac\n\
          printf 'reviewed\\n'\n",
     )
     .expect("write fake hermes");
@@ -114,6 +128,7 @@ fn write_fake_hermes(dir: &Path) -> PathBuf {
 /// One fixture: a lane worktree at the certified head, a fake harness on
 /// PATH, a daemon-owned review root and the run's bound implementer session.
 struct Fixture {
+    root: PathBuf,
     worktrees_root: PathBuf,
     lane: PathBuf,
     review_root: PathBuf,
@@ -154,6 +169,7 @@ impl Fixture {
         let review_root = dir.join("reviews");
         let session = run_session_handle(RUN).expect("the run session derives");
         Fixture {
+            root: dir.clone(),
             worktrees_root,
             lane,
             review_root,
@@ -162,6 +178,19 @@ impl Fixture {
             base: BASE.to_string(),
             session,
         }
+    }
+
+    /// The fix leg's OWN lane checkout (issue #238): the run's implementer
+    /// lane, next round — derived from the closed `(role, round)` set, never
+    /// spelled out in the test.
+    fn fix_lane(&self) -> PathBuf {
+        self.worktrees_root
+            .join(canter::lane::lane_checkout(ISSUE as u64, "implementer", 2))
+    }
+
+    /// The engine's OWN fix-round record path for this run's review step.
+    fn fix_receipt(&self) -> PathBuf {
+        canter::mutation::fix_round_receipt_path(&self.review_root, &self.session, STEP)
     }
 
     /// The reviewer lane identity this run's review step addresses.
@@ -184,11 +213,53 @@ impl Fixture {
 
 /// One `hf-plan/v1` document whose spine carries the review step under test.
 fn plan_with_review_step(params: Val) -> PlanBindings {
-    let steps = Val::Arr(vec![object(vec![
+    plan_with_steps(Val::Arr(vec![object(vec![
         ("id", string(STEP)),
         ("kind", string("review_evidence")),
         ("params", params),
-    ])]);
+    ])]))
+}
+
+/// The same plan document with the run's OWN implementer leg in front of the
+/// review step (issue #238): the `prompt` step the run's implementer lane was
+/// built by is where a fix round resolves its role binding, lane and branch.
+fn plan_with_fix_leg(review_params: Val) -> PlanBindings {
+    plan_with_steps(Val::Arr(vec![
+        object(vec![
+            ("id", string("p1")),
+            ("kind", string("worktree_create")),
+            (
+                "params",
+                object(vec![
+                    ("worktree", string(&format!("issues-{ISSUE}"))),
+                    ("branch", string(&format!("issue-{ISSUE}"))),
+                ]),
+            ),
+        ]),
+        object(vec![
+            ("id", string("p2")),
+            ("kind", string("prompt")),
+            (
+                "params",
+                object(vec![
+                    ("harness_key", string(IMPLEMENTER_KEY)),
+                    ("kind", string("hermes")),
+                    ("execution", string("headless")),
+                    ("worktree", string(&format!("issues-{ISSUE}"))),
+                    ("payload", string("do the bounded work")),
+                ]),
+            ),
+        ]),
+        object(vec![
+            ("id", string(STEP)),
+            ("kind", string("review_evidence")),
+            ("params", review_params),
+        ]),
+    ]))
+}
+
+/// One `hf-plan/v1` document bound over the given step spine.
+fn plan_with_steps(steps: Val) -> PlanBindings {
     let placeholder = object(vec![
         ("schema", string("hf-plan/v1")),
         ("plan_id", string("hf_plan_0000000000000000")),
@@ -1649,5 +1720,245 @@ fn a_review_row_the_agent_never_took_is_never_a_proven_delivery() {
     assert!(
         !review_verdict_path(&fixture.review_root, &fixture.session, STEP).exists(),
         "the step never advanced to a verdict wait"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (c) a recorded FAIL reaches the run's own fix round (issue #238)
+// ---------------------------------------------------------------------------
+
+/// The verdict document ONE reviewer wrote for the fix-round witnesses: the
+/// failing check is named, a passing one rides beside it so the brief's
+/// derivation is discriminating.
+fn failed_verdict(fixture: &Fixture, failing: &str, passing: &str) -> String {
+    verdict_doc(
+        &fixture.head,
+        &fixture.base,
+        "fail",
+        Val::Arr(vec![check(failing, "failed"), check(passing, "passed")]),
+    )
+}
+
+#[test]
+fn a_recorded_review_fail_reaches_the_runs_own_fix_round_without_an_operator() {
+    let fixture = Fixture::new("fix-round");
+    let params = reviewer_leg_params(&reviewer_binding_doc(), 20);
+    let plan = plan_with_fix_leg(params.clone());
+
+    let outcome = review_with_written_verdict(
+        &fixture,
+        &plan,
+        &params,
+        failed_verdict(&fixture, "AC1-cursor", "AC2-brief"),
+    );
+
+    // AC1: the recorded FAIL reaches a fix round in the SAME effect that
+    // consumed the verdict — no operator action between the two.
+    assert_eq!(outcome.status, "succeeded", "{outcome:?}");
+    let fix = outcome
+        .result
+        .get("fix_round")
+        .cloned()
+        .expect("the FAIL was handed to a fix round");
+    assert_eq!(
+        fix.get("schema").and_then(Val::as_str),
+        Some("hf-fix-round/v1")
+    );
+    assert_eq!(fix.get("round").and_then(Val::as_int), Some(1));
+    assert_eq!(
+        fix.get("bound").and_then(Val::as_int),
+        Some(canter::mutation::FIX_ROUNDS_MAX as i64)
+    );
+    assert_eq!(
+        fix.get("feature_head").and_then(Val::as_str),
+        Some(fixture.head.as_str())
+    );
+    assert_eq!(fix.get("reused").and_then(Val::as_bool), Some(false));
+    let lane = fix
+        .get("lane")
+        .and_then(Val::as_str)
+        .expect("the fix leg's lane identity");
+    assert!(!lane.is_empty());
+
+    // The fix leg's OWN lane checkout exists AT the certified head: created,
+    // not borrowed from the implementer lane's own checkout.
+    let fix_lane = fixture.fix_lane();
+    assert!(fix_lane.is_dir(), "the fix leg's lane was created");
+    assert_eq!(
+        git(&fix_lane, &["rev-parse", "--verify", "HEAD"]).trim(),
+        fixture.head,
+        "the fix leg starts at the reviewed head"
+    );
+    assert_ne!(fix_lane, fixture.lane, "the fix leg owns its own checkout");
+
+    // AC2: the instruction the fix leg was PROMPTED with is derived from the
+    // recorded verdict — it quotes the failing check and nothing else, the
+    // certified head, and the run's own feature branch.
+    let prompted =
+        std::fs::read_to_string(fix_lane.join("argv.txt")).expect("the fix leg was prompted");
+    assert!(
+        prompted.contains(&format!(
+            "Automatic fix round 1 of {}",
+            canter::mutation::FIX_ROUNDS_MAX
+        )),
+        "{prompted}"
+    );
+    assert!(prompted.contains("AC1-cursor"), "{prompted}");
+    assert!(
+        !prompted.contains("AC2-brief"),
+        "only the failures the reviewer recorded are quoted: {prompted}"
+    );
+    assert!(prompted.contains(&fixture.head), "{prompted}");
+    assert!(
+        prompted.contains(&format!("issue-{ISSUE}")),
+        "the instruction names the run's own feature branch: {prompted}"
+    );
+
+    // The engine's own record of the round is durable, so the bound counts it
+    // and the classification can read the handoff back.
+    let receipt =
+        std::fs::read_to_string(fixture.fix_receipt()).expect("the fix round was recorded");
+    assert!(receipt.contains("\"round\":1"), "{receipt}");
+    assert!(receipt.contains(&fixture.head), "{receipt}");
+}
+
+#[test]
+fn a_re_dispatch_of_the_same_head_reuses_the_recorded_fix_round() {
+    let fixture = Fixture::new("fix-reuse");
+    let params = reviewer_leg_params(&reviewer_binding_doc(), 20);
+    let plan = plan_with_fix_leg(params.clone());
+
+    let first = review_with_written_verdict(
+        &fixture,
+        &plan,
+        &params,
+        failed_verdict(&fixture, "AC1-cursor", "AC2-brief"),
+    );
+    assert_eq!(first.status, "succeeded", "{first:?}");
+    assert_eq!(
+        first
+            .result
+            .get("fix_round")
+            .and_then(|fix| fix.get("reused"))
+            .and_then(Val::as_bool),
+        Some(false)
+    );
+    // Drop the leg's own argv records: a SECOND prompt would recreate them.
+    let prompted_record = fixture.fix_lane().join("argv.txt");
+    std::fs::remove_file(&prompted_record).expect("the fixture owns the record");
+    // The bare-subprocess review substrate has no asynchronous leg, so the
+    // re-dispatch re-delivers the REVIEW brief: the fixture's writer waits for
+    // that prompt (and nothing else) before the reviewer's own write.
+    std::fs::remove_file(fixture.fake_argv()).expect("the review prompt record");
+
+    let second = review_with_written_verdict(
+        &fixture,
+        &plan,
+        &params,
+        failed_verdict(&fixture, "AC1-cursor", "AC2-brief"),
+    );
+    assert_eq!(second.status, "succeeded", "{second:?}");
+    let fix = second
+        .result
+        .get("fix_round")
+        .cloned()
+        .expect("the FAIL was handed to a fix round");
+    assert_eq!(
+        fix.get("reused").and_then(Val::as_bool),
+        Some(true),
+        "the same head REUSES the round it was already handed to: {fix:?}"
+    );
+    assert_eq!(fix.get("round").and_then(Val::as_int), Some(1));
+    assert!(
+        !prompted_record.exists(),
+        "a reused fix round is never re-prompted"
+    );
+}
+
+#[test]
+fn an_exhausted_fix_round_bound_escalates_and_names_the_failures() {
+    let fixture = Fixture::new("fix-bound");
+    let params = reviewer_leg_params(&reviewer_binding_doc(), 20);
+    let plan = plan_with_fix_leg(params.clone());
+
+    // The run's automatic rounds are spent: the record names the bound and an
+    // EARLIER head, so this FAIL opens the next round and finds none.
+    std::fs::create_dir_all(&fixture.review_root).expect("review root");
+    std::fs::write(
+        fixture.fix_receipt(),
+        canter::canonical::canonical_text(&object(vec![
+            ("schema", string("hf-fix-round/v1")),
+            ("round", integer(canter::mutation::FIX_ROUNDS_MAX as i64)),
+            ("bound", integer(canter::mutation::FIX_ROUNDS_MAX as i64)),
+            ("feature_head", string(&"1".repeat(40))),
+            ("lane", string("lane-0123456789abcdef")),
+            ("agent", string("")),
+            ("workspace", string("")),
+            ("pane", string("")),
+            ("delivery_attempts", integer(1)),
+        ])),
+    )
+    .expect("seed the spent bound");
+
+    let outcome = review_with_written_verdict(
+        &fixture,
+        &plan,
+        &params,
+        failed_verdict(&fixture, "AC3-escalation", "AC4-code"),
+    );
+
+    assert_eq!(outcome.status, "refused", "{outcome:?}");
+    assert_eq!(
+        outcome.code.as_deref(),
+        Some(canter::mutation::code::FIX_BOUND_EXHAUSTED),
+        "{outcome:?}"
+    );
+    let message = outcome.message.clone().unwrap_or_default();
+    assert!(
+        message.contains("AC3-escalation"),
+        "the escalation names the failures the reviewer recorded: {message}"
+    );
+    assert!(
+        !message.contains("AC4-code"),
+        "and only the failures: {message}"
+    );
+    assert!(
+        message.contains(&canter::mutation::FIX_ROUNDS_MAX.to_string()),
+        "the escalation names the bound: {message}"
+    );
+    assert!(
+        !outcome.result.get("fix_round").is_some(),
+        "an exhausted bound dispatches nothing"
+    );
+}
+
+#[test]
+fn a_refused_fix_prompt_keeps_its_own_code() {
+    let fixture = Fixture::new("fix-refused");
+    let params = reviewer_leg_params(&reviewer_binding_doc(), 20);
+    let plan = plan_with_fix_leg(params.clone());
+    // The fix leg refuses the instruction (a substrate-level refusal).
+    std::fs::write(fixture.root.join("fix-prompt-fails"), "1").expect("marker");
+
+    let outcome = review_with_written_verdict(
+        &fixture,
+        &plan,
+        &params,
+        failed_verdict(&fixture, "AC4-code", "AC1-cursor"),
+    );
+
+    assert_eq!(
+        outcome.code.as_deref(),
+        Some(canter::mutation::code::FIX_PROMPT),
+        "a failed delivery is the fix round's OWN refusal: {outcome:?}"
+    );
+    let message = outcome.message.clone().unwrap_or_default();
+    assert!(
+        message.contains(canter::mutation::code::EXIT),
+        "the substrate's own code rides in the message: {message}"
+    );
+    assert!(
+        !fixture.fix_receipt().exists(),
+        "a round that never reached its leg is never counted against the bound"
     );
 }

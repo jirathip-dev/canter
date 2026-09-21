@@ -745,6 +745,29 @@ clears a repository/fleet-level hold or bypasses a gate.
   recorded attempt keeps its own rules: the driver still dispatches a
   never-attempted autonomous step, and the refusal-before-any-effect case
   keeps `supervision.dispatch_refused` above.
+- **Fix-round handoff (issue #238)**: a recorded review FAIL is handed to the
+  run's own fix round by the review step itself, and the classification reports
+  the handoff's recorded disposition instead of parking on the FAIL. The
+  handoff's record is the review step's own outcome (the round, the automatic
+  bound and the fix leg's lane), read back with the same material the
+  classification already reads:
+  - the handoff was DISPATCHED for the newest verdict's head — class
+    `waiting-workers`, reason `supervision.fix_round_dispatched`, the fix leg's
+    lane as the detail, `eligible:false` (the repair leg is work in flight, not
+    completion);
+  - the handoff was REFUSED, or its budget is spent — class
+    `needs-attention`, reason `supervision.fix_round_refused` /
+    `supervision.fix_rounds_exhausted`, the fix round's OWN engine code
+    (`refusal.fix.spawn` / `refusal.fix.prompt` / `refusal.fix.lane` /
+    `refusal.fix.bound_exhausted`) as the detail, `eligible:false`. The refusal
+    is the review step's recorded outcome, so `run status` names the same code;
+  - a FAIL whose review step recorded no fix round at all — a plan that
+    presents its own review facts, or a run recorded before this handoff
+    existed — keeps `supervision.review_failed`, now with the review step as
+    its detail instead of an empty one.
+  A fix-round record naming ANOTHER head is never this FAIL's handoff (the
+  certified head moved past it), so the rule is keyed to the head the verdict
+  names, never to the newest row.
 - **Refused continuation dispatch (issue #141)**: when the engine refuses the
   driver's continuation of the frontier step BEFORE its claim (a fan-out
   admission refusal such as `refusal.admission.proof_stale`, a derived

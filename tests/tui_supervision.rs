@@ -51,6 +51,19 @@ const REVISION: &str = "1111111111111111111111111111111111111111";
 const WORKFLOW_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const POLICY_HASH: &str = "feedface01234567feedface01234567feedface01234567feedface01234567";
 
+/// The no-progress ceiling of a recorded-state wait, in seconds (issue #232).
+///
+/// Progress-driven, never a fixed wall-clock bound: the driver wakes
+/// semantically on each committed step and otherwise re-checks on its bounded
+/// timer fallback (`canter::supervision::DEFAULT_CHECK_INTERVAL_SECS`, 60 s),
+/// so one starved wake legitimately leaves the recorded check count unchanged
+/// for a little over a minute on a loaded host. The wait below therefore fails
+/// only after this much time with NO new committed check — two driver ticks,
+/// so a single starved wake can never fail a witness — and it stays inside the
+/// CI test driver's per-suite budget (`scripts/ci-test-driver.py`,
+/// `PER_SUITE_SECONDS = 300`).
+const NO_PROGRESS_SECS: u64 = 120;
+
 fn config() -> Config {
     Config {
         path: PathBuf::from("canter.toml"),
@@ -349,10 +362,14 @@ fn shutdown(mut daemon: Child) {
 /// Wait until the daemon's OWN driver committed at least one check for `run`
 /// and return that `supervision.status` document (read with an independent
 /// client).
+///
+/// Fails only after `NO_PROGRESS_SECS` with no NEW committed check (issue
+/// #232), naming the progress observed and the elapsed time.
 fn wait_for_committed_check(fixture: &Fixture, run: &str) -> Val {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let mut last = None;
-    while Instant::now() < deadline {
+    let started = Instant::now();
+    let mut last_progress = started;
+    let mut progress = -1i64;
+    loop {
         let doc = rpc_ok(
             &fixture.socket,
             "b0000001",
@@ -360,13 +377,23 @@ fn wait_for_committed_check(fixture: &Fixture, run: &str) -> Val {
             Some(&supervision::status_params(run)),
         );
         let checks = int_at(&doc, &["evaluation", "checks"]);
-        last = Some(doc);
         if checks.is_some_and(|checks| checks >= 1) {
-            return last.expect("status doc");
+            return doc;
         }
+        let observed = checks.unwrap_or(-1);
+        if observed != progress {
+            progress = observed;
+            last_progress = Instant::now();
+        }
+        let stalled = last_progress.elapsed().as_secs();
+        assert!(
+            stalled < NO_PROGRESS_SECS,
+            "no committed check observed: no progress for {stalled}s of {}s waited (recorded \
+             {observed} check(s)); last status: {doc:?}",
+            started.elapsed().as_secs()
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
-    panic!("no committed check observed; last status: {last:?}");
 }
 
 // ---------------------------------------------------------------------------

@@ -47,6 +47,49 @@ fn item_of<'a>(doc: &'a Val, id: &str) -> &'a Val {
         .unwrap_or_else(|| panic!("item {id} in {doc:?}"))
 }
 
+/// The no-progress ceiling of a frontier wait, in seconds (issue #232).
+///
+/// Progress-driven, never a fixed wall-clock bound: the driver wakes
+/// semantically on each committed step and otherwise re-checks on its
+/// bounded timer fallback (`canter::supervision::DEFAULT_CHECK_INTERVAL_SECS`,
+/// 60 s), so one starved wake legitimately holds the frontier for a little
+/// over a minute on a loaded host. Four ticks is the ceiling — a starved
+/// wake can never fail the witness — and it stays comfortably inside the CI
+/// test driver's per-suite budget (`scripts/ci-test-driver.py`,
+/// `PER_SUITE_SECONDS = 300`), so a genuinely stuck frontier still reports
+/// itself instead of being killed by the driver.
+const FRONTIER_NO_PROGRESS_SECS: u64 = 240;
+
+/// The durable progress a frontier wait tracks: the whole recorded cursor —
+/// frontier, attempt ledger, in-flight step — canonically rendered, so any
+/// new attempt, settlement or frontier move counts as progress while a
+/// re-read of an unchanged cursor does not.
+fn frontier_progress(sup: &Val) -> String {
+    canonical_text(field(sup, &["cursor"]))
+}
+
+/// The durable progress a recorded-CLASS wait tracks: the cursor plus the
+/// committed check ledger (count, last check, continuation) of the recorded
+/// evaluation, canonically rendered. A committed check, a settlement or a
+/// frontier move counts as progress; the read-time fields that change on
+/// every read (`freshness.age_secs`, `progress.age_secs`,
+/// `next_check.due_in_secs`) are deliberately excluded, so re-reading an
+/// unchanged record can never pass for progress.
+fn recorded_progress(sup: &Val) -> String {
+    canonical_text(&object(vec![
+        ("cursor", field(sup, &["cursor"]).clone()),
+        ("checks", field(sup, &["evaluation", "checks"]).clone()),
+        (
+            "last_check",
+            field(sup, &["evaluation", "last_check"]).clone(),
+        ),
+        (
+            "continuation",
+            field(sup, &["evaluation", "continuation"]).clone(),
+        ),
+    ]))
+}
+
 fn hold_codes(item: &Val) -> Vec<String> {
     field(item, &["holds"])
         .as_array()
@@ -379,17 +422,40 @@ impl Fixture {
         std::fs::read_to_string(self.path("state/canter/journal/audit.jsonl")).unwrap()
     }
 
-    /// Wait (bounded) until the run's recorded frontier is `step`, and return
-    /// the supervision status document that shows it.
+    /// Wait until the run's recorded frontier is `step`, and return the
+    /// supervision status document that shows it.
+    ///
+    /// PROGRESS-DRIVEN, never a fixed wall-clock bound (issue #232): the
+    /// ceiling is `FRONTIER_NO_PROGRESS_SECS` of NO durable progress, and any
+    /// new recorded attempt, settlement or frontier move resets it. A
+    /// genuinely stuck frontier still fails, naming the progress observed and
+    /// the elapsed time.
     fn wait_for_frontier(&self, run: &str, step: &str) -> Val {
-        let deadline = Instant::now() + Duration::from_secs(90);
+        let started = Instant::now();
+        let mut last_progress = started;
+        let mut progress = String::new();
         loop {
             let sup = self.supervision(run);
             if text(&sup, &["cursor", "next_step"]) == step {
                 return sup;
             }
-            if Instant::now() >= deadline {
-                panic!("the frontier never reached {step}: {sup:?}");
+            let observed = frontier_progress(&sup);
+            if observed != progress {
+                progress = observed;
+                last_progress = Instant::now();
+            }
+            let stalled = last_progress.elapsed().as_secs();
+            if stalled >= FRONTIER_NO_PROGRESS_SECS {
+                panic!(
+                    "the frontier never reached {step}: no progress for {stalled}s of {}s \
+                     waited (frontier {:?}, {} recorded attempt(s), in_flight {:?}): {sup:?}",
+                    started.elapsed().as_secs(),
+                    text(&sup, &["cursor", "next_step"]),
+                    field(&sup, &["cursor", "attempts"])
+                        .as_array()
+                        .map_or(0, Vec::len),
+                    text(&sup, &["cursor", "in_flight"]),
+                );
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -405,7 +471,9 @@ impl Fixture {
         self.first(run);
         let sup = self.wait_for_frontier(run, "p5-5");
         assert_eq!(text(&sup, &["cursor", "next_step_kind"]), "collect_outcome");
-        let deadline = Instant::now() + Duration::from_secs(90);
+        let deadline_free_start = Instant::now();
+        let mut last_progress = deadline_free_start;
+        let mut progress = String::new();
         let mut stable = String::new();
         let mut reads = 0usize;
         loop {
@@ -427,12 +495,25 @@ impl Fixture {
                     return (sup, class);
                 }
             } else {
-                stable = class;
+                stable = class.clone();
                 reads = 1;
             }
-            if Instant::now() >= deadline {
-                panic!("the recorded class never settled at p5-5: {sup:?}");
+            let observed = recorded_progress(&sup);
+            if observed != progress {
+                progress = observed;
+                last_progress = Instant::now();
             }
+            let stalled = last_progress.elapsed().as_secs();
+            assert!(
+                stalled < FRONTIER_NO_PROGRESS_SECS,
+                "the recorded class never settled at p5-5: no progress for {stalled}s of {}s \
+                 waited (class {class:?}, frontier {:?}, {} recorded check(s)): {sup:?}",
+                deadline_free_start.elapsed().as_secs(),
+                text(&sup, &["cursor", "next_step"]),
+                field(&sup, &["evaluation", "checks"])
+                    .as_int()
+                    .unwrap_or(-1),
+            );
             std::thread::sleep(Duration::from_millis(700));
         }
     }

@@ -1775,6 +1775,12 @@ pub fn render_human(doc: &Val) -> String {
             let reason = item.get("reason").and_then(Val::as_str).unwrap_or("-");
             let instance = item.get("instance_id").and_then(Val::as_str).unwrap_or("-");
             lines.push(format!("  {id}: {status} ({reason}) run={instance}"));
+            // #236: the human text carries the producer's own message — for a
+            // wait that is the occupancy (count, cap and the lanes holding
+            // it), not only the refusal code.
+            if let Some(message) = item.get("message").and_then(Val::as_str) {
+                lines.push(format!("      {message}"));
+            }
         }
     }
     // Issue #96: the durable queue cursor and the current hold, if any.
@@ -1798,6 +1804,11 @@ pub fn render_human(doc: &Val) -> String {
                     .unwrap_or("-"),
                 held.get("reason").and_then(Val::as_str).unwrap_or("-"),
             ));
+            // #236: the held row's own message (the occupancy a cap refusal
+            // names) is rendered in the human text too.
+            if let Some(message) = held.get("message").and_then(Val::as_str) {
+                lines.push(format!("      {message}"));
+            }
         }
     }
     lines.push(format!(

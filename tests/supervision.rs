@@ -12,7 +12,8 @@
 //!   yields exactly one fresh reconciliation, and nothing ever spawns,
 //!   prompts or continues work.
 //!
-//! No fixed real sleeps: every wait is a bounded poll with a deadline.
+//! No fixed real sleeps: every wait on recorded canter state is a poll that
+//! fails only after a documented no-progress ceiling (issue #232).
 #[path = "support/process_group.rs"]
 mod process_group;
 
@@ -509,22 +510,82 @@ fn path_of(doc: &Val, keys: &[&str]) -> Val {
     cursor
 }
 
-/// Poll `supervision.status` until the recorded check count reaches `want`
-/// (bounded; no fixed sleeps).
+/// The no-progress ceiling of a recorded-state wait, in seconds (issue #232).
+///
+/// Progress-driven, never a fixed wall-clock bound: the driver wakes
+/// semantically on each committed step and otherwise re-checks on its bounded
+/// timer fallback (`canter::supervision::DEFAULT_CHECK_INTERVAL_SECS`, 60 s),
+/// so one starved wake legitimately leaves the recorded frontier, the attempt
+/// ledger or the committed check count unchanged for a little over a minute
+/// on a loaded host. Every wait below that observes one of those records
+/// therefore fails only after this much time with NO durable change — any new
+/// recorded attempt, committed check or frontier move resets the ceiling.
+/// Two driver ticks, so a single starved wake can never fail a witness, and
+/// it leaves room inside the CI test driver's per-suite budget
+/// (`scripts/ci-test-driver.py`, `PER_SUITE_SECONDS = 300`) for the suite's
+/// own serialized baseline, so a genuinely stuck witness still reports itself
+/// instead of being killed by the driver.
+const NO_PROGRESS_SECS: u64 = 120;
+
+/// Poll `supervision.status` until the recorded check count reaches `want`,
+/// failing only after `NO_PROGRESS_SECS` with no NEW committed check (issue
+/// #232) and naming the progress observed and the elapsed time.
 fn wait_for_checks(fixture: &DaemonFixture, run: &str, want: i64) -> Val {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let mut last = String::new();
+    let started = Instant::now();
+    let mut last_progress = started;
+    let mut progress = -1i64;
     let mut id = 100u64;
-    while Instant::now() < deadline {
+    loop {
         id += 1;
         let doc = status_doc(&fixture.socket, &fresh_id(id), run);
-        if checks_of(&doc) >= want {
+        let checks = checks_of(&doc);
+        if checks >= want {
             return doc;
         }
-        last = canter::canonical::canonical_text(&doc);
+        if checks != progress {
+            progress = checks;
+            last_progress = Instant::now();
+        }
+        let last = canter::canonical::canonical_text(&doc);
+        let stalled = last_progress.elapsed().as_secs();
+        assert!(
+            stalled < NO_PROGRESS_SECS,
+            "run {run} never reached {want} recorded check(s): no progress for {stalled}s of {}s \
+             waited (recorded {checks}); last: {last}",
+            started.elapsed().as_secs()
+        );
         std::thread::sleep(Duration::from_millis(25));
     }
-    panic!("run {run} never reached {want} recorded check(s); last: {last}");
+}
+
+/// Poll the run's recorded attempt ledger until `step` has an attempt row,
+/// failing only after `NO_PROGRESS_SECS` with no NEW recorded attempt (issue
+/// #232) and naming the progress observed and the elapsed time.
+fn wait_for_step_attempt(fixture: &DaemonFixture, run: &str, step: &str) -> Vec<(String, String)> {
+    let started = Instant::now();
+    let mut last_progress = started;
+    let mut progress = String::new();
+    loop {
+        let attempts = fixture.seed().run_step_attempts(run).expect("attempts");
+        if attempts.iter().any(|(id, _)| id == step) {
+            return attempts;
+        }
+        let observed = format!("{attempts:?}");
+        if observed != progress {
+            progress = observed;
+            last_progress = Instant::now();
+        }
+        let stalled = last_progress.elapsed().as_secs();
+        assert!(
+            stalled < NO_PROGRESS_SECS,
+            "the driver never dispatched {step}: no progress for {stalled}s of {}s waited \
+             ({} recorded attempt(s)): {attempts:?}\n{}",
+            started.elapsed().as_secs(),
+            attempts.len(),
+            std::fs::read_to_string(fixture.daemon_log()).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1908,15 +1969,7 @@ fn an_armed_run_is_advanced_by_the_drivers_own_dispatch() {
 
     // AC-F4: the driver dispatches the next unachieved step by itself — no
     // further client request — through the apply engine.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut attempts = Vec::new();
-    while Instant::now() < deadline {
-        attempts = fixture.seed().run_step_attempts(&run).expect("attempts");
-        if attempts.iter().any(|(step, _)| step == "p2") {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let attempts = wait_for_step_attempt(&fixture, &run, "p2");
     let p2 = attempts
         .iter()
         .find(|(step, _)| step == "p2")
@@ -2098,15 +2151,7 @@ fn retry_lane_scenario(name: &str) -> (DaemonFixture, GroupChild, String) {
     // The driver continues by itself: `p2` was never dispatched, so its
     // contract-complete committed params are presented. The pre-existing
     // branch makes the real adapter fail and records the diagnosis.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut attempts = Vec::new();
-    while Instant::now() < deadline {
-        attempts = fixture.seed().run_step_attempts(&run).expect("attempts");
-        if attempts.iter().any(|(step, _)| step == "p2") {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let attempts = wait_for_step_attempt(&fixture, &run, "p2");
     let p2 = attempts
         .iter()
         .find(|(step, _)| step == "p2")
@@ -3385,7 +3430,9 @@ fn supervised_collection(mode: &str) {
     let submitted = rpc_ok(&fixture.socket, &fresh_id(1), "queue.submit", Some(params));
     let run = instance_of(&submitted, 5);
     let lane = fixture.dir.join("worktrees/issues-5");
-    let deadline = Instant::now() + Duration::from_secs(40);
+    let started = Instant::now();
+    let mut last_progress = started;
+    let mut progress = String::new();
     let mut waiting_checks = None;
     loop {
         let doc = status_doc(&fixture.socket, &fresh_id(2), &run);
@@ -3397,6 +3444,11 @@ fn supervised_collection(mode: &str) {
             .attempts;
         if attempts.iter().any(|(step, _, _)| step == "collect") {
             break;
+        }
+        let observed = format!("{attempts:?}");
+        if observed != progress {
+            progress = observed;
+            last_progress = Instant::now();
         }
         if class_of(&doc) == "waiting-workers" {
             assert_eq!(evaluation(&doc).get("eligible"), Some(&Val::Bool(true)));
@@ -3416,9 +3468,13 @@ fn supervised_collection(mode: &str) {
                 std::fs::write(fixture.dir.join("allow-stop"), "stop").unwrap();
             }
         }
+        let stalled = last_progress.elapsed().as_secs();
         assert!(
-            Instant::now() < deadline,
-            "collection never settled: {}\n{}",
+            stalled < NO_PROGRESS_SECS,
+            "collection never settled: no progress for {stalled}s of {}s waited \
+             ({} recorded attempt(s)): {}\n{}",
+            started.elapsed().as_secs(),
+            attempts.len(),
             canter::canonical::canonical_text(&doc),
             std::fs::read_to_string(fixture.daemon_log()).unwrap_or_default()
         );

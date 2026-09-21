@@ -66,6 +66,27 @@ fn item_of<'a>(doc: &'a Val, id: &str) -> &'a Val {
         .unwrap_or_else(|| panic!("item {id} in {doc:?}"))
 }
 
+/// The no-progress ceiling of a frontier wait, in seconds (issue #232).
+///
+/// Progress-driven, never a fixed wall-clock bound: the driver wakes
+/// semantically on each committed step and otherwise re-checks on its
+/// bounded timer fallback (`canter::supervision::DEFAULT_CHECK_INTERVAL_SECS`,
+/// 60 s), so one starved wake legitimately holds the frontier for a little
+/// over a minute on a loaded host. Four ticks is the ceiling — a starved
+/// wake can never fail the witness — and it stays comfortably inside the CI
+/// test driver's per-suite budget (`scripts/ci-test-driver.py`,
+/// `PER_SUITE_SECONDS = 300`), so a genuinely stuck frontier still reports
+/// itself instead of being killed by the driver.
+const FRONTIER_NO_PROGRESS_SECS: u64 = 240;
+
+/// The durable progress a frontier wait tracks: the whole recorded cursor —
+/// frontier, attempt ledger, in-flight step — canonically rendered, so any
+/// new attempt, settlement or frontier move counts as progress while a
+/// re-read of an unchanged cursor does not.
+fn frontier_progress(sup: &Val) -> String {
+    canonical_text(field(sup, &["cursor"]))
+}
+
 struct Fixture {
     root: PathBuf,
     daemon: Option<GroupChild>,
@@ -103,8 +124,20 @@ impl Fixture {
             "bin/hermes",
             "#!/bin/sh\nprintf 'x\\n' >> \"$HOME/prompt-count\"\nprintf 'worker delta\\n' > autonomous.txt\ngit add autonomous.txt\ngit -c user.name=Worker -c user.email=worker@example.invalid commit -m 'worker delivery'\nprintf '%s\\n' \"$@\" > \"$HOME/prompt-argv\"\nprintf 'fixture output\\n'\n",
         );
+        // Issue #225: the publish path COMPUTES the hosted CI conclusion at
+        // the certified head through the forge CLI, so the fixture answers the
+        // deterministic green check its own head carries.
+        fixture.write(
+            "bin/gh",
+            "#!/bin/sh\ncase \"$1\" in\n  run)\n    case \"$2\" in\n      list) printf '[{\"databaseId\":4242,\"workflowName\":\"ci\",\"status\":\"completed\",\"conclusion\":\"success\"}]'; exit 0 ;;\n    esac ;;\nesac\nexit 1\n",
+        );
         std::fs::set_permissions(
             fixture.path("bin/hermes"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            fixture.path("bin/gh"),
             std::fs::Permissions::from_mode(0o755),
         )
         .unwrap();
@@ -435,36 +468,58 @@ impl Fixture {
         }
     }
 
-    /// Wait (bounded) until the run's recorded frontier is `step`, and return
-    /// the supervision status document that shows it.
-    fn wait_for_frontier(&self, run: &str, step: &str) -> Val {
-        let deadline = Instant::now() + Duration::from_secs(90);
+    /// Poll the run's supervision status until `done` accepts it, failing
+    /// only after `FRONTIER_NO_PROGRESS_SECS` of NO durable progress — any
+    /// new recorded attempt, settlement or frontier move resets the ceiling
+    /// (issue #232) — and naming the observed progress and the elapsed time.
+    fn wait_for_durable<F>(&self, run: &str, want: &str, done: F) -> Val
+    where
+        F: Fn(&Val) -> bool,
+    {
+        let started = Instant::now();
+        let mut last_progress = started;
+        let mut progress = String::new();
         loop {
             let sup = self.supervision(run);
-            if text(&sup, &["cursor", "next_step"]) == step {
+            if done(&sup) {
                 return sup;
             }
-            if Instant::now() >= deadline {
-                panic!("the frontier never reached {step}: {sup:?}");
+            let observed = frontier_progress(&sup);
+            if observed != progress {
+                progress = observed;
+                last_progress = Instant::now();
+            }
+            let stalled = last_progress.elapsed().as_secs();
+            if stalled >= FRONTIER_NO_PROGRESS_SECS {
+                panic!(
+                    "the run never reached {want}: no progress for {stalled}s of {}s waited \
+                     (frontier {:?}, {} recorded attempt(s), in_flight {:?}): {sup:?}",
+                    started.elapsed().as_secs(),
+                    text(&sup, &["cursor", "next_step"]),
+                    field(&sup, &["cursor", "attempts"])
+                        .as_array()
+                        .map_or(0, Vec::len),
+                    text(&sup, &["cursor", "in_flight"]),
+                );
             }
             std::thread::sleep(Duration::from_millis(100));
         }
     }
 
-    /// Wait (bounded) until one step's LATEST recorded attempt reaches
-    /// `status`, and return the supervision status document that shows it.
+    /// Wait until the run's recorded frontier is `step`, and return the
+    /// supervision status document that shows it.
+    fn wait_for_frontier(&self, run: &str, step: &str) -> Val {
+        self.wait_for_durable(run, &format!("frontier {step}"), |sup| {
+            text(sup, &["cursor", "next_step"]) == step
+        })
+    }
+
+    /// Wait until one step's LATEST recorded attempt reaches `status`, and
+    /// return the supervision status document that shows it.
     fn wait_for_attempt(&self, run: &str, step: &str, status: &str) -> Val {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            let sup = self.supervision(run);
-            if attempt(&sup, step).is_some_and(|(recorded, _)| recorded == status) {
-                return sup;
-            }
-            if Instant::now() >= deadline {
-                panic!("step {step} never reached {status}: {sup:?}");
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        self.wait_for_durable(run, &format!("step {step} {status}"), |sup| {
+            attempt(sup, step).is_some_and(|(recorded, _)| recorded == status)
+        })
     }
 }
 

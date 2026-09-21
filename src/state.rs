@@ -741,13 +741,53 @@ struct GrantBinding {
     status: String,
 }
 
+/// Every counted lane — the fan-out gate's own run-state set, across all
+/// repositories — as the admission gate's footprints (#236). The SAME rows
+/// the counted axes derive from, so a cap refusal names exactly the lanes it
+/// counted; the per-repository subset is derived from this one set. Ordered
+/// by run id, so one durable state renders one message.
+fn counted_lane_footprints(
+    tx: &rusqlite::Transaction<'_>,
+    label: &str,
+) -> Result<Vec<crate::lifecycle::LaneFootprint>, StateError> {
+    let mut statement = tx
+        .prepare(
+            "SELECT repository, issue_number, scope, instance_id FROM instances
+              WHERE status IN ('new', 'running', 'human_queue', 'blocked')
+              ORDER BY instance_id",
+        )
+        .map_err(|err| StateError::from_sqlite(label, err))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(crate::lifecycle::LaneFootprint {
+                repository: row.get::<_, String>(0)?,
+                harness_key: String::new(),
+                scope: row.get::<_, String>(2)?,
+                issue_number: row.get::<_, i64>(1)?,
+                identity: row.get::<_, String>(3)?,
+            })
+        })
+        .map_err(|err| StateError::from_sqlite(label, err))?;
+    let mut lanes = Vec::new();
+    for row in rows {
+        lanes.push(row.map_err(|err| StateError::from_sqlite(label, err))?);
+    }
+    Ok(lanes)
+}
+
 /// Running fan-out slot accounting for one submission transaction: the
 /// counted lanes (read under the guard) plus the runs admitted so far, in
 /// the preview's axis order.
 struct FanoutSlots<'a> {
     caps: &'a crate::lifecycle::ConcurrencyCaps,
-    counted_global: i64,
-    counted_repository: i64,
+    /// Repository this submission is for (the per-repository axis).
+    repository: &'a str,
+    /// Every counted lane (all repositories) as the admission gate's own
+    /// footprints: the global axis names them all, the per-repository axis
+    /// names the subset in `repository` — through the ONE authoritative
+    /// occupancy renderer (#236). Ordered by run id, so one durable state
+    /// renders one message.
+    counted_lanes: Vec<crate::lifecycle::LaneFootprint>,
     harness_lanes: Option<i64>,
     admitted_global: i64,
     admitted_repository: i64,
@@ -755,26 +795,42 @@ struct FanoutSlots<'a> {
 }
 
 impl FanoutSlots<'_> {
+    /// The counted lanes of this submission's repository — the same set the
+    /// per-repository axis counts, so a refusal names exactly it (#236).
+    fn repository_lanes(&self) -> Vec<&crate::lifecycle::LaneFootprint> {
+        self.counted_lanes
+            .iter()
+            .filter(|lane| lane.repository == self.repository)
+            .collect()
+    }
+
     /// The hold that parks the next eligible item, if one applies: capacity
     /// first (the preview's axis order), then the attestation gap.
     fn hold(&self) -> Option<(&'static str, String)> {
-        if self.counted_global + self.admitted_global >= self.caps.global as i64 {
+        if self.counted_lanes.len() as i64 + self.admitted_global >= self.caps.global as i64 {
             return Some((
                 crate::lifecycle::code::CAP_GLOBAL,
                 format!(
-                    "the global concurrency cap ({}) is reached ({} active lanes); the item \
+                    "the global concurrency cap ({}) is reached ({} active lanes: {}); the item \
                      waits",
-                    self.caps.global, self.counted_global
+                    self.caps.global,
+                    self.counted_lanes.len(),
+                    crate::lifecycle::lane_occupants(self.counted_lanes.iter())
                 ),
             ));
         }
-        if self.counted_repository + self.admitted_repository >= self.caps.per_repository as i64 {
+        let repository_lanes = self.repository_lanes();
+        if repository_lanes.len() as i64 + self.admitted_repository
+            >= self.caps.per_repository as i64
+        {
             return Some((
                 crate::lifecycle::code::CAP_REPOSITORY,
                 format!(
-                    "the per-repository concurrency cap ({}) is reached ({} active lanes); the \
-                     item waits",
-                    self.caps.per_repository, self.counted_repository
+                    "the per-repository concurrency cap ({}) is reached ({} active lanes: {}); \
+                     the item waits",
+                    self.caps.per_repository,
+                    repository_lanes.len(),
+                    crate::lifecycle::lane_occupants(repository_lanes)
                 ),
             ));
         }
@@ -817,7 +873,6 @@ struct QueueAdmission<'a> {
     workflow_id: &'a str,
     workflow_hash: &'a str,
     ownership: &'a BTreeMap<i64, OwnedRunSnapshot>,
-    repository_lanes: &'a [(i64, String)],
 }
 
 /// One membership item's admission inputs.
@@ -1131,8 +1186,9 @@ fn admit_queue_item_in_tx(
     if let Some((code, message)) = slots.hold() {
         return Ok(AdmissionDecision::Waiting { code, message });
     }
-    if ctx.repository_lanes.iter().any(|(lane_issue, lane_scope)| {
-        *lane_issue != item.issue_number && crate::lifecycle::paths_overlap(&scope, lane_scope)
+    if slots.repository_lanes().iter().any(|lane| {
+        lane.issue_number != item.issue_number
+            && crate::lifecycle::paths_overlap(&scope, &lane.scope)
     }) {
         return Ok(AdmissionDecision::Waiting {
             code: crate::lifecycle::code::MONOREPO_OVERLAP,
@@ -4501,41 +4557,13 @@ impl State {
             owned
         };
         // Counted lanes: the fan-out capacity axes plus the same-repository
-        // declared scopes for the overlap re-check.
-        let counted_global: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM instances
-                  WHERE status IN ('new', 'running', 'human_queue', 'blocked')",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|err| StateError::from_sqlite("submit_queue_run: counted", err))?;
-        let repository_lanes: Vec<(i64, String)> = {
-            let mut statement = tx
-                .prepare(
-                    "SELECT issue_number, scope FROM instances
-                      WHERE repository = ?1
-                        AND status IN ('new', 'running', 'human_queue', 'blocked')",
-                )
-                .map_err(|err| StateError::from_sqlite("submit_queue_run: lanes", err))?;
-            let rows = statement
-                .query_map(params![plan.repository], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                })
-                .map_err(|err| StateError::from_sqlite("submit_queue_run: lanes query", err))?;
-            let mut lanes = Vec::new();
-            for row in rows {
-                lanes.push(
-                    row.map_err(|err| StateError::from_sqlite("submit_queue_run: lanes row", err))?,
-                );
-            }
-            lanes
-        };
-        let counted_repository = repository_lanes.len() as i64;
+        // declared scopes for the overlap re-check — one set, read under the
+        // guard, that a refusal names.
+        let counted_lanes = counted_lane_footprints(&tx, "submit_queue_run: counted lanes")?;
         let mut slots = FanoutSlots {
             caps: &plan.admission_caps,
-            counted_global,
-            counted_repository,
+            repository: &plan.repository,
+            counted_lanes,
             harness_lanes: plan.harness_lanes,
             admitted_global: 0,
             admitted_repository: 0,
@@ -4566,7 +4594,6 @@ impl State {
                         workflow_id: &plan.workflow_id,
                         workflow_hash: &plan.workflow_hash,
                         ownership: &owned,
-                        repository_lanes: &repository_lanes,
                     };
                     let candidate = QueueAdmissionItem {
                         issue_number: item.issue_number,
@@ -8788,6 +8815,77 @@ pub(crate) fn dispatch_refusal_of(
     })
 }
 
+/// The newest recorded fix-round dispatch of one run (issue #238), read from
+/// the run's own step outcomes: the review step that consumed a FAIL records
+/// the fix round it handed that FAIL to in its result document, so the round
+/// the run is waiting on is a recorded fact and not a second ledger. `None`
+/// when no step of the run ever dispatched a fix round.
+fn newest_fix_round_locked(
+    conn: &Connection,
+    instance_id: &str,
+) -> Result<Option<SupervisionFixRound>, StateError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT request_line, outcome FROM idempotency
+              WHERE method = 'apply' AND outcome IS NOT NULL
+                AND outcome LIKE '%fix_round%'
+              ORDER BY rowid",
+        )
+        .map_err(|err| StateError::from_sqlite("supervision fix round: prepare", err))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(|err| StateError::from_sqlite("supervision fix round: query", err))?;
+    let mut newest: Option<SupervisionFixRound> = None;
+    for row in rows {
+        let (line, outcome) =
+            row.map_err(|err| StateError::from_sqlite("supervision fix round: row", err))?;
+        let Some(outcome) = outcome else {
+            continue;
+        };
+        let Ok(request) = Val::parse_json(&line) else {
+            continue;
+        };
+        let params = request.get("params").cloned().unwrap_or_else(null);
+        if params.get("instance_id").and_then(Val::as_str) != Some(instance_id) {
+            continue;
+        }
+        let Ok(outcome) = Val::parse_json(&outcome) else {
+            continue;
+        };
+        let Some(fix) = outcome
+            .get("result")
+            .and_then(|result| result.get("fix_round"))
+        else {
+            continue;
+        };
+        if fix.get("schema").and_then(Val::as_str) != Some("hf-fix-round/v1") {
+            continue;
+        }
+        let (Some(round), Some(bound), Some(lane), Some(feature_head)) = (
+            fix.get("round").and_then(Val::as_int),
+            fix.get("bound").and_then(Val::as_int),
+            fix.get("lane").and_then(Val::as_str),
+            fix.get("feature_head").and_then(Val::as_str),
+        ) else {
+            continue;
+        };
+        newest = Some(SupervisionFixRound {
+            step: params
+                .get("step")
+                .and_then(Val::as_str)
+                .unwrap_or("")
+                .to_string(),
+            feature_head: feature_head.to_string(),
+            round,
+            bound,
+            lane: lane.to_string(),
+        });
+    }
+    Ok(newest)
+}
+
 /// Read a grant row out of an `hf-grant/v1` document (validated by the
 /// caller through [`crate::schema::validate_doc`]).
 fn grant_row_from_doc(doc: &Val) -> Result<GrantRow, StateError> {
@@ -12174,6 +12272,10 @@ pub struct SupervisionEvidence {
     /// The NEWEST recorded REFUSAL of this run's own continuation dispatch
     /// (issue #141), when one exists.
     pub dispatch_refusal: Option<SupervisionDispatchRefusal>,
+    /// The NEWEST recorded fix-round dispatch of this run's review step
+    /// (issue #238), when one exists: the round of the automatic bound the
+    /// recorded FAIL was handed to.
+    pub fix_round: Option<SupervisionFixRound>,
 }
 
 /// One recorded refusal of a supervised continuation dispatch (issue #141).
@@ -12196,6 +12298,28 @@ pub struct SupervisionDispatchRefusal {
     pub reason: String,
     /// When the refusal was recorded (RFC3339 UTC).
     pub at: String,
+}
+
+/// One recorded fix-round dispatch of a supervised run (issue #238).
+///
+/// A review FAIL no longer parks the run: the review step hands the failure
+/// to the run's own fix round, and the apply outcome of that step carries the
+/// dispatch (round of the automatic bound, the fix leg's lane and the
+/// certified head it was dispatched for). Reading it back lets the
+/// classification report the fix round as live work — "awaiting a fix round"
+/// — instead of reporting a FAIL that nothing continues.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SupervisionFixRound {
+    /// The review step whose recorded FAIL was handed to the fix round.
+    pub step: String,
+    /// The certified head the fix round was dispatched for.
+    pub feature_head: String,
+    /// The fix round (1-based) and the automatic bound it counts against.
+    pub round: i64,
+    /// See [`SupervisionFixRound::round`].
+    pub bound: i64,
+    /// The fix leg's lane session (the identity the instruction reached).
+    pub lane: String,
 }
 
 /// The recorded dispatch context of one run: the first topology it bound,
@@ -12998,35 +13122,9 @@ fn advance_queue_in_tx(
                 // the SAME caps and occupancy attestation the submission
                 // committed under, and the SAME guard-verifying helper.
                 let epoch = current_epoch_locked(tx)?;
-                let counted_global: i64 = tx
-                    .query_row(
-                        "SELECT COUNT(*) FROM instances
-                          WHERE status IN ('new', 'running', 'human_queue', 'blocked')",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .map_err(|err| StateError::from_sqlite("queue_advance: counted", err))?;
-                let mut statement = tx
-                    .prepare(
-                        "SELECT issue_number, scope FROM instances
-                          WHERE repository = ?1
-                            AND status IN ('new', 'running', 'human_queue', 'blocked')",
-                    )
-                    .map_err(|err| StateError::from_sqlite("queue_advance: lanes", err))?;
-                let rows = statement
-                    .query_map(params![submission.repository], |row| {
-                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                    })
-                    .map_err(|err| StateError::from_sqlite("queue_advance: lanes query", err))?;
-                let mut repository_lanes: Vec<(i64, String)> = Vec::new();
-                for row in rows {
-                    repository_lanes.push(
-                        row.map_err(|err| {
-                            StateError::from_sqlite("queue_advance: lanes row", err)
-                        })?,
-                    );
-                }
-                drop(statement);
+                // The counted lanes: the SAME rows the capacity axes and the
+                // overlap re-check derive from, so a refusal names them.
+                let counted_lanes = counted_lane_footprints(tx, "queue_advance: counted lanes")?;
                 let mut owned: BTreeMap<i64, OwnedRunSnapshot> = BTreeMap::new();
                 let mut statement = tx
                     .prepare(
@@ -13063,8 +13161,8 @@ fn advance_queue_in_tx(
                 };
                 let mut slots = FanoutSlots {
                     caps: &caps,
-                    counted_global,
-                    counted_repository: repository_lanes.len() as i64,
+                    repository: &submission.repository,
+                    counted_lanes,
                     harness_lanes: submission.harness_lanes,
                     admitted_global: 0,
                     admitted_repository: 0,
@@ -13079,7 +13177,6 @@ fn advance_queue_in_tx(
                     workflow_id: &submission.workflow_id,
                     workflow_hash: &submission.workflow_hash,
                     ownership: &owned,
-                    repository_lanes: &repository_lanes,
                 };
                 let candidate_item = QueueAdmissionItem {
                     issue_number: candidate.issue_number,
@@ -13724,6 +13821,12 @@ impl State {
             .optional()
             .map_err(|err| StateError::from_sqlite("supervision_evidence: dispatch refusal", err))?
             .and_then(|(target, at)| dispatch_refusal_of(instance_id, &target, &at));
+        // Issue #238: the newest recorded fix-round dispatch of this run. The
+        // review step's own apply outcome carries it (round of the automatic
+        // bound, the fix leg's lane, the certified head it was handed), so the
+        // classification reads the FAIL handoff from the same records it
+        // classifies the step from — never from a second bookkeeping row.
+        let fix_round = newest_fix_round_locked(&conn, instance_id)?;
         Ok(Some(SupervisionEvidence {
             run,
             has_dispatch_context,
@@ -13741,6 +13844,7 @@ impl State {
             item,
             newest_evidence,
             dispatch_refusal,
+            fix_round,
         }))
     }
 
@@ -14459,6 +14563,47 @@ mod tests {
         Retention {
             audit_rows: 4,
             event_rows: 4,
+        }
+    }
+
+    /// #236: the per-repository cap refusal names what occupies the slot — the
+    /// count, the cap and the holding lane identities — not a bare count.
+    #[test]
+    fn the_per_repository_cap_refusal_names_its_occupants() {
+        let caps = crate::lifecycle::ConcurrencyCaps {
+            global: 8,
+            per_repository: 1,
+            per_harness: 2,
+        };
+        let lanes = vec![crate::lifecycle::LaneFootprint {
+            repository: "example-org/widgets".to_string(),
+            harness_key: String::new(),
+            scope: "worktrees/issues/7".to_string(),
+            issue_number: 7,
+            identity: "run-0123456789abcdef".to_string(),
+        }];
+        let slots = FanoutSlots {
+            caps: &caps,
+            repository: "example-org/widgets",
+            counted_lanes: lanes,
+            harness_lanes: Some(0),
+            admitted_global: 0,
+            admitted_repository: 0,
+            admitted_harness: 0,
+        };
+        let (code, message) = slots.hold().expect("the per-repository cap holds");
+        assert_eq!(code, crate::lifecycle::code::CAP_REPOSITORY);
+        for needle in [
+            "the per-repository concurrency cap (1)",
+            "1 active lanes",
+            "example-org/widgets#7",
+            "run-0123456789abcdef",
+            "worktrees/issues/7",
+        ] {
+            assert!(
+                message.contains(needle),
+                "the refusal names {needle}: {message}"
+            );
         }
     }
 
@@ -17379,5 +17524,127 @@ mod tests {
             .cancel_lane_replacement(&record.replacement_id, "too late", at)
             .expect_err("cancel after retirement");
         assert_eq!(err.code, replacement_code::RETIRED, "{}", err.message);
+    }
+
+    /// The fix-round read-back of issue #238: the review step's own apply
+    /// outcome carries the round a recorded FAIL was handed to, and the read
+    /// returns exactly THIS run's newest one — another run's round and a
+    /// non-fix outcome of the same run are never read as its handoff.
+    #[test]
+    fn a_recorded_fix_round_is_read_back_from_the_runs_own_outcome() {
+        let conn = Connection::open_in_memory().expect("memory db");
+        conn.execute_batch(
+            "CREATE TABLE idempotency (key TEXT PRIMARY KEY, request_id TEXT NOT NULL,
+                method TEXT NOT NULL, status TEXT NOT NULL, epoch INTEGER NOT NULL,
+                request_line TEXT NOT NULL, outcome TEXT);",
+        )
+        .expect("idempotency schema");
+        let insert = |key: &str, run: &str, step: &str, fix: Option<(i64, &str)>| {
+            let request = object(vec![(
+                "params",
+                object(vec![("instance_id", string(run)), ("step", string(step))]),
+            )]);
+            let result = match fix {
+                Some((round, lane)) => object(vec![(
+                    "fix_round",
+                    object(vec![
+                        ("schema", string("hf-fix-round/v1")),
+                        ("round", integer(round)),
+                        ("bound", integer(3)),
+                        ("feature_head", string(&"a".repeat(40))),
+                        ("lane", string(lane)),
+                    ]),
+                )]),
+                None => object(vec![("verdict", string("pass"))]),
+            };
+            let outcome = object(vec![("status", string("succeeded")), ("result", result)]);
+            conn.execute(
+                "INSERT INTO idempotency (key, request_id, method, status, epoch,
+                    request_line, outcome) VALUES (?1, 'req', 'apply', 'spent', 1, ?2, ?3)",
+                params![key, canonical_text(&request), canonical_text(&outcome)],
+            )
+            .expect("idempotency row");
+        };
+        insert("ik-a-1", "run-a", "p6-5", None);
+        insert("ik-b-1", "run-b", "p6-5", Some((1, "lane-other")));
+        insert("ik-a-2", "run-a", "p6-5", Some((1, "lane-first")));
+        insert("ik-a-3", "run-a", "p6-5", Some((2, "lane-second")));
+
+        let read = newest_fix_round_locked(&conn, "run-a")
+            .expect("read")
+            .expect("this run's recorded fix round");
+        assert_eq!(read.step, "p6-5");
+        assert_eq!(read.round, 2, "the NEWEST recorded round is read");
+        assert_eq!(read.bound, 3);
+        assert_eq!(read.lane, "lane-second");
+        assert_eq!(read.feature_head, "a".repeat(40));
+        assert!(
+            newest_fix_round_locked(&conn, "run-c")
+                .expect("read")
+                .is_none(),
+            "a run that never dispatched a fix round has none"
+        );
+    }
+
+    /// AC4 of issue #238 at the durable-record level: a fix round whose
+    /// instruction the substrate refused is the review step's own recorded
+    /// failure, so `run status` (and the classification's `last_failure`)
+    /// carries the fix round's OWN code — never a generic diagnosis.
+    #[test]
+    fn a_refused_fix_round_is_the_runs_own_recorded_failure() {
+        let path = temp_db("fix-refused.db");
+        let state = State::open(&path, Retention::default()).expect("state open");
+        {
+            let conn = state.lock("test: refuse a fix round").expect("lock");
+            let request = object(vec![(
+                "params",
+                object(vec![
+                    ("instance_id", string("run-0123456789abcdef")),
+                    ("step", string("p6-5")),
+                ]),
+            )]);
+            let outcome = object(vec![
+                ("status", string("failed")),
+                ("result", null()),
+                (
+                    "error",
+                    object(vec![
+                        ("code", string(crate::mutation::code::FIX_PROMPT)),
+                        (
+                            "message",
+                            string(
+                                "the fix round's instruction was not delivered to lane \
+                                 \"lane-0123456789abcdef\" (adapter.exit): the substrate never \
+                                 took the submission",
+                            ),
+                        ),
+                    ]),
+                ),
+            ]);
+            conn.execute(
+                "INSERT INTO idempotency (key, request_id, method, status, epoch,
+                    request_line, outcome, claimed_at, resolved_at)
+                 VALUES (?1, 'req', 'apply', 'spent', 1, ?2, ?3,
+                    '2026-09-20T00:00:00Z', '2026-09-20T00:00:01Z')",
+                params![
+                    "ik_run-0123456789abcdef-p6-5",
+                    canonical_text(&request),
+                    canonical_text(&outcome)
+                ],
+            )
+            .expect("recorded apply outcome");
+        }
+        let failure = state
+            .run_step_failure("run-0123456789abcdef")
+            .expect("read")
+            .expect("the refused fix round is the run's standing failure");
+        assert_eq!(failure.step, "p6-5");
+        assert_eq!(failure.status, "failed");
+        assert_eq!(failure.code, crate::mutation::code::FIX_PROMPT);
+        assert!(
+            failure.message.contains("not delivered"),
+            "the substrate's own reason rides along: {}",
+            failure.message
+        );
     }
 }
