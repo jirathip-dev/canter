@@ -887,6 +887,20 @@ release process activates (docs/RELEASING.md), then semver applies.
   helpers, so the two routes cannot drift. Real-daemon witnesses in
   `tests/mutation_engine.rs`.
 
+### Fixed (issue #101 — one clock read per audit record)
+
+- `append_audit_locked` binds ONE instant per record: the value is handed to
+  the append at the call boundary (`append_audit_at_locked`) and the SAME
+  value builds the hash-chained canonical `line` and the persisted `at`
+  column. Two reads could straddle a wall-clock second boundary and leave a
+  row whose own columns disagreed with its hashed line, so the next open's
+  chain verification refused it (`state.audit_tampered` / "column/line
+  mismatch") on a loaded host. The regression test drives the call-boundary
+  seam with an instant far from any wall-clock read — a re-introduced second
+  read disagrees with it and is RED — and the production entry point is
+  asserted against the same column/line invariant plus the reopen check
+  (`src/state.rs`).
+
 ### Changed
 
 - The bounded check re-evaluation is reachable in the exact case it exists
