@@ -609,6 +609,7 @@ fn dispatch(shared: &Arc<Shared>, request: &Request) -> String {
         "state.epoch" => method_state_epoch(shared, request),
         "queue.submit" => method_queue_submit(shared, request),
         "queue.status" => method_queue_status(shared, request),
+        "queue.redrive" => method_queue_redrive(shared, request),
         "run.pause" => method_run_pause(shared, request),
         "run.resume" => method_run_resume(shared, request),
         "run.retry" => method_run_retry(shared, request),
@@ -4236,13 +4237,71 @@ fn method_queue_status(shared: &Arc<Shared>, request: &Request) -> String {
     }
 }
 
+/// `queue.redrive`: re-evaluate ONE committed submission's parked items
+/// against the live fan-out capacity (#236). The operator control that
+/// recovers a submission stranded by a transient cap — the #96 cursor only
+/// moves on a verified delivery, so a parked submission had no way back.
+///
+/// Bounded to exactly that submission and audited: only its own `waiting`
+/// items are re-evaluated, through the SAME approved admission inputs and
+/// the SAME guard-verifying helper the submission and the advance use;
+/// nothing is spawned, nothing is killed, no lane is touched, and the request
+/// journals one mutation claim like every other control on this surface.
+fn method_queue_redrive(shared: &Arc<Shared>, request: &Request) -> String {
+    let Some(submission_id) = request
+        .params
+        .as_ref()
+        .and_then(|params| params.get("submission_id"))
+        .and_then(Val::as_str)
+        .filter(|text| crate::formats::is_submission_id(text))
+    else {
+        return err_response(
+            &request.id,
+            "refusal.malformed",
+            "queue.redrive requires params.submission_id (qs_ + 16 hex)",
+        );
+    };
+    let target = format!("queue-redrive:{submission_id}");
+    let key = match journal_mutation(shared, request, "mutate.queue.redrive", &target) {
+        Intent::Claimed { key } => key,
+        Intent::Replay { response } => return replay(shared, &response),
+        Intent::Refused { code, message } => return err_response(&request.id, code, &message),
+    };
+    let at = time::rfc3339_now();
+    let state = match shared.lock_state() {
+        Ok(state) => state,
+        Err(message) => return err_response(&request.id, "state.unavailable", message),
+    };
+    if let Err(err) = state.redrive_queue_submission(submission_id, &key, &at) {
+        return err_response(&request.id, err.code, err.message);
+    }
+    // The same pure projection `queue status` reads back, so the operator's
+    // before/after read agree byte for byte.
+    match state.queue_submission_by_id(submission_id) {
+        Ok(Some((row, items))) => {
+            let advances = state
+                .queue_advance_rows(&row.submission_id)
+                .unwrap_or_default();
+            ok_response(
+                &request.id,
+                crate::queue_executor::submission_doc(&row, &items, &advances),
+            )
+        }
+        Ok(None) => err_response(
+            &request.id,
+            "state.not_found",
+            format!("no submission {submission_id:?} exists"),
+        ),
+        Err(err) => err_response(&request.id, err.code, err.message),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Run-scoped controls (issue #86): safe-boundary pause, resume and bounded
 // retry for exactly ONE queue run. Every method journals its intent through
 // the shared claim machinery; nothing on this surface spawns, kills, cleans
 // up, mutates Git, clears a fleet/repository-level hold or bypasses a gate.
 // ---------------------------------------------------------------------------
-
 /// `run.pause`: record ONE durable pause request for exactly one run. The
 /// request stops admitting new step dispatch for the run immediately; work
 /// already in flight keeps running and the pause commits its reached
