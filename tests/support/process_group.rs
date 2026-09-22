@@ -1,5 +1,7 @@
 //! Test-child containment: every daemon owns one process group and is reaped.
 
+#![allow(dead_code)]
+
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};

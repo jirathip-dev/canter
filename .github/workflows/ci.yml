@@ -360,6 +360,7 @@ jobs:
           "--test service_plans",
           "--test start_adopt",
           "--test supervision",
+          "--test supervision_collection",
           "--test supervision_dispatch_refusal",
           "--test tui_board",
           "--test tui_live_wiring",
