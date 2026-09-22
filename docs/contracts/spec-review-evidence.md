@@ -304,8 +304,18 @@ positively and negatively:
 bare FAIL: `supervision.fix_round_dispatched` (class `waiting-workers`, detail:
 the fix leg's lane) while the repair leg works, `supervision.fix_round_refused`
 with the fix round's OWN engine code as detail when the handoff was refused,
-and `supervision.fix_rounds_exhausted` when the budget is spent. `run status`
+and `supervision.fix_rounds_exhausted` when the budget is spent. The handoff is
+read from the review step's own apply row — the response document the daemon
+persists (`result.fix_round`), with the `outcome` column read beside it (issue
+#254) — and its `hf-fix-round/v1` validation is unchanged. `run status`
 carries the same code, because the refusal IS the review step's recorded
-outcome (`last_failure`). A FAIL recorded before this handoff existed — or by a
-plan that presents its own review facts and dispatches no leg — keeps
+outcome (`last_failure`). A handoff recorded at a head the run's newest
+recorded review evidence does NOT name is its own fix-round disposition —
+`supervision.fix_round_head_moved` (class `needs-attention`), whose detail
+names the fix leg's recorded lane and both head prefixes — never a bare
+`supervision.review_failed`; and the run's own bounded check re-evaluation is
+driven for the recorded FAIL as well (the same control, the same per-`(run,
+step)` bound, at the recorded head), so a FAIL-then-fix sequence continues
+instead of parking on the FAIL. A FAIL recorded before this handoff existed —
+or by a plan that presents its own review facts and dispatches no leg — keeps
 `supervision.review_failed` with the review step named as its detail.

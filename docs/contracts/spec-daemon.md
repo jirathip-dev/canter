@@ -807,9 +807,12 @@ clears a repository/fleet-level hold or bypasses a gate.
 - **Fix-round handoff (issue #238)**: a recorded review FAIL is handed to the
   run's own fix round by the review step itself, and the classification reports
   the handoff's recorded disposition instead of parking on the FAIL. The
-  handoff's record is the review step's own outcome (the round, the automatic
+  handoff's record is the review step's own apply row (the round, the automatic
   bound and the fix leg's lane), read back with the same material the
-  classification already reads:
+  classification already reads — from the RESPONSE document the daemon
+  persists (`hf-rpc-response/v1`, `result.fix_round`), with the `outcome`
+  column read beside it (issue #254) and its `hf-fix-round/v1` validation
+  unchanged:
   - the handoff was DISPATCHED for the newest verdict's head — class
     `waiting-workers`, reason `supervision.fix_round_dispatched`, the fix leg's
     lane as the detail, `eligible:false` (the repair leg is work in flight, not
@@ -820,13 +823,25 @@ clears a repository/fleet-level hold or bypasses a gate.
     (`refusal.fix.spawn` / `refusal.fix.prompt` / `refusal.fix.lane` /
     `refusal.fix.bound_exhausted`) as the detail, `eligible:false`. The refusal
     is the review step's recorded outcome, so `run status` names the same code;
+  - the newest recorded handoff names ANOTHER head than the newest recorded
+    review evidence (issue #254: the repair leg advanced the branch past the
+    head the FAIL was handed at) — class `needs-attention`, reason
+    `supervision.fix_round_head_moved`, the fix leg's recorded lane as the
+    detail followed by both head prefixes, `eligible:false`. The recorded round
+    is not this evidence's handoff, so the movement is named instead of
+    discarded: still the fix-round disposition, never a bare
+    `supervision.review_failed`;
   - a FAIL whose review step recorded no fix round at all — a plan that
     presents its own review facts, or a run recorded before this handoff
     existed — keeps `supervision.review_failed`, now with the review step as
     its detail instead of an empty one.
   A fix-round record naming ANOTHER head is never this FAIL's handoff (the
   certified head moved past it), so the rule is keyed to the head the verdict
-  names, never to the newest row.
+  names, never to the newest row — and the driver's own recovery-control
+  derivation reads the recorded FAIL too (issue #254): when the run's newest
+  recorded review evidence carries a non-passing check and its check producer
+  already succeeded, the run's own bounded re-evaluation is driven at the
+  recorded head instead of the run parking on the FAIL.
 - **Refused continuation dispatch (issue #141)**: when the engine refuses the
   driver's continuation of the frontier step BEFORE its claim (a fan-out
   admission refusal such as `refusal.admission.proof_stale`, a derived

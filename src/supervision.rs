@@ -376,6 +376,13 @@ pub mod codes {
     /// the fix leg carries the instruction: the run waits on its own repair
     /// round, and `detail` names the fix leg's lane.
     pub const FIX_DISPATCHED: &str = "supervision.fix_round_dispatched";
+    /// The newest recorded fix-round handoff names ANOTHER head than the run's
+    /// newest recorded review evidence (issue #254): the repair leg advanced
+    /// the branch past the head this FAIL was handed at, so the recorded round
+    /// is not the handoff of THIS evidence. The fix round's own recorded lane
+    /// is named as the remedy, with both head prefixes — the class is the
+    /// fix-round disposition, never a bare `supervision.review_failed`.
+    pub const FIX_HEAD_MOVED: &str = "supervision.fix_round_head_moved";
     /// The next step's latest attempt was refused for capacity.
     pub const CAPACITY_BLOCKED: &str = "supervision.capacity_blocked";
     /// A step dispatch is in flight: legitimate long-running work.
@@ -411,6 +418,9 @@ pub mod codes {
     /// check, so its verified-delivery consumer is refused (issue #230) and
     /// the driver drives the run's OWN bounded, audited recovery control —
     /// the check producer re-evaluated on a fresh lane round (issue #243).
+    /// Issue #254: the recorded FAIL the review step handed to the run's own
+    /// fix round is the SAME precondition ([`recorded_fail_refusal`]), so the
+    /// FAIL shape drives the same control instead of parking on it.
     /// The tail behind the unverified delivery is still never driven and the
     /// run is still never reported eligible.
     pub const REEVALUATION: &str = "supervision.reevaluation.next_round";
@@ -920,9 +930,11 @@ pub fn reevaluation_reason(step: &str) -> String {
 /// `Some` only in the exact recorded shape the deadlock is made of — the
 /// frontier is a committed tail step the run's own caps authorize, after the
 /// run's reviewed-evidence step, and the run's newest recorded review evidence
-/// is a `pass` bound to the run's own pins at one exact head whose named checks
-/// are NOT all `passed` ([`unverified_delivery_refusal`], the SAME derivation
-/// the classification reads) — and only while the recorded bound
+/// carries a non-passing check at one exact head bound to the run's own pins:
+/// the `pass` whose named checks are not all `passed` ([`unverified_delivery_refusal`],
+/// the SAME derivation the classification reads), or the recorded FAIL that
+/// evidence names and the review step handed to the run's own fix round
+/// (issue #254, [`recorded_fail_refusal`]) — and only while the recorded bound
 /// ([`crate::run_control::RUN_REEVALUATION_MAX`], counted from the durable
 /// journal) has NOT been spent.
 ///
@@ -936,7 +948,13 @@ fn reevaluation_intent(
     frontier: &str,
     frontier_kind: &str,
 ) -> Option<DispatchIntent> {
-    unverified_delivery_refusal(evidence, frontier, frontier_kind)?;
+    // The recorded precondition of the control (issue #230, extended by #254
+    // to the recorded FAIL the run's own fix round was handed): the run's
+    // newest recorded review evidence carries a non-passing check, so its
+    // verified-delivery consumer is refused while the check producer cannot be
+    // re-run by anything but this control.
+    unverified_delivery_refusal(evidence, frontier, frontier_kind)
+        .or_else(|| recorded_fail_refusal(evidence, frontier, frontier_kind))?;
     // The producer: the run's own check-producing step — the reviewed-evidence
     // step of the committed spine that declares its reviewer LEG (the only
     // shape that computes checks) and whose latest recorded attempt SUCCEEDED
@@ -1061,6 +1079,76 @@ fn delivery_held(evidence: &SupervisionEvidence) -> bool {
         || evidence.in_flight.is_some()
 }
 
+/// The recorded subject the tail's own refusal and the run's own recovery
+/// control are both derived from (issues #230, #243, #254): the run holds the
+/// capability of this committed TAIL step, the step comes AFTER the run's
+/// reviewed-evidence step, and the run's newest recorded review evidence is
+/// bound to the run's own pins at one exact head. The verdict is NOT decided
+/// here — each reader below says which one it accepts.
+fn delivery_evidence_subject(
+    evidence: &SupervisionEvidence,
+    step: &str,
+    kind: &str,
+) -> Option<(String, crate::mutation::EvidenceView)> {
+    // A run that is held, or that has a step in flight, is not a delivery at
+    // all — the SAME fact [`verified_delivery`] applies, from the SAME
+    // derivation, so the invariant is LOCAL here instead of positional in
+    // `classify`'s arm order (fix round F1, finding NB-1).
+    if delivery_held(evidence) {
+        return None;
+    }
+    if !COMMITTED_TAIL_STEP_KINDS.contains(&kind) {
+        return None;
+    }
+    evidence.item.as_ref()?;
+    let capability = crate::mutation::required_capability(kind)?;
+    if !run_caps(evidence).iter().any(|cap| cap == capability) {
+        return None;
+    }
+    if !after_delivery_step(evidence, step) {
+        return None;
+    }
+    let run = &evidence.run;
+    let newest = evidence.newest_evidence.as_ref()?;
+    if newest.workflow_hash != run.workflow_hash
+        || newest.policy_hash != run.policy_hash
+        || !crate::formats::is_hex40(&newest.feature_head)
+    {
+        return None;
+    }
+    Some((
+        newest.evidence_id.clone(),
+        crate::mutation::EvidenceView {
+            evidence_id: newest.evidence_id.clone(),
+            feature_head: newest.feature_head.clone(),
+            integration_base: newest.integration_base.clone(),
+            workflow_hash: newest.workflow_hash.clone(),
+            policy_hash: newest.policy_hash.clone(),
+            verdict: newest.verdict.clone(),
+            reviewer: newest.reviewer.clone(),
+            checks: newest.checks.clone(),
+            created_at: newest.created_at.clone(),
+        },
+    ))
+}
+
+/// The engine's own refusal of an already-bound record whose named checks are
+/// not all `passed` (issues #230, #254).
+fn non_passing_refusal(
+    step: &str,
+    subject: &(String, crate::mutation::EvidenceView),
+) -> Option<UnverifiedDelivery> {
+    let non_passing = crate::mutation::non_passing_checks(&subject.1).ok()?;
+    if non_passing.is_empty() {
+        return None;
+    }
+    Some(UnverifiedDelivery {
+        step: step.to_string(),
+        code: crate::mutation::code::EVIDENCE_FAILED.to_string(),
+        reason: crate::mutation::evidence_failed_message(&subject.0, &non_passing),
+    })
+}
+
 /// The engine's own refusal of the run's verified-delivery consumer, derived
 /// from the SAME recorded facts the dispatch gate reads (issue #230).
 ///
@@ -1085,53 +1173,33 @@ fn unverified_delivery_refusal(
     step: &str,
     kind: &str,
 ) -> Option<UnverifiedDelivery> {
-    // A run that is held, or that has a step in flight, is not a delivery at
-    // all — the SAME fact [`verified_delivery`] applies, from the SAME
-    // derivation, so the invariant is LOCAL here instead of positional in
-    // `classify`'s arm order (fix round F1, finding NB-1).
-    if delivery_held(evidence) {
+    let subject = delivery_evidence_subject(evidence, step, kind)?;
+    if subject.1.verdict != "pass" {
         return None;
     }
-    if !COMMITTED_TAIL_STEP_KINDS.contains(&kind) {
+    non_passing_refusal(step, &subject)
+}
+
+/// The SAME recorded subject in the OTHER verdict a FAIL handoff is made of
+/// (issue #254): the review step recorded a `fail` whose named checks are not
+/// all `passed`, so the run's newest recorded review evidence is exactly the
+/// non-passing record the run's own bounded check re-evaluation exists for.
+///
+/// Deliberately SEPARATE from [`unverified_delivery_refusal`]: the read-time
+/// refusal of the tail is the engine's own `pass`-keyed gate, and a recorded
+/// FAIL keeps its own documented classification (the fix-round disposition, or
+/// `supervision.review_failed` when no handoff was recorded). Only the
+/// driver's own recovery-control derivation reads this one.
+fn recorded_fail_refusal(
+    evidence: &SupervisionEvidence,
+    step: &str,
+    kind: &str,
+) -> Option<UnverifiedDelivery> {
+    let subject = delivery_evidence_subject(evidence, step, kind)?;
+    if subject.1.verdict != "fail" {
         return None;
     }
-    evidence.item.as_ref()?;
-    let capability = crate::mutation::required_capability(kind)?;
-    if !run_caps(evidence).iter().any(|cap| cap == capability) {
-        return None;
-    }
-    if !after_delivery_step(evidence, step) {
-        return None;
-    }
-    let run = &evidence.run;
-    let newest = evidence.newest_evidence.as_ref()?;
-    if newest.verdict != "pass"
-        || newest.workflow_hash != run.workflow_hash
-        || newest.policy_hash != run.policy_hash
-        || !crate::formats::is_hex40(&newest.feature_head)
-    {
-        return None;
-    }
-    let view = crate::mutation::EvidenceView {
-        evidence_id: newest.evidence_id.clone(),
-        feature_head: newest.feature_head.clone(),
-        integration_base: newest.integration_base.clone(),
-        workflow_hash: newest.workflow_hash.clone(),
-        policy_hash: newest.policy_hash.clone(),
-        verdict: newest.verdict.clone(),
-        reviewer: newest.reviewer.clone(),
-        checks: newest.checks.clone(),
-        created_at: newest.created_at.clone(),
-    };
-    let non_passing = crate::mutation::non_passing_checks(&view).ok()?;
-    if non_passing.is_empty() {
-        return None;
-    }
-    Some(UnverifiedDelivery {
-        step: step.to_string(),
-        code: crate::mutation::code::EVIDENCE_FAILED.to_string(),
-        reason: crate::mutation::evidence_failed_message(&newest.evidence_id, &non_passing),
-    })
+    non_passing_refusal(step, &subject)
 }
 
 /// ONE derived refusal of a frontier the driver may not dispatch (issue #230):
@@ -1258,13 +1326,28 @@ pub fn classify(
         );
     }
     if newest_verdict(evidence) == "fail" {
-        if let Some(fix) = &evidence.fix_round
-            && evidence
+        if let Some(fix) = &evidence.fix_round {
+            let newest_head = evidence
                 .newest_evidence
                 .as_ref()
-                .is_some_and(|newest| newest.feature_head == fix.feature_head)
-        {
-            return Verdict::new("waiting-workers", codes::FIX_DISPATCHED, false, &fix.lane);
+                .map(|newest| newest.feature_head.clone())
+                .unwrap_or_default();
+            if newest_head == fix.feature_head {
+                return Verdict::new("waiting-workers", codes::FIX_DISPATCHED, false, &fix.lane);
+            }
+            // Issue #254: the newest recorded handoff names ANOTHER head than
+            // the run's newest recorded review evidence — the repair leg
+            // advanced the branch past the head this evidence names, so the
+            // recorded round is not its handoff. The disposition is still the
+            // fix round's own (never a bare `review_failed`): the recorded lane
+            // IS the remedy, and both head prefixes are named so the movement
+            // is readable from the same read.
+            return Verdict::new(
+                "needs-attention",
+                codes::FIX_HEAD_MOVED,
+                false,
+                &fix_round_head_moved_detail(fix, &newest_head),
+            );
         }
         // A FAIL whose review step recorded no fix round at all — a plan that
         // presents its own review facts, or a run recorded before this
@@ -1437,6 +1520,23 @@ pub fn classify(
         Some(_) => Verdict::new("healthy", codes::RECENT_PROGRESS, false, &next_step),
         None => Verdict::new("unknown", codes::PROGRESS_UNOBSERVED, false, &next_step),
     }
+}
+
+/// The bounded detail of a recorded handoff that names a head the run's newest
+/// recorded review evidence does not name (issue #254): the remedy FIRST — the
+/// fix leg's own lane — then both 12-character head prefixes, so the movement
+/// the disposition reports is readable from the same status read.
+fn fix_round_head_moved_detail(
+    fix: &crate::state::SupervisionFixRound,
+    newest_head: &str,
+) -> String {
+    let prefix = |head: &str| head.chars().take(12).collect::<String>();
+    format!(
+        "{} (handoff recorded at {}, newest evidence at {})",
+        fix.lane,
+        prefix(&fix.feature_head),
+        prefix(newest_head)
+    )
 }
 
 /// The age (seconds) of an RFC3339 instant against `now_unix`; `None` when
@@ -2361,6 +2461,9 @@ pub fn render_human(doc: &Val) -> String {
     if reason.starts_with("supervision.fix_round") && !detail.is_empty() {
         lines.push(match reason.as_str() {
             codes::FIX_DISPATCHED => format!("fix round dispatched to lane {detail}"),
+            codes::FIX_HEAD_MOVED => {
+                format!("fix round recorded for another head (lane {detail})")
+            }
             codes::FIX_EXHAUSTED => {
                 format!("fix round refused: {detail} (the automatic bound is spent)")
             }
@@ -3778,15 +3881,45 @@ mod tests {
             "a dispatched fix round is work in flight, never completion"
         );
 
-        // (2) The recorded round belongs to ANOTHER head (the certified head
-        //     moved past it): it is not this FAIL's handoff, and the FAIL
-        //     still names the review step it parks on.
+        // (2) The recorded round belongs to ANOTHER head (the repair leg
+        //     advanced the branch past the head this FAIL was handed at): it is
+        //     not this FAIL's handoff — and the disposition still is the fix
+        //     round's own, naming the remedy (the recorded lane) and both head
+        //     prefixes. Never a bare `supervision.review_failed` (issue #254).
         let mut stale = dispatched;
         stale.fix_round.as_mut().expect("recorded").feature_head = "f".repeat(40);
         let verdict = classify_at(stale);
         assert_eq!(verdict.class, "needs-attention");
-        assert_eq!(verdict.reason, codes::REVIEW_FAILED);
-        assert_eq!(verdict.detail, "p6");
+        assert_eq!(verdict.reason, codes::FIX_HEAD_MOVED);
+        assert_ne!(
+            verdict.reason,
+            codes::REVIEW_FAILED,
+            "a visible fix round is never reported as a bare review failure"
+        );
+        assert_eq!(
+            verdict.detail,
+            format!(
+                "lane-0123456789abcdef (handoff recorded at {}, newest evidence at {})",
+                "f".repeat(12),
+                head.chars().take(12).collect::<String>()
+            ),
+            "the remedy (the recorded lane) and the moved head are both named"
+        );
+        assert!(!verdict.eligible);
+        let human = render_human(&object(vec![(
+            "evaluation",
+            object(vec![
+                ("reason", string(codes::FIX_HEAD_MOVED)),
+                ("detail", string(&verdict.detail)),
+            ]),
+        )]));
+        assert!(
+            human.contains(
+                "fix round recorded for another head (lane lane-0123456789abcdef \
+                 (handoff recorded at"
+            ),
+            "the human read names the lane and the movement: {human}"
+        );
 
         // (3) The handoff was REFUSED: the fix round's OWN engine code is the
         //     detail, so the missing piece is actionable — never a bare park.
