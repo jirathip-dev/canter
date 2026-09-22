@@ -4512,6 +4512,10 @@ pub struct FixRoundReceipt {
     pub workspace: String,
     /// The pane the leg was started in ('' headless).
     pub pane: String,
+    /// The fix leg's OWN lane checkout, relative to the run's worktrees root
+    /// (issue #256): the recorded place the leg's own state lives, so the
+    /// handoff can be read against the head the leg DELIVERED.
+    pub worktree: String,
     /// The submission attempts the proven delivery took.
     pub delivery_attempts: i64,
 }
@@ -4528,6 +4532,7 @@ impl FixRoundReceipt {
             ("agent", string(&self.agent)),
             ("workspace", string(&self.workspace)),
             ("pane", string(&self.pane)),
+            ("worktree", string(&self.worktree)),
             ("delivery_attempts", integer(self.delivery_attempts)),
             ("failures", Val::Arr(failures.to_vec())),
             ("reused", bool_(reused)),
@@ -4630,6 +4635,14 @@ impl FixRoundReceipt {
                 .to_string(),
             pane: doc
                 .get("pane")
+                .and_then(Val::as_str)
+                .unwrap_or("")
+                .to_string(),
+            // Issue #256: the leg's own lane checkout. A record written before
+            // this slice names none, and a handoff that names none is observed
+            // against no checkout at all (never a guessed path).
+            worktree: doc
+                .get("worktree")
                 .and_then(Val::as_str)
                 .unwrap_or("")
                 .to_string(),
@@ -4866,6 +4879,56 @@ fn ensure_fix_lane(
     verify_fix_lane(ctx, relative, &lane, feature_head)
 }
 
+/// Observe the repair leg's OWN lane checkout (issue #256): the head it holds,
+/// and whether that head is a DESCENDANT of the certified head the recorded
+/// handoff names.
+///
+/// The leg's own checkout is the ONLY state that names the delivered head —
+/// the head a handoff was dispatched for is the head the FAIL was handed at
+/// and can never move by itself. `None` when there is nothing to observe (no
+/// recorded lane, an unreadable or uncleanable checkout): an unobserved leg is
+/// never reported as moved. Read-only: no effect, no journal, no repair.
+pub fn observe_fix_leg_checkout(
+    root: &Path,
+    worktree: &str,
+    certified: &str,
+) -> Option<crate::state::FixLegState> {
+    if worktree.is_empty() || !is_hex40(certified) {
+        return None;
+    }
+    let lane = contained_path(root, worktree).ok()?;
+    let head = git_read_stdout(&lane, &["rev-parse", "--verify", "HEAD"])?;
+    if !is_hex40(&head) {
+        return None;
+    }
+    // A clean `merge-base --is-ancestor` exit IS the answer (its stdout is
+    // empty), so only the exit code is read here.
+    let delivered = head != certified
+        && git_read_stdout(&lane, &["merge-base", "--is-ancestor", certified, &head]).is_some();
+    Some(crate::state::FixLegState { head, delivered })
+}
+
+/// One read-only `git` invocation in `cwd` (issue #256), through the SAME
+/// bounded runner and allowlisted environment every other adapter read uses.
+/// `Some(stdout)` only for a clean exit; every other outcome (a failure, a
+/// deadline, an unresolvable checkout) is `None` — a read that could not be
+/// taken is never a fact.
+fn git_read_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
+    let env = adapter_environment();
+    let owned: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+    let out = crate::process::run(ProcSpec {
+        program: "git",
+        args: &owned,
+        env: &env,
+        cwd: Some(cwd),
+        timeout: crate::observe::ADAPTER_TIMEOUT,
+    });
+    out.status
+        .exit_code()
+        .filter(|code| *code == 0)
+        .map(|_| out.stdout.trim().to_string())
+}
+
 /// The fix instruction ONE recorded review FAIL produces (issue #238): built
 /// from the verdict the reviewer wrote — the certified head it reviewed, the
 /// integration base, and the failing checks it named — never from a human
@@ -5037,6 +5100,10 @@ fn dispatch_fix_round(
             .and_then(Val::as_str)
             .unwrap_or_default()
             .to_string(),
+        // Issue #256: the lane checkout the leg's OWN state lives in — the
+        // same derived path the leg was created/verified at, recorded so a
+        // later read can see the head the leg delivered.
+        worktree: relative.clone(),
         delivery_attempts: payload.get("attempts").and_then(Val::as_int).unwrap_or(1),
     };
     receipt.write(&receipt_path, &failures)?;

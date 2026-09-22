@@ -2888,6 +2888,7 @@ fn seed_fix_round_response(
     step: &str,
     key: &str,
     fix: (&str, &str, i64, i64),
+    worktree: &str,
 ) {
     let (head, lane, round, bound) = fix;
     let line = canonical_text(&object(vec![
@@ -2941,6 +2942,10 @@ fn seed_fix_round_response(
                         ("bound", integer(bound)),
                         ("feature_head", string(head)),
                         ("lane", string(lane)),
+                        // Issue #256: the repair leg's OWN lane checkout, written
+                        // the way the engine writes it ('' when the recorded
+                        // handoff names none).
+                        ("worktree", string(worktree)),
                     ]),
                 ),
             ]),
@@ -3450,6 +3455,7 @@ fn a_recorded_fail_handoff_is_named_and_drives_the_run_past_the_fail() {
         "p6",
         &idem_key("254-p6"),
         (&head, fix_lane, 1, 3),
+        "",
     );
     state
         .record_evidence(
@@ -3644,6 +3650,7 @@ fn a_recorded_handoff_for_another_head_is_named_and_still_drives_the_run() {
         "p6",
         &idem_key("255-p6"),
         (&recorded_at, fix_lane, 1, 3),
+        "",
     );
     state
         .record_evidence(
@@ -4431,4 +4438,353 @@ fn the_audited_operator_measurement_produces_the_proof_a_parked_run_needs() {
     );
     assert!(remedy.get("control").is_some_and(Val::is_null));
     shutdown(daemon);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #256: the fix-round handoff is read against the repair leg's OWN state
+// ---------------------------------------------------------------------------
+
+/// One `git` invocation in `cwd` (synthetic fixture checkouts only).
+fn git(cwd: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        // #226: copy nothing from the host's shared git templates.
+        .env("GIT_TEMPLATE_DIR", "")
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// Issue #256 fixture: a supervised run parked on a recorded review FAIL whose
+/// handoff names the run's own repair leg, plus that leg's OWN lane checkout —
+/// a REAL git checkout under the run's recorded `worktrees_root`, holding the
+/// certified head and (with `advance`) the repair commit the leg delivered one
+/// commit later.
+///
+/// The handoff shape is the LIVE one: the review step's own apply row keeps
+/// `result.fix_round` in its RESPONSE document (`outcome.result` null), and the
+/// handoff names both the leg's lane session and the lane checkout its own
+/// state lives in.
+struct FixLegFixture {
+    fixture: DaemonFixture,
+    run: String,
+    lane_root: PathBuf,
+    /// The head the FAIL was handed at (the head the handoff names).
+    certified: String,
+    /// The head the leg's own checkout holds after its repair commit.
+    delivered: String,
+    /// The fix leg's lane session the handoff records.
+    lane: String,
+    /// The control's inner re-dispatch key (`ik_<run>-<step>-r<round>`).
+    inner_key: String,
+}
+
+fn fix_leg_fixture(name: &str, submission: &str, advance: bool) -> FixLegFixture {
+    let fixture = DaemonFixture::new(name);
+    let state = fixture.seed();
+    let steps = vec![
+        step("p1", "checkout"),
+        step("p5", "collect_outcome"),
+        review_leg_step("p6", "issues/6", 1),
+        step("p7", "merge"),
+    ];
+    let (_, digest) = render_bound(
+        &state,
+        &request_with_steps(vec![selected("#6", REV_A)], steps.clone()),
+    );
+    let items = submit_with_steps(&state, submission, &[(6, GRANT_6)], steps);
+    let run = items[0].instance_id.clone().expect("admitted");
+    state
+        .arm_supervision(
+            &run,
+            &canter::state::SupervisionAuthorizationPlan {
+                desired: "armed".to_string(),
+                check_interval_secs: 10,
+                progress_timeout_secs: 900,
+            },
+            &digest,
+            "merge",
+            1,
+            AT,
+        )
+        .expect("arm");
+    // The lane root the run's own topology declares: a REAL directory, exactly
+    // as a live run's worktrees root is.
+    let lane_root = std::env::temp_dir().join(format!(
+        "hf-run-256-{name}-lane-root-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&lane_root);
+    let lane_relative = canter::lane::lane_checkout(6, "implementer", 2);
+    let lane = lane_root.join(&lane_relative);
+    std::fs::create_dir_all(&lane).expect("lane dir");
+    git(&lane, &["init", "-q", "-b", "issue-6"]);
+    git(&lane, &["config", "user.email", "fixture@example.test"]);
+    git(&lane, &["config", "user.name", "fixture"]);
+    std::fs::write(lane.join("delivery.txt"), "the reviewed delivery\n").expect("delivery");
+    git(&lane, &["add", "-A"]);
+    git(&lane, &["commit", "-qm", "the reviewed delivery"]);
+    let certified = git(&lane, &["rev-parse", "HEAD"]).trim().to_string();
+    // The repair the leg commits in its OWN checkout: a DESCENDANT of the
+    // certified head, never the head the FAIL was handed at.
+    std::fs::write(lane.join("repair.txt"), "the repair round 1\n").expect("repair");
+    git(&lane, &["add", "-A"]);
+    git(
+        &lane,
+        &["commit", "-qm", "queue intake: the repair (Refs #245)"],
+    );
+    let delivered = git(&lane, &["rev-parse", "HEAD"]).trim().to_string();
+    if !advance {
+        // The leg has delivered NOTHING: its own checkout is left exactly at
+        // the certified head, so the run is genuinely waiting on it.
+        git(&lane, &["reset", "-q", "--hard", &certified]);
+    }
+    let base = "bb".repeat(20);
+    let fix_lane = "lane-0123456789abcdef";
+    seed_topology_with_admission(
+        &state,
+        &run,
+        "p1",
+        &idem_key(&format!("256-p1-{name}")),
+        &canter::time::rfc3339_now(),
+        &lane_root,
+    );
+    seed_collection(
+        &state,
+        &run,
+        "p5",
+        &idem_key(&format!("256-p5-{name}")),
+        &certified,
+        &base,
+        "issue-6",
+    );
+    // The review step's OWN apply row, written the way the daemon writes it.
+    seed_fix_round_response(
+        &state,
+        &run,
+        "p6",
+        &idem_key(&format!("256-p6-{name}")),
+        (&certified, fix_lane, 1, 3),
+        &lane_relative,
+    );
+    state
+        .record_evidence(
+            &run,
+            REPO,
+            &certified,
+            &base,
+            WORKFLOW_HASH,
+            POLICY_HASH,
+            "fail",
+            "rev-6-r1",
+            &checks(&[
+                ("hosted-ci", "passed"),
+                ("local_full_suite_raw_101", "failed"),
+            ]),
+        )
+        .expect("the recorded FAIL");
+    let inner_key = format!(
+        "ik_{}-p6-r{}",
+        run.trim_start_matches("run-"),
+        canter::run_control::reevaluation_lane_round(1)
+    );
+    FixLegFixture {
+        fixture,
+        run,
+        lane_root,
+        certified,
+        delivered,
+        lane: fix_lane.to_string(),
+        inner_key,
+    }
+}
+
+/// Read the live observation the daemon's own `supervision.status` reports for
+/// one run (`evaluation.observed`: the read-time classification and its detail).
+fn status_observation(fixture: &DaemonFixture, run: &str, seed: u32) -> Val {
+    let status = rpc_ok(
+        &fixture.socket,
+        &fresh_id(seed),
+        "supervision.status",
+        Some(object(vec![("instance_id", string(run))])),
+    );
+    status
+        .get("evaluation")
+        .and_then(|evaluation| evaluation.get("observed"))
+        .cloned()
+        .expect("the status document carries the read-time observation")
+}
+
+/// Issue #256 (AC1, AC2, AC4): the fix-round disposition is derived from the
+/// repair leg's OWN recorded state — its own lane checkout — and the next
+/// review round is bound to the head that leg DELIVERED.
+///
+/// Witnessed over the LIVE daemon: the same recorded handoff (naming the head
+/// the FAIL was handed at) is read (0) the pre-#256 way — the stale wait the
+/// defect is made of, with no leg observation — and then (1) through the
+/// daemon's own observation of the leg's checkout, where the delivered
+/// descendant head is named. (2) The control's inner re-dispatch of the review
+/// producer — the SAME `run_dispatch` the driver's own bounded re-evaluation
+/// calls (the driver's thread-level drive is the unchanged #243/#254 slice) —
+/// records the DELIVERED head as the head the next round binds.
+///
+/// What this does NOT prove, and the round report states plainly: a live
+/// reviewer leg consuming a verdict at the delivered head (a synthetic fixture
+/// owns no harness) — the effect-side materialization of the bound head is the
+/// reviewer-lane creation the #210/#238 slices already prove.
+#[test]
+fn a_delivered_repair_leg_is_named_and_the_next_round_binds_the_delivered_head() {
+    let f = fix_leg_fixture("fr256d", "qs_0000000000000256", true);
+    assert_ne!(f.delivered, f.certified, "the fixture really advanced");
+
+    // (0) The pre-#256 read over the SAME recorded facts: the handoff names the
+    //     head the FAIL was handed at, so the run is reported as waiting on a
+    //     repair leg that has already delivered — never as moved.
+    let state = f.fixture.seed();
+    let evidence = state
+        .supervision_evidence(&f.run)
+        .expect("evidence read")
+        .expect("supervised run");
+    let row = state
+        .supervision_rows()
+        .expect("rows")
+        .into_iter()
+        .find(|row| row.instance_id == f.run)
+        .expect("the armed row");
+    let policy = canter::supervision::Policy {
+        check_interval_secs: row.check_interval_secs,
+        progress_timeout_secs: row.progress_timeout_secs,
+    };
+    let digest = evidence
+        .submission_digest
+        .clone()
+        .expect("the run is authorized");
+    let stale =
+        canter::supervision::classify(&evidence, &digest, &policy, canter::time::unix_now());
+    println!(
+        "PRE-#256 READ class={} reason={} detail={} eligible={}",
+        stale.class, stale.reason, stale.detail, stale.eligible
+    );
+    assert_eq!(stale.class, "waiting-workers");
+    assert_eq!(stale.reason, canter::supervision::codes::FIX_DISPATCHED);
+    assert_eq!(
+        stale.detail, f.lane,
+        "the unobserved read can only name the lane it recorded"
+    );
+
+    // (1) The daemon reads the recorded handoff's lane checkout: the leg's own
+    //     state holds a DESCENDANT head, so the disposition names the movement
+    //     — the remedy first, then both head prefixes.
+    let daemon = f.fixture.spawn(None);
+    wait_ready(&f.fixture);
+    let observed = status_observation(&f.fixture, &f.run, 61);
+    println!(
+        "supervision.status.observed => {}",
+        canonical_text(&observed)
+    );
+    assert_eq!(
+        observed.get("class").and_then(Val::as_str),
+        Some("needs-attention")
+    );
+    assert_eq!(
+        observed.get("reason").and_then(Val::as_str),
+        Some("supervision.fix_round_head_moved")
+    );
+    assert_ne!(
+        observed.get("reason").and_then(Val::as_str),
+        Some("supervision.fix_round_dispatched"),
+        "a leg that delivered is never reported as work in flight"
+    );
+    let detail = observed
+        .get("detail")
+        .and_then(Val::as_str)
+        .unwrap_or_default();
+    assert!(
+        detail.starts_with(&f.lane),
+        "the remedy (the recorded lane) is named first: {detail}"
+    );
+    assert!(
+        detail.contains(&f.certified[..12]) && detail.contains(&f.delivered[..12]),
+        "both heads are named: {detail}"
+    );
+    assert_eq!(observed.get("eligible").and_then(Val::as_bool), Some(false));
+
+    // (2) The next review round binds the DELIVERED head — driven with ZERO
+    //     operator control: the daemon's own armed driver re-evaluates the
+    //     recorded FAIL's check producer (the unchanged #243/#254 control), and
+    //     the run's own `run_dispatch` records the delivered head as the
+    //     observed head the reviewer leg's derived checkout materializes.
+    //     Nothing is asked of an operator here: the claim is polled for.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let claim = loop {
+        let state = f.fixture.seed();
+        if let Some(claim) = state.claim(&f.inner_key).expect("claim read") {
+            break claim;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the armed driver never re-dispatched the run's own review producer"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    println!("INNER DISPATCH request => {}", claim.request_line);
+    assert!(
+        claim
+            .request_line
+            .contains(&format!("\"feature_head\":\"{}\"", f.delivered)),
+        "the round binds the DELIVERED head: {}",
+        claim.request_line
+    );
+    assert!(
+        !claim
+            .request_line
+            .contains(&format!("\"feature_head\":\"{}\"", f.certified)),
+        "the round never rebinds the head the FAIL was handed at: {}",
+        claim.request_line
+    );
+    // ...and the same recorded evidence still drives that ONE recovery act:
+    // the producer, never the tail behind the FAIL. (Asserted on the
+    // PRE-dispatch shape by the #254 witness; here the driver has already
+    // taken the act, so the control's own gate has moved on.)
+
+    shutdown(daemon);
+    let _ = std::fs::remove_dir_all(&f.lane_root);
+}
+
+/// Issue #256 (AC3, AC4): the in-flight disposition keeps its current meaning.
+/// A handoff whose repair leg's OWN checkout has NOT advanced is still
+/// `waiting-workers` / `supervision.fix_round_dispatched` naming the leg's lane
+/// — the observation only ever reports a movement that is really there.
+#[test]
+fn a_repair_leg_that_did_not_advance_keeps_the_waiting_workers_disposition() {
+    let f = fix_leg_fixture("fr256w", "qs_0000000000000257", false);
+    let daemon = f.fixture.spawn(None);
+    wait_ready(&f.fixture);
+    let observed = status_observation(&f.fixture, &f.run, 63);
+    println!(
+        "supervision.status.observed => {}",
+        canonical_text(&observed)
+    );
+    assert_eq!(
+        observed.get("class").and_then(Val::as_str),
+        Some("waiting-workers")
+    );
+    assert_eq!(
+        observed.get("reason").and_then(Val::as_str),
+        Some("supervision.fix_round_dispatched")
+    );
+    assert_eq!(
+        observed.get("detail").and_then(Val::as_str),
+        Some(f.lane.as_str()),
+        "the wait still names the leg's recorded lane"
+    );
+    assert_eq!(observed.get("eligible").and_then(Val::as_bool), Some(false));
+    shutdown(daemon);
+    let _ = std::fs::remove_dir_all(&f.lane_root);
 }
