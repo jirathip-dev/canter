@@ -293,6 +293,12 @@ pub struct RunDispatchArgs {
     pub topology: Option<PathBuf>,
     /// Optional fresh admission attestation document.
     pub admission: Option<PathBuf>,
+    /// Issue #250: the audited operator identity that authorizes the daemon's
+    /// OWN host-resource measurement at dispatch time. Presented with a
+    /// reason or not at all.
+    pub operator: Option<String>,
+    /// Issue #250: the bounded reason recorded with that measurement.
+    pub reason: Option<String>,
     /// `--idempotency-key`: replay-safe automation key.
     pub idempotency_key: Option<String>,
     /// Explicit daemon socket override.
@@ -1680,17 +1686,17 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
                 }
                 recorder = Some(value);
             }
-            "--operator" if action.as_str() == "reevaluate" => {
+            "--operator" if action.as_str() == "reevaluate" || action.as_str() == "dispatch" => {
                 let value = flag_value(rest, &mut index, command, "--operator")?;
                 if value.is_empty()
                     || value.len() > 128
                     || value.contains(':')
                     || value.chars().any(char::is_control)
                 {
-                    return Err(ParseError::Usage(
-                        "run reevaluate: --operator must be 1-128 printable characters without ':'"
-                            .to_string(),
-                    ));
+                    return Err(ParseError::Usage(format!(
+                        "run {}: --operator must be 1-128 printable characters without ':'",
+                        action.as_str()
+                    )));
                 }
                 operator = Some(value);
             }
@@ -1882,9 +1888,11 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
             })
         }
         "dispatch" => {
-            if reason.is_some() || digest.is_some() {
+            if digest.is_some() {
                 return Err(ParseError::Usage(
-                    "run dispatch takes --run, --step and --param only".to_string(),
+                    "run dispatch takes --run, --step, --param and the audited --operator/--reason \
+                     pair only"
+                        .to_string(),
                 ));
             }
             let Some(step) = step else {
@@ -1892,12 +1900,22 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
                     "run dispatch: --step STEP is required (the committed-spine step)".to_string(),
                 ));
             };
+            // Issue #250: the audited operator measurement is a PAIR.
+            if operator.is_some() != reason.is_some() {
+                return Err(ParseError::Usage(
+                    "run dispatch: present BOTH --operator IDENTITY and --reason TEXT (the audited \
+                     pair that authorizes the daemon's own host-resource measurement), or neither"
+                        .to_string(),
+                ));
+            }
             RunAction::Dispatch(RunDispatchArgs {
                 run,
                 step,
                 params: step_params,
                 topology,
                 admission,
+                operator,
+                reason,
                 idempotency_key,
                 socket,
             })
@@ -5640,7 +5658,16 @@ fn execute_run_dispatch(args: &RunDispatchArgs, invocation: &Invocation) -> CmdR
                 .collect(),
         ))
     };
-    let mut params = crate::run_control::dispatch_params(&key, &args.run, &args.step, supplied);
+    let mut params = crate::run_control::dispatch_params(
+        &key,
+        &args.run,
+        &args.step,
+        supplied,
+        match (&args.operator, &args.reason) {
+            (Some(operator), Some(reason)) => Some((operator.as_str(), reason.as_str())),
+            _ => None,
+        },
+    );
     for (name, path) in [("topology", &args.topology), ("admission", &args.admission)] {
         if let Some(path) = path {
             let value = std::fs::read_to_string(path)
@@ -6186,8 +6213,8 @@ USAGE:
     canter run resolve --run RUN_ID --step STEP --recorder IDENTITY \
 --evidence FILE [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run dispatch --run RUN_ID --step STEP [--param KEY=VALUE]... \
-[--topology FILE] [--admission FILE] [--idempotency-key IK] [--socket PATH] \
-[--config PATH] [--json]
+[--topology FILE] [--admission FILE] [--operator IDENTITY --reason TEXT] \
+[--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run status --run RUN_ID [--socket PATH] [--config PATH] [--json]
 
 The scope is the RUN only: --run names exactly one durable run record
@@ -6259,6 +6286,17 @@ committed submission. `--topology FILE` supplies the documented topology for
 the run's first dispatch; later dispatches reuse that immutable recorded
 topology. `--admission FILE` may provide a fresh caller-attested admission
 measurement. No `hf-plan/v1` is ever hand-built.
+--operator IDENTITY --reason TEXT (a PAIR: both or neither) is the audited
+operator's own measurement of the host-resource proof (issue #250): the
+daemon measures the host at the run's lane root at dispatch time and binds
+the measurement into the run's recorded admission (superseding a lapsed
+proof), recording the identity, the reason, the superseded proof and the
+measurement in the hash-chained journal BEFORE it presents them — so a
+remedy that needs a proof is executable by the party it is addressed to.
+The caps and occupancy stay the run's own recorded ones: the measurement
+supplies a proof, never a cap. A host that cannot be measured (or a run that
+recorded no admission to bind it into) produces nothing and the admission
+gate still refuses the absent or lapsed proof, typed.
 The operator's inputs are merged over the step's committed params and
 validated against the step kind's existing param contract BEFORE anything
 is journaled. That pre-screen is TOTAL over the step kinds: each kind's own
@@ -6295,7 +6333,14 @@ the issue can be submitted again on its own merits.
 
 status reads the control state back read-only (daemon `run.status`):
 active / pause_requested (request durable, in-flight work still running) /
-paused (the safe boundary has been reached).
+paused (the safe boundary has been reached). Its `remedy` block is the
+DECISION for a parked run (issue #250): the ONE control whose own gate will
+accept the run's diagnosed frontier step (with its exact documented command
+and the reason the others do not apply), or — when the bounded-retry budget
+is spent, the step carries no re-evaluable check and no proof can be
+produced — the terminal typed `escalation.run.owner_decision` naming the
+owner decision, never an eligible-looking park; the read claims, measures,
+journals and dispatches nothing.
 
 EXIT CODES: 0 ok · 1 daemon/transport error · 2 usage · 4 refusal
 (refusal.run.*, refusal.request.malformed, refusal.state.epoch,

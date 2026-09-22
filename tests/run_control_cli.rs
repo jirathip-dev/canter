@@ -601,6 +601,52 @@ fn cli_run_duplicate_key_refuses_a_reused_key_and_usage_errors_exit_two() {
         );
     }
 
+    // The commands the `run status` decision NAMES are accepted by this same
+    // surface (issue #250): the bounded retry is `--run`/`--step` (no operator
+    // pair), and the audited operator dispatch is the `--operator IDENTITY
+    // --reason TEXT` pair. Both reach the daemon and are refused there (the
+    // run is paused), never rejected as a usage error — a documented remedy
+    // the CLI refuses is a dead-end even when the engine would accept it.
+    for args in [
+        &[
+            "run",
+            "retry",
+            "--run",
+            &run,
+            "--step",
+            "p1",
+            "--socket",
+            &socket_arg,
+            "--json",
+        ][..],
+        &[
+            "run",
+            "dispatch",
+            "--run",
+            &run,
+            "--step",
+            "p1",
+            "--operator",
+            "operator-a",
+            "--reason",
+            "the named remedy, presented",
+            "--socket",
+            &socket_arg,
+            "--json",
+        ][..],
+    ] {
+        let (exit, stdout, stderr) = fixture.cli(args);
+        assert_ne!(exit, 2, "{args:?} is a documented command: {stderr}");
+        assert_eq!(
+            exit, 4,
+            "{args:?} reaches the daemon's own refusal: {stdout}"
+        );
+        assert!(
+            error_code(&envelope(&stdout)).starts_with("refusal."),
+            "{args:?}: the refusal is the engine's own typed code: {stdout}"
+        );
+    }
+
     // The help surface documents the subcommands.
     let (exit, stdout, stderr) = fixture.cli(&["run", "--help"]);
     assert_eq!(exit, 0, "run --help exit; stderr: {stderr}");
