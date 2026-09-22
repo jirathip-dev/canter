@@ -5865,10 +5865,28 @@ fn run_dispatch(shared: &Arc<Shared>, request: &Request, reevaluation: Option<&s
 /// decision the operator should have been told: the ONE control that applies,
 /// or the terminal typed escalation. Nothing is claimed, measured or written.
 fn remedy_for_run(state: &crate::state::State, run: &crate::state::InstanceRow) -> Option<Val> {
-    let failure = state.run_step_failure(&run.instance_id).ok().flatten()?;
-    let step = failure.step.clone();
-    let proof = failure.code == crate::lifecycle::code::PROOF_STALE
-        || failure.code == crate::lifecycle::code::PROOF_MISSING;
+    // Issue #250: a run can be parked by a dispatch that left NO attempt row
+    // (the fan-out admission gate refuses before any intent is journaled,
+    // issue #141), so the park is read from the recorded admission itself when
+    // the ledger names nothing — the same facts the gate reads, and only when
+    // the gate would really decide that dispatch.
+    let (step, code, diagnosed) = match state.run_step_failure(&run.instance_id).ok().flatten() {
+        Some(failure) => {
+            // The diagnosis is the SAME fact the bounded-retry fence reads:
+            // the step's newest recorded attempt is its own failure, never the
+            // run's lapsed window.
+            let diagnosed = state
+                .run_step_diagnosed(&run.instance_id, &failure.step)
+                .unwrap_or(false);
+            (failure.step.clone(), failure.code.clone(), diagnosed)
+        }
+        None => {
+            let (step, code) = recorded_proof_park(state, run)?;
+            (step, code, false)
+        }
+    };
+    let proof = code == crate::lifecycle::code::PROOF_STALE
+        || code == crate::lifecycle::code::PROOF_MISSING;
     // Only a proof park turns on "can a proof be produced"; elsewhere the
     // question is moot and the answer is never consulted.
     let proof_producible = if proof {
@@ -5903,13 +5921,78 @@ fn remedy_for_run(state: &crate::state::State, run: &crate::state::InstanceRow) 
         &crate::run_control::RemedyFacts {
             run: run.instance_id.clone(),
             step,
-            code: failure.code.clone(),
+            code,
+            diagnosed,
             retries_consumed,
             retry_held,
             reevaluation_applies,
             proof_producible,
         },
     ))
+}
+
+/// Issue #250: the park a run carries when NO attempt row names it — the
+/// fan-out admission gate refuses BEFORE any intent is journaled (issue #141),
+/// so a run whose dispatch was refused for its own recorded admission has
+/// nothing for `run_step_failure` to read, while the refusal's own text points
+/// the operator at `run status` for the ONE control that applies.
+///
+/// The decision is derived from the SAME durable facts the gate itself reads:
+/// the run's frontier step, and only when its kind is one the gate DECIDES
+/// (the fan-out kinds, and a self-dispatching review step), plus the recorded
+/// dispatch context's admission and whether its proof is really past the
+/// freshness bound the gate applies. `None` whenever the run is not parked
+/// that way — a step the gate never decides, a fresh proof, a run with no
+/// recorded admission to bind a measurement into, or a read that cannot
+/// answer. Nothing is measured, claimed or written here.
+fn recorded_proof_park(
+    state: &crate::state::State,
+    run: &crate::state::InstanceRow,
+) -> Option<(String, String)> {
+    let spine = state.run_step_spine(&run.instance_id).ok().flatten()?;
+    let attempts = state.run_step_attempts(&run.instance_id).ok()?;
+    let frontier = crate::run_control::frontier_of(&spine, &attempts, &run.current_node)?;
+    let documents = state.run_step_documents(&run.instance_id).ok().flatten()?;
+    let step = documents
+        .iter()
+        .find(|document| document.get("id").and_then(Val::as_str) == Some(frontier.as_str()))?;
+    let kind = crate::mutation::step_kind(step).ok()?;
+    let decided = matches!(kind.as_str(), "harness_start" | "prompt")
+        || (kind == "review_evidence"
+            && step
+                .get("params")
+                .is_some_and(|params| crate::mutation::declares_reviewer_leg(Some(params))));
+    if !decided {
+        return None;
+    }
+    // The context must carry the admission the gate would decide the NEXT
+    // dispatch of that step on: without one there is nothing to bind a
+    // measurement into, and the absent proof is never invented here. The proof
+    // instant is read the SAME way the gate's own parser reads it
+    // (`flags.admission.host_proof.measured_at`, RFC3339).
+    let context = state
+        .run_dispatch_context(&run.instance_id)
+        .ok()
+        .flatten()?;
+    let admission = context.admission?;
+    let measured_at = admission
+        .get("host_proof")
+        .and_then(|proof| proof.get("measured_at"))
+        .and_then(Val::as_str)
+        .and_then(crate::time::unix_from_rfc3339);
+    let fresh = measured_at.is_some_and(|measured_at_unix| {
+        crate::lifecycle::HostProof { measured_at_unix }.fresh_at(crate::time::unix_now())
+    });
+    if fresh {
+        return None;
+    }
+    // The same two codes the gate's own proof precondition returns.
+    let code = if measured_at.is_some() {
+        crate::lifecycle::code::PROOF_STALE
+    } else {
+        crate::lifecycle::code::PROOF_MISSING
+    };
+    Some((frontier, code.to_string()))
 }
 
 /// Whether `run.reevaluate` would be accepted for this (run, step) — the

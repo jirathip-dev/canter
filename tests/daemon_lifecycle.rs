@@ -767,13 +767,15 @@ fn admission_refuses_missing_or_stale_proof_and_missing_caps_over_the_wire() {
         Some(scenario.apply_params(30, None)),
     );
     assert_eq!(code, "refusal.admission.proof_missing", "{message}");
-    // Issue #243: the refusal names the failing precondition AND the reachable
-    // remedy — the exact command that presents the missing measurement — and
-    // the gate itself is untouched (the attempt still refuses).
+    // Issue #243/#250: the refusal names the failing precondition AND the
+    // reachable remedy — the exact command that produces the missing
+    // measurement (the audited operator's own host measurement), with the
+    // attestation file kept for a run that recorded no admission to bind it
+    // into — and the gate itself is untouched (the attempt still refuses).
     assert!(
         message.contains(&format!(
-            "canter run dispatch --run {INSTANCE_ID} --step h1 --admission FILE"
-        )),
+            "canter run dispatch --run {INSTANCE_ID} --step h1 --operator IDENTITY --reason TEXT"
+        )) && message.contains("otherwise present `--admission FILE`"),
         "the missing-proof refusal names the remedy: {message}"
     );
 
@@ -791,16 +793,17 @@ fn admission_refuses_missing_or_stale_proof_and_missing_caps_over_the_wire() {
         Some(scenario.apply_params(31, Some(stale))),
     );
     assert_eq!(code, "refusal.admission.proof_stale");
-    // Issue #243: the stale refusal names both renewal paths (the run's own
-    // bounded check re-evaluation, which re-measures at dispatch time, and the
-    // operator's explicit attestation) for THIS run and step.
+    // Issue #243/#250: the stale refusal names the failing precondition and
+    // the ONE control that applies (the audited operator's own measurement,
+    // which supersedes the lapsed proof at dispatch time) plus the run's own
+    // check re-evaluation for the producer case, for THIS run and step.
     assert!(
         message.contains(&format!(
-            "canter run reevaluate --run {INSTANCE_ID} --step h1 --operator IDENTITY --reason TEXT"
+            "canter run dispatch --run {INSTANCE_ID} --step h1 --operator IDENTITY --reason TEXT"
         )) && message.contains(&format!(
-            "canter run dispatch --run {INSTANCE_ID} --step h1 --admission FILE"
-        )),
-        "the stale-proof refusal names the remedies: {message}"
+            "canter run reevaluate --run {INSTANCE_ID} --step h1 --operator IDENTITY --reason TEXT"
+        )) && message.contains(&format!("canter run status --run {INSTANCE_ID}")),
+        "the stale-proof refusal names the remedy: {message}"
     );
 
     // A fresh proof but no caps declared refuses (unknown measurements

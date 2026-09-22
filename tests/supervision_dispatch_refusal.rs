@@ -1039,12 +1039,14 @@ fn a_repaired_frontier_refused_by_the_engine_is_named_and_never_reported_eligibl
     let started = Instant::now();
     let mut last_progress = started;
     let mut progress = 0usize;
-    // Issue #243: the refusal names the failing PRECONDITION and the remedy —
-    // the exact commands that renew the proof for THIS run and step — not a
-    // bare code.
+    // Issue #243/#250: the refusal names the failing PRECONDITION and the
+    // reachable remedy — the exact control that produces the proof for THIS
+    // run and step (the audited operator's own host measurement) — not a bare
+    // code, and it still fits the bounded reason the record keeps.
     let precondition =
         format!("{run}:p3:refusal.admission.proof_stale:reason:the host-resource proof is stale");
-    let remedy = format!("canter run dispatch --run {run} --step p3 --admission FILE");
+    let remedy =
+        format!("canter run dispatch --run {run} --step p3 --operator IDENTITY --reason TEXT");
     let recorded = |refusals: &[(String, String)]| {
         refusals
             .iter()

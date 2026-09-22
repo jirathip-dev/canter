@@ -3155,9 +3155,10 @@ fn an_unsatisfiable_proof_refusal_names_the_precondition_and_the_remedy() {
     );
     assert!(
         message.contains(&format!(
-            "canter run dispatch --run {run} --step p6 --admission FILE"
+            "canter run dispatch --run {run} --step p6 --operator IDENTITY --reason TEXT"
         )),
-        "the refusal names the explicit attestation path: {message}"
+        "the refusal names the audited operator measurement that produces the proof (issue #250): \
+         {message}"
     );
     // Nothing was fabricated: no renewal is recorded for an unmeasurable host.
     let state = fixture.seed();
@@ -3626,7 +3627,7 @@ fn the_audited_operator_measurement_produces_the_proof_a_parked_run_needs() {
             "issue-6",
         );
     }
-    let _daemon = fixture.spawn(None);
+    let daemon = fixture.spawn(None);
     wait_ready(&fixture);
 
     // (A) The measured defect: the frontier fan-out refuses the lapsed proof,
@@ -3658,6 +3659,60 @@ fn the_audited_operator_measurement_produces_the_proof_a_parked_run_needs() {
         canter::lifecycle::code::PROOF_STALE,
         "the ordinary dispatch refuses the lapsed proof: {}",
         canter::canonical::canonical_text(&refused)
+    );
+
+    // (D) The park the ledger cannot see: the fan-out admission gate refuses
+    // BEFORE any intent is journaled, so the run carries no attempt row while
+    // the refusal's own text points the operator at `run status`. The decision
+    // is read from the run's OWN recorded admission — the same facts the gate
+    // reads — and names the ONE control that reaches the step: the audited
+    // operator dispatch, with its exact documented command for THIS run and
+    // step. A run whose proof is fresh is not parked this way and the block
+    // stays quiet (proved below, after the same run is re-measured).
+    let live_status = rpc(
+        &fixture.socket,
+        &fresh_id(37),
+        "run.status",
+        Some(canter::run_control::status_params(&plain)),
+    );
+    eprintln!(
+        "run.status (live admission park) => {}",
+        canter::canonical::canonical_text(&live_status)
+    );
+    let live_remedy = live_status
+        .get("result")
+        .and_then(|result| result.get("remedy"))
+        .cloned()
+        .expect("the control document carries the remedy decision");
+    assert_eq!(
+        live_remedy.get("state").and_then(Val::as_str),
+        Some("applicable"),
+        "a live proof park still names its control: {live_remedy:?}"
+    );
+    assert_eq!(
+        live_remedy.get("control").and_then(Val::as_str),
+        Some("run.dispatch"),
+        "{live_remedy:?}"
+    );
+    assert_eq!(
+        live_remedy.get("command").and_then(Val::as_str),
+        Some(
+            format!(
+                "canter run dispatch --run {plain} --step p6 --operator IDENTITY --reason TEXT"
+            )
+            .as_str()
+        ),
+        "the decision carries the documented command (issue #250): {live_remedy:?}"
+    );
+    // The decision names the SAME park the gate refused (the recorded
+    // admission's lapsed proof), read the way the gate's own parser reads it.
+    assert!(
+        live_remedy
+            .get("because")
+            .and_then(Val::as_str)
+            .unwrap_or_default()
+            .contains(&format!("code {}", canter::lifecycle::code::PROOF_STALE)),
+        "the decision names the refused precondition: {live_remedy:?}"
     );
 
     // (B) The audited operator pair: the proof is PRODUCED (measured at
@@ -3756,6 +3811,106 @@ fn the_audited_operator_measurement_produces_the_proof_a_parked_run_needs() {
         "nothing was measured for the run whose lane root is absent"
     );
 
+    // (E) Branch (3) exactly as the measured scenario reaches it: the ledger
+    // records the proof park, the bounded-retry budget is spent, and the host
+    // is measurable. The decision names the audited operator dispatch — and the
+    // NAMED control is EXECUTABLE: the run's own lapsed window is not a step
+    // diagnosis, so no bounded-retry authorization is demanded of the
+    // re-dispatch, and the measurement is bound BEFORE the admission gate
+    // decides (the fence refuses nothing, and the gate never decides on the
+    // lapsed proof).
+    seed_refused_attempt(
+        &state,
+        &plain,
+        "p6",
+        &idem_key("250-journaled-park"),
+        canter::lifecycle::code::PROOF_STALE,
+    );
+    for consumed in ["250-spent-1", "250-spent-2", "250-spent-3"] {
+        state
+            .record_run_retry(&plain, "p6", AT)
+            .expect("bounded retry authorization");
+        state
+            .claim_run_retry(&plain, "p6", &idem_key(consumed), AT)
+            .expect("consume the authorization");
+    }
+    let parked = rpc(
+        &fixture.socket,
+        &fresh_id(38),
+        "run.status",
+        Some(canter::run_control::status_params(&plain)),
+    );
+    eprintln!(
+        "run.status (journaled proof park, budget spent) => {}",
+        canter::canonical::canonical_text(&parked)
+    );
+    let remedy = parked
+        .get("result")
+        .and_then(|result| result.get("remedy"))
+        .cloned()
+        .expect("the control document carries the remedy decision");
+    assert_eq!(
+        remedy.get("state").and_then(Val::as_str),
+        Some("applicable"),
+        "{remedy:?}"
+    );
+    assert_eq!(
+        remedy.get("control").and_then(Val::as_str),
+        Some("run.dispatch"),
+        "the audited operator dispatch is the ONE control for a proof park: {remedy:?}"
+    );
+    assert_eq!(
+        remedy.get("command").and_then(Val::as_str),
+        Some(
+            format!(
+                "canter run dispatch --run {plain} --step p6 --operator IDENTITY --reason TEXT"
+            )
+            .as_str()
+        ),
+        "{remedy:?}"
+    );
+    // The NAMED control, executed through the real daemon: nothing fences it
+    // and the measurement it binds is what the gate decides on.
+    let executed = rpc(
+        &fixture.socket,
+        &fresh_id(39),
+        "run.dispatch",
+        Some(canter::run_control::dispatch_params(
+            &idem_key("250-named-control"),
+            &plain,
+            "p6",
+            None,
+            Some((operator, reason)),
+        )),
+    );
+    eprintln!(
+        "the NAMED control, executed => {}",
+        canter::canonical::canonical_text(&executed)
+    );
+    let executed_code = executed
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .and_then(Val::as_str)
+        .unwrap_or_default();
+    assert_ne!(
+        executed_code,
+        "refusal.run.retry_required",
+        "the named control is not fenced by the bounded retry: {}",
+        canter::canonical::canonical_text(&executed)
+    );
+    assert_ne!(
+        executed_code,
+        canter::lifecycle::code::PROOF_STALE,
+        "the named control reaches the gate with a fresh measurement: {}",
+        canter::canonical::canonical_text(&executed)
+    );
+    assert_eq!(
+        executed_code,
+        "refusal.session.unbound",
+        "the named control reached the NEXT, unrelated refusal past both fences: {}",
+        canter::canonical::canonical_text(&executed)
+    );
+
     // The decision: while the bounded-retry budget is unspent, `run status`
     // names the retry — ONE control, with its command; once it is spent and
     // nothing else applies, the same read escalates terminally.
@@ -3764,7 +3919,7 @@ fn the_audited_operator_measurement_produces_the_proof_a_parked_run_needs() {
         &unmeasurable,
         "p6",
         &idem_key("250-refused"),
-        canter::lifecycle::code::PROOF_STALE,
+        canter::mutation::code::WORKER_TIMEOUT,
     );
     state
         .record_run_retry(&unmeasurable, "p6", AT)
@@ -3825,13 +3980,11 @@ fn the_audited_operator_measurement_produces_the_proof_a_parked_run_needs() {
         Some("run.retry"),
         "{remedy:?}"
     );
-    assert!(
-        remedy
-            .get("command")
-            .and_then(Val::as_str)
-            .unwrap_or_default()
-            .starts_with("canter run retry --run run-"),
-        "the decision carries the documented command: {remedy:?}"
+    assert_eq!(
+        remedy.get("command").and_then(Val::as_str),
+        Some(format!("canter run retry --run {unmeasurable} --step p6").as_str()),
+        "the decision carries the command `canter run retry` itself accepts (issue #250): \
+         {remedy:?}"
     );
     // Spend the rest of the bound: each authorization is CONSUMED by the ONE
     // re-dispatch it authorizes before the next can be minted.
@@ -3873,4 +4026,5 @@ fn the_audited_operator_measurement_produces_the_proof_a_parked_run_needs() {
         "the escalation is TYPED: {remedy:?}"
     );
     assert!(remedy.get("control").is_some_and(Val::is_null));
+    shutdown(daemon);
 }

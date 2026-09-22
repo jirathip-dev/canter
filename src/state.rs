@@ -238,11 +238,40 @@ pub const DISPATCH_REFUSAL_REASON_MAX: usize = 300;
 /// frontier behind `refusal.run.retry_required`. One fact, three readers:
 /// the retry fence ([`State::claim_run_retry`]), the daemon's supervised
 /// dispatch decision and the supervision driver's own eligibility.
+///
+/// Issue #250: the fan-out admission gate's two host-resource-proof codes are
+/// the SAME class. The gate decides them BEFORE any intent is journaled (the
+/// recorded admission is the run's own authorization window, and its proof
+/// lapsed or was never recorded), so a record carrying one of them is never
+/// the step's own failure: it is the run's own lapsed window, and the ONE
+/// control that renews it — the run's own re-dispatch, or the audited
+/// operator's measurement — never needs a bounded retry authorization to
+/// reach the step (`run status`'s `remedy` decision names it, and the
+/// admission gate itself still decides the presented proof).
 pub fn step_attempt_diagnosed(status: &str, code: &str) -> bool {
     if !matches!(status, "failed" | "refused" | "ambiguous") {
         return false;
     }
     code != crate::mutation::code::GRANT_EXPIRED
+        && code != crate::lifecycle::code::PROOF_STALE
+        && code != crate::lifecycle::code::PROOF_MISSING
+}
+
+/// The NEWEST recorded attempt of ONE step of one run, out of the durable
+/// attempt rows ([`State::run_step_attempts_with_codes`], oldest first): the
+/// row every diagnosis reader keys on — the bounded-retry fence, the
+/// supervision driver's eligibility and the `run status` remedy decision
+/// (issue #250) — so a park that is the run's own lapsed window is never
+/// fenced by an OLDER, already-spent step failure. `None` when the step was
+/// never attempted (a first dispatch is never fenced).
+fn latest_step_attempt<'a>(
+    attempts: &'a [(String, String, String, String)],
+    step_id: &str,
+) -> Option<(&'a str, &'a str, &'a str)> {
+    attempts
+        .iter()
+        .rfind(|(step, _, _, _)| step == step_id)
+        .map(|(step, status, code, _)| (step.as_str(), status.as_str(), code.as_str()))
 }
 
 /// The journal action ONE recorded check re-evaluation is written under
@@ -4145,11 +4174,28 @@ impl State {
     /// Check one step dispatch against the bounded-retry fence (issue #86)
     /// and consume the single-use authorization when one is needed:
     /// a first dispatch of a step is never fenced; a re-dispatch of a step
-    /// whose recorded outcomes include a terminal non-success consumes one
+    /// whose NEWEST recorded outcome is a terminal non-success consumes one
     /// unconsumed authorization, and refuses (`RunRetryClaim::Missing`)
     /// when none exists. A recorded refusal of the run's OWN lapsed window
     /// is not a step diagnosis ([`step_attempt_diagnosed`], issue #184), so
     /// a lapse never demands a retry.
+    ///
+    /// Issue #250: the diagnosis is read from the step's NEWEST recorded
+    /// attempt — the same row the supervision readers and the `run status`
+    /// remedy decision key on — so a park that is the run's own lapsed window
+    /// (the fan-out admission's proof codes, a lapsed grant) is not fenced:
+    /// the ONE control that renews it (the run's own re-dispatch, which
+    /// re-measures the lane root, or the audited operator's measurement)
+    /// reaches the step, and the step's own diagnosis re-appears as the newest
+    /// row the moment that re-dispatch runs and fails again.
+    ///
+    /// The run's own authorization for THIS step is read FIRST, whatever the
+    /// diagnosis says — the authorization authorizes exactly ONE re-dispatch
+    /// of that exact step, so the dispatch that arrives spends it (single use)
+    /// instead of a lapsed-window park leaving it pending forever (which would
+    /// fence `run.release` on an authorization nothing can consume). `Missing`
+    /// is therefore only ever returned for a step whose newest attempt is a
+    /// diagnosis and which holds no authorization.
     pub fn claim_run_retry(
         &self,
         instance_id: &str,
@@ -4160,12 +4206,8 @@ impl State {
         self.ensure_writable()?;
         let conn = self.lock("claim_run_retry")?;
         let attempts = self.run_step_attempts_with_codes(&conn, instance_id)?;
-        let diagnosed = attempts
-            .iter()
-            .any(|(step, status, code, _)| step == step_id && step_attempt_diagnosed(status, code));
-        if !diagnosed {
-            return Ok(RunRetryClaim::NotRequired);
-        }
+        let diagnosed = latest_step_attempt(&attempts, step_id)
+            .is_some_and(|(_, status, code)| step_attempt_diagnosed(status, code));
         // Supervision reserved and consumed its own slot with the intent.
         let consumed: Option<String> = conn
             .query_row(
@@ -4191,7 +4233,11 @@ impl State {
             .optional()
             .map_err(|err| StateError::from_sqlite("claim_run_retry: pending", err))?;
         let Some((retry_id, attempt)) = pending else {
-            return Ok(RunRetryClaim::Missing);
+            return Ok(if diagnosed {
+                RunRetryClaim::Missing
+            } else {
+                RunRetryClaim::NotRequired
+            });
         };
         let affected = conn
             .execute(
@@ -14454,6 +14500,20 @@ impl State {
                     })
                 }
             }))
+    }
+
+    /// Whether ONE (run, step) carries a recorded step DIAGNOSIS — the SAME
+    /// fact the bounded-retry fence reads ([`State::claim_run_retry`]) and the
+    /// `run status` remedy decision is keyed on (issue #250): the step's
+    /// NEWEST recorded attempt is a diagnosis ([`step_attempt_diagnosed`]).
+    /// A step that was never attempted is not diagnosed — a first dispatch is
+    /// never fenced, and the ONE control that renews the run's own lapsed
+    /// window never needs a bounded retry authorization.
+    pub fn run_step_diagnosed(&self, instance_id: &str, step_id: &str) -> Result<bool, StateError> {
+        let conn = self.lock("run_step_diagnosed")?;
+        let attempts = self.run_step_attempts_with_codes(&conn, instance_id)?;
+        Ok(latest_step_attempt(&attempts, step_id)
+            .is_some_and(|(_, status, code)| step_attempt_diagnosed(status, code)))
     }
 
     /// Record ONE refused continuation dispatch of a supervised run (issue

@@ -1137,6 +1137,13 @@ pub struct RemedyFacts {
     /// The recorded failure code of that step (the admission gate's own
     /// `refusal.admission.*` codes are what the proof branch is keyed on).
     pub code: String,
+    /// Whether the step carries a recorded DIAGNOSIS: a terminal non-success
+    /// attempt of the step's OWN work ([`crate::state::step_attempt_diagnosed`]).
+    /// A park that only records the run's own lapsed window (the fan-out
+    /// admission's proof codes, a lapsed grant) is NOT one, so the bounded
+    /// retry — which authorizes exactly one re-dispatch of a diagnosed step —
+    /// is never the applicable control there.
+    pub diagnosed: bool,
     /// Bounded retries this (run, step) already CONSUMED (a held,
     /// unconsumed authorization is [`RemedyFacts::retry_held`], not budget).
     pub retries_consumed: i64,
@@ -1201,10 +1208,10 @@ pub fn remedy_doc(facts: &RemedyFacts) -> Val {
             ("statement", string(REMEDY_STATEMENT)),
         ]);
     }
-    // (2a) The run already HOLDS an unconsumed authorization: the ONE
-    // re-dispatch that consumes it is the applicable control (minting another
-    // would refuse `refusal.run.retry_pending`).
-    if facts.retry_held {
+    // (2a) The run already HOLDS an unconsumed authorization for a DIAGNOSED
+    // step: the ONE re-dispatch that consumes it is the applicable control
+    // (minting another would refuse `refusal.run.retry_pending`).
+    if facts.retry_held && facts.diagnosed {
         let command = if proof_park {
             format!(
                 "canter run dispatch --run {run} --step {step} --operator IDENTITY --reason TEXT"
@@ -1229,18 +1236,18 @@ pub fn remedy_doc(facts: &RemedyFacts) -> Val {
             ("statement", string(REMEDY_STATEMENT)),
         ]);
     }
-    // (2b) A diagnosed step with retry budget left: the operator's own bounded
+    // (2b) A DIAGNOSED step with retry budget left: the operator's own bounded
     // retry is the ONE control, and its single re-dispatch presents the
-    // dispatch-time measurement.
-    if facts.retries_consumed < RUN_RETRY_MAX {
+    // dispatch-time measurement. The command is the one `canter run retry`
+    // itself documents and accepts (`--run` and `--step`; the authorization it
+    // mints is consumed by the re-dispatch, not by the mint).
+    if facts.diagnosed && facts.retries_consumed < RUN_RETRY_MAX {
         return object(vec![
             ("state", string("applicable")),
             ("control", string("run.retry")),
             (
                 "command",
-                string(&format!(
-                    "canter run retry --run {run} --step {step} --operator IDENTITY --reason TEXT"
-                )),
+                string(&format!("canter run retry --run {run} --step {step}")),
             ),
             ("code", null()),
             (
@@ -1275,17 +1282,20 @@ pub fn remedy_doc(facts: &RemedyFacts) -> Val {
                 "because",
                 string(&format!(
                     "step {step} is a fan-out whose host-resource proof (measured {}, code {}) is \
-                     what its dispatch is refused for, and the retry budget is spent ({RUN_RETRY_MAX} \
-                     of {RUN_RETRY_MAX} used); the audited operator dispatch is the one control that \
-                     still reaches it, because the daemon measures the host on the recorded \
-                     operator's behalf and binds the measurement (a check re-evaluation does not \
-                     apply: this step carries no re-evaluable terminal-success check)",
+                     what its dispatch is refused for, and the daemon can measure the host for the \
+                     recorded operator: the audited operator dispatch is the one control that \
+                     reaches it — it measures the host at the run's lane root at dispatch time and \
+                     binds the measurement BEFORE the admission gate decides, so the gate decides \
+                     on a fresh proof (the bounded retry does not apply: the recorded park is the \
+                     run's OWN lapsed window, not a failure of the step, so no re-dispatch of it \
+                     needs or spends a bounded retry authorization; {} of {RUN_RETRY_MAX} used)",
                     if facts.code == crate::lifecycle::code::PROOF_MISSING {
                         "never recorded"
                     } else {
                         "before the freshness window"
                     },
-                    facts.code
+                    facts.code,
+                    facts.retries_consumed
                 )),
             ),
             ("statement", string(REMEDY_STATEMENT)),
