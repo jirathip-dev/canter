@@ -3,15 +3,22 @@
 //! repository's own issue surface), a local bare origin carrying `staging`
 //! (the remote's own integration head), and a real recorded state store.
 //!
+//! The commit leg (`--out`, no `--dry-run`) is exercised end to end against a
+//! REAL daemon child: the document is rendered, one grant is minted per
+//! selected item through the same surface the operator path uses, and the
+//! daemon commits one admitted run per selected item (AC1).
+//!
 //! Evidence rules: raw process exits are asserted directly, the JSON envelope
 //! is parsed as documented, and the mutation-free claim of `--dry-run` is
 //! proven by hashing the state store before and after the run (the journal
 //! lives in that store, so an unchanged store is an unchanged journal).
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use canter::canonical::sha256_hex;
+use canter::client::Connection;
 use canter::state::{Retention, State};
 use canter::value::Val;
 
@@ -48,6 +55,17 @@ struct Fixture {
     state_dir: PathBuf,
     config_path: PathBuf,
     checkout: PathBuf,
+}
+
+/// The real daemon child, killed and reaped on drop: a failing assertion can
+/// never leak a fixture daemon into the driver's survivor sweep.
+struct Daemon(Child);
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 impl Fixture {
@@ -136,12 +154,78 @@ impl Fixture {
         self.state_dir.join("canter").join("state.db")
     }
 
+    fn socket(&self) -> PathBuf {
+        self.dir.join("daemon.sock")
+    }
+
     /// Create the recorded state store the way the daemon would (real
     /// migrations). Returns the store path.
     fn seed(&self) -> PathBuf {
         std::fs::create_dir_all(self.state_dir.join("canter")).expect("state dir");
         let _store = State::open(&self.db(), Retention::default()).expect("open state");
         self.db()
+    }
+
+    /// Spawn the real daemon child over the fixture socket and state home
+    /// (the `daemon_rpc`/`queue_cli` pattern), under the same controlled
+    /// environment the CLI sees.
+    fn spawn(&self) -> Daemon {
+        std::fs::create_dir_all(&self.state_dir).expect("state home");
+        let host_path = std::env::var("PATH").unwrap_or_default();
+        let path = format!("{}:{host_path}", self.dir.join("fakebin").display());
+        let mut command = Command::new(bin());
+        command
+            .args(["daemon", "run", "--socket"])
+            .arg(self.socket())
+            .current_dir(&self.checkout)
+            .env_clear()
+            .env("PATH", path)
+            .env("HOME", &self.dir)
+            .env("XDG_STATE_HOME", &self.state_dir)
+            .env("LANG", "C")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(
+                std::fs::File::create(self.dir.join("daemon.stderr.log")).expect("stderr log"),
+            ));
+        Daemon(command.spawn().expect("spawn daemon"))
+    }
+
+    /// Wait (bounded) until the daemon answers `status` on the socket.
+    fn wait_ready(&self) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if canter::lock::socket_presence(&self.socket()) == canter::lock::SocketPresence::Active
+            {
+                let ok = Connection::open(&self.socket())
+                    .and_then(|mut connection| {
+                        connection.send_request("aaaaaaaaaaaaaaaa", "status", None)?;
+                        connection.read_response()
+                    })
+                    .map(|response| response.ok)
+                    .unwrap_or(false);
+                if ok {
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let stderr =
+            std::fs::read_to_string(self.dir.join("daemon.stderr.log")).unwrap_or_default();
+        panic!(
+            "daemon did not become ready on {}; stderr:\n{stderr}",
+            self.socket().display()
+        );
+    }
+
+    /// Terminate the daemon child and wait (bounded) for it to exit, so the
+    /// store can be reopened. The [`Daemon`] guard repeats this on drop.
+    fn shutdown(&self, mut daemon: Daemon) {
+        let _ = daemon.0.kill();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while daemon.0.try_wait().expect("try_wait").is_none() {
+            assert!(Instant::now() < deadline, "daemon did not exit");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Run the CLI with the controlled environment: fake `gh` first on PATH,
@@ -382,4 +466,143 @@ fn the_integration_head_is_the_default_revision_and_an_unresolvable_one_refuses_
         "a refusal must not write the state store"
     );
     assert!(!out_path.exists(), "a refusal must not write a document");
+}
+
+/// AC1 (the commit leg, end to end): one non-`--dry-run` invocation turns the
+/// repository's own issue state into ONE bound-input submission over a REAL
+/// daemon — the document is written to `--out`, one grant is minted per
+/// selected item through the same surface the operator path uses, and the
+/// daemon commits ONE admitted run per selected item.
+#[test]
+fn the_commit_leg_commits_one_run_per_admitted_item_over_a_live_daemon() {
+    let fixture = Fixture::new("commit", true);
+    fixture.seed();
+    let daemon = fixture.spawn();
+    fixture.wait_ready();
+
+    let out_path = fixture.dir.join("request.json");
+    let out_arg = out_path.display().to_string();
+    let submitted = run(
+        &fixture,
+        &intake_args(
+            &fixture,
+            &[
+                "--out",
+                &out_arg,
+                "--host-available",
+                "yes",
+                "--harness-lanes",
+                "0",
+            ],
+        ),
+    );
+    assert_eq!(
+        submitted.status.code(),
+        Some(0),
+        "intake commit exit; stderr: {}",
+        String::from_utf8_lossy(&submitted.stderr)
+    );
+    let envelope = envelope(&submitted);
+    let data = envelope.get("data").cloned().expect("data");
+    // The committed submission document, not a dry-run render.
+    assert_eq!(
+        data.get("schema").and_then(Val::as_str),
+        Some("hf-queue-submission/v1"),
+        "the commit leg answers with the committed submission: {}",
+        stdout(&submitted)
+    );
+    assert_eq!(
+        data.get("intake")
+            .and_then(|intake| intake.get("schema"))
+            .and_then(Val::as_str),
+        Some("hf-intake/v1"),
+        "the decision rides with the submission: {}",
+        stdout(&submitted)
+    );
+    assert_eq!(
+        data.get("out").and_then(Val::as_str),
+        Some(out_arg.as_str()),
+        "the submission names the written document"
+    );
+    let admission = data.get("admission").cloned().expect("admission");
+    assert_eq!(
+        admission.get("admitted").and_then(Val::as_int),
+        Some(2),
+        "both ready issues are admitted: {}",
+        stdout(&submitted)
+    );
+    assert_eq!(
+        admission.get("refused").and_then(Val::as_int),
+        Some(0),
+        "nothing is refused: {}",
+        stdout(&submitted)
+    );
+    assert_eq!(
+        admission.get("waiting").and_then(Val::as_int),
+        Some(0),
+        "nothing waits: {}",
+        stdout(&submitted)
+    );
+    // ONE run per admitted item: each admitted issue carries its own run id.
+    let items = data
+        .get("items")
+        .and_then(Val::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let runs: Vec<String> = items
+        .iter()
+        .map(|item| {
+            assert_eq!(
+                item.get("status").and_then(Val::as_str),
+                Some("admitted"),
+                "every selected item is admitted: {item:?}"
+            );
+            item.get("instance_id")
+                .and_then(Val::as_str)
+                .expect("an admitted item names its run")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(runs.len(), 2, "one run per admitted item");
+    let unique: std::collections::BTreeSet<&String> = runs.iter().collect();
+    assert_eq!(
+        unique.len(),
+        2,
+        "each admitted item gets its OWN run: {runs:?}"
+    );
+    // The bound-input document the submission confirmed is on disk.
+    let written = std::fs::read_to_string(&out_path).expect("written document");
+    let bound = Val::parse_json(written.trim()).expect("bound-input document");
+    assert_eq!(
+        bound.get("schema").and_then(Val::as_str),
+        Some(canter::queue_preview::QUEUE_PREVIEW_SCHEMA),
+        "the written document is the operator path's bound-input document"
+    );
+
+    fixture.shutdown(daemon);
+    // The daemon committed durable rows: one run (instance) per admitted item,
+    // and one ownership row per admitted item.
+    let db = fixture.seed();
+    let state = State::open(&db, Retention::default()).expect("reopen state");
+    let instances = state.list_instances().expect("instances");
+    assert_eq!(
+        instances.len(),
+        2,
+        "the daemon committed one run per admitted item: {instances:?}"
+    );
+    let recorded: std::collections::BTreeSet<String> = instances
+        .iter()
+        .map(|row| row.instance_id.clone())
+        .collect();
+    for run in &runs {
+        assert!(
+            recorded.contains(run),
+            "run {run} is the committed row the submission named: {recorded:?}"
+        );
+    }
+    assert_eq!(
+        state.queue_ownership_rows().expect("ownership").len(),
+        2,
+        "one ownership row per admitted item"
+    );
 }
