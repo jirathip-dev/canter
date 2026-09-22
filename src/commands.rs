@@ -353,6 +353,11 @@ pub struct QueueIntakeArgs {
     pub harness: String,
     /// Explicit target host identity token.
     pub host: String,
+    /// Presented host availability; `None` = unknown (a hold). Intake never
+    /// assumes capacity.
+    pub host_available: Option<bool>,
+    /// Presented same-harness occupancy; `None` = unknown (a hold).
+    pub harness_lanes: Option<i64>,
     /// The integration branch whose head is the default revision rule.
     pub integration_branch: Option<String>,
     /// Tracker declared revision pins (`--pin N=HEX40`): a declared pin wins
@@ -2287,17 +2292,15 @@ fn parse_queue_intake(rest: &[&String]) -> Result<Invocation, ParseError> {
             }
             "--max-items" => {
                 let raw = flag_value(rest, &mut index, "queue", "--max-items")?;
-                if let Ok(parsed) = raw.parse::<usize>() {
-                    if parsed > 0 {
-                        max_items = parsed;
-                        index += 1;
-                        continue;
+                match raw.parse::<usize>() {
+                    Ok(parsed) if parsed > 0 => max_items = parsed,
+                    _ => {
+                        return Err(ParseError::Usage(format!(
+                            "queue intake: --max-items takes a positive integer (the declared \
+                             item bound), got {raw:?}"
+                        )));
                     }
                 }
-                return Err(ParseError::Usage(format!(
-                    "queue intake: --max-items takes a positive integer (the declared item \
-                     bound), got {raw:?}"
-                )));
             }
             "--dry-run" => dry_run = true,
             "--out" => {
@@ -2391,6 +2394,8 @@ fn parse_queue_intake(rest: &[&String]) -> Result<Invocation, ParseError> {
             label,
             harness,
             host,
+            host_available,
+            harness_lanes,
             integration_branch,
             pins,
             max_items,
@@ -5373,8 +5378,8 @@ fn execute_queue_intake(args: &QueueIntakeArgs, invocation: &Invocation) -> CmdR
             harness: args.harness.clone(),
             reviewer_harness: None,
             host: args.host.clone(),
-            host_available: Some(true),
-            harness_lanes: Some(1),
+            host_available: args.host_available,
+            harness_lanes: args.harness_lanes,
             caps: args.caps,
             boundary_phase: None,
             integration_branch: Some(integration.clone()),
@@ -5428,8 +5433,8 @@ fn execute_queue_intake(args: &QueueIntakeArgs, invocation: &Invocation) -> CmdR
             epoch: None,
             grants,
             resume: Vec::new(),
-            host_available: Some(true),
-            harness_lanes: Some(1),
+            host_available: args.host_available,
+            harness_lanes: args.harness_lanes,
             caps: args.caps,
             supervise: args.supervise.clone(),
             topology: args.topology.clone(),
