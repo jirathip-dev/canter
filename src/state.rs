@@ -9354,30 +9354,44 @@ pub(crate) fn dispatch_refusal_of(
 }
 
 /// The newest recorded fix-round dispatch of one run (issue #238), read from
-/// the run's own step outcomes: the review step that consumed a FAIL records
-/// the fix round it handed that FAIL to in its result document, so the round
+/// the run's own step records: the review step that consumed a FAIL records the
+/// fix round it handed that FAIL to in the document it returned, so the round
 /// the run is waiting on is a recorded fact and not a second ledger. `None`
 /// when no step of the run ever dispatched a fix round.
+///
+/// Issue #254: the daemon persists that returned document in the apply row's
+/// RESPONSE column (the canonical `hf-rpc-response/v1` line, `result.fix_round`),
+/// while the row's `outcome.result` is `null` — so the handoff is read from
+/// where it is ACTUALLY written, the same way the repository's other recorded
+/// read models read a dispatch's own result (`run_dispatch_context`,
+/// `delivery_certificate_locked`). The `outcome` shape stays readable beside it
+/// (a row written by a writer that kept the result in the outcome is the same
+/// document), and the validation is identical either way: an
+/// `hf-fix-round/v1` document with all four named fields, or nothing at all.
 fn newest_fix_round_locked(
     conn: &Connection,
     instance_id: &str,
 ) -> Result<Option<SupervisionFixRound>, StateError> {
     let mut statement = conn
         .prepare(
-            "SELECT request_line, outcome FROM idempotency
+            "SELECT request_line, outcome, COALESCE(response, '') FROM idempotency
               WHERE method = 'apply' AND outcome IS NOT NULL
-                AND outcome LIKE '%fix_round%'
+                AND (outcome LIKE '%fix_round%' OR response LIKE '%fix_round%')
               ORDER BY rowid",
         )
         .map_err(|err| StateError::from_sqlite("supervision fix round: prepare", err))?;
     let rows = statement
         .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })
         .map_err(|err| StateError::from_sqlite("supervision fix round: query", err))?;
     let mut newest: Option<SupervisionFixRound> = None;
     for row in rows {
-        let (line, outcome) =
+        let (line, outcome, response) =
             row.map_err(|err| StateError::from_sqlite("supervision fix round: row", err))?;
         let Some(outcome) = outcome else {
             continue;
@@ -9389,13 +9403,23 @@ fn newest_fix_round_locked(
         if params.get("instance_id").and_then(Val::as_str) != Some(instance_id) {
             continue;
         }
-        let Ok(outcome) = Val::parse_json(&outcome) else {
-            continue;
-        };
-        let Some(fix) = outcome
-            .get("result")
-            .and_then(|result| result.get("fix_round"))
-        else {
+        let recorded = Val::parse_json(&outcome)
+            .ok()
+            .and_then(|outcome| {
+                outcome
+                    .get("result")
+                    .and_then(|result| result.get("fix_round"))
+                    .cloned()
+            })
+            .or_else(|| {
+                Val::parse_json(&response).ok().and_then(|response| {
+                    response
+                        .get("result")
+                        .and_then(|result| result.get("fix_round"))
+                        .cloned()
+                })
+            });
+        let Some(fix) = recorded else {
             continue;
         };
         if fix.get("schema").and_then(Val::as_str) != Some("hf-fix-round/v1") {
@@ -18168,41 +18192,63 @@ mod tests {
     }
 
     /// The fix-round read-back of issue #238: the review step's own apply
-    /// outcome carries the round a recorded FAIL was handed to, and the read
+    /// record carries the round a recorded FAIL was handed to, and the read
     /// returns exactly THIS run's newest one — another run's round and a
     /// non-fix outcome of the same run are never read as its handoff.
+    ///
+    /// Issue #254: the record is read from where the DAEMON persists it. An
+    /// apply row keeps the effect's returned document in its RESPONSE column
+    /// (`hf-rpc-response/v1`, `result.fix_round`) while `outcome.result` is
+    /// `null` — the two live shapes this repository's acceptance run recorded —
+    /// so both columns are read, and an unreadable/future-schema document in
+    /// either one is still never a handoff.
     #[test]
-    fn a_recorded_fix_round_is_read_back_from_the_runs_own_outcome() {
+    fn a_recorded_fix_round_is_read_back_from_the_runs_own_apply_row() {
         let conn = Connection::open_in_memory().expect("memory db");
         conn.execute_batch(
             "CREATE TABLE idempotency (key TEXT PRIMARY KEY, request_id TEXT NOT NULL,
                 method TEXT NOT NULL, status TEXT NOT NULL, epoch INTEGER NOT NULL,
-                request_line TEXT NOT NULL, outcome TEXT);",
+                request_line TEXT NOT NULL, outcome TEXT, response TEXT);",
         )
         .expect("idempotency schema");
+        let fix_round = |round: i64, lane: &str, schema: &str| {
+            object(vec![(
+                "fix_round",
+                object(vec![
+                    ("schema", string(schema)),
+                    ("round", integer(round)),
+                    ("bound", integer(3)),
+                    ("feature_head", string(&"a".repeat(40))),
+                    ("lane", string(lane)),
+                ]),
+            )])
+        };
         let insert = |key: &str, run: &str, step: &str, fix: Option<(i64, &str)>| {
             let request = object(vec![(
                 "params",
                 object(vec![("instance_id", string(run)), ("step", string(step))]),
             )]);
+            // The daemon's own split: the effect's facts live in the RESPONSE
+            // document and the outcome carries no `result` at all.
             let result = match fix {
-                Some((round, lane)) => object(vec![(
-                    "fix_round",
-                    object(vec![
-                        ("schema", string("hf-fix-round/v1")),
-                        ("round", integer(round)),
-                        ("bound", integer(3)),
-                        ("feature_head", string(&"a".repeat(40))),
-                        ("lane", string(lane)),
-                    ]),
-                )]),
+                Some((round, lane)) => fix_round(round, lane, "hf-fix-round/v1"),
                 None => object(vec![("verdict", string("pass"))]),
             };
-            let outcome = object(vec![("status", string("succeeded")), ("result", result)]);
+            let response = object(vec![
+                ("ok", crate::value::Val::Bool(true)),
+                ("schema", string("hf-rpc-response/v1")),
+                ("result", result.clone()),
+            ]);
+            let outcome = object(vec![("status", string("succeeded")), ("result", null())]);
             conn.execute(
                 "INSERT INTO idempotency (key, request_id, method, status, epoch,
-                    request_line, outcome) VALUES (?1, 'req', 'apply', 'spent', 1, ?2, ?3)",
-                params![key, canonical_text(&request), canonical_text(&outcome)],
+                    request_line, outcome, response) VALUES (?1, 'req', 'apply', 'spent', 1, ?2, ?3, ?4)",
+                params![
+                    key,
+                    canonical_text(&request),
+                    canonical_text(&outcome),
+                    canonical_text(&response)
+                ],
             )
             .expect("idempotency row");
         };
@@ -18224,6 +18270,41 @@ mod tests {
                 .expect("read")
                 .is_none(),
             "a run that never dispatched a fix round has none"
+        );
+
+        // The SAME row shape with a schema this reader does not validate FAILS
+        // CLOSED: a future document is not a handoff, and the round that DID
+        // validate is still the one read back.
+        let stale = object(vec![(
+            "params",
+            object(vec![
+                ("instance_id", string("run-d")),
+                ("step", string("p6-5")),
+            ]),
+        )]);
+        let response = object(vec![
+            ("ok", crate::value::Val::Bool(true)),
+            ("schema", string("hf-rpc-response/v1")),
+            ("result", fix_round(1, "lane-future", "hf-fix-round/v2")),
+        ]);
+        conn.execute(
+            "INSERT INTO idempotency (key, request_id, method, status, epoch,
+                request_line, outcome, response) VALUES ('ik-d-1', 'req', 'apply', 'spent', 1, ?1, ?2, ?3)",
+            params![
+                canonical_text(&stale),
+                canonical_text(&object(vec![
+                    ("status", string("succeeded")),
+                    ("result", null()),
+                ])),
+                canonical_text(&response)
+            ],
+        )
+        .expect("unvalidated row");
+        assert!(
+            newest_fix_round_locked(&conn, "run-d")
+                .expect("read")
+                .is_none(),
+            "an `hf-fix-round/v1` schema check is never weakened by the new column"
         );
     }
 

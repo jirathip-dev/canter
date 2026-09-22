@@ -981,6 +981,24 @@ release process activates (docs/RELEASING.md), then semver applies.
   one leg — a genuinely foreign checkout (the run's own lane, a sibling leg's,
   another issue's) is never reinterpreted and is refused typed exactly as
   before, and the bare-subprocess fallback keeps its byte-for-byte binding.
+- The recorded FAIL handoff is read from where the daemon ACTUALLY persists it
+  (issue #254), so a review FAIL reports its fix-round disposition instead of
+  parking with no remedy. The review step's own apply row keeps the effect's
+  returned document in its RESPONSE column (`hf-rpc-response/v1`,
+  `result.fix_round`) while `outcome.result` is `null` — the supervision
+  evidence loader read only the outcome column, so `evidence.fix_round` was
+  `None` in production and the classifier fell through to a bare
+  `supervision.review_failed`. The loader now reads the response document
+  (the same way the other recorded read models read a dispatch's own result)
+  with its validation unchanged (`hf-fix-round/v1` plus the four named fields;
+  the outcome shape stays readable beside it). A handoff recorded at another
+  head than the run's newest recorded review evidence is no longer silent
+  either: it is reported as the fix-round disposition
+  `supervision.fix_round_head_moved` (class `needs-attention`), whose detail
+  names the remedy — the fix leg's recorded lane — and both head prefixes.
+  The driver drives the run's own bounded check re-evaluation for the recorded
+  FAIL as well (the same control, the same per-`(run, step)` bound), so a
+  FAIL-then-fix sequence is not parked on the fail.
 
 ### Security
 
