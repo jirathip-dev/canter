@@ -998,6 +998,26 @@ release process activates (docs/RELEASING.md), then semver applies.
   one leg — a genuinely foreign checkout (the run's own lane, a sibling leg's,
   another issue's) is never reinterpreted and is refused typed exactly as
   before, and the bare-subprocess fallback keeps its byte-for-byte binding.
+- The recorded fix-round handoff is read where the daemon persists it, and the
+  run drives its own bounded check re-evaluation for a recorded FAIL (issue
+  #255 / #254) — and the disposition it reports is derived from the repair
+  leg's OWN recorded state, never from the head the FAIL was handed at (issue
+  #256). The head a handoff is DISPATCHED for is a recorded fact and can never
+  move by itself; the leg advances the branch in its OWN lane checkout, so the
+  engine's `hf-fix-round/v1` record now names that checkout (`worktree`: the
+  lane the leg was created or verified at) and the daemon reads THAT checkout's
+  head when it classifies the run — a bounded, allowlisted, READ-ONLY `git`
+  read taken outside the state guard. A head that DESCENDS the certified head
+  means the leg delivered, and the disposition says so instead of reporting a
+  dispatched leg as work in flight. A leg whose own checkout has not advanced
+  keeps `waiting-workers` / `supervision.fix_round_dispatched` unchanged, and
+  every read that cannot be taken leaves the recorded disposition exactly as it
+  was. The same read binds the next review round: a review dispatch of a run
+  whose handoff leg delivered a descendant head presents THAT head as the
+  observed head, so the reviewer leg's derived checkout materializes the
+  delivered commit instead of re-reviewing a head whose check can never flip.
+  The run's own delivery-certification gate (issue #202) is untouched: a head
+  the run's own collection has not certified is still never consumed.
 - The recorded FAIL handoff is read from where the daemon ACTUALLY persists it
   (issue #254), so a review FAIL reports its fix-round disposition instead of
   parking with no remedy. The review step's own apply row keeps the effect's

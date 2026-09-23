@@ -9443,6 +9443,14 @@ fn newest_fix_round_locked(
             round,
             bound,
             lane: lane.to_string(),
+            // Issue #256: the leg's OWN lane checkout, recorded by the engine
+            // at dispatch. A record that names none (a row written before this
+            // slice) observes nothing and keeps its recorded disposition.
+            worktree: fix
+                .get("worktree")
+                .and_then(Val::as_str)
+                .unwrap_or("")
+                .to_string(),
         });
     }
     Ok(newest)
@@ -12838,6 +12846,12 @@ pub struct SupervisionEvidence {
     /// (issue #238), when one exists: the round of the automatic bound the
     /// recorded FAIL was handed to.
     pub fix_round: Option<SupervisionFixRound>,
+    /// The observed state of that handoff's OWN repair leg (issue #256): the
+    /// head its lane checkout holds, read from the leg's own checkout by the
+    /// caller that can observe the host. `None` = not observed (no recorded
+    /// handoff, no recorded lane, or an unreadable checkout), and an
+    /// unobserved leg is never reported as moved.
+    pub fix_leg: Option<FixLegState>,
     /// Every recorded check re-evaluation of this run as `(step, count)`
     /// (issue #243): the durable bound the driver reads before it drives the
     /// run's own bounded recovery control. Counted from the hash-chained
@@ -12887,6 +12901,30 @@ pub struct SupervisionFixRound {
     pub bound: i64,
     /// The fix leg's lane session (the identity the instruction reached).
     pub lane: String,
+    /// The fix leg's OWN lane checkout, relative to the run's worktrees root
+    /// (issue #256): the engine records where the leg's state lives, so the
+    /// classification can read the head the leg DELIVERED instead of the head
+    /// the FAIL was handed at. Empty when the recorded handoff names none (a
+    /// row written before this slice), in which case no leg is ever observed.
+    pub worktree: String,
+}
+
+/// The observed state of one run's repair leg (issue #256): the head the
+/// leg's OWN lane checkout holds.
+///
+/// The head a handoff was DISPATCHED for is the head the FAIL was handed at —
+/// it can never move by itself. A repair leg advances the branch in its own
+/// checkout, so the leg's own checkout is the only recorded state that names
+/// the delivered head; observing it is what lets a run stop waiting on a
+/// worker that has already delivered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FixLegState {
+    /// The head the leg's own lane checkout holds (40-hex).
+    pub head: String,
+    /// True when that head is a DESCENDANT of the certified head the recorded
+    /// handoff names (the leg committed a repair past the reviewed head, so
+    /// the branch it must push has moved).
+    pub delivered: bool,
 }
 
 /// The recorded dispatch context of one run: the first topology it bound,
@@ -14416,6 +14454,7 @@ impl State {
             newest_evidence,
             dispatch_refusal,
             fix_round,
+            fix_leg: None,
             reevaluations,
         }))
     }

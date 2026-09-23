@@ -2091,6 +2091,48 @@ fn read_dispatch_material(
     })
 }
 
+/// Issue #256: bind a review round to the head the recorded handoff's OWN
+/// repair leg DELIVERED.
+///
+/// The head the FAIL was handed at is a recorded fact and never moves by
+/// itself; the leg advances the branch in its OWN lane checkout. That checkout
+/// is the only durable state that names the delivered head, so it is observed
+/// here — read-only, outside the state guard, through the same bounded git
+/// runner every adapter read uses — and the observed descendant head replaces
+/// the run's recorded head for THIS review dispatch: the reviewer leg's derived
+/// checkout then materializes the delivered commit, and the round's own
+/// head-keyed verification accepts a verdict that names it (the run's
+/// delivery-certification gate, issue #202, is untouched and decides
+/// consumption exactly as before). A handoff that names no lane, a leg that
+/// never moved and every read that cannot be taken leave the material exactly
+/// as the run recorded it.
+fn bind_delivered_review_head(shared: &Arc<Shared>, instance_id: &str, head: &mut Option<String>) {
+    if head.is_none() {
+        return;
+    }
+    let (mut evidence, worktrees_root) = {
+        let state = match shared.lock_state() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        let evidence = match state.supervision_evidence(instance_id) {
+            Ok(Some(evidence)) => evidence,
+            _ => return,
+        };
+        let worktrees_root = crate::supervision::recorded_worktrees_root(&state, instance_id);
+        (evidence, worktrees_root)
+    };
+    crate::supervision::observe_fix_leg(&mut evidence, worktrees_root.as_deref());
+    if let Some(delivered) = evidence
+        .fix_leg
+        .as_ref()
+        .filter(|leg| leg.delivered)
+        .map(|leg| leg.head.clone())
+    {
+        *head = Some(delivered);
+    }
+}
+
 /// Build the `apply` request one committed-spine dispatch presents (issue #92
 /// F4 and the operator dispatch surface) from already-read durable material:
 /// the run's own committed step spine (params included), the run row (grant,
@@ -5741,6 +5783,16 @@ fn run_dispatch(shared: &Arc<Shared>, request: &Request, reevaluation: Option<&s
             publish_route,
         )
     };
+    // Issue #256: a REVIEW round binds the head the recorded handoff's OWN
+    // repair leg delivered, when its lane checkout has advanced past the head
+    // the FAIL was handed at. The recorded dispatch context names the stale
+    // head (it never moves by itself), so without this read the round would
+    // re-review the same head forever while the delivered repair sits
+    // unreviewed. Read-only: the observation never writes, and a leg that did
+    // not move leaves every input exactly as it was.
+    if kind == crate::mutation::DELIVERY_STEP_KIND {
+        bind_delivered_review_head(shared, &parsed.instance_id, &mut material.feature_head);
+    }
     // Issue #243: the control that recomputes a recorded check is the RUN's own
     // act, exactly like the supervisor's continuation dispatch (issue #198), so
     // its inner re-dispatch presents a measurement taken at THIS dispatch when
@@ -6184,6 +6236,14 @@ fn method_supervision_status(shared: &Arc<Shared>, request: &Request) -> String 
                 check_interval_secs: row.check_interval_secs,
                 progress_timeout_secs: row.progress_timeout_secs,
             };
+            // Issue #256: the recorded handoff's OWN lane checkout is the root
+            // the repair leg's delivered head is read from. The read is taken
+            // AFTER the state guard is released, so a status read never holds
+            // the state across a host read.
+            let worktrees_root = crate::supervision::recorded_worktrees_root(&state, &instance_id);
+            drop(state);
+            let mut evidence = evidence;
+            crate::supervision::observe_fix_leg(&mut evidence, worktrees_root.as_deref());
             let verdict = crate::supervision::classify(
                 &evidence,
                 &row.authorization_digest,

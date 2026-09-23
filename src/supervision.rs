@@ -81,6 +81,7 @@
 //! the policy, the pure classification and the driver loop that takes the
 //! state guard only for short reads and writes (never across a wait).
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -1327,6 +1328,27 @@ pub fn classify(
     }
     if newest_verdict(evidence) == "fail" {
         if let Some(fix) = &evidence.fix_round {
+            // Issue #256: the disposition is derived from the repair leg's OWN
+            // recorded state, not from the head the FAIL was handed at. The
+            // leg's own lane checkout holds the head it DELIVERED, so a leg
+            // that has already advanced the branch is never reported as work
+            // in flight: the movement is named, with the remedy (the recorded
+            // lane) first and both head prefixes, and the run is not left
+            // waiting on a worker that has already reported by moving its own
+            // head.
+            if let Some(delivered) = evidence
+                .fix_leg
+                .as_ref()
+                .filter(|leg| leg.delivered)
+                .map(|leg| leg.head.as_str())
+            {
+                return Verdict::new(
+                    "needs-attention",
+                    codes::FIX_HEAD_MOVED,
+                    false,
+                    &fix_round_delivered_detail(fix, delivered),
+                );
+            }
             let newest_head = evidence
                 .newest_evidence
                 .as_ref()
@@ -1520,6 +1542,58 @@ pub fn classify(
         Some(_) => Verdict::new("healthy", codes::RECENT_PROGRESS, false, &next_step),
         None => Verdict::new("unknown", codes::PROGRESS_UNOBSERVED, false, &next_step),
     }
+}
+
+/// Observe the run's recorded fix-round leg against its OWN lane checkout
+/// (issue #256).
+///
+/// The head a handoff was DISPATCHED for is the head the FAIL was handed at
+/// and can never move by itself; the leg's own checkout is the only recorded
+/// state that names the head it DELIVERED. The observation is a read (bounded
+/// git, allowlisted environment — no effect, no journal, no write): every
+/// failure to take it leaves `fix_leg` unset, and an unobserved leg is never
+/// reported as moved.
+pub fn observe_fix_leg(evidence: &mut SupervisionEvidence, worktrees_root: Option<&Path>) {
+    if evidence.fix_leg.is_some() {
+        return;
+    }
+    let (Some(root), Some(fix)) = (worktrees_root, evidence.fix_round.as_ref()) else {
+        return;
+    };
+    evidence.fix_leg =
+        crate::mutation::observe_fix_leg_checkout(root, &fix.worktree, &fix.feature_head);
+}
+
+/// The `worktrees_root` one run's own recorded topology declares (issue #256):
+/// the containment root the handoff's recorded lane checkout is read under.
+/// `None` when the run recorded no topology (or none that names a root) — the
+/// observation is then simply not taken.
+pub fn recorded_worktrees_root(state: &crate::state::State, instance_id: &str) -> Option<PathBuf> {
+    let context = state.run_dispatch_context(instance_id).ok().flatten()?;
+    context
+        .topology
+        .get("worktrees_root")
+        .and_then(Val::as_str)
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The bounded detail of a recorded handoff whose OWN leg DELIVERED a head
+/// past the one the FAIL was handed at (issue #256): the remedy FIRST — the
+/// fix leg's own lane — then both 12-character head prefixes: the head the
+/// verdict certified (the head the handoff was dispatched for) and the head
+/// the leg's own checkout delivered.
+fn fix_round_delivered_detail(
+    fix: &crate::state::SupervisionFixRound,
+    delivered_head: &str,
+) -> String {
+    let prefix = |head: &str| head.chars().take(12).collect::<String>();
+    format!(
+        "{} (reviewed at {}, delivered at {})",
+        fix.lane,
+        prefix(&fix.feature_head),
+        prefix(delivered_head)
+    )
 }
 
 /// The bounded detail of a recorded handoff that names a head the run's newest
@@ -2231,7 +2305,7 @@ impl SupervisorCore {
     /// ONE run-scoped reconciliation: short read, pure classification,
     /// short write. The state guard is released between the phases.
     fn reconcile(&self, instance_id: &str, boot: bool, now_unix: i64) -> bool {
-        let (row, evidence, trigger) = {
+        let (row, evidence, trigger, worktrees_root) = {
             let state = match self.state.lock() {
                 Ok(state) => state,
                 Err(_) => return false,
@@ -2245,8 +2319,14 @@ impl SupervisorCore {
                 _ => return false,
             };
             let trigger = state.supervision_trigger(instance_id).ok().flatten();
-            (row, evidence, trigger)
+            let worktrees_root = recorded_worktrees_root(&state, instance_id);
+            (row, evidence, trigger, worktrees_root)
         };
+        // Issue #256: the repair leg's OWN checkout is read AFTER the state
+        // guard is released — the classification reads a fact about the leg's
+        // own state, and that read never holds the state.
+        let mut evidence = evidence;
+        observe_fix_leg(&mut evidence, worktrees_root.as_deref());
         let plan = check_plan(&row, &evidence, trigger.as_ref(), boot, now_unix);
         let committed = {
             let state = match self.state.lock() {
@@ -2665,6 +2745,7 @@ mod tests {
             newest_evidence: None,
             dispatch_refusal: None,
             fix_round: None,
+            fix_leg: None,
             reevaluations: Vec::new(),
         }
     }
@@ -3870,6 +3951,7 @@ mod tests {
             round: 1,
             bound: 3,
             lane: "lane-0123456789abcdef".to_string(),
+            worktree: "issues-5-impl2".to_string(),
         });
         let verdict = classify_at(dispatched.clone());
         assert_eq!(verdict.class, "waiting-workers");
@@ -3920,6 +4002,58 @@ mod tests {
             ),
             "the human read names the lane and the movement: {human}"
         );
+
+        // (2b) The repair leg's OWN checkout has DELIVERED a descendant head
+        //      (issue #256): the disposition is derived from the LEG's own
+        //      recorded state, never from the head the FAIL was handed at — so
+        //      a leg that already advanced the branch is reported as moved (not
+        //      as a worker still in flight), naming the recorded lane and both
+        //      head prefixes.
+        let mut delivered =
+            evidence_with_failed_review(run_row("run-0123456789abcdef"), &steps, &head);
+        delivered.fix_round = Some(crate::state::SupervisionFixRound {
+            step: "p6".to_string(),
+            feature_head: head.clone(),
+            round: 1,
+            bound: 3,
+            lane: "lane-0123456789abcdef".to_string(),
+            worktree: "issues-5-impl2".to_string(),
+        });
+        let delivered_head = "a".repeat(40);
+        delivered.fix_leg = Some(crate::state::FixLegState {
+            head: delivered_head.clone(),
+            delivered: true,
+        });
+        let verdict = classify_at(delivered.clone());
+        assert_eq!(verdict.class, "needs-attention");
+        assert_eq!(
+            verdict.reason,
+            codes::FIX_HEAD_MOVED,
+            "a delivered leg is never reported as work in flight"
+        );
+        assert_eq!(
+            verdict.detail,
+            format!(
+                "lane-0123456789abcdef (reviewed at {}, delivered at {})",
+                head.chars().take(12).collect::<String>(),
+                delivered_head.chars().take(12).collect::<String>()
+            ),
+            "the remedy (the recorded lane) and both heads are named"
+        );
+        assert!(!verdict.eligible);
+
+        // (2c) The leg's own checkout has NOT advanced: the wait keeps its
+        //      current meaning (issue #256 AC3) — the in-flight disposition is
+        //      only for a leg that has not delivered a head.
+        let mut swimming = delivered;
+        swimming.fix_leg = Some(crate::state::FixLegState {
+            head: head.clone(),
+            delivered: false,
+        });
+        let verdict = classify_at(swimming);
+        assert_eq!(verdict.class, "waiting-workers");
+        assert_eq!(verdict.reason, codes::FIX_DISPATCHED);
+        assert_eq!(verdict.detail, "lane-0123456789abcdef");
 
         // (3) The handoff was REFUSED: the fix round's OWN engine code is the
         //     detail, so the missing piece is actionable — never a bare park.

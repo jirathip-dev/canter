@@ -816,7 +816,9 @@ clears a repository/fleet-level hold or bypasses a gate.
   - the handoff was DISPATCHED for the newest verdict's head — class
     `waiting-workers`, reason `supervision.fix_round_dispatched`, the fix leg's
     lane as the detail, `eligible:false` (the repair leg is work in flight, not
-    completion);
+    completion). The wait keeps this meaning only while the repair leg's OWN
+    lane checkout has not advanced: the leg's own state is what tells a leg
+    that is still working from one that has DELIVERED (issue #256);
   - the handoff was REFUSED, or its budget is spent — class
     `needs-attention`, reason `supervision.fix_round_refused` /
     `supervision.fix_rounds_exhausted`, the fix round's OWN engine code
@@ -831,6 +833,31 @@ clears a repository/fleet-level hold or bypasses a gate.
     is not this evidence's handoff, so the movement is named instead of
     discarded: still the fix-round disposition, never a bare
     `supervision.review_failed`;
+  - the handoff's OWN repair leg has DELIVERED a head past the one the FAIL was
+    handed at (issue #256) — the SAME class and reason
+    (`needs-attention` / `supervision.fix_round_head_moved`), the fix leg's
+    recorded lane as the detail followed by both head prefixes (the head the
+    verdict certified and the head the leg's own checkout holds),
+    `eligible:false`. The disposition is derived from the repair leg's OWN
+    recorded state, never from the head the FAIL was handed at: the engine's
+    `hf-fix-round/v1` record names the leg's own lane checkout (`worktree`,
+    recorded where the leg was created or verified) and the classification
+    reads THAT checkout's head — bounded `git`, allowlisted environment,
+    read-only, outside the state guard — where a head DESCENDING the certified
+    head is the delivery itself. Nothing is inferred: a leg whose own checkout
+    has not advanced, a handoff that names no lane, and every read that cannot
+    be taken are all "no movement", and the recorded disposition stands
+    unchanged;
+  - the same read binds the next review round (issue #256): a dispatch of the
+    run's review step presents the DELIVERED head as the observed head when the
+    recorded handoff's leg delivered a descendant one, so the reviewer leg's
+    derived checkout materializes the delivered commit (the reviewer lane's own
+    creation/verification, unchanged) instead of re-reviewing the head whose
+    check can never flip. The run's own delivery-certification gate (issue
+    #202, `refusal.delivery.unbound`) is untouched: a head the run's own
+    collection has never certified is still never consumed, so the delivered
+    head still has to be certified by that collection before a step consumes it
+    (the gate's own message names exactly that precondition);
   - a FAIL whose review step recorded no fix round at all — a plan that
     presents its own review facts, or a run recorded before this handoff
     existed — keeps `supervision.review_failed`, now with the review step as
