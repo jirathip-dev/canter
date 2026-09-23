@@ -1,13 +1,13 @@
 //! Issue #170 (N7/N8) end-to-end acceptance: the pane-collection wait —
-//! leg A of two.
+//! leg B of two.
 //!
 //! The six collection witnesses are split across two suites because EACH
 //! `tests/*.rs` file is its own hosted suite with its own 150 s serial budget
 //! (`--test-threads=1 --nocapture`), and each witness drives a real daemon
 //! through the product's own 5 s sample cadence, so their walls add. This leg
-//! carries the three heaviest witnesses (invalid-base control, confirmed-stop
-//! refusal, delta delivery); `tests/supervision_collection_b.rs` carries the
-//! other three. The witnesses are verbatim from the round-1..3 content; the
+//! carries the three daemon-paced witnesses (typed timeout park, mid-turn
+//! status flap, extend-past-the-window); `tests/supervision_collection.rs`
+//! (leg A) carries the other three. The witnesses are verbatim from the round-1..3 content; the
 //! shared fixture lives in `tests/support/pane_fixture.rs`.
 //!
 //! No fixed real sleeps: every wait on recorded canter state is a poll that
@@ -22,9 +22,9 @@ use canter::value::{Val, integer, object, string};
 use pane_fixture::{
     DaemonFixture, HARNESS, NO_PROGRESS_SECS, REV_A, caller_apply_params, checks_of, class_of,
     evaluation, fresh_id, git_output, harness_binding_doc, harness_pane_steps,
-    harness_submit_params, idem_key, init_repo, instance_of, plan_doc_with_steps, render_bound,
-    request_with, resolved, rpc_ok, seed_grant, selected, shutdown, status_doc, wait_for_checks,
-    wait_ready, write_fake_herdr,
+    harness_submit_params, idem_key, init_repo, instance_of, render_bound, request_with, resolved,
+    rpc_ok, seed_grant, selected, shutdown, status_doc, wait_for_checks, wait_ready,
+    write_fake_herdr,
 };
 
 fn supervised_collection(mode: &str) {
@@ -394,148 +394,40 @@ fn supervised_collection(mode: &str) {
 }
 
 #[test]
-fn collection_invalid_base_refuses_before_any_worker_poll() {
-    use canter::mutation::{EffectContext, bind_plan, execute_step, run_session_handle};
-    let fixture = DaemonFixture::new("collect-base-refusal");
-    let root = fixture.dir.join("worktrees");
-    std::fs::create_dir_all(&root).unwrap();
-    let lane = root.join("issues-5");
-    init_repo(&lane);
-    git_output(&lane, &["remote", "remove", "origin"]);
-    let base = git_output(&lane, &["rev-parse", "HEAD"]).trim().to_string();
-    let session = run_session_handle("run-0000000000000005").unwrap();
-    let bin = write_fake_herdr(&fixture.dir);
-    let worker = fixture.dir.join("herdr-state");
-    std::fs::create_dir_all(&worker).unwrap();
-    for (name, value) in [
-        ("name", "impl-5".to_string()),
-        ("pane", "w1:p1".to_string()),
-        ("cwd", lane.to_string_lossy().to_string()),
-        ("lane", session.session_id.clone()),
-        ("generation", session.identity.generation.to_string()),
-        ("state", "unknown".to_string()),
-    ] {
-        std::fs::write(worker.join(name), value).unwrap();
-    }
-    let env = std::collections::BTreeMap::from([
-        (
-            "PATH".to_string(),
-            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
-        ),
-        (
-            "HOME".to_string(),
-            fixture.dir.to_string_lossy().to_string(),
-        ),
-    ]);
-    let steps = Val::Arr(vec![
-        object(vec![
-            ("id", string("prompt")),
-            ("kind", string("prompt")),
-            (
-                "params",
-                object(vec![
-                    ("harness_key", string(HARNESS)),
-                    ("kind", string("hermes")),
-                    ("worktree", string("issues-5")),
-                    ("payload", string("bounded work")),
-                ]),
-            ),
-        ]),
-        object(vec![
-            ("id", string("collect")),
-            ("kind", string("collect_outcome")),
-        ]),
-    ]);
-    let plan = bind_plan(&plan_doc_with_steps(steps, 5)).unwrap();
-    let collect = |base: Option<&str>| {
-        let mut params = object(vec![
-            ("worktree", string("issues-5")),
-            // A 3 s no-progress window: short enough to park the positive
-            // control fast, long enough that the fake live worker's own row is
-            // never racing a one-second subprocess budget under load.
-            ("deadline_secs", integer(3)),
-        ]);
-        if let (Some(base), Val::Obj(fields)) = (base, &mut params) {
-            fields.insert("base_head".to_string(), string(base));
-        }
-        execute_step(&EffectContext {
-            plan: &plan,
-            step_id: "collect",
-            kind: "collect_outcome",
-            params: Some(&params),
-            repository: "example-org/widgets",
-            integration_branch: "staging",
-            production_branches: &[],
-            publish_route: "push",
-            worktrees_root: &root,
-            integration_repo: &lane,
-            observed_feature_head: None,
-            observed_integration_base: None,
-            env: &env,
-            role: None,
-            session: Some(&session),
-            archive_root: None,
-            review_root: None,
-            retired_run_ids: &[],
-        })
-    };
-    let log = fixture.dir.join("herdr-argv.txt");
-    let absent = "0".repeat(40);
-    // Same typed refusal on an attached no-origin checkout, a detached one,
-    // and a fresh repository without a HEAD. None may observe the live worker.
-    for layout in ["no-origin", "detached", "fresh"] {
-        if layout == "detached" {
-            git_output(&lane, &["checkout", "--detach", &base]);
-        } else if layout == "fresh" {
-            std::fs::remove_dir_all(lane.join(".git")).unwrap();
-            git_output(&lane, &["init", "-b", "staging"]);
-        }
-        for (head, code) in [
-            (None, "refusal.request.malformed"),
-            (Some("not-a-commit"), "refusal.request.malformed"),
-            (Some(absent.as_str()), "refusal.worker.output_location"),
-        ] {
-            let outcome = collect(head);
-            assert_eq!(outcome.status, "refused", "{layout}: {outcome:?}");
-            assert_eq!(outcome.code.as_deref(), Some(code), "{layout}: {outcome:?}");
-            assert!(
-                !log.exists(),
-                "invalid base must never poll a worker: {layout}"
-            );
-        }
-        if layout == "detached" {
-            let outcome = collect(Some(&base));
-            assert_eq!(
-                outcome.code.as_deref(),
-                Some("refusal.worker.output_location")
-            );
-            assert!(
-                !log.exists(),
-                "a detached checkout must refuse before polling"
-            );
-        }
-        if layout == "no-origin" {
-            // Positive control: identical binding, valid base -> the fake live
-            // worker IS read, and the injected three-second no-progress window
-            // parks it (the lane reads back no progress at all).
-            let outcome = collect(Some(&base));
-            assert_eq!(outcome.code.as_deref(), Some("effect.worker_timeout"));
-            assert!(
-                std::fs::read_to_string(&log)
-                    .unwrap()
-                    .contains("agent get impl-5")
-            );
-            std::fs::remove_file(&log).unwrap();
-        }
-    }
+fn collection_deadline_parks_worker_timeout_without_redispatch() {
+    supervised_collection("timeout");
 }
 
+/// Issue #170 N7 witness (a), end to end: a worker that is STILL WORKING but
+/// whose reported status flaps to `done` twice is not a stopped worker. The
+/// pre-change wait read exactly that flap as a stop and refused
+/// `refusal.collect.empty_delta` (the live `p5-101` refusal came four minutes
+/// into a 93-minute turn and consumed the run's retry); the delivered wait
+/// keeps reading, the delivery that lands later is certified, and no emptiness
+/// refusal exists for this run.
+/// Issue #170 N7 witness (a), end to end: a worker that is STILL WORKING but
+/// whose reported status flaps to `done` twice is not a stopped worker. The
+/// pre-change wait read exactly that flap as a stop and refused
+/// `refusal.collect.empty_delta` (the live `p5-101` refusal came four minutes
+/// into a 93-minute turn and consumed the run's retry); the delivered wait
+/// keeps reading, the delivery that lands later is certified, and no emptiness
+/// refusal exists for this run.
 #[test]
-fn collection_stopped_without_delta_is_still_refused() {
-    supervised_collection("empty");
+fn collection_status_flap_mid_turn_is_never_an_empty_refusal() {
+    supervised_collection("flap");
 }
 
+/// Issue #170 N8 witness (c), end to end: the collection's `deadline_secs` is
+/// the wait's NO-PROGRESS WINDOW, not a wall. This step declares 10 s while
+/// the lane keeps reporting it is working (and commits its delivery) well past
+/// that — the wait EXTENDS and the run collects, instead of the pre-change
+/// `effect.worker_timeout` park at the declared wall.
+/// Issue #170 N8 witness (c), end to end: the collection's `deadline_secs` is
+/// the wait's NO-PROGRESS WINDOW, not a wall. This step declares 10 s while
+/// the lane keeps reporting it is working (and commits its delivery) well past
+/// that — the wait EXTENDS and the run collects, instead of the pre-change
+/// `effect.worker_timeout` park at the declared wall.
 #[test]
-fn collection_waits_for_pane_delivery_without_operator_dispatch() {
-    supervised_collection("delta");
+fn collection_still_working_past_the_declared_wall_is_not_parked() {
+    supervised_collection("extend");
 }
