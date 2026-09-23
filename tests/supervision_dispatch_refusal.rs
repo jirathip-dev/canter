@@ -713,6 +713,22 @@ fn request_repaired_frontier(
 /// `PER_SUITE_SECONDS = 300`).
 const NO_PROGRESS_SECS: u64 = 120;
 
+/// The ceiling for a wait on the FIRST event of a scenario (the driver's
+/// first attempt of the frontier, the first recorded refusal): there is no
+/// recorded progress to reset the #232 window yet, so it is sized from the
+/// scenario's own check interval (`repaired_lane_scenario` arms 5 s — the
+/// product minimum) with a measured allowance for a loaded hosted runner,
+/// where one driver wake plus its dispatch can lag far behind the local wall
+/// (the macOS leg's `a_repeatedly_refused_continuation…` expired the flat
+/// 120 s window with `0 recorded refused attempt(s)` before the driver's
+/// first tick landed). The strict assertions AFTER a wait are unchanged —
+/// this only decides how long the fixture may take to produce the first
+/// record the scenario needs, and it bounds every wait so a scenario whose
+/// premise never materializes fails typed instead of hanging.
+fn first_event_ceiling_secs() -> u64 {
+    (canter::supervision::MIN_CHECK_INTERVAL_SECS as u64).saturating_mul(30)
+}
+
 /// The durable progress a recorded-state wait tracks: the cursor plus the
 /// committed check ledger (count, last check, continuation) of the recorded
 /// evaluation, canonically rendered. A committed check, a settlement or a
@@ -736,24 +752,21 @@ fn recorded_progress(doc: &Val) -> String {
 /// #232) and naming the progress observed and the elapsed time.
 fn wait_for_step_attempt(fixture: &DaemonFixture, run: &str, step: &str) -> Vec<(String, String)> {
     let started = Instant::now();
-    let mut last_progress = started;
-    let mut progress = String::new();
+    // FIRST-event wait: the ledger may have no row for this step yet, so the
+    // ceiling is the first-event allowance (see `first_event_ceiling_secs`),
+    // not the flat no-progress window — there is no recorded progress to
+    // reset it.
+    let first_ceiling = first_event_ceiling_secs();
     loop {
         let attempts = fixture.seed().run_step_attempts(run).expect("attempts");
         if attempts.iter().any(|(id, _)| id == step) {
             return attempts;
         }
-        let observed = format!("{attempts:?}");
-        if observed != progress {
-            progress = observed;
-            last_progress = Instant::now();
-        }
-        let stalled = last_progress.elapsed().as_secs();
+        let stalled = started.elapsed().as_secs();
         assert!(
-            stalled < NO_PROGRESS_SECS,
-            "the driver never dispatched {step}: no progress for {stalled}s of {}s waited \
-             ({} recorded attempt(s)): {attempts:?}\n{}",
-            started.elapsed().as_secs(),
+            stalled < first_ceiling,
+            "the driver never dispatched {step}: no progress for {stalled}s of {first_ceiling}s \
+             waited ({} recorded attempt(s)): {attempts:?}\n{}",
             attempts.len(),
             std::fs::read_to_string(fixture.daemon_log()).unwrap_or_default()
         );
@@ -774,12 +787,22 @@ fn wait_for_status(
     let mut last_progress = started;
     let mut progress = String::new();
     let mut seed = 0x1410u64;
+    // The WHOLE wait is bounded by the first-event ceiling: the #232 reset
+    // below keeps a healthy wait alive through recorded-progress gaps, but a
+    // scenario whose premise never materializes (e.g. the product
+    // classification reverted) must fail typed instead of waiting forever.
+    let total_ceiling = first_event_ceiling_secs();
     loop {
         seed += 1;
         let last = status_doc(&fixture.socket, &fresh_id(seed), run);
         if predicate(&last) {
             return last;
         }
+        let waited = started.elapsed().as_secs();
+        assert!(
+            waited < total_ceiling,
+            "{label} never held: {waited}s waited of the {total_ceiling}s whole-wait ceiling"
+        );
         let observed = recorded_progress(&last);
         if observed != progress {
             progress = observed;
@@ -993,8 +1016,15 @@ fn a_repaired_frontier_refused_by_the_engine_is_named_and_never_reported_eligibl
     // THAT dispatch is the one the engine refuses, so the run's own status
     // must name the refusal instead of claiming the step is an eligible
     // continuation.
+    // The wait pins the REASON this scenario is about, not the coarse class:
+    // `needs-attention` is shared with other diagnosable states (a transient
+    // attempt row's own refusal, for one), so waiting on the class can return
+    // early with a different reason and trip the pinned assertion below (the
+    // macOS hosted leg's `supervision.step_diagnosed` vs
+    // `supervision.dispatch_refused`).
     let doc = wait_for_status(&fixture, &run, "the refusal is classified", |doc| {
         class_of(doc) == "needs-attention"
+            && picked(doc, &["evaluation", "reason"]) == "supervision.dispatch_refused"
     });
     assert_eq!(
         picked(&doc, &["evaluation", "reason"]),
@@ -1037,8 +1067,6 @@ fn a_repaired_frontier_refused_by_the_engine_is_named_and_never_reported_eligibl
     // identity `<run>:<step>:<code>`, bounded at the recording site — the
     // engine's own message, never a re-worded one.
     let started = Instant::now();
-    let mut last_progress = started;
-    let mut progress = 0usize;
     // Issue #243: the refusal names the failing PRECONDITION and the remedy —
     // the exact commands that renew the proof for THIS run and step — not a
     // bare code.
@@ -1050,21 +1078,21 @@ fn a_repaired_frontier_refused_by_the_engine_is_named_and_never_reported_eligibl
             .iter()
             .any(|(target, _)| target.starts_with(&precondition) && target.contains(&remedy))
     };
+    // FIRST-event wait: the journal may have no refusal row yet, so the
+    // ceiling is the first-event allowance (see `first_event_ceiling_secs`),
+    // not the flat no-progress window — there is no recorded progress to
+    // reset it.
+    let first_ceiling = first_event_ceiling_secs();
     let refusals = loop {
         let refusals = dispatch_refusals(&fixture, &run);
         if recorded(&refusals) {
             break refusals;
         }
-        if refusals.len() != progress {
-            progress = refusals.len();
-            last_progress = Instant::now();
-        }
-        let stalled = last_progress.elapsed().as_secs();
+        let stalled = started.elapsed().as_secs();
         assert!(
-            stalled < NO_PROGRESS_SECS,
+            stalled < first_ceiling,
             "the supervisor's refused continuation is recorded against the run: no progress for \
-             {stalled}s of {}s waited ({} recorded dispatch refusal(s)): {refusals:?}",
-            started.elapsed().as_secs(),
+             {stalled}s of {first_ceiling}s waited ({} recorded dispatch refusal(s)): {refusals:?}",
             refusals.len()
         );
         std::thread::sleep(Duration::from_millis(100));
@@ -1241,24 +1269,24 @@ fn a_repeatedly_refused_continuation_is_not_redispatched_every_tick() {
     let code = "refusal.admission.proof_stale";
 
     // The driver's own dispatch of the frontier, refused by the engine.
+    // FIRST-event wait: nothing is recorded yet, so the ceiling is the
+    // first-event allowance (see `first_event_ceiling_secs`), not the flat
+    // no-progress window — there is no recorded progress to reset it (the
+    // macOS hosted leg expired a flat 120 s window with `0 recorded refused
+    // attempt(s)` before the driver's first tick landed on the loaded
+    // runner).
     let started = Instant::now();
-    let mut last_progress = started;
-    let mut progress = 0usize;
+    let first_ceiling = first_event_ceiling_secs();
     let first = loop {
         let first = refused_attempts(&fixture, "p3", code);
         if first > 0 {
             break first;
         }
-        if first != progress {
-            progress = first;
-            last_progress = Instant::now();
-        }
-        let stalled = last_progress.elapsed().as_secs();
+        let stalled = started.elapsed().as_secs();
         assert!(
-            stalled < NO_PROGRESS_SECS,
-            "the driver attempted the frontier at least once: no progress for {stalled}s of {}s \
-             waited ({first} recorded refused attempt(s))",
-            started.elapsed().as_secs()
+            stalled < first_ceiling,
+            "the driver attempted the frontier at least once: no progress for {stalled}s of \
+             {first_ceiling}s waited ({first} recorded refused attempt(s))"
         );
         std::thread::sleep(Duration::from_millis(100));
     };
