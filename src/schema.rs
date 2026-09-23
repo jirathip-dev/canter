@@ -1201,7 +1201,7 @@ pub const SUPPORTED_FAMILIES: [Family; 18] = [
 /// of a run's own recorded checks by their producer); `queue.redrive` is added
 /// by issue #236 (the bounded, audited operator re-drive of ONE committed
 /// submission's parked items).
-pub const RPC_METHODS: [&str; 42] = [
+pub const RPC_METHODS: [&str; 43] = [
     "capabilities",
     "doctor",
     "status",
@@ -1240,6 +1240,7 @@ pub const RPC_METHODS: [&str; 42] = [
     "run.dispatch",
     "run.status",
     "supervision.status",
+    "supervision.arm",
     "backup.create",
     "restore.begin",
     "journal.tail",

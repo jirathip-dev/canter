@@ -602,9 +602,18 @@ clears a repository/fleet-level hold or bypasses a gate.
 - Supervision is a daemon-owned reconciliation driver, NOT another agent
   and NOT a scheduler: routine checks make no inference requests, and
   nothing on this surface spawns, prompts, resumes, retries, mutates Git or
-  clears a hold. `supervision.status` is the only method it adds, and issue
-  #96 adds no method at all: the continuation rides on the SAME driver.
-- Arming is part of the run's submission, never a separate call:
+  clears a hold. `supervision.status` (the read) and `supervision.arm` (the
+  bounded recovery, issue #261) are the only methods it adds, and issue #96
+  adds no method at all: the continuation rides on the SAME driver.
+- Arming is committed WITH the run's submission — and issue #261 makes every
+  admission path honor that: a later admission of a submission's parked item
+  (`queue redrive`) arms the run it admits with the SAME authorization the
+  submission committed, and a submission that committed no `armed`
+  authorization refuses the whole re-drive typed
+  (`refusal.queue.supervision_unarmed`) instead of admitting a run nothing
+  can drive. `supervision.arm` is the ONE separate call: the operator's
+  bounded, audited recovery of an already-admitted run that carries no
+  arming authorization.
   `queue.submit` accepts an OPTIONAL `params.supervision`
   (`hf-supervision-authorization/v1`: `desired` in the closed set
   `armed` | `disabled`, plus an optional bounded `policy` with
@@ -621,6 +630,21 @@ clears a repository/fleet-level hold or bypasses a gate.
   one fresh snapshot reconciliation per armed run (missed windows are
   skipped, never replayed). A persisted event cursor that retention moved
   past falls back to a fresh snapshot wake.
+- `supervision.arm` requires `params.idempotency_key` and
+  `params.instance_id` (`run-` + 16 hex) and renders `hf-supervision-arm/v1`:
+  the run, the armed supervision row (its id, generation, authorization
+  digest, approved boundary and policy) and the submission whose committed
+  authorization was re-applied. The control arms EXACTLY ONE already-admitted
+  run that carries no arming authorization, with the exact authorization that
+  run's OWN committed submission presented (bound to that submission's
+  approved digest, boundary phase and state epoch) — nothing is invented,
+  nothing is dispatched, and the arm and its hash-chained audit row
+  (`supervision.arm`) commit in ONE transaction, so one idempotency key has
+  exactly one effect. It refuses typed: a terminal run
+  (`refusal.supervision.terminal_run`), a run that is already armed
+  (`refusal.supervision.already_armed`), a run no committed submission
+  admitted (`refusal.supervision.unbound`), and a run whose submission
+  committed no `armed` authorization (`refusal.supervision.unarmed`).
 - `supervision.status` requires `params.instance_id` (`run-` + 16 hex) and
   renders `hf-supervision/v1` read-only: the recorded authorization and
   policy, the closed classification (`healthy`, `waiting-workers`, `worker-timeout`,
@@ -632,7 +656,14 @@ clears a repository/fleet-level hold or bypasses a gate.
   observed meaningful-progress marker (time, age, source), the continuation
   report count and the folded pending wake. No claim, no journal write and
   no marker movement: a read, a heartbeat or a rendered status is never
-  progress. `state.not_found` when the run carries no authorization. The
+  progress. Issue #261 AC4: an ADMITTED run that carries no supervision row
+  at all is not a bare not-found — the read answers `hf-supervision/v1` with
+  `supervision.state: "unarmed"`, `evaluation.reason:
+  supervision.unarmed_inert`, `eligible:false` and the remedy
+  (`supervision arm --run …`), so "admitted, unarmed, nothing will drive it"
+  is distinguishable from "armed, waiting" BEFORE the run's counted slot
+  blocks a re-admission. `state.not_found` stays for an unknown run and for a
+  run that no committed submission admitted. The
   reported `class`/`reason`/`eligible` are the RECORDED result of the last
   committed check (and, before the first check, the read's own observation);
   the read-time re-classification of the same evidence is carried separately

@@ -5037,6 +5037,95 @@ impl State {
         Ok((submission, items))
     }
 
+    /// The ARMED authorization a submission committed with itself (issue
+    /// #261): the `params.supervision` block of the submission's own
+    /// committed `queue.submit` request — the SAME durable row a later
+    /// admission of this submission reads its dispatch context from. `None`
+    /// when the submission committed no explicit `armed` authorization
+    /// (supervision stays disabled: the default), so a later admission has
+    /// nothing to arm a run with.
+    fn submission_arming_authorization_locked(
+        conn: &Connection,
+        submission_id: &str,
+    ) -> Result<Option<SupervisionAuthorizationPlan>, StateError> {
+        let mut statement = conn
+            .prepare(
+                "SELECT key, request_line FROM idempotency
+                  WHERE method = 'queue.submit' AND outcome IS NOT NULL
+                  ORDER BY rowid DESC",
+            )
+            .map_err(|err| {
+                StateError::from_sqlite("submission_arming_authorization: prepare", err)
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|err| {
+                StateError::from_sqlite("submission_arming_authorization: query", err)
+            })?;
+        for row in rows {
+            let (key, line) = row.map_err(|err| {
+                StateError::from_sqlite("submission_arming_authorization: row", err)
+            })?;
+            let Ok(request) = Val::parse_json(&line) else {
+                continue;
+            };
+            let Some(params) = request.get("params") else {
+                continue;
+            };
+            let Some(digest) = params.get("digest").and_then(Val::as_str) else {
+                continue;
+            };
+            if crate::queue_executor::submission_id(digest, &key) != submission_id {
+                continue;
+            }
+            let Some(value) = params.get("supervision") else {
+                // The committed request carried no authorization block at all;
+                // a state-level submission (no daemon journal row) is asked
+                // for its arming source below.
+                break;
+            };
+            let Ok(authorization) = crate::supervision::parse_authorization(value) else {
+                return Ok(None);
+            };
+            if authorization.desired != "armed" {
+                return Ok(None);
+            }
+            return Ok(Some(SupervisionAuthorizationPlan {
+                desired: authorization.desired,
+                check_interval_secs: authorization.policy.check_interval_secs,
+                progress_timeout_secs: authorization.policy.progress_timeout_secs,
+            }));
+        }
+        // A submission whose runs were armed by the submit path carries the
+        // SAME authorization on those runs: the already-armed admitted run is
+        // the source a later admission inherits from (the same substitution
+        // the #96 advance makes from the delivering run's own row).
+        let sibling: Option<SupervisionAuthorizationPlan> = conn
+            .query_row(
+                "SELECT s.check_interval_secs, s.progress_timeout_secs
+                   FROM queue_submission_items i
+                   JOIN supervisions s ON s.instance_id = i.instance_id
+                  WHERE i.submission_id = ?1 AND i.status = 'admitted'
+                    AND s.desired = 'armed'
+                  ORDER BY i.rowid LIMIT 1",
+                params![submission_id],
+                |row| {
+                    Ok(SupervisionAuthorizationPlan {
+                        desired: "armed".to_string(),
+                        check_interval_secs: row.get(0)?,
+                        progress_timeout_secs: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|err| {
+                StateError::from_sqlite("submission_arming_authorization: sibling", err)
+            })?;
+        Ok(sibling)
+    }
+
     /// Re-drive ONE committed submission's parked (`waiting`) items against
     /// the live fan-out capacity (#236).
     ///
@@ -5095,6 +5184,23 @@ impl State {
                 ),
             ));
         }
+        // Issue #261: a re-drive ADMITS runs, so it must arm what it admits.
+        // The authorization is the ONE this submission committed (the same
+        // explicit authorization the submit path armed with, bound to the
+        // same digest/boundary/epoch); a submission that committed none
+        // refuses the WHOLE control typed BEFORE any item is admitted —
+        // never an inert run whose slot nothing can free.
+        let Some(arming) = Self::submission_arming_authorization_locked(&tx, submission_id)? else {
+            return Err(state_error(
+                crate::queue_executor::codes::SUPERVISION_UNARMED,
+                format!(
+                    "submission {submission_id} committed no `armed` supervision authorization, \
+                     so a re-drive would admit runs nothing can drive and the transient cap hold \
+                     it repairs would become permanent; this control never admits an inert run: \
+                     re-submit the parked items with `--supervise arm`"
+                ),
+            ));
+        };
         let epoch = current_epoch_locked(&tx)?;
         let counted_lanes =
             counted_lane_footprints(&tx, "redrive_queue_submission: counted lanes")?;
@@ -5199,6 +5305,20 @@ impl State {
             };
             match admit_queue_item_in_tx(&tx, &admission, &candidate, &mut slots)? {
                 AdmissionDecision::Admitted { instance_id } => {
+                    // Issue #261: the admitted run is armed in the SAME
+                    // transaction, with the SAME explicit authorization the
+                    // submission committed and the SAME bindings the submit
+                    // path uses (approved digest, boundary phase, run
+                    // generation). An admitted run is never inert.
+                    arm_supervision_in_tx(
+                        &tx,
+                        &instance_id,
+                        &arming,
+                        &submission.digest,
+                        &submission.boundary_phase,
+                        submission.state_epoch,
+                        at,
+                    )?;
                     tx.execute(
                         "UPDATE queue_submission_items
                             SET status = 'admitted', reason = NULL, message = NULL,
@@ -13035,6 +13155,19 @@ pub struct SupervisionAuthorizationPlan {
     pub progress_timeout_secs: i64,
 }
 
+/// One `supervision.arm` outcome (issue #261): the re-read supervision row,
+/// the run it arms and the submission whose committed authorization armed it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SupervisionArm {
+    /// The armed supervision row.
+    pub row: SupervisionRow,
+    /// The run the row belongs to.
+    pub run: InstanceRow,
+    /// The submission that admitted the run and whose committed authorization
+    /// was re-applied.
+    pub submission_id: String,
+}
+
 /// One supervision-write outcome (the row plus whether it was a duplicate).
 fn supervision_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<SupervisionRow> {
     Ok(SupervisionRow {
@@ -13092,7 +13225,7 @@ fn supervision_wake_class(action: &str) -> &'static str {
     match kind {
         "review_evidence" => "review",
         "hosted_check" | "post_merge_verify" => "ci",
-        "run.pause" | "run.resume" | "run.retry" => "control",
+        "run.pause" | "run.resume" | "run.retry" | "supervision.arm" => "control",
         _ => "completion",
     }
 }
@@ -13986,6 +14119,162 @@ impl State {
             .map_err(|err| StateError::from_sqlite("arm_supervision: commit", err))?;
         self.supervision_row_locked(&conn, instance_id)?
             .ok_or_else(|| state_error("state.supervision_invalid", "supervision row missing"))
+    }
+
+    /// Arm ONE already-admitted run that carries no arming authorization
+    /// (issue #261): the bounded, audited operator control that recovers an
+    /// inert run without release-and-resubmit.
+    ///
+    /// The authorization is NOT invented by the caller and NOT re-presented:
+    /// it is the exact authorization the run's OWN committed submission
+    /// presented, re-applied with the binding the submit path used (the
+    /// submission's approved digest, boundary phase and state epoch). A
+    /// terminal run, a run that is already armed, a run no submission
+    /// admitted and a submission that committed no `armed` authorization all
+    /// refuse typed; the arm and its hash-chained audit row commit in ONE
+    /// transaction, so the control is exactly one durable effect per key.
+    pub fn arm_admitted_run(
+        &self,
+        instance_id: &str,
+        key: &str,
+        at: &str,
+    ) -> Result<SupervisionArm, StateError> {
+        self.ensure_writable()?;
+        if !crate::formats::is_run_id(instance_id) {
+            return Err(state_error(
+                crate::supervision::codes::TARGET,
+                format!("supervision.arm addresses ONE run identity; {instance_id:?} is not one"),
+            ));
+        }
+        let mut conn = self.lock("arm_admitted_run")?;
+        let tx = conn
+            .transaction()
+            .map_err(|err| StateError::from_sqlite("arm_admitted_run: begin", err))?;
+        let run_sql = format!("{} WHERE instance_id = ?1", instance_select_sql());
+        let run: Option<InstanceRow> = tx
+            .query_row(run_sql.as_str(), params![instance_id], instance_row_from)
+            .optional()
+            .map_err(|err| StateError::from_sqlite("arm_admitted_run: run", err))?;
+        let Some(run) = run else {
+            return Err(state_error(
+                "state.not_found",
+                format!("no run {instance_id:?} exists"),
+            ));
+        };
+        if run.status == "done" || run.status == "invalidated" {
+            return Err(state_error(
+                crate::supervision::codes::ARM_TERMINAL,
+                format!(
+                    "run {instance_id} is {}; a terminal run is never armed",
+                    run.status
+                ),
+            ));
+        }
+        let row_sql = format!("{} WHERE instance_id = ?1", supervision_select_sql());
+        let existing: Option<SupervisionRow> = tx
+            .query_row(row_sql.as_str(), params![instance_id], supervision_row_from)
+            .optional()
+            .map_err(|err| StateError::from_sqlite("arm_admitted_run: supervision", err))?;
+        if let Some(row) = existing
+            && row.desired == "armed"
+        {
+            return Err(state_error(
+                crate::supervision::codes::ARM_ARMED,
+                format!(
+                    "run {instance_id} is already armed ({}); this control recovers an admitted \
+                     run that carries no arming authorization",
+                    row.supervision_id
+                ),
+            ));
+        }
+        let submission_id: Option<String> = tx
+            .query_row(
+                "SELECT submission_id FROM queue_submission_items
+                  WHERE instance_id = ?1 AND status = 'admitted'
+                  ORDER BY rowid DESC LIMIT 1",
+                params![instance_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("arm_admitted_run: submission", err))?;
+        let Some(submission_id) = submission_id else {
+            return Err(state_error(
+                crate::supervision::codes::ARM_UNBOUND,
+                format!(
+                    "run {instance_id} was not admitted by a committed queue submission, so no \
+                     authorization is bound to it and arming it would invent one"
+                ),
+            ));
+        };
+        let Some(arming) = Self::submission_arming_authorization_locked(&tx, &submission_id)?
+        else {
+            return Err(state_error(
+                crate::supervision::codes::ARM_UNARMED,
+                format!(
+                    "the submission {submission_id} that admitted run {instance_id} committed no \
+                     `armed` supervision authorization, so there is nothing to arm it with; \
+                     arming would invent an authorization the operator never gave"
+                ),
+            ));
+        };
+        let submission_sql = format!("{} WHERE submission_id = ?1", queue_submission_select_sql());
+        let submission: Option<QueueSubmissionRow> = tx
+            .query_row(
+                submission_sql.as_str(),
+                params![submission_id],
+                queue_submission_row_from,
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("arm_admitted_run: held submission", err))?;
+        let Some(submission) = submission else {
+            return Err(state_error(
+                "state.corrupt",
+                format!("submission {submission_id} is missing"),
+            ));
+        };
+        arm_supervision_in_tx(
+            &tx,
+            instance_id,
+            &arming,
+            &submission.digest,
+            &submission.boundary_phase,
+            submission.state_epoch,
+            at,
+        )?;
+        self.append_audit_locked(
+            &tx,
+            "supervision.arm",
+            &format!("run:{instance_id}"),
+            key,
+            None,
+            None,
+        )?;
+        tx.commit()
+            .map_err(|err| StateError::from_sqlite("arm_admitted_run: commit", err))?;
+        let row = self
+            .supervision_row_locked(&conn, instance_id)?
+            .ok_or_else(|| state_error("state.supervision_invalid", "supervision row missing"))?;
+        Ok(SupervisionArm {
+            row,
+            run,
+            submission_id,
+        })
+    }
+
+    /// The committed queue submission that admitted one run, when one
+    /// admitted it: the durable link the arm control and the unarmed read
+    /// both use. `None` for a run no committed submission created.
+    pub fn admitted_submission_of(&self, instance_id: &str) -> Result<Option<String>, StateError> {
+        let conn = self.lock("admitted_submission_of")?;
+        conn.query_row(
+            "SELECT submission_id FROM queue_submission_items
+              WHERE instance_id = ?1 AND status = 'admitted'
+              ORDER BY rowid DESC LIMIT 1",
+            params![instance_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|err| StateError::from_sqlite("admitted_submission_of: read", err))
     }
 
     /// One supervision row by run identity.

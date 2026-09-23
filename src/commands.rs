@@ -78,6 +78,7 @@ USAGE:
     canter run dispatch --run RUN_ID --step STEP [--param KEY=VALUE]... [--topology FILE] [--admission FILE] [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run status --run RUN_ID [--socket PATH] [--config PATH] [--json]
     canter supervision status --run RUN_ID [--socket PATH] [--config PATH] [--json]
+    canter supervision arm --run RUN_ID [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter grant issue --request FILE --issue N --expires-in SECS [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter service doctor [--config PATH] [--json]
     canter service install-plan [--config PATH] [--json]
@@ -107,9 +108,12 @@ COMMANDS:
                      run (pause/resume/retry/resolve/dispatch are typed controls;
                      status is read-only; the surface is run-scoped only).
     supervision      Read the versioned supervision status of exactly ONE
-                     supervised run back (read-only; an armed driver may
-                     dispatch through apply, while this status/control
-                     surface never dispatches work).
+                     run back, and arm ONE already-admitted run that carries
+                     no arming authorization (status is read-only; arm is the
+                     bounded, audited recovery of an inert run and re-applies
+                     the authorization the run's own submission committed;
+                     an armed driver may dispatch through apply, while this
+                     status/control surface never dispatches work).
     grant            Mint ONE route grant (`hf-grant/v1`) through the daemon
                      from a reviewed bound-input document, so the operator
                      authority path has a supported way to obtain the grant
@@ -382,14 +386,30 @@ pub struct QueueIntakeArgs {
 }
 
 /// Supervision subcommands (issue #95): the versioned status read of
-/// exactly ONE supervised run. Read-only: nothing on this surface arms,
-/// disarms or nudges supervision (arming is part of the run's queue
-/// submission, and the driver is daemon-owned).
+/// exactly ONE supervised run. `supervision status` is read-only;
+/// `supervision arm` is the ONE bounded, audited control on this surface: it
+/// arms an already-admitted run with the exact authorization the run's own
+/// committed submission presented (issue #261). Nothing here disarms,
+/// nudges, dispatches or releases anything — the driver stays daemon-owned.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SupervisionAction {
     /// Read one run's supervision status back (read-only):
     /// `supervision status`.
     Status(SupervisionStatusArgs),
+    /// Arm ONE already-admitted run that carries no arming authorization
+    /// (issue #261): `supervision arm`.
+    Arm(SupervisionArmArgs),
+}
+
+/// `supervision arm`: the bounded recovery of ONE inert admitted run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SupervisionArmArgs {
+    /// The admitted run identity (`run-` + 16 hex).
+    pub run: String,
+    /// Explicit idempotency key (a fresh per-invocation claim by default).
+    pub idempotency_key: Option<String>,
+    /// Explicit daemon socket override.
+    pub socket: Option<String>,
 }
 
 /// `supervision status`: one exact run read.
@@ -2007,6 +2027,7 @@ fn parse_supervision(args: &[&String]) -> Result<Invocation, ParseError> {
         .ok_or_else(|| ParseError::Help(help_request("supervision")))?;
     let command = match action.as_str() {
         "status" => "supervision status",
+        "arm" => "supervision arm",
         "-h" | "--help" => return Err(ParseError::Help(help_request("supervision"))),
         other => {
             return Err(ParseError::Usage(format!(
@@ -2018,6 +2039,7 @@ fn parse_supervision(args: &[&String]) -> Result<Invocation, ParseError> {
     let mut config_path: Option<PathBuf> = None;
     let mut socket: Option<String> = None;
     let mut run: Option<String> = None;
+    let mut idempotency_key: Option<String> = None;
     let rest = &args[1..];
     let mut index = 0;
     while index < rest.len() {
@@ -2029,6 +2051,9 @@ fn parse_supervision(args: &[&String]) -> Result<Invocation, ParseError> {
             }
             "--socket" => {
                 socket = Some(flag_value(rest, &mut index, command, "--socket")?);
+            }
+            "--idempotency-key" => {
+                idempotency_key = Some(flag_value(rest, &mut index, command, "--idempotency-key")?);
             }
             "--run" => {
                 let value = flag_value(rest, &mut index, command, "--run")?;
@@ -2065,10 +2090,21 @@ fn parse_supervision(args: &[&String]) -> Result<Invocation, ParseError> {
         lane_action: None,
         queue_action: None,
         run_action: None,
-        supervision_action: Some(SupervisionAction::Status(SupervisionStatusArgs {
-            run,
-            socket,
-        })),
+        supervision_action: Some(if command == "supervision arm" {
+            // A read is never claimed: the key is only meaningful for `arm`.
+            if idempotency_key.is_some() {
+                return Err(ParseError::Usage(format!(
+                    "{command}: --idempotency-key is not accepted (this subcommand is a read)"
+                )));
+            }
+            SupervisionAction::Arm(SupervisionArmArgs {
+                run,
+                idempotency_key,
+                socket,
+            })
+        } else {
+            SupervisionAction::Status(SupervisionStatusArgs { run, socket })
+        }),
         grant_action: None,
     })
 }
@@ -6358,6 +6394,34 @@ fn execute_run_status(args: &RunStatusArgs, invocation: &Invocation) -> CmdResul
 /// marker and never re-arms anything.
 fn execute_supervision(action: SupervisionAction, invocation: &Invocation) -> CmdResult {
     match action {
+        SupervisionAction::Arm(args) => {
+            let paths = match run_control_paths(args.socket.as_deref(), invocation) {
+                Ok(paths) => paths,
+                Err(result) => return result,
+            };
+            let key = args.idempotency_key.clone().unwrap_or_else(fresh_run_key);
+            let params = crate::supervision::arm_params(&key, &args.run);
+            match client::call(&paths.socket_path, "supervision.arm", Some(&params)) {
+                Ok(result) => {
+                    let supervision = result
+                        .get("supervision")
+                        .cloned()
+                        .unwrap_or_else(crate::value::null);
+                    let human = format!(
+                        "supervision: {} armed ({})",
+                        args.run,
+                        supervision
+                            .get("id")
+                            .and_then(Val::as_str)
+                            .unwrap_or_default()
+                    );
+                    ok_result(result, human)
+                }
+                Err(RpcError { code, message }) => {
+                    lane_error(&code, format!("supervision arm: {message}"), false)
+                }
+            }
+        }
         SupervisionAction::Status(args) => {
             let paths = match run_control_paths(args.socket.as_deref(), invocation) {
                 Ok(paths) => paths,

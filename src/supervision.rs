@@ -349,6 +349,20 @@ pub mod codes {
     pub const UNAPPROVED_PLAN: &str = "supervision.unapproved_plan";
     /// No committed submission evidence backs this run.
     pub const UNBOUND: &str = "supervision.unbound";
+    /// A terminal run (`done` / `invalidated`) is never armed (issue #261).
+    pub const ARM_TERMINAL: &str = "refusal.supervision.terminal_run";
+    /// The run already carries an ARMED supervision row: the recovery control
+    /// addresses an admitted run that has no arming authorization (issue #261).
+    pub const ARM_ARMED: &str = "refusal.supervision.already_armed";
+    /// No committed submission admitted this run, so no authorization is bound
+    /// to it and nothing can be armed (issue #261).
+    pub const ARM_UNBOUND: &str = "refusal.supervision.unbound";
+    /// The run's own submission committed no `armed` authorization: arming it
+    /// would invent an authorization the operator never gave (issue #261).
+    pub const ARM_UNARMED: &str = "refusal.supervision.unarmed";
+    /// The read-time reason of an ADMITTED run that carries no supervision row
+    /// at all: nothing will drive it (issue #261 AC4).
+    pub const UNARMED_INERT: &str = "supervision.unarmed_inert";
     /// No committed step spine is recorded for the run.
     pub const SPINE_MISSING: &str = "supervision.spine_missing";
     /// The run carries a durable pause request or pause.
@@ -627,6 +641,177 @@ pub fn authorization_params(desired: &str, policy: Policy) -> Val {
                 ),
             ]),
         ),
+    ])
+}
+
+/// The `supervision.arm` document schema id (issue #261, module-local).
+pub const ARM_SCHEMA: &str = "hf-supervision-arm/v1";
+
+/// The statement every `supervision.arm` document carries: what the control
+/// did and did NOT do.
+pub const ARM_STATEMENT: &str = "arm only: exactly ONE already-admitted run's supervision is armed with the exact authorization its own committed submission presented (bound to that submission's approved digest, boundary and epoch); nothing is dispatched, resumed, retried, released or widened by this control, no policy is invented, and a run that is already armed, terminal, or not admitted by a submission refuses typed";
+
+/// Validate one `supervision.arm` request: exactly one run identity plus the
+/// caller's idempotency key (a fresh claim per invocation, exactly one effect
+/// per key). Fail closed before any state is read.
+pub fn parse_arm_params(params: &Val) -> Result<(String, String), SupervisionError> {
+    let Val::Obj(map) = params else {
+        return Err(SupervisionError::new(
+            "refusal.malformed",
+            "supervision.arm params must be an object",
+        ));
+    };
+    for key in map.keys() {
+        if !["idempotency_key", "instance_id"].contains(&key.as_str()) {
+            return Err(SupervisionError::new(
+                "refusal.malformed",
+                format!("supervision.arm does not accept params.{key}"),
+            ));
+        }
+    }
+    let instance_id = map
+        .get("instance_id")
+        .and_then(Val::as_str)
+        .unwrap_or("")
+        .to_string();
+    if !formats::is_run_id(&instance_id) {
+        return Err(SupervisionError::new(
+            codes::TARGET,
+            format!(
+                "supervision.arm addresses exactly ONE run (`run-` + 16 hex); \
+                 {instance_id:?} is not a run identity"
+            ),
+        ));
+    }
+    let key = map
+        .get("idempotency_key")
+        .and_then(Val::as_str)
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| {
+            SupervisionError::new(
+                "refusal.malformed",
+                "supervision.arm requires params.idempotency_key",
+            )
+        })?
+        .to_string();
+    Ok((instance_id, key))
+}
+
+/// The `hf-supervision-arm/v1` projection of ONE recorded arm: the run, the
+/// armed supervision row and the submission whose committed authorization it
+/// re-armed with.
+pub fn arm_doc(armed: &crate::state::SupervisionArm, at: &str, key: &str) -> Val {
+    let row = &armed.row;
+    let run = &armed.run;
+    object(vec![
+        ("schema", string(ARM_SCHEMA)),
+        ("statement", string(ARM_STATEMENT)),
+        (
+            "run",
+            object(vec![
+                ("instance_id", string(&run.instance_id)),
+                ("repository", string(&run.repository)),
+                ("issue_number", integer(run.issue_number)),
+                ("status", string(&run.status)),
+                ("phase", string(&run.phase)),
+                ("node", string(&run.current_node)),
+                ("state_epoch", integer(run.state_epoch)),
+            ]),
+        ),
+        (
+            "supervision",
+            object(vec![
+                ("id", string(&row.supervision_id)),
+                ("desired", string(&row.desired)),
+                ("state", string("active")),
+                ("armed_at", string(&row.armed_at)),
+                ("owner_generation", integer(row.owner_generation)),
+                ("run_generation", integer(row.run_generation)),
+                ("authorization_digest", string(&row.authorization_digest)),
+                ("approved_boundary", string(&row.approved_boundary)),
+                ("check_interval_secs", integer(row.check_interval_secs)),
+                ("progress_timeout_secs", integer(row.progress_timeout_secs)),
+            ]),
+        ),
+        (
+            "submission",
+            object(vec![("submission_id", string(&armed.submission_id))]),
+        ),
+        ("authorized_at", string(at)),
+        ("idempotency_key", string(key)),
+    ])
+}
+
+/// The read-only `hf-supervision/v1` projection of an ADMITTED run that
+/// carries NO supervision row at all (issue #261 AC4): the run exists and
+/// occupies the counted set, but nothing will drive it. The read tells that
+/// state and the remedy apart from `armed, waiting` instead of leaving a cap
+/// refusal as the only symptom — and it is a READ: no claim, no journal
+/// write, no marker movement.
+pub fn unarmed_doc(run: &crate::state::InstanceRow, submission_id: Option<&str>, at: &str) -> Val {
+    object(vec![
+        ("schema", string(SUPERVISION_SCHEMA)),
+        (
+            "run",
+            object(vec![
+                ("instance_id", string(&run.instance_id)),
+                ("repository", string(&run.repository)),
+                ("issue_number", integer(run.issue_number)),
+                ("status", string(&run.status)),
+                ("phase", string(&run.phase)),
+                ("node", string(&run.current_node)),
+                ("state_epoch", integer(run.state_epoch)),
+                ("paused", bool_(run.paused)),
+                ("pause_requested", bool_(run.pause_requested)),
+                ("human_queue", bool_(run.human_queue)),
+                ("terminal_blockers", integer(run.terminal_blockers as i64)),
+            ]),
+        ),
+        (
+            "supervision",
+            object(vec![
+                ("id", string("")),
+                ("desired", string("disabled")),
+                ("state", string("unarmed")),
+                ("armed_at", string("")),
+            ]),
+        ),
+        (
+            "evaluation",
+            object(vec![
+                ("class", string("unknown")),
+                ("reason", string(codes::UNARMED_INERT)),
+                ("eligible", bool_(false)),
+                (
+                    "detail",
+                    string(
+                        "admitted with no arming authorization: no supervision row exists, so                          nothing will drive this run's next step and it holds its counted slot                          until it is armed or released",
+                    ),
+                ),
+            ]),
+        ),
+        (
+            "remedy",
+            object(vec![
+                (
+                    "control",
+                    string(&format!("supervision arm --run {}", run.instance_id)),
+                ),
+                (
+                    "submission_id",
+                    submission_id.map(string).unwrap_or_else(|| string("")),
+                ),
+            ]),
+        ),
+        ("observed_at", string(at)),
+    ])
+}
+
+/// The canonical `supervision.arm` request document (issue #261).
+pub fn arm_params(idempotency_key: &str, instance_id: &str) -> Val {
+    object(vec![
+        ("idempotency_key", string(idempotency_key)),
+        ("instance_id", string(instance_id)),
     ])
 }
 
