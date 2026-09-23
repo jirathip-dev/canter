@@ -628,6 +628,7 @@ fn dispatch(shared: &Arc<Shared>, request: &Request) -> String {
         "run.retry" => method_run_retry(shared, request),
         "run.reevaluate" => method_run_reevaluate(shared, request),
         "run.release" => method_run_release(shared, request),
+        "run.retire-lane" => method_run_retire_lane(shared, request),
         "run.resolve" => method_run_resolve(shared, request),
         "run.dispatch" => method_run_dispatch(shared, request),
         "run.status" => method_run_status(shared, request),
@@ -4974,6 +4975,202 @@ fn method_run_release(shared: &Arc<Shared>, request: &Request) -> String {
             request,
             &key,
             "run.release",
+            false,
+            null(),
+            Some((code, message)),
+        ),
+    }
+}
+
+/// `run.retire-lane` (issue #236): retire the stale LANE RECORDS of ONE run
+/// the ledger records as terminal, so a released run's residue is recoverable
+/// by ONE bounded, audited operator control instead of hand-editing state.
+///
+/// The gate is the ledger and it comes FIRST: a run that is not terminal
+/// refuses typed (`refusal.lane.live_run`) with nothing claimed, journaled or
+/// touched — a live lane still holds its issue's unique ownership, so it is
+/// never in the retired set. For a terminal run ONE audited claim commits:
+///
+/// - the durable lane records the run still holds (the leftover ownership
+///   rows that name it the owner of its issue, removed in one transaction
+///   with the `run.retire-lane` audit record), and
+/// - its lane residue under the SAME #190/#222 policy a bind step applies —
+///   the run's own linked lane workspace, its registered lane checkout, and
+///   its local lane branch only when the published branch carries the same
+///   tip (a local-only delivery is never deleted). The lane is the run's own
+///   implementer leg (derived, never presented) and the integration clone is
+///   the run's own recorded topology; a first-time topology can be presented
+///   exactly as the dispatch surface accepts one.
+fn method_run_retire_lane(shared: &Arc<Shared>, request: &Request) -> String {
+    let Some(params) = request.params.as_ref() else {
+        return err_response(
+            &request.id,
+            "refusal.malformed",
+            "run.retire-lane requires params: idempotency_key, instance_id, reason",
+        );
+    };
+    let parsed = match crate::run_control::parse_lane_retirement_params(params) {
+        Ok(parsed) => parsed,
+        Err(err) => return err_response(&request.id, err.code, err.message),
+    };
+    // The gate reads durable state only, before any claim exists: a live run
+    // is refused here and the refusal is journaled by nobody.
+    let (instance, recorded) = {
+        let state = match shared.lock_state() {
+            Ok(state) => state,
+            Err(message) => return err_response(&request.id, "state.unavailable", message),
+        };
+        let instance = match state.instance_by_id(&parsed.instance_id) {
+            Ok(Some(instance)) => instance,
+            Ok(None) => {
+                return err_response(
+                    &request.id,
+                    "state.not_found",
+                    format!("no instance {}", parsed.instance_id),
+                );
+            }
+            Err(err) => return err_response(&request.id, err.code, err.message),
+        };
+        let recorded = match state.run_dispatch_context(&parsed.instance_id) {
+            Ok(recorded) => recorded,
+            Err(err) => return err_response(&request.id, err.code, err.message),
+        };
+        (instance, recorded)
+    };
+    if !matches!(instance.status.as_str(), "done" | "invalidated") {
+        return err_response(
+            &request.id,
+            crate::run_control::codes::LANE_LIVE,
+            format!(
+                "run {} is live (status {:?}); only a terminal run's lane records are retired — a \
+                 live lane still holds its issue's unique ownership, so it is never in the retired \
+                 set (a run that can never progress is retired with `run release` first)",
+                parsed.instance_id, instance.status
+            ),
+        );
+    }
+    // The lane paths: the run's OWN recorded topology (the same document its
+    // dispatches re-present), else the presented one — never a mixture. A run
+    // whose recorded topology is empty has none bound yet, exactly like the
+    // dispatch surface's first-dispatch rule.
+    let recorded_topology = recorded
+        .as_ref()
+        .map(|recorded| recorded.topology.clone())
+        .filter(|topology| !topology.is_null());
+    let topology = match (recorded_topology.as_ref(), parsed.topology.as_ref()) {
+        (Some(recorded), Some(presented)) if recorded != presented => {
+            return err_response(
+                &request.id,
+                crate::run_control::codes::SCOPE,
+                format!(
+                    "run {} already bound a different topology; a retire never changes its lane \
+                     paths",
+                    parsed.instance_id
+                ),
+            );
+        }
+        (Some(recorded), _) => recorded.clone(),
+        (None, Some(presented)) => presented.clone(),
+        (None, None) => {
+            return err_response(
+                &request.id,
+                crate::run_control::codes::SCOPE,
+                format!(
+                    "run {} recorded no lane topology (its own applies recorded none); present \
+                     --topology FILE with integration_repo and worktrees_root so the retire \
+                     addresses the lane the run bound",
+                    parsed.instance_id
+                ),
+            );
+        }
+    };
+    let topology_path = |key: &str| -> Result<PathBuf, String> {
+        let text = topology
+            .get(key)
+            .and_then(Val::as_str)
+            .ok_or_else(|| format!("topology.{key} is required"))?;
+        let path = PathBuf::from(text);
+        if !path.is_absolute() {
+            return Err(format!("topology.{key} must be an absolute path"));
+        }
+        Ok(path)
+    };
+    let integration_repo = match topology_path("integration_repo") {
+        Ok(path) => path,
+        Err(message) => {
+            return err_response(&request.id, crate::run_control::codes::SCOPE, &message);
+        }
+    };
+    let worktrees_root = match topology_path("worktrees_root") {
+        Ok(path) => path,
+        Err(message) => {
+            return err_response(&request.id, crate::run_control::codes::SCOPE, &message);
+        }
+    };
+    let target = format!("run-lane:{}", parsed.instance_id);
+    let key = match journal_mutation(shared, request, "mutate.run.retire-lane", &target) {
+        Intent::Claimed { key } => key,
+        Intent::Replay { response } => return replay(shared, &response),
+        Intent::Refused { code, message } => return err_response(&request.id, code, &message),
+    };
+    crash_point("run.retire-lane.after-intent");
+    let outcome = (|| -> Result<Val, (&'static str, String)> {
+        let at = time::rfc3339_now();
+        let retired = {
+            let state = shared
+                .lock_state()
+                .map_err(|message| ("state.unavailable", message))?;
+            state
+                .retire_run_lane_records(&parsed.instance_id, &parsed.reason, &key)
+                .map_err(|err| (err.code, err.message))?
+        };
+        // The residue half runs OUTSIDE the state lock (bounded children never
+        // stall other daemon work) and its outcome is RECORDED, never forced:
+        // the durable half is already committed and audited.
+        let env = crate::config::adapter_environment();
+        let residue = crate::mutation::retire_run_lane(
+            &integration_repo,
+            &worktrees_root,
+            &parsed.instance_id,
+            retired.run.issue_number,
+            &env,
+        );
+        let residue_doc = if residue.status == "succeeded" {
+            residue.result.clone()
+        } else {
+            object(vec![
+                ("status", string(residue.status)),
+                (
+                    "code",
+                    match &residue.code {
+                        Some(code) => string(code),
+                        None => null(),
+                    },
+                ),
+                (
+                    "message",
+                    match &residue.message {
+                        Some(message) => string(message),
+                        None => null(),
+                    },
+                ),
+            ])
+        };
+        Ok(crate::run_control::lane_retirement_doc(
+            &retired,
+            &parsed.reason,
+            &at,
+            residue_doc,
+            &key,
+        ))
+    })();
+    match outcome {
+        Ok(doc) => finish_mutation(shared, request, &key, "run.retire-lane", true, doc, None),
+        Err((code, message)) => finish_mutation(
+            shared,
+            request,
+            &key,
+            "run.retire-lane",
             false,
             null(),
             Some((code, message)),
@@ -10860,6 +11057,16 @@ fn reconcile_run_control(
         // committed — it never under-reports, and no control is repeated
         // either way.
         "run.release" => run.status == "invalidated",
+        // The retire's own commit marker is the ownership ledger: the
+        // retirement removes the leftover rows in the SAME transaction as its
+        // `run.retire-lane` audit record, so a run that still holds one did
+        // not commit. A terminal run that held none at all over-reports
+        // exactly like the release readback — it never under-reports, and no
+        // control is repeated either way.
+        "run.retire-lane" => state
+            .queue_ownership_rows()
+            .map(|rows| !rows.iter().any(|row| row.instance_id == instance_id))
+            .unwrap_or(false),
         _ => false,
     };
     log.write(

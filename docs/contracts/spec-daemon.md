@@ -385,7 +385,8 @@ daemon mutation (`params.idempotency_key` required on the mutating paths;
 a same-key retry replays the recorded response) and render a module-local
 document (`hf-run-control/v1` / `hf-run-retry/v1` /
 `hf-run-reevaluation/v1` /
-`hf-run-resolution/v1` / `hf-run-dispatch/v1` / `hf-run-release/v1`,
+`hf-run-resolution/v1` / `hf-run-dispatch/v1` / `hf-run-release/v1` /
+`hf-run-lane-retirement/v1`,
 deliberately outside the closed `hf-*` family set like the #84 preview and
 the #85 submission).
 
@@ -393,9 +394,9 @@ the #85 submission).
 
 | level | identity | methods | effect of a control |
 | --- | --- | --- | --- |
-| run | one `run-` + 16 hex instance id | `run.pause` / `run.resume` / `run.retry` / `run.reevaluate` / `run.release` / `run.resolve` / `run.dispatch` / `run.status` | exactly this run: stop admitting new steps, lift THIS run's pause, authorize one bounded re-dispatch of one diagnosed step (authorization only), re-evaluate the run's own recorded checks by re-running its check producer at the same certified head (bounded, attributed, journaled; recomputation only), release a run that can never progress — its issue ownership and the occupancy it held are freed and it goes terminal (bookkeeping only), resolve one diagnosed prompt from recorder-attributed evidence without an effect, or dispatch ONE committed-spine step with the caller's own step inputs |
+| run | one `run-` + 16 hex instance id | `run.pause` / `run.resume` / `run.retry` / `run.reevaluate` / `run.release` / `run.retire-lane` / `run.resolve` / `run.dispatch` / `run.status` | exactly this run: stop admitting new steps, lift THIS run's pause, authorize one bounded re-dispatch of one diagnosed step (authorization only), re-evaluate the run's own recorded checks by re-running its check producer at the same certified head (bounded, attributed, journaled; recomputation only), release a run that can never progress — its issue ownership and the occupancy it held are freed and it goes terminal (bookkeeping only), retire the stale LANE RECORDS of a run the ledger already records as terminal — its leftover issue ownership rows and its own lane's residue, derived from that run's own issue, under the same #190/#222 policy a bind step applies (a live run refuses `refusal.lane.live_run` and is never touched), resolve one diagnosed prompt from recorder-attributed evidence without an effect, or dispatch ONE committed-spine step with the caller's own step inputs |
 | fleet | the whole run population | NONE — there is no `fleet.*` method in the closed set | a fleet-level hold is an operator policy expressed as the set of paused runs; every resume is fenced on the exact instance id, so no run control ever lifts another run's pause or anything fleet-wide |
-| lane | one handoff lane generation (`rp_` records) | `lane.*` only | run controls never touch lane records; a non-run identity refuses `refusal.run.target` |
+| lane | one handoff lane generation (`rp_` records) | `lane.*` only | a run control never ADDRESSES a lane identity (`rp_` records are never touched and a lane id never resolves to a run: it refuses `refusal.run.target`); `run.retire-lane` retires the lane of the ONE terminal run it addresses, derived from that run's own issue, and refuses every non-terminal run (`refusal.lane.live_run`) |
 
 No method on this surface kills a process, cleans up work, mutates Git,
 clears a repository/fleet-level hold or bypasses a gate.
@@ -553,6 +554,34 @@ clears a repository/fleet-level hold or bypasses a gate.
   engine refuses a terminal instance (`refusal.instance.state`) and
   supervision's dispatch intent is a no-op for it, while the freed issue
   is admitted by a fresh submission on its own merits.
+- `run.retire-lane` (issue #236) requires `params.instance_id`,
+  `params.reason` (1-300 printable characters), `params.idempotency_key` and
+  — only for a run whose own applies recorded no topology — an optional
+  `params.topology` (the same `integration_branch`/`integration_repo`/
+  `worktrees_root` document `queue.submit` and `apply` present). It retires
+  the stale LANE RECORDS of exactly ONE run that is TERMINAL in the ledger
+  (`done` or `invalidated`): the leftover `queue_ownership` rows that still
+  name it the owner of its issue are removed in ONE transaction with a
+  `run.retire-lane` audit record, and its lane residue is retired in the same
+  operation under the existing #190/#222 policy — the run's OWN linked lane
+  workspace (the identity-verified one-pane registration at the run's own
+  checkout; a different pane, another lane's binding or an unverifiable
+  read-back is refused and recorded, never forced), its REGISTERED lane
+  checkout in the integration clone, and its local lane branch only when the
+  published branch carries the same tip (a local-only delivery is never
+  deleted). The lane is DERIVED from the run's own repository issue (its own
+  implementer leg: `issue-<N>` at `issues-<N>`), never from a caller-named
+  path, and the integration clone comes from the run's own recorded topology.
+  The control refuses typed BEFORE any claim or effect when the run is NOT
+  terminal (`refusal.lane.live_run`, naming the run and its status): a live
+  lane still holds its issue's unique ownership and is never in the retired
+  set. An unknown run is `state.not_found`; a terminal run that holds nothing
+  left is an audited no-op that reports `ownership_rows_removed: 0`. The same
+  idempotency key replays the recorded response. Nothing is spawned, killed,
+  resumed, retried, released or dispatched, no other run's lane, ownership or
+  pause is touched, no other issue's lane is addressed, and the #190/#222
+  automatic reclaim at a bind step is unchanged — this is the operator's own
+  bounded path to the same policy.
 - `run.resolve` requires one diagnosed `prompt` step plus a recorder identity
   and closed artifact evidence (`feature_head`, the prompt's bound `branch`,
   `pull_request {repository, number}`, and non-empty named `checks`). It

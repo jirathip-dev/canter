@@ -37,6 +37,15 @@ pub fn lane_checkout(issue: u64, role: &str, round: u64) -> String {
     lane_identity(issue, role, round).2
 }
 
+/// The lane BRANCH of one run's own implementer lane (round 1): `issue-<N>`.
+/// The ONE derivation the plan producer renders into `worktree_create` and
+/// every operator control that addresses the run's lane reads back (issue
+/// #236): a lane addressed by the ledger, by a plan step or by a retire
+/// control is the same lane, never a re-spelled name.
+pub fn lane_branch(issue: u64) -> String {
+    format!("issue-{issue}")
+}
+
 /// The three public identity strings of one leg, in one place.
 fn lane_identity(issue: u64, role: &str, round: u64) -> (String, String, String) {
     match (role, round) {
@@ -96,6 +105,19 @@ mod tests {
                 (agent.to_string(), workspace.to_string())
             );
             assert_eq!(lane_checkout(issue, role, round), checkout);
+        }
+    }
+
+    #[test]
+    fn every_lane_addressed_by_the_ledger_or_a_control_is_the_same_lane() {
+        // Issue #236: the branch a plan step binds and the branch a retire
+        // control reclaims are ONE derivation — never two spellings that can
+        // drift apart.
+        for (issue, branch, checkout) in
+            [(236, "issue-236", "issues-236"), (7, "issue-7", "issues-7")]
+        {
+            assert_eq!(lane_branch(issue), branch);
+            assert_eq!(lane_checkout(issue, "implementer", 1), checkout);
         }
     }
 

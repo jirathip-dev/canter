@@ -74,6 +74,7 @@ USAGE:
     canter run retry --run RUN_ID --step STEP [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run reevaluate --run RUN_ID --step STEP --operator IDENTITY --reason TEXT [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run release --run RUN_ID --reason TEXT [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
+    canter run retire-lane --run RUN_ID --reason TEXT [--topology FILE] [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run resolve --run RUN_ID --step STEP --recorder IDENTITY --evidence FILE [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run dispatch --run RUN_ID --step STEP [--param KEY=VALUE]... [--topology FILE] [--admission FILE] [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run status --run RUN_ID [--socket PATH] [--config PATH] [--json]
@@ -103,9 +104,11 @@ COMMANDS:
     queue            Preview one reviewed run (the plan producer), submit one
                      approved selected-issue run, or read one committed
                      submission back (preview/status are read-only).
-    run              Pause, resume, retry, resolve, dispatch, or inspect ONE
-                     run (pause/resume/retry/resolve/dispatch are typed controls;
-                     status is read-only; the surface is run-scoped only).
+    run              Pause, resume, retry, reevaluate, release, retire-lane,
+                     resolve, dispatch, or inspect ONE run (pause/resume/retry/
+                     reevaluate/release/retire-lane/resolve/dispatch are typed
+                     controls; status is read-only; the surface is run-scoped
+                     only).
     supervision      Read the versioned supervision status of exactly ONE
                      supervised run back (read-only; an armed driver may
                      dispatch through apply, while this status/control
@@ -180,6 +183,10 @@ pub enum RunAction {
     /// Release ONE run that can never progress, freeing its issue ownership
     /// and the occupancy it held: `run release` (issue #146).
     Release(RunReleaseArgs),
+    /// Retire the stale lane records of ONE run the ledger records as
+    /// terminal — its leftover issue ownership rows and its own lane's
+    /// residue: `run retire-lane` (issue #236).
+    RetireLane(RunRetireLaneArgs),
     /// Resolve ONE diagnosed prompt from recorder-attributed artifact evidence
     /// without issuing its effect again: `run resolve`.
     Resolve(RunResolveArgs),
@@ -211,6 +218,23 @@ pub struct RunReleaseArgs {
     pub run: String,
     /// Operator reason (1-300 printable characters; audited with the run).
     pub reason: String,
+    /// `--idempotency-key`: replay-safe automation key.
+    pub idempotency_key: Option<String>,
+    /// Explicit daemon socket override.
+    pub socket: Option<String>,
+}
+
+/// `run retire-lane`: the exact target, the recorded operator reason and —
+/// only for a run whose own applies recorded none — the lane-path topology
+/// (issue #236).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunRetireLaneArgs {
+    /// Explicit run id (`run-` + 16 hex), terminal in the ledger.
+    pub run: String,
+    /// Operator reason (1-300 printable characters; audited with the retire).
+    pub reason: String,
+    /// `--topology FILE`: presented only when the run recorded no topology.
+    pub topology: Option<PathBuf>,
     /// `--idempotency-key`: replay-safe automation key.
     pub idempotency_key: Option<String>,
     /// Explicit daemon socket override.
@@ -1640,6 +1664,7 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
         "retry" => "run retry",
         "reevaluate" => "run reevaluate",
         "release" => "run release",
+        "retire-lane" => "run retire-lane",
         "resolve" => "run resolve",
         "dispatch" => "run dispatch",
         "status" => "run status",
@@ -1725,6 +1750,10 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
                 } else {
                     admission = Some(value);
                 }
+            }
+            "--topology" if action.as_str() == "retire-lane" => {
+                let value = PathBuf::from(flag_value(rest, &mut index, command, "--topology")?);
+                topology = Some(value);
             }
             "--recorder" if action.as_str() == "resolve" => {
                 let value = flag_value(rest, &mut index, command, "--recorder")?;
@@ -1902,6 +1931,34 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
             RunAction::Release(RunReleaseArgs {
                 run,
                 reason,
+                idempotency_key,
+                socket,
+            })
+        }
+        "retire-lane" => {
+            if digest.is_some()
+                || step.is_some()
+                || !step_params.is_empty()
+                || admission.is_some()
+                || operator.is_some()
+                || recorder.is_some()
+                || evidence.is_some()
+            {
+                return Err(ParseError::Usage(
+                    "run retire-lane takes --run, --reason and optional --topology only"
+                        .to_string(),
+                ));
+            }
+            let Some(reason) = reason else {
+                return Err(ParseError::Usage(
+                    "run retire-lane: --reason TEXT is required (the audited retirement reason)"
+                        .to_string(),
+                ));
+            };
+            RunAction::RetireLane(RunRetireLaneArgs {
+                run,
+                reason,
+                topology,
                 idempotency_key,
                 socket,
             })
@@ -6082,6 +6139,7 @@ fn execute_run(action: RunAction, invocation: &Invocation) -> CmdResult {
         RunAction::Retry(args) => execute_run_retry(&args, invocation),
         RunAction::Reevaluate(args) => execute_run_reevaluate(&args, invocation),
         RunAction::Release(args) => execute_run_release(&args, invocation),
+        RunAction::RetireLane(args) => execute_run_retire_lane(&args, invocation),
         RunAction::Resolve(args) => execute_run_resolve(&args, invocation),
         RunAction::Dispatch(args) => execute_run_dispatch(&args, invocation),
         RunAction::Status(args) => execute_run_status(&args, invocation),
@@ -6266,6 +6324,48 @@ fn execute_run_resolve(args: &RunResolveArgs, invocation: &Invocation) -> CmdRes
         }
         Err(RpcError { code, message }) => {
             lane_error(&code, format!("run resolve: {message}"), false)
+        }
+    }
+}
+
+/// `run retire-lane`: retire the stale lane records of ONE run the ledger
+/// records as terminal (daemon `run.retire-lane`, issue #236). The lane is
+/// derived daemon-side from the run's own issue and its OWN recorded
+/// topology; a first-time topology is read here and never a lane path or a
+/// worktree an operator spells out.
+fn execute_run_retire_lane(args: &RunRetireLaneArgs, invocation: &Invocation) -> CmdResult {
+    let paths = match run_control_paths(args.socket.as_deref(), invocation) {
+        Ok(paths) => paths,
+        Err(result) => return result,
+    };
+    let key = args.idempotency_key.clone().unwrap_or_else(fresh_run_key);
+    let topology = match &args.topology {
+        None => None,
+        Some(path) => {
+            let value = std::fs::read_to_string(path)
+                .map_err(|err| err.to_string())
+                .and_then(|text| Val::parse_json(&text));
+            match value {
+                Ok(value @ Val::Obj(_)) => Some(value),
+                _ => {
+                    return lane_error(
+                        "usage.run_retire_lane",
+                        "run retire-lane: --topology requires a readable JSON object".to_string(),
+                        false,
+                    );
+                }
+            }
+        }
+    };
+    let params =
+        crate::run_control::lane_retirement_params(&key, &args.run, &args.reason, topology);
+    match client::call(&paths.socket_path, "run.retire-lane", Some(&params)) {
+        Ok(result) => {
+            let human = crate::run_control::render_human(&result);
+            ok_result(result, human)
+        }
+        Err(RpcError { code, message }) => {
+            lane_error(&code, format!("run retire-lane: {message}"), false)
         }
     }
 }
@@ -6831,7 +6931,7 @@ state.not_found) · 5 config error.
 ";
 
 const RUN_USAGE: &str = "\
-canter run <pause|resume|retry|reevaluate|release|resolve|dispatch|status> — run-scoped controls for ONE run
+canter run <pause|resume|retry|reevaluate|release|retire-lane|resolve|dispatch|status> — run-scoped controls for ONE run
 
 USAGE:
     canter run pause --run RUN_ID --reason TEXT [--idempotency-key IK] \
@@ -6844,6 +6944,8 @@ USAGE:
 [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run release --run RUN_ID --reason TEXT [--idempotency-key IK] \
 [--socket PATH] [--config PATH] [--json]
+    canter run retire-lane --run RUN_ID --reason TEXT [--topology FILE] \
+[--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run resolve --run RUN_ID --step STEP --recorder IDENTITY \
 --evidence FILE [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run dispatch --run RUN_ID --step STEP [--param KEY=VALUE]... \
@@ -6964,6 +7066,27 @@ that window (`usable:false`) without ever
 presenting or reusing it — continuing that work needs a freshly minted
 grant window, never a silent reuse of the expired one. After the release
 the issue can be submitted again on its own merits.
+
+retire-lane retires the stale lane records of ONE run the ledger already
+records as terminal (daemon `run.retire-lane`, issue #236). It exists because
+a run that reached `done`/`invalidated` without its own `p8` cleanup keeps
+durable lane records — the ownership row that still names it the owner of its
+issue, its linked lane workspace, its registered lane checkout and its local
+lane branch — and nothing could retire them but hand-editing state or waiting
+for a successor run to reclaim them at its bind step. One audited transaction
+removes the leftover ownership rows and the same #190/#222 policy a bind step
+applies retires that run's OWN lane: the lane is derived from the run's own
+issue (its own implementer leg), the integration clone comes from the run's
+OWN recorded topology (a first-time topology may be presented with
+`--topology FILE`), a registration that is not this run's own one-pane lane
+workspace is refused and left untouched, and a local branch is deleted only
+when the published branch carries the same tip — a local-only delivery is
+never deleted. A run that is NOT terminal refuses typed
+`refusal.lane.live_run` and nothing is read, claimed or touched: a live lane
+still holds its issue's unique ownership (release such a run first if it can
+never progress). The operator `--reason`, the exact run identity and what was
+retired are recorded in the audit, and the same `--idempotency-key` replays
+the recorded response.
 
 status reads the control state back read-only (daemon `run.status`):
 active / pause_requested (request durable, in-flight work still running) /
