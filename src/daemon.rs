@@ -1319,13 +1319,16 @@ fn resolve_run_binding(
 fn fanout_refusal_message(code: &str, message: &str, run: &str, step: &str) -> String {
     let remedy = match code {
         crate::lifecycle::code::PROOF_STALE => format!(
-            "; renew with `canter run reevaluate --run {run} --step {step} --operator IDENTITY \
-             --reason TEXT` (the run's own check producer) or `canter run dispatch --run {run} \
-             --step {step} --admission FILE`"
+            "; renew with `canter run dispatch --run {run} --step {step} --operator IDENTITY \
+             --reason TEXT` (the daemon measures the host for the recorded operator and binds the \
+             measurement), or `canter run reevaluate --run {run} --step {step} --operator \
+             IDENTITY --reason TEXT` for the run's own check producer; `canter run status --run \
+             {run}` names the ONE control that applies"
         ),
         crate::lifecycle::code::PROOF_MISSING => format!(
-            "; present one with `canter run dispatch --run {run} --step {step} --admission FILE` \
-             (a proof that was never recorded is never invented by a renewal)"
+            "; produce one with `canter run dispatch --run {run} --step {step} --operator IDENTITY \
+             --reason TEXT` when the run recorded an admission to bind it into, otherwise present \
+             `--admission FILE`; a measurement is never invented for a run that recorded none"
         ),
         _ => return message.to_string(),
     };
@@ -2138,6 +2141,48 @@ fn read_dispatch_material(
     })
 }
 
+/// Issue #256: bind a review round to the head the recorded handoff's OWN
+/// repair leg DELIVERED.
+///
+/// The head the FAIL was handed at is a recorded fact and never moves by
+/// itself; the leg advances the branch in its OWN lane checkout. That checkout
+/// is the only durable state that names the delivered head, so it is observed
+/// here — read-only, outside the state guard, through the same bounded git
+/// runner every adapter read uses — and the observed descendant head replaces
+/// the run's recorded head for THIS review dispatch: the reviewer leg's derived
+/// checkout then materializes the delivered commit, and the round's own
+/// head-keyed verification accepts a verdict that names it (the run's
+/// delivery-certification gate, issue #202, is untouched and decides
+/// consumption exactly as before). A handoff that names no lane, a leg that
+/// never moved and every read that cannot be taken leave the material exactly
+/// as the run recorded it.
+fn bind_delivered_review_head(shared: &Arc<Shared>, instance_id: &str, head: &mut Option<String>) {
+    if head.is_none() {
+        return;
+    }
+    let (mut evidence, worktrees_root) = {
+        let state = match shared.lock_state() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        let evidence = match state.supervision_evidence(instance_id) {
+            Ok(Some(evidence)) => evidence,
+            _ => return,
+        };
+        let worktrees_root = crate::supervision::recorded_worktrees_root(&state, instance_id);
+        (evidence, worktrees_root)
+    };
+    crate::supervision::observe_fix_leg(&mut evidence, worktrees_root.as_deref());
+    if let Some(delivered) = evidence
+        .fix_leg
+        .as_ref()
+        .filter(|leg| leg.delivered)
+        .map(|leg| leg.head.clone())
+    {
+        *head = Some(delivered);
+    }
+}
+
 /// Build the `apply` request one committed-spine dispatch presents (issue #92
 /// F4 and the operator dispatch surface) from already-read durable material:
 /// the run's own committed step spine (params included), the run row (grant,
@@ -2462,6 +2507,159 @@ fn renew_host_proof_for_dispatch(
         ),
     );
     Some(renewal)
+}
+
+/// Issue #250: produce the host-resource proof ONE dispatch presents, on an
+/// audited operator's behalf.
+///
+/// The measured defect: every remedy a parked run named needed an artifact no
+/// exposed control could produce — `run dispatch` asked for an `--admission
+/// FILE` that nothing emitted. This is the control: when the caller presents
+/// the audited operator pair, the daemon takes its OWN measurement of the
+/// host at the run's lane root (the same observation #198 takes when it
+/// continues a run) and binds it as the proof this dispatch presents.
+///
+/// Bounded and honest by construction:
+/// - only a fan-out step of a LIVE run (never a paused, human-held or
+///   finished one) and only when the run recorded an admission document to
+///   bind the measurement INTO — the caps and the occupancy stay the run's
+///   own recorded ones verbatim, because the measurement supplies a PROOF,
+///   never a cap;
+/// - only from a measurement of THIS dispatch (`Unmeasurable` hosts produce
+///   nothing: the gate then refuses the absent or lapsed proof exactly as
+///   before, typed);
+/// - the act is recorded BEFORE the proof is presented — one
+///   `host.proof.renewal.operator` journal record naming the operator, the
+///   reason, the superseded proof (or its absence) and the measurement — so
+///   the proof-producing control is auditable without reading a daemon log.
+///
+/// Nothing else moves: the freshness bound, the caps, the occupancy, the
+/// overlap and every other admission decision stay the gate's own.
+fn operator_measured_proof(
+    shared: &Arc<Shared>,
+    material: &mut DispatchMaterial,
+    step_id: &str,
+    key: &str,
+    operator: &str,
+    reason: &str,
+) -> bool {
+    let Some(step) = material
+        .steps
+        .iter()
+        .find(|step| step.get("id").and_then(Val::as_str) == Some(step_id))
+    else {
+        return false;
+    };
+    // Only a fan-out step owes a proof at all.
+    if !fanout_step_kind(step) {
+        return false;
+    }
+    let instance = &material.instance;
+    // The measurement is the run's own act on the operator's behalf: only a
+    // live run is measured (never a paused, held, blocked or finished one).
+    let live = matches!(instance.status.as_str(), "new" | "running")
+        && !instance.paused
+        && !instance.pause_requested
+        && !instance.human_queue
+        && instance.terminal_blockers == 0;
+    if !live {
+        return false;
+    }
+    // The run recorded no admission document at all: there is nothing to
+    // bind a measurement into (the caps are the caller's own attestation), so
+    // nothing is measured and the gate keeps refusing `proof_missing`.
+    let Some(admission) = material.admission.clone() else {
+        return false;
+    };
+    let Some(lane_root) = material
+        .topology
+        .get("worktrees_root")
+        .and_then(Val::as_str)
+        .map(PathBuf::from)
+    else {
+        return false;
+    };
+    let measurement = measure_host(&lane_root);
+    let crate::lifecycle::HostMeasurement::Measured {
+        measured_at_unix,
+        available_bytes,
+    } = measurement
+    else {
+        if let crate::lifecycle::HostMeasurement::Unmeasurable { reason } = &measurement {
+            shared.log.write(
+                "warn",
+                "run.host_proof.unmeasurable",
+                &format!(
+                    "run {} step {step_id}: the operator-authorized measurement produced nothing \
+                     ({reason}); the recorded admission is presented unchanged and the admission \
+                     gate decides",
+                    instance.instance_id
+                ),
+            );
+        }
+        return false;
+    };
+    let presented = admission
+        .get("host_proof")
+        .and_then(|proof| proof.get("measured_at"))
+        .and_then(Val::as_str)
+        .and_then(time::unix_from_rfc3339);
+    let now = time::unix_now();
+    if presented.is_some_and(|measured_at_unix| {
+        crate::lifecycle::HostProof { measured_at_unix }.fresh_at(now)
+    }) {
+        // The recorded proof is still fresh: it is presented as recorded and
+        // no measurement is taken.
+        return false;
+    }
+    let measured_at = time::rfc3339_from_unix(measured_at_unix);
+    let superseded_at = presented
+        .map(time::rfc3339_from_unix)
+        .unwrap_or_else(|| "none".to_string());
+    let Some(bound) = admission_with_renewed_proof(&admission, &measured_at) else {
+        return false;
+    };
+    // The audit record comes first: an act that cannot be recorded is never
+    // presented.
+    let recorded = match shared.lock_state() {
+        Ok(state) => state.record_operator_host_proof_renewal(
+            &instance.instance_id,
+            key,
+            operator,
+            reason,
+            &superseded_at,
+            &measured_at,
+            available_bytes,
+        ),
+        Err(message) => Err(crate::state::StateError {
+            code: "state.unavailable",
+            message,
+        }),
+    };
+    if let Err(err) = recorded {
+        shared.log.write(
+            "error",
+            "run.host_proof.renewal_failed",
+            &format!(
+                "run {} step {step_id}: the operator-authorized measurement could not be recorded \
+                 ({err:?}); it is not presented",
+                instance.instance_id
+            ),
+        );
+        return false;
+    }
+    material.admission = Some(bound);
+    shared.log.write(
+        "info",
+        "run.host_proof.renewed_by_operator",
+        &format!(
+            "run {} produced a host-resource proof for step {step_id} on the recorded operator's \
+             behalf: superseded {superseded_at}, measured {measured_at} at dispatch time \
+             ({available_bytes} bytes available at the lane root)",
+            instance.instance_id
+        ),
+    );
+    true
 }
 
 /// The `hf-plan/v1` document one committed-spine dispatch binds (issue #92
@@ -2831,9 +3029,17 @@ fn method_apply_from(shared: &Arc<Shared>, request: &Request, supervised: bool) 
                 // consumes supervision's own bounded retry. A recorded
                 // refusal of the run's OWN lapsed window is not a step
                 // diagnosis (the step never ran), so a lapse burns nothing.
+                // Issue #241: an authorization the run already HOLDS — the
+                // operator's `run.retry` — is consumed by this dispatch, the
+                // re-dispatch it authorized, instead of refusing it
+                // `refusal.run.retry_pending`; a consumed authorization is
+                // spent exactly once (the row is single use).
                 automatic_retry = evidence.attempts.iter().any(|(step, status, code)| {
                     step == &parsed.step && crate::state::step_attempt_diagnosed(status, code)
-                });
+                }) || evidence
+                    .retries
+                    .iter()
+                    .any(|retry| retry.step_id == parsed.step && retry.consumed_at.is_empty());
                 Ok(crate::supervision::dispatch_intent(&row, &evidence)
                     .is_some_and(|intent| intent.step_id == parsed.step))
             })();
@@ -4406,6 +4612,7 @@ fn method_run_pause(shared: &Arc<Shared>, request: &Request) -> String {
             in_flight.as_deref(),
             Some(&row.resume_digest),
             last_failure.as_ref(),
+            None,
         ))
     })();
     match outcome {
@@ -4465,6 +4672,7 @@ fn method_run_resume(shared: &Arc<Shared>, request: &Request) -> String {
             in_flight.as_deref(),
             None,
             last_failure.as_ref(),
+            None,
         ))
     })();
     match outcome {
@@ -5383,6 +5591,7 @@ fn method_run_reevaluate(shared: &Arc<Shared>, request: &Request) -> String {
         &parsed.instance_id,
         &parsed.step,
         Some(step_params),
+        None,
     );
     let dispatch_request = Request {
         id: request.id.clone(),
@@ -5624,6 +5833,16 @@ fn run_dispatch(shared: &Arc<Shared>, request: &Request, reevaluation: Option<&s
             publish_route,
         )
     };
+    // Issue #256: a REVIEW round binds the head the recorded handoff's OWN
+    // repair leg delivered, when its lane checkout has advanced past the head
+    // the FAIL was handed at. The recorded dispatch context names the stale
+    // head (it never moves by itself), so without this read the round would
+    // re-review the same head forever while the delivered repair sits
+    // unreviewed. Read-only: the observation never writes, and a leg that did
+    // not move leaves every input exactly as it was.
+    if kind == crate::mutation::DELIVERY_STEP_KIND {
+        bind_delivered_review_head(shared, &parsed.instance_id, &mut material.feature_head);
+    }
     // Issue #243: the control that recomputes a recorded check is the RUN's own
     // act, exactly like the supervisor's continuation dispatch (issue #198), so
     // its inner re-dispatch presents a measurement taken at THIS dispatch when
@@ -5635,6 +5854,23 @@ fn run_dispatch(shared: &Arc<Shared>, request: &Request, reevaluation: Option<&s
     // re-evaluation ever takes this path.
     if reevaluation.is_some() {
         renew_host_proof_for_dispatch(shared, &mut material, &parsed.step, &parsed.idempotency_key);
+    }
+    // Issue #250: the audited operator's own measurement. A parked run's
+    // remedies used to name an `--admission FILE` no control could emit; when
+    // the caller presents the operator pair, the daemon measures the host at
+    // the run's lane root and binds the measurement as the proof this
+    // dispatch presents (recorded before it is presented, `host.proof.renewal.
+    // operator`). A host that cannot be measured produces nothing and the
+    // admission gate keeps refusing the recorded proof, typed.
+    if let (Some(operator), Some(reason)) = (&parsed.operator, &parsed.reason) {
+        operator_measured_proof(
+            shared,
+            &mut material,
+            &parsed.step,
+            &parsed.idempotency_key,
+            operator,
+            reason,
+        );
     }
     // Fail closed BEFORE anything is journaled or claimed: a request that is
     // not well-formed enough to be attempted refuses typed here, so the
@@ -5720,6 +5956,218 @@ fn run_dispatch(shared: &Arc<Shared>, request: &Request, reevaluation: Option<&s
     ok_response(&request.id, document)
 }
 
+/// Issue #250: the remedy decision for ONE parked run, derived read-only from
+/// the SAME durable facts each control's own gate reads.
+///
+/// The measured defect: a run parked by a refused dispatch named three
+/// remedies and NONE could be satisfied — the retry budget was spent, the
+/// re-evaluation does not address a diagnosed step, and the `--admission
+/// FILE` the dispatch asked for was emitted by no control. An operator had to
+/// try all three to discover that the run was immovable. This computes the
+/// decision the operator should have been told: the ONE control that applies,
+/// or the terminal typed escalation. Nothing is claimed, measured or written.
+fn remedy_for_run(state: &crate::state::State, run: &crate::state::InstanceRow) -> Option<Val> {
+    // Issue #250: a run can be parked by a dispatch that left NO attempt row
+    // (the fan-out admission gate refuses before any intent is journaled,
+    // issue #141), so the park is read from the recorded admission itself when
+    // the ledger names nothing — the same facts the gate reads, and only when
+    // the gate would really decide that dispatch.
+    let (step, code, diagnosed) = match state.run_step_failure(&run.instance_id).ok().flatten() {
+        Some(failure) => {
+            // The diagnosis is the SAME fact the bounded-retry fence reads:
+            // the step's newest recorded attempt is its own failure, never the
+            // run's lapsed window.
+            let diagnosed = state
+                .run_step_diagnosed(&run.instance_id, &failure.step)
+                .unwrap_or(false);
+            (failure.step.clone(), failure.code.clone(), diagnosed)
+        }
+        None => {
+            let (step, code) = recorded_proof_park(state, run)?;
+            (step, code, false)
+        }
+    };
+    let proof = code == crate::lifecycle::code::PROOF_STALE
+        || code == crate::lifecycle::code::PROOF_MISSING;
+    // Only a proof park turns on "can a proof be produced"; elsewhere the
+    // question is moot and the answer is never consulted.
+    let proof_producible = if proof {
+        state
+            .run_dispatch_context(&run.instance_id)
+            .ok()
+            .flatten()
+            .is_some_and(|context| {
+                let has_admission = context.admission.is_some();
+                let lane_root = context.topology.get("worktrees_root").and_then(Val::as_str);
+                has_admission
+                    && lane_root.is_some_and(|root| {
+                        matches!(
+                            measure_host(&PathBuf::from(root)),
+                            crate::lifecycle::HostMeasurement::Measured { .. }
+                        )
+                    })
+            })
+    } else {
+        false
+    };
+    let retries = state.run_retries(&run.instance_id).ok()?;
+    let retries_consumed = retries
+        .iter()
+        .filter(|row| row.step_id == step && !row.consumed_at.is_empty())
+        .count() as i64;
+    let retry_held = retries
+        .iter()
+        .any(|row| row.step_id == step && row.consumed_at.is_empty());
+    let reevaluation_applies = reevaluation_applies_to(state, run, &step);
+    Some(crate::run_control::remedy_doc(
+        &crate::run_control::RemedyFacts {
+            run: run.instance_id.clone(),
+            step,
+            code,
+            diagnosed,
+            retries_consumed,
+            retry_held,
+            reevaluation_applies,
+            proof_producible,
+        },
+    ))
+}
+
+/// Issue #250: the park a run carries when NO attempt row names it — the
+/// fan-out admission gate refuses BEFORE any intent is journaled (issue #141),
+/// so a run whose dispatch was refused for its own recorded admission has
+/// nothing for `run_step_failure` to read, while the refusal's own text points
+/// the operator at `run status` for the ONE control that applies.
+///
+/// The decision is derived from the SAME durable facts the gate itself reads:
+/// the run's frontier step, and only when its kind is one the gate DECIDES
+/// (the fan-out kinds, and a self-dispatching review step), plus the recorded
+/// dispatch context's admission and whether its proof is really past the
+/// freshness bound the gate applies. `None` whenever the run is not parked
+/// that way — a step the gate never decides, a fresh proof, a run with no
+/// recorded admission to bind a measurement into, or a read that cannot
+/// answer. Nothing is measured, claimed or written here.
+fn recorded_proof_park(
+    state: &crate::state::State,
+    run: &crate::state::InstanceRow,
+) -> Option<(String, String)> {
+    let spine = state.run_step_spine(&run.instance_id).ok().flatten()?;
+    let attempts = state.run_step_attempts(&run.instance_id).ok()?;
+    let frontier = crate::run_control::frontier_of(&spine, &attempts, &run.current_node)?;
+    let documents = state.run_step_documents(&run.instance_id).ok().flatten()?;
+    let step = documents
+        .iter()
+        .find(|document| document.get("id").and_then(Val::as_str) == Some(frontier.as_str()))?;
+    let kind = crate::mutation::step_kind(step).ok()?;
+    let decided = matches!(kind.as_str(), "harness_start" | "prompt")
+        || (kind == "review_evidence"
+            && step
+                .get("params")
+                .is_some_and(|params| crate::mutation::declares_reviewer_leg(Some(params))));
+    if !decided {
+        return None;
+    }
+    // The context must carry the admission the gate would decide the NEXT
+    // dispatch of that step on: without one there is nothing to bind a
+    // measurement into, and the absent proof is never invented here. The proof
+    // instant is read the SAME way the gate's own parser reads it
+    // (`flags.admission.host_proof.measured_at`, RFC3339).
+    let context = state
+        .run_dispatch_context(&run.instance_id)
+        .ok()
+        .flatten()?;
+    let admission = context.admission?;
+    let measured_at = admission
+        .get("host_proof")
+        .and_then(|proof| proof.get("measured_at"))
+        .and_then(Val::as_str)
+        .and_then(crate::time::unix_from_rfc3339);
+    let fresh = measured_at.is_some_and(|measured_at_unix| {
+        crate::lifecycle::HostProof { measured_at_unix }.fresh_at(crate::time::unix_now())
+    });
+    if fresh {
+        return None;
+    }
+    // The same two codes the gate's own proof precondition returns.
+    let code = if measured_at.is_some() {
+        crate::lifecycle::code::PROOF_STALE
+    } else {
+        crate::lifecycle::code::PROOF_MISSING
+    };
+    Some((frontier, code.to_string()))
+}
+
+/// Whether `run.reevaluate` would be accepted for this (run, step) — the
+/// SAME facts its own gate reads (`reevaluation_plan` over the recorded
+/// attempt, the declared reviewer leg, the newest evidence's non-passing
+/// checks and the recorded re-evaluations). A read that cannot answer is
+/// `false`: the decision then refuses rather than naming a control that would
+/// itself refuse.
+fn reevaluation_applies_to(
+    state: &crate::state::State,
+    run: &crate::state::InstanceRow,
+    step: &str,
+) -> bool {
+    let Ok(documents) = state.run_step_documents(&run.instance_id) else {
+        return false;
+    };
+    let documents = documents.unwrap_or_default();
+    let declared = documents
+        .iter()
+        .find(|document| document.get("id").and_then(Val::as_str) == Some(step));
+    let kind = declared
+        .and_then(|document| crate::mutation::step_kind(document).ok())
+        .unwrap_or_default();
+    let leg = declared
+        .and_then(|document| document.get("params"))
+        .is_some_and(|params| crate::mutation::declares_reviewer_leg(Some(params)));
+    let Ok(attempts) = state.run_step_attempts(&run.instance_id) else {
+        return false;
+    };
+    let latest = attempts
+        .iter()
+        .rfind(|(id, _)| id == step)
+        .map(|(_, status)| status.clone());
+    let successes = attempts
+        .iter()
+        .filter(|(id, status)| id == step && status == "succeeded")
+        .count() as i64;
+    let failing = state
+        .evidence_for_instance(&run.instance_id)
+        .ok()
+        .and_then(|rows| rows.into_iter().next())
+        .map(|row| {
+            crate::mutation::non_passing_checks(&crate::mutation::EvidenceView {
+                evidence_id: row.evidence_id.clone(),
+                feature_head: row.feature_head.clone(),
+                integration_base: row.integration_base.clone(),
+                workflow_hash: row.workflow_hash.clone(),
+                policy_hash: row.policy_hash.clone(),
+                verdict: row.verdict.clone(),
+                reviewer: row.reviewer.clone(),
+                checks: row.checks.clone(),
+                created_at: row.created_at.clone(),
+            })
+        })
+        .transpose()
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let recorded = state
+        .run_reevaluations(&run.instance_id, step)
+        .map(|rows| rows.len() as i64)
+        .unwrap_or(0);
+    crate::run_control::reevaluation_plan(
+        &kind,
+        leg,
+        latest.as_deref(),
+        &failing,
+        recorded,
+        successes,
+    )
+    .is_ok()
+}
+
 /// `run.status`: read the control state of exactly one run back read-only —
 /// `pause_requested` (the request is durable, in-flight work still runs)
 /// versus `paused` (the safe boundary has been reached) versus `active`,
@@ -5755,6 +6203,12 @@ fn method_run_status(shared: &Arc<Shared>, request: &Request) -> String {
                     Ok(failure) => failure,
                     Err(err) => return err_response(&request.id, err.code, err.message),
                 };
+                // Issue #250: the remedy decision — the ONE control that
+                // applies to the parked step, or the terminal typed
+                // escalation. Derived from the same durable facts each
+                // control's own gate reads (read-only; nothing is measured
+                // into durable state, claimed or dispatched).
+                let remedy = remedy_for_run(&state, &row);
                 ok_response(
                     &request.id,
                     crate::run_control::control_doc(
@@ -5762,6 +6216,7 @@ fn method_run_status(shared: &Arc<Shared>, request: &Request) -> String {
                         in_flight.as_deref(),
                         digest.as_deref(),
                         last_failure.as_ref(),
+                        remedy.as_ref(),
                     ),
                 )
             }
@@ -5831,6 +6286,14 @@ fn method_supervision_status(shared: &Arc<Shared>, request: &Request) -> String 
                 check_interval_secs: row.check_interval_secs,
                 progress_timeout_secs: row.progress_timeout_secs,
             };
+            // Issue #256: the recorded handoff's OWN lane checkout is the root
+            // the repair leg's delivered head is read from. The read is taken
+            // AFTER the state guard is released, so a status read never holds
+            // the state across a host read.
+            let worktrees_root = crate::supervision::recorded_worktrees_root(&state, &instance_id);
+            drop(state);
+            let mut evidence = evidence;
+            crate::supervision::observe_fix_leg(&mut evidence, worktrees_root.as_deref());
             let verdict = crate::supervision::classify(
                 &evidence,
                 &row.authorization_digest,

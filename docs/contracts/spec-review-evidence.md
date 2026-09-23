@@ -298,14 +298,38 @@ positively and negatively:
   keyed by the certified head. A re-dispatch of the SAME review attempt
   therefore REUSES the round that head was already handed to (the leg is never
   re-prompted and the bound is never burnt twice), while a MOVED head opens the
-  next round of the same budget.
+  next round of the same budget. The record also names the leg's OWN lane
+  checkout (`worktree`, the lane the leg was created or verified at, issue
+  #256): the head a handoff was dispatched for can never move by itself, so the
+  leg's own checkout is the recorded state a classification reads to tell a
+  repair leg that is still working from one that has DELIVERED — and a handoff
+  that names no checkout (a record written before this slice) observes nothing
+  and keeps its recorded disposition.
 
 `supervision status` reports the handoff's recorded disposition instead of a
 bare FAIL: `supervision.fix_round_dispatched` (class `waiting-workers`, detail:
-the fix leg's lane) while the repair leg works, `supervision.fix_round_refused`
+the fix leg's lane) while the repair leg works — the leg's OWN checkout is read
+for this, so a leg that has already delivered a descendant head is never
+reported as work in flight (issue #256, `supervision.fix_round_head_moved`
+below) — `supervision.fix_round_refused`
 with the fix round's OWN engine code as detail when the handoff was refused,
-and `supervision.fix_rounds_exhausted` when the budget is spent. `run status`
+and `supervision.fix_rounds_exhausted` when the budget is spent. The handoff is
+read from the review step's own apply row — the response document the daemon
+persists (`result.fix_round`), with the `outcome` column read beside it (issue
+#254) — and its `hf-fix-round/v1` validation is unchanged. `run status`
 carries the same code, because the refusal IS the review step's recorded
-outcome (`last_failure`). A FAIL recorded before this handoff existed — or by a
-plan that presents its own review facts and dispatches no leg — keeps
+outcome (`last_failure`). A handoff recorded at a head the run's newest
+recorded review evidence does NOT name is its own fix-round disposition —
+`supervision.fix_round_head_moved` (class `needs-attention`), whose detail
+names the fix leg's recorded lane and both head prefixes — never a bare
+`supervision.review_failed`; and the run's own bounded check re-evaluation is
+driven for the recorded FAIL as well (the same control, the same per-`(run,
+step)` bound, at the recorded head), so a FAIL-then-fix sequence continues
+instead of parking on the FAIL. A handoff whose leg DELIVERED a descendant head
+in its own lane checkout (issue #256) reports the same class and reason, with
+the certified and the delivered head prefixes; the same read binds the next
+review round to the delivered head, and the head a handoff was DISPATCHED for is
+never mistaken for the head the leg delivered. A FAIL recorded before this
+handoff existed —
+or by a plan that presents its own review facts and dispatches no leg — keeps
 `supervision.review_failed` with the review step named as its detail.

@@ -457,9 +457,14 @@ clears a repository/fleet-level hold or bypasses a gate.
   already exists (`refusal.run.retry_pending`) and an exhausted attempt
   bound (`refusal.run.retry_bound`, three bounded retries per step). On
   success it records ONE single-use authorization (`run_retries`) and
-  NOTHING else: the retry dispatches no step, spawns nothing and consumes
-  no authorization — the authorized re-dispatch belongs to the operator,
-  who supplies the corrected step inputs (see `run.dispatch`). A
+  NOTHING else: the request dispatches no step and spawns nothing. The
+  authorization is consumed by the ONE re-dispatch of that exact step — the
+  run's own armed supervision performs it (issue #241: the held authorization
+  is spent by the very re-dispatch it authorizes, recorded under that
+  dispatch's journaled idempotency key, and a consumed authorization is never
+  spent twice), or the operator's own `run.dispatch` consumes it when it
+  arrives first, which is also how corrected step inputs are presented (see
+  `run.dispatch`). A
   re-dispatch of a diagnosed failed step without an unconsumed
   authorization refuses `refusal.run.retry_required` before any effect.
 - `run.reevaluate` (issue #230) requires `params.instance_id`,
@@ -530,7 +535,11 @@ clears a repository/fleet-level hold or bypasses a gate.
   genuinely live: a step-dispatch claim still in flight
   (`refusal.run.in_flight` — nothing is killed, cancelled or cleaned up),
   an unconsumed bounded retry authorization (`refusal.run.retry_pending` —
-  the authorization is never burned) and an unknown run (`state.not_found`).
+  the authorization is never burned by a release, and the refusal names the
+  remedy precisely: the authorization is spent by the ONE re-dispatch of that
+  exact step, which the run's own armed supervision performs at its next
+  check, or `run dispatch` of that step consumes it) and an unknown run
+  (`state.not_found`).
   Terminal runs (`done` or `invalidated`) can release leftover ownership.
   The same idempotency key replays the recorded response; a fresh key records
   an audited ownership-absent no-op if ownership is already freed.
@@ -634,7 +643,20 @@ clears a repository/fleet-level hold or bypasses a gate.
   newest recorded NON-succeeded step attempt with its raw message (`step`,
   `status`, `code`, `message`; `null` when the run has no standing failure) —
   issue #219: the frontier's diagnosis is readable WITH its reason, not as a
-  bare code.
+  bare code. The `evaluation` block also carries `retry`: the frontier step's
+  own bounded-retry disposition, read from the same durable rows the engine's
+  fence reads — `state` is `none` (no recorded non-success diagnosis),
+  `awaiting-authorization` (diagnosed, nothing authorized, and the driver
+  derives no dispatch: an operator authorization is the act that authorizes
+  one), `authorized-awaiting-dispatch` (the run HOLDS an unconsumed `run.retry`
+  authorization for that exact step: it is spent by the ONE re-dispatch it
+  authorizes — issue #241), `driver-dispatch` (no authorization is held yet:
+  supervision mints and consumes its own on the check), or `exhausted` (the
+  shared bounded budget is spent, the typed escalation of issue #241 AC2) —
+  with `step`, `consumed` and `bound`. A continuation the engine REFUSED is
+  still named separately (`evaluation.refusal`), so `awaiting an operator
+  authorization`, `authorized, awaiting dispatch` and `dispatch refused:
+  <code>` are three distinct reads.
 - A run with NO recorded progress observation yet (a fresh arm: `progress_at`
   empty, or an unreadable instant) is **held** — class `unknown`, reason
   `supervision.progress_unobserved`, `eligible:false` — never eligible: an
@@ -668,10 +690,23 @@ clears a repository/fleet-level hold or bypasses a gate.
   by `queue submit --supervise arm --topology FILE`; later derived heads and
   session identities come only from the run's recorded apply outcomes. None
   is invented. A
-  DIAGNOSED step (a recorded non-success) is never re-dispatched by the
-  driver, with or without a pending `run.retry` authorization: re-dispatching
-  it means carrying the operator's CORRECTED step params, which the driver
-  does not hold — the operator's own `run.dispatch` owns it. A fan-out step
+  DIAGNOSED step (a recorded non-success) is re-dispatched by the driver only
+  within the shared bounded retry budget (issue #179), and that re-dispatch
+  presents the committed step's OWN params; the retry it spends is minted and
+  consumed atomically through the apply path. The diagnoses a re-dispatch can
+  never repair — `effect.worker_timeout`, `refusal.evidence.verdict_stale`,
+  `refusal.delivery.moved` / `refusal.delivery.unbound` — stay parked with
+  their bounded retries UNSPENT. An authorization the run already HOLDS (a
+  `run.retry` row, issue #241) is consumed by that very re-dispatch, exactly
+  once, recorded under the dispatch's own journaled idempotency key: the
+  driver dispatches it, so a held authorization never parks the frontier and
+  never makes a run unreleasable. The ONE exception is the risk-classed
+  committed TAIL (`merge` / `cleanup`), which keeps issue #152's rule
+  verbatim: an ATTEMPTED tail stays the operator's, and a held authorization
+  over it is spent by that operator's own `run.dispatch` — which is also how
+  corrected step inputs are presented, and which consumes the authorization
+  when it arrives before the driver's next check (it is the only consumer for
+  a run that is not armed). A fan-out step
   still needs the submission-presented
   admission inputs: supervision re-presents the run's committed caps and
   occupancy and, when the run's own recorded proof has LAPSED, presents a
@@ -802,36 +837,83 @@ clears a repository/fleet-level hold or bypasses a gate.
   that has already run and diagnosed a concrete failure or refusal — the
   measured #147 prompt, whose outcome says nothing was delivered — is never
   reported as `waiting-workers`/`waiting-CI`/`waiting-approval`: nothing is
-  in flight, the driver never re-dispatches a diagnosed step, and a wait for
+  in flight, and a wait for
   workers that are not running is exactly the lie that parked that run. The
-  driver fence is unchanged (a diagnosed step is still never re-dispatched,
-  with or without a pending `run.retry` authorization), and a step with NO
+  driver fence is unchanged in what it refuses: a diagnosed step whose
+  recorded code is one a re-dispatch can never repair, or whose bounded budget
+  is spent, is never re-dispatched — while an authorization the run already
+  holds is consumed by the re-dispatch it authorizes (issue #241), so a
+  diagnosed frontier is reported with its own code as the detail and is never
+  presented as eligible. A step with NO
   recorded attempt keeps its own rules: the driver still dispatches a
   never-attempted autonomous step, and the refusal-before-any-effect case
-  keeps `supervision.dispatch_refused` above.
+  keeps `supervision.dispatch_refused` above. The frontier's own retry
+  disposition is read back separately in `evaluation.retry` (below).
 - **Fix-round handoff (issue #238)**: a recorded review FAIL is handed to the
   run's own fix round by the review step itself, and the classification reports
   the handoff's recorded disposition instead of parking on the FAIL. The
-  handoff's record is the review step's own outcome (the round, the automatic
+  handoff's record is the review step's own apply row (the round, the automatic
   bound and the fix leg's lane), read back with the same material the
-  classification already reads:
+  classification already reads — from the RESPONSE document the daemon
+  persists (`hf-rpc-response/v1`, `result.fix_round`), with the `outcome`
+  column read beside it (issue #254) and its `hf-fix-round/v1` validation
+  unchanged:
   - the handoff was DISPATCHED for the newest verdict's head — class
     `waiting-workers`, reason `supervision.fix_round_dispatched`, the fix leg's
     lane as the detail, `eligible:false` (the repair leg is work in flight, not
-    completion);
+    completion). The wait keeps this meaning only while the repair leg's OWN
+    lane checkout has not advanced: the leg's own state is what tells a leg
+    that is still working from one that has DELIVERED (issue #256);
   - the handoff was REFUSED, or its budget is spent — class
     `needs-attention`, reason `supervision.fix_round_refused` /
     `supervision.fix_rounds_exhausted`, the fix round's OWN engine code
     (`refusal.fix.spawn` / `refusal.fix.prompt` / `refusal.fix.lane` /
     `refusal.fix.bound_exhausted`) as the detail, `eligible:false`. The refusal
     is the review step's recorded outcome, so `run status` names the same code;
+  - the newest recorded handoff names ANOTHER head than the newest recorded
+    review evidence (issue #254: the repair leg advanced the branch past the
+    head the FAIL was handed at) — class `needs-attention`, reason
+    `supervision.fix_round_head_moved`, the fix leg's recorded lane as the
+    detail followed by both head prefixes, `eligible:false`. The recorded round
+    is not this evidence's handoff, so the movement is named instead of
+    discarded: still the fix-round disposition, never a bare
+    `supervision.review_failed`;
+  - the handoff's OWN repair leg has DELIVERED a head past the one the FAIL was
+    handed at (issue #256) — the SAME class and reason
+    (`needs-attention` / `supervision.fix_round_head_moved`), the fix leg's
+    recorded lane as the detail followed by both head prefixes (the head the
+    verdict certified and the head the leg's own checkout holds),
+    `eligible:false`. The disposition is derived from the repair leg's OWN
+    recorded state, never from the head the FAIL was handed at: the engine's
+    `hf-fix-round/v1` record names the leg's own lane checkout (`worktree`,
+    recorded where the leg was created or verified) and the classification
+    reads THAT checkout's head — bounded `git`, allowlisted environment,
+    read-only, outside the state guard — where a head DESCENDING the certified
+    head is the delivery itself. Nothing is inferred: a leg whose own checkout
+    has not advanced, a handoff that names no lane, and every read that cannot
+    be taken are all "no movement", and the recorded disposition stands
+    unchanged;
+  - the same read binds the next review round (issue #256): a dispatch of the
+    run's review step presents the DELIVERED head as the observed head when the
+    recorded handoff's leg delivered a descendant one, so the reviewer leg's
+    derived checkout materializes the delivered commit (the reviewer lane's own
+    creation/verification, unchanged) instead of re-reviewing the head whose
+    check can never flip. The run's own delivery-certification gate (issue
+    #202, `refusal.delivery.unbound`) is untouched: a head the run's own
+    collection has never certified is still never consumed, so the delivered
+    head still has to be certified by that collection before a step consumes it
+    (the gate's own message names exactly that precondition);
   - a FAIL whose review step recorded no fix round at all — a plan that
     presents its own review facts, or a run recorded before this handoff
     existed — keeps `supervision.review_failed`, now with the review step as
     its detail instead of an empty one.
   A fix-round record naming ANOTHER head is never this FAIL's handoff (the
   certified head moved past it), so the rule is keyed to the head the verdict
-  names, never to the newest row.
+  names, never to the newest row — and the driver's own recovery-control
+  derivation reads the recorded FAIL too (issue #254): when the run's newest
+  recorded review evidence carries a non-passing check and its check producer
+  already succeeded, the run's own bounded re-evaluation is driven at the
+  recorded head instead of the run parking on the FAIL.
 - **Refused continuation dispatch (issue #141)**: when the engine refuses the
   driver's continuation of the frontier step BEFORE its claim (a fan-out
   admission refusal such as `refusal.admission.proof_stale`, a derived

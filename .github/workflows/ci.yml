@@ -347,6 +347,8 @@ jobs:
           "--test profile_binding",
           "--test queue_advance",
           "--test queue_cli",
+          "--test queue_intake",
+          "--test queue_intake_surface",
           "--test queue_preview",
           "--test queue_submit",
           "--test redact_scale",

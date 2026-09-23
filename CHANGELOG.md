@@ -6,6 +6,23 @@ release process activates (docs/RELEASING.md), then semver applies.
 
 ## [Unreleased]
 
+### Added (issue #245 — `queue intake`, the deterministic feeder)
+
+- `canter queue intake` turns the repository's own issue state into ONE
+  bound-input submission by rule: the open issues carrying the ready label
+  (default `canter:ready`) are selected in ascending issue-number order, each
+  revision resolves by the documented rule (a tracker-declared `--pin N=HEX40`
+  wins; otherwise the repository's integration head at intake time, read from
+  the remote), an issue already owned or queued is never re-submitted
+  (`intake.owned`), items beyond the declared `--max-items` bound wait
+  (`intake.cap`) instead of bypassing admission, and an unresolvable revision
+  refuses typed (`refusal.intake.revision`) without submitting anything.
+  `--dry-run` prints the exact decision and mutates nothing; `--json` names the
+  selected issues, revisions, caps, digest and each item's status. The rendered
+  document, the per-item grants and the submission are the SAME surfaces the
+  operator path uses (`queue preview` → `grant issue` → `queue submit`).
+  Contract: `docs/contracts/spec-intake.md`.
+
 ### Added (bootstrap)
 
 - Public repository foundation for canter (issue #2):
@@ -887,8 +904,46 @@ release process activates (docs/RELEASING.md), then semver applies.
   helpers, so the two routes cannot drift. Real-daemon witnesses in
   `tests/mutation_engine.rs`.
 
+### Fixed (issue #101 — one clock read per audit record)
+
+- `append_audit_locked` binds ONE instant per record: the value is handed to
+  the append at the call boundary (`append_audit_at_locked`) and the SAME
+  value builds the hash-chained canonical `line` and the persisted `at`
+  column. Two reads could straddle a wall-clock second boundary and leave a
+  row whose own columns disagreed with its hashed line, so the next open's
+  chain verification refused it (`state.audit_tampered` / "column/line
+  mismatch") on a loaded host. The regression test drives the call-boundary
+  seam with an instant far from any wall-clock read — a re-introduced second
+  read disagrees with it and is RED — and the production entry point is
+  asserted against the same column/line invariant plus the reopen check
+  (`src/state.rs`).
+
 ### Changed
 
+- An authorized bounded retry is consumed by the run's own supervision
+  (issue #241). `run retry` records the single-use authorization; the very
+  re-dispatch it authorizes now spends it — the armed driver derives the
+  continuation of that exact diagnosed step (including the ambiguous effects
+  and worker/review timeouts the class vocabulary names) and the daemon's
+  supervised apply path consumes the HELD row with the dispatch's own
+  journaled idempotency key, instead of refusing it `refusal.run.retry_pending`
+  and parking the frontier until an operator dispatched by hand. The
+  consumption is exactly once (a second attempt still needs its own
+  authorization), the bounded budget is unchanged (a spent bound parks typed),
+  a re-dispatch without an authorization still refuses
+  `refusal.run.retry_required` before any effect, and `run release` still
+  never burns an authorization — its refusal now names the remedy precisely.
+  `supervision status` reads the frontier's retry disposition back
+  (`evaluation.retry`: `awaiting-authorization` / `authorized-awaiting-dispatch`
+  / `driver-dispatch` / `exhausted`), so "awaiting an operator authorization",
+  "authorized, awaiting dispatch" and a refused continuation are three
+  distinct reads. The ONE exception is the risk-classed committed TAIL
+  (`merge` / `cleanup`): an ATTEMPTED tail keeps issue #152's rule (it stays
+  the operator's) and a held authorization over it is consumed by the
+  operator's own `run dispatch`. The operator's own corrected `run dispatch`
+  still consumes
+  the authorization when it arrives first (and is the only consumer for a run
+  whose supervision is not armed).
 - The bounded check re-evaluation is reachable in the exact case it exists
   for (issue #243). `run reevaluate` re-dispatches the run's own check
   producer, so its inner dispatch is a fan-out like any other: the control
@@ -943,6 +998,44 @@ release process activates (docs/RELEASING.md), then semver applies.
   one leg — a genuinely foreign checkout (the run's own lane, a sibling leg's,
   another issue's) is never reinterpreted and is refused typed exactly as
   before, and the bare-subprocess fallback keeps its byte-for-byte binding.
+- The recorded fix-round handoff is read where the daemon persists it, and the
+  run drives its own bounded check re-evaluation for a recorded FAIL (issue
+  #255 / #254) — and the disposition it reports is derived from the repair
+  leg's OWN recorded state, never from the head the FAIL was handed at (issue
+  #256). The head a handoff is DISPATCHED for is a recorded fact and can never
+  move by itself; the leg advances the branch in its OWN lane checkout, so the
+  engine's `hf-fix-round/v1` record now names that checkout (`worktree`: the
+  lane the leg was created or verified at) and the daemon reads THAT checkout's
+  head when it classifies the run — a bounded, allowlisted, READ-ONLY `git`
+  read taken outside the state guard. A head that DESCENDS the certified head
+  means the leg delivered, and the disposition says so instead of reporting a
+  dispatched leg as work in flight. A leg whose own checkout has not advanced
+  keeps `waiting-workers` / `supervision.fix_round_dispatched` unchanged, and
+  every read that cannot be taken leaves the recorded disposition exactly as it
+  was. The same read binds the next review round: a review dispatch of a run
+  whose handoff leg delivered a descendant head presents THAT head as the
+  observed head, so the reviewer leg's derived checkout materializes the
+  delivered commit instead of re-reviewing a head whose check can never flip.
+  The run's own delivery-certification gate (issue #202) is untouched: a head
+  the run's own collection has not certified is still never consumed.
+- The recorded FAIL handoff is read from where the daemon ACTUALLY persists it
+  (issue #254), so a review FAIL reports its fix-round disposition instead of
+  parking with no remedy. The review step's own apply row keeps the effect's
+  returned document in its RESPONSE column (`hf-rpc-response/v1`,
+  `result.fix_round`) while `outcome.result` is `null` — the supervision
+  evidence loader read only the outcome column, so `evidence.fix_round` was
+  `None` in production and the classifier fell through to a bare
+  `supervision.review_failed`. The loader now reads the response document
+  (the same way the other recorded read models read a dispatch's own result)
+  with its validation unchanged (`hf-fix-round/v1` plus the four named fields;
+  the outcome shape stays readable beside it). A handoff recorded at another
+  head than the run's newest recorded review evidence is no longer silent
+  either: it is reported as the fix-round disposition
+  `supervision.fix_round_head_moved` (class `needs-attention`), whose detail
+  names the remedy — the fix leg's recorded lane — and both head prefixes.
+  The driver drives the run's own bounded check re-evaluation for the recorded
+  FAIL as well (the same control, the same per-`(run, step)` bound), so a
+  FAIL-then-fix sequence is not parked on the fail.
 
 ### Security
 

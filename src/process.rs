@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
 /// How a child process ended.
@@ -38,6 +39,24 @@ impl ProcStatus {
         match self {
             ProcStatus::Exit(code) => Some(*code),
             _ => None,
+        }
+    }
+
+    /// How the process ended, with the program and the argv **as recorded**
+    /// (`[program, args..]`): a refusal that reports a failed read must name
+    /// its cause — the status, the program and the exact argv — instead of
+    /// quoting the captured payload (issue #258, AC2).
+    pub fn describe(&self, program: &str, args: &[String]) -> String {
+        let argv: Vec<&str> = std::iter::once(program)
+            .chain(args.iter().map(String::as_str))
+            .collect();
+        let argv = argv.join(" ");
+        match self {
+            ProcStatus::Exit(code) => format!("{argv} exited with code {code}"),
+            ProcStatus::TimedOut => {
+                format!("{argv} was killed when its deadline expired (no exit status was recorded)")
+            }
+            ProcStatus::SpawnFailed(err) => format!("{argv} could not be spawned: {err}"),
         }
     }
 }
@@ -69,6 +88,26 @@ pub struct ProcOut {
     pub elapsed_ms: u64,
 }
 
+impl ProcOut {
+    /// The diagnosable cause of one failed read: how the process ended with
+    /// the program and argv as recorded, plus the first non-empty stderr
+    /// line (redacted and bounded). Never the captured payload — a refusal
+    /// that quotes stdout cannot be told from a success (issue #258, AC2).
+    pub fn failure_detail(&self, program: &str, args: &[String]) -> String {
+        let stderr_line = self
+            .stderr
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("(no stderr)");
+        format!(
+            "{}; first stderr line: {}",
+            crate::redact::redact(&self.status.describe(program, args)),
+            crate::observe::diagnostics(stderr_line)
+        )
+    }
+}
+
 /// Run one bounded subprocess invocation (see module docs for the bounds).
 pub fn run(spec: ProcSpec<'_>) -> ProcOut {
     let started = Instant::now();
@@ -96,6 +135,14 @@ pub fn run(spec: ProcSpec<'_>) -> ProcOut {
         }
     };
 
+    // Drain both pipes WHILE the child runs. Reading only after the child
+    // exits deadlocks on any output larger than the pipe buffer (the child
+    // blocks on write, the deadline expires, and a complete result is killed
+    // and misreported as a failure — issue #258, the intake path's first live
+    // use: 246 KB of issue JSON against a 64 KB pipe).
+    let stdout_reader = drain(child.stdout.take());
+    let stderr_reader = drain(child.stderr.take());
+
     let status = loop {
         if started.elapsed() >= spec.timeout {
             let _ = child.kill();
@@ -115,14 +162,8 @@ pub fn run(spec: ProcSpec<'_>) -> ProcOut {
         }
     };
 
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        let _ = pipe.read_to_string(&mut stdout);
-    }
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.read_to_string(&mut stderr);
-    }
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
     let _ = child.wait();
 
     let timed_out = started.elapsed() >= spec.timeout;
@@ -144,6 +185,18 @@ pub fn run(spec: ProcSpec<'_>) -> ProcOut {
 
 fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+/// Read one captured pipe to its end on its own thread (lossy UTF-8), so the
+/// parent never blocks the child on a full pipe buffer.
+fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> thread::JoinHandle<String> {
+    thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_string(&mut text);
+        }
+        text
+    })
 }
 
 #[cfg(test)]
@@ -215,6 +268,21 @@ mod tests {
             timeout: Duration::from_secs(10),
         });
         assert_eq!(out.stdout, "unset", "host env must not reach the child");
+    }
+
+    #[test]
+    fn output_larger_than_the_pipe_buffer_is_read_in_full() {
+        // Issue #258: a child whose output exceeds the pipe buffer must not
+        // deadlock (the deadline then killed a complete, valid result).
+        let out = run(ProcSpec {
+            program: "sh",
+            args: &args(&["-c", "yes x | head -c 200000"]),
+            env: &env(),
+            cwd: None,
+            timeout: Duration::from_secs(20),
+        });
+        assert_eq!(out.status.exit_code(), Some(0));
+        assert_eq!(out.stdout.len(), 200_000);
     }
 
     #[test]

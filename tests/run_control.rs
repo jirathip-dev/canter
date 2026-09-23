@@ -2875,6 +2875,87 @@ fn reevaluation_records(
     state.run_reevaluations(run, step).expect("journal read")
 }
 
+/// Seed ONE succeeded `review_evidence` attempt whose recorded RESPONSE carries
+/// a recorded FAIL handoff — the LIVE row shape of issue #254: the effect's
+/// facts (`feature_head`, `verdict`, `fix_round`) are in the response document
+/// (`hf-rpc-response/v1`) while `outcome.result` is null. The row IS the
+/// review step's own attempt (`succeeded`), exactly as the daemon wrote it for
+/// the reported acceptance run, so an attempt read and a handoff read see the
+/// same record.
+fn seed_fix_round_response(
+    state: &State,
+    run: &str,
+    step: &str,
+    key: &str,
+    fix: (&str, &str, i64, i64),
+    worktree: &str,
+) {
+    let (head, lane, round, bound) = fix;
+    let line = canonical_text(&object(vec![
+        ("schema", string("hf-rpc-request/v1")),
+        ("id", string(&fresh_id(51))),
+        ("method", string("apply")),
+        (
+            "params",
+            object(vec![
+                ("idempotency_key", string(key)),
+                ("instance_id", string(run)),
+                ("step", string(step)),
+            ]),
+        ),
+    ]));
+    let request_id = fresh_id(52);
+    state
+        .journal_intent(
+            "mutate.review_evidence",
+            &format!("{REPO}:{run}:{step}"),
+            key,
+            &request_id,
+            "apply",
+            None,
+            None,
+            &line,
+        )
+        .expect("claim the fix-round attempt");
+    let outcome_line = canonical_text(&object(vec![
+        ("schema", string("hf-outcome/v1")),
+        ("plan_id", string("hf_plan_0000000000000000")),
+        ("step_id", string(step)),
+        ("status", string("succeeded")),
+        ("idempotency_key", string(key)),
+        ("observed_at", string(AT)),
+        ("result", Val::Null),
+        ("error", Val::Null),
+    ]));
+    let response_line = canonical_text(&object(vec![
+        ("ok", Val::Bool(true)),
+        (
+            "result",
+            object(vec![
+                ("feature_head", string(head)),
+                ("verdict", string("fail")),
+                (
+                    "fix_round",
+                    object(vec![
+                        ("schema", string("hf-fix-round/v1")),
+                        ("round", integer(round)),
+                        ("bound", integer(bound)),
+                        ("feature_head", string(head)),
+                        ("lane", string(lane)),
+                        // Issue #256: the repair leg's OWN lane checkout, written
+                        // the way the engine writes it ('' when the recorded
+                        // handoff names none).
+                        ("worktree", string(worktree)),
+                    ]),
+                ),
+            ]),
+        ),
+    ]));
+    state
+        .resolve_claim(key, "apply", "spent", &outcome_line, Some(&response_line))
+        .expect("resolve the fix-round attempt");
+}
+
 /// Every `host.proof.renewal` line of the fixture's durable journal, parsed.
 fn recorded_renewals(state: &State) -> Vec<Val> {
     let (_, journal) = state.journal_tail(0, 2000).expect("journal read");
@@ -3155,9 +3236,10 @@ fn an_unsatisfiable_proof_refusal_names_the_precondition_and_the_remedy() {
     );
     assert!(
         message.contains(&format!(
-            "canter run dispatch --run {run} --step p6 --admission FILE"
+            "canter run dispatch --run {run} --step p6 --operator IDENTITY --reason TEXT"
         )),
-        "the refusal names the explicit attestation path: {message}"
+        "the refusal names the audited operator measurement that produces the proof (issue #250): \
+         {message}"
     );
     // Nothing was fabricated: no renewal is recorded for an unmeasurable host.
     let state = fixture.seed();
@@ -3300,6 +3382,336 @@ fn the_driver_drives_the_runs_own_bounded_recovery_control_never_the_tail() {
     let verdict = canter::supervision::classify(&evidence, &digest, &policy, now_unix);
     assert_eq!(verdict.class, "needs-attention");
     assert!(!verdict.eligible);
+}
+
+/// Issue #254 (AC1/AC3): the recorded FAIL handoff — read from where the daemon
+/// ACTUALLY persists it — is reported as the fix-round disposition naming the
+/// fix leg's lane, and the driver drives the run's OWN bounded check
+/// re-evaluation for that recorded FAIL instead of parking on it. Once the
+/// producer's re-run has recorded a passing record for the same certified head
+/// (the repair landed and the re-evaluation recomputed), the run's cursor is
+/// PAST the fail: its frontier is the committed publish step and the driver
+/// dispatches it.
+///
+/// The rows are the LIVE shapes: the review step's own apply row keeps the
+/// handoff in its RESPONSE document (`result.fix_round`, `outcome.result` null)
+/// and the run's newest recorded review evidence is the `fail` at the head that
+/// handoff names.
+///
+/// What this does NOT prove, and the round report states plainly: a live
+/// reviewer leg to a written verdict (a synthetic fixture owns no harness) and
+/// the effect's own lane re-binding (the unchanged #248 slice).
+#[test]
+fn a_recorded_fail_handoff_is_named_and_drives_the_run_past_the_fail() {
+    let fixture = StateFixture::new("fix-round-driver-254");
+    let state = fixture.open();
+    let head = "aa".repeat(20);
+    let base = "bb".repeat(20);
+    let fix_lane = "lane-0123456789abcdef";
+    let steps = vec![
+        step("p1", "checkout"),
+        step("p5", "collect_outcome"),
+        review_leg_step("p6", "issues/6", 1),
+        step("p7", "merge"),
+    ];
+    // The digest the run is authorized under IS the committed submission's own
+    // bound-input digest, so the armed authorization is the real one.
+    let (_, digest) = render_bound(
+        &state,
+        &request_with_steps(vec![selected("#6", REV_A)], steps.clone()),
+    );
+    let items = submit_with_steps(&state, "qs_0000000000000254", &[(6, GRANT_6)], steps);
+    let run = items[0].instance_id.clone().expect("admitted");
+    state
+        .arm_supervision(
+            &run,
+            &canter::state::SupervisionAuthorizationPlan {
+                desired: "armed".to_string(),
+                check_interval_secs: 10,
+                progress_timeout_secs: 60,
+            },
+            &digest,
+            "merge",
+            1,
+            AT,
+        )
+        .expect("arm");
+    seed_topology(&state, &run, "p1", &idem_key("254-p1"));
+    seed_collection(
+        &state,
+        &run,
+        "p5",
+        &idem_key("254-p5"),
+        &head,
+        &base,
+        "issue-6",
+    );
+    // The review step's OWN apply row, written the way the daemon writes it:
+    // the FAIL handoff is in the RESPONSE column, and the same row is the
+    // step's recorded attempt.
+    seed_fix_round_response(
+        &state,
+        &run,
+        "p6",
+        &idem_key("254-p6"),
+        (&head, fix_lane, 1, 3),
+        "",
+    );
+    state
+        .record_evidence(
+            &run,
+            REPO,
+            &head,
+            &base,
+            WORKFLOW_HASH,
+            POLICY_HASH,
+            "fail",
+            "rev-6-r1",
+            &checks(&[
+                ("hosted-ci", "passed"),
+                ("local_full_suite_raw_101", "failed"),
+            ]),
+        )
+        .expect("the recorded FAIL");
+    let row = state
+        .supervision_rows()
+        .expect("rows")
+        .into_iter()
+        .find(|row| row.instance_id == run)
+        .expect("the armed row");
+    let policy = canter::supervision::Policy {
+        check_interval_secs: row.check_interval_secs,
+        progress_timeout_secs: row.progress_timeout_secs,
+    };
+    let now_unix = canter::time::unix_now();
+    let evidence = state
+        .supervision_evidence(&run)
+        .expect("evidence read")
+        .expect("supervised run");
+
+    // (1) The classification reports the fix-round disposition naming the lane
+    //     — never `supervision.review_failed` with an empty remedy. THIS is the
+    //     read the reported defect got wrong: with the handoff unread, the raw
+    //     output below is `needs-attention` / `supervision.review_failed`.
+    let verdict = canter::supervision::classify(&evidence, &digest, &policy, now_unix);
+    println!(
+        "CLASSIFY class={} reason={} detail={} eligible={}",
+        verdict.class, verdict.reason, verdict.detail, verdict.eligible
+    );
+    assert_eq!(verdict.class, "waiting-workers");
+    assert_eq!(verdict.reason, canter::supervision::codes::FIX_DISPATCHED);
+    assert_eq!(verdict.detail, fix_lane);
+    assert_ne!(verdict.reason, canter::supervision::codes::REVIEW_FAILED);
+    assert!(!verdict.eligible);
+
+    // (2) The handoff the response document carries IS read back — the reader
+    //     that only looked at `outcome.result` saw nothing at all here.
+    let fix = evidence
+        .fix_round
+        .as_ref()
+        .expect("the response-carried handoff is read back");
+    assert_eq!(fix.lane, fix_lane);
+    assert_eq!(fix.step, "p6");
+    assert_eq!(fix.feature_head, head);
+    assert_eq!((fix.round, fix.bound), (1, 3));
+    println!(
+        "READ BACK handoff round={} bound={} lane={} head={}",
+        fix.round, fix.bound, fix.lane, fix.feature_head
+    );
+
+    // (3) The driver's ONE act is the run's own bounded recovery control: the
+    //     check PRODUCER, never the tail behind the unverified delivery.
+    let intent = canter::supervision::dispatch_intent(&row, &evidence)
+        .expect("the recorded FAIL drives the run's own recovery control");
+    println!(
+        "DRIVER step={} kind={} reason={}",
+        intent.step_id, intent.kind, intent.reason
+    );
+    assert_eq!(intent.step_id, "p6", "the producer, never the tail");
+    assert_eq!(intent.kind, "review_evidence");
+    assert_eq!(intent.reason, canter::supervision::codes::REEVALUATION);
+    assert_ne!(intent.step_id, "p7");
+
+    // (4) The producer's re-run records a PASSING record for the same certified
+    //     head (the repair landed and the re-evaluation recomputed): the run's
+    //     cursor is PAST the fail — its frontier is the committed publish step
+    //     and the driver dispatches it.
+    //
+    //     Two records written inside the SAME wall-clock second share a
+    //     `created_at`, and the read path breaks that tie on the (random)
+    //     `evidence_id`, so the fixture waits for the next second before
+    //     writing the recomputation: the ordering this witness asserts on is
+    //     then a total order on write time. The tie itself is disclosed as a
+    //     residual uncertainty in the round report (in production the
+    //     recomputation is a reviewer leg, minutes later).
+    let failed_at = evidence
+        .newest_evidence
+        .as_ref()
+        .expect("the recorded FAIL is the newest record")
+        .created_at
+        .clone();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while canter::time::rfc3339_now() == failed_at {
+        assert!(
+            Instant::now() < deadline,
+            "the fixture clock never left {failed_at}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    state
+        .record_evidence(
+            &run,
+            REPO,
+            &head,
+            &base,
+            WORKFLOW_HASH,
+            POLICY_HASH,
+            "pass",
+            "rev-6-r2",
+            &checks(&[
+                ("hosted-ci", "passed"),
+                ("local_full_suite_raw_101", "passed"),
+            ]),
+        )
+        .expect("the recomputed record");
+    let evidence = state
+        .supervision_evidence(&run)
+        .expect("evidence read")
+        .expect("supervised run");
+    assert_eq!(
+        canter::supervision::next_unachieved_step(&evidence),
+        Some(("p7".to_string(), "merge".to_string())),
+        "the recomputed record carries the run's cursor past the FAIL"
+    );
+    let intent = canter::supervision::dispatch_intent(&row, &evidence)
+        .expect("the run's own publish step is dispatched");
+    println!(
+        "CURSOR PAST THE FAIL step={} kind={} reason={}",
+        intent.step_id, intent.kind, intent.reason
+    );
+    assert_eq!(intent.step_id, "p7");
+    assert_eq!(intent.kind, "merge");
+}
+
+/// Issue #254 (AC2): a recorded handoff whose head the run's newest recorded
+/// review evidence does NOT name is still a typed fix-round disposition naming
+/// the remedy — and the driver STILL drives the run's own bounded
+/// re-evaluation, so the shape is never a silent park either way.
+#[test]
+fn a_recorded_handoff_for_another_head_is_named_and_still_drives_the_run() {
+    let fixture = StateFixture::new("fix-round-moved-254");
+    let state = fixture.open();
+    let head = "aa".repeat(20);
+    let recorded_at = "cc".repeat(20);
+    let base = "bb".repeat(20);
+    let fix_lane = "lane-0123456789abcdef";
+    let steps = vec![
+        step("p1", "checkout"),
+        step("p5", "collect_outcome"),
+        review_leg_step("p6", "issues/6", 1),
+        step("p7", "merge"),
+    ];
+    let (_, digest) = render_bound(
+        &state,
+        &request_with_steps(vec![selected("#6", REV_A)], steps.clone()),
+    );
+    let items = submit_with_steps(&state, "qs_0000000000000255", &[(6, GRANT_6)], steps);
+    let run = items[0].instance_id.clone().expect("admitted");
+    state
+        .arm_supervision(
+            &run,
+            &canter::state::SupervisionAuthorizationPlan {
+                desired: "armed".to_string(),
+                check_interval_secs: 10,
+                progress_timeout_secs: 60,
+            },
+            &digest,
+            "merge",
+            1,
+            AT,
+        )
+        .expect("arm");
+    seed_topology(&state, &run, "p1", &idem_key("255-p1"));
+    seed_collection(
+        &state,
+        &run,
+        "p5",
+        &idem_key("255-p5"),
+        &head,
+        &base,
+        "issue-6",
+    );
+    // The repair leg advanced the branch: the handoff was recorded at the head
+    // the FAIL was handed at, and the run's newest recorded review evidence
+    // names a DIFFERENT head.
+    seed_fix_round_response(
+        &state,
+        &run,
+        "p6",
+        &idem_key("255-p6"),
+        (&recorded_at, fix_lane, 1, 3),
+        "",
+    );
+    state
+        .record_evidence(
+            &run,
+            REPO,
+            &head,
+            &base,
+            WORKFLOW_HASH,
+            POLICY_HASH,
+            "fail",
+            "rev-6-r1",
+            &checks(&[
+                ("hosted-ci", "passed"),
+                ("local_full_suite_raw_101", "failed"),
+            ]),
+        )
+        .expect("the recorded FAIL");
+    let row = state
+        .supervision_rows()
+        .expect("rows")
+        .into_iter()
+        .find(|row| row.instance_id == run)
+        .expect("the armed row");
+    let policy = canter::supervision::Policy {
+        check_interval_secs: row.check_interval_secs,
+        progress_timeout_secs: row.progress_timeout_secs,
+    };
+    let now_unix = canter::time::unix_now();
+    let evidence = state
+        .supervision_evidence(&run)
+        .expect("evidence read")
+        .expect("supervised run");
+
+    let verdict = canter::supervision::classify(&evidence, &digest, &policy, now_unix);
+    println!(
+        "CLASSIFY (moved) class={} reason={} detail={} eligible={}",
+        verdict.class, verdict.reason, verdict.detail, verdict.eligible
+    );
+    assert_eq!(verdict.class, "needs-attention");
+    assert_eq!(verdict.reason, canter::supervision::codes::FIX_HEAD_MOVED);
+    assert_ne!(verdict.reason, canter::supervision::codes::REVIEW_FAILED);
+    assert!(
+        verdict.detail.starts_with(fix_lane),
+        "the remedy (the recorded lane) is named FIRST: {}",
+        verdict.detail
+    );
+    assert!(
+        verdict.detail.contains(&recorded_at[..12]) && verdict.detail.contains(&head[..12]),
+        "both heads are named: {}",
+        verdict.detail
+    );
+    assert!(!verdict.eligible);
+
+    let intent = canter::supervision::dispatch_intent(&row, &evidence)
+        .expect("a handoff for another head still drives the run's own control");
+    println!(
+        "DRIVER (moved) step={} kind={} reason={}",
+        intent.step_id, intent.kind, intent.reason
+    );
+    assert_eq!(intent.step_id, "p6");
+    assert_eq!(intent.reason, canter::supervision::codes::REEVALUATION);
 }
 
 /// B3 (fix round F1): AC1's LINK, witnessed over the run's OWN durable rows
@@ -3489,4 +3901,890 @@ fn a_recomputed_record_carries_the_run_to_its_publish_step() {
         .expect("the publish step is dispatched by the driver");
     assert_eq!(intent.step_id, "p7");
     assert_eq!(intent.kind, "merge");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #250 — the audited operator's own host-resource measurement
+// ---------------------------------------------------------------------------
+
+/// Every `host.proof.renewal.operator` line of the fixture's durable journal,
+/// parsed (the audit record of the proof-producing control).
+fn recorded_operator_renewals(state: &State) -> Vec<Val> {
+    let (_, journal) = state.journal_tail(0, 2000).expect("journal read");
+    journal
+        .iter()
+        .filter(|line| line.contains("\"action\":\"host.proof.renewal.operator\""))
+        .filter_map(|line| Val::parse_json(line).ok())
+        .collect()
+}
+
+/// One recorded REFUSED attempt of (run, step) carrying `code`: the durable
+/// record `run.status` reads back. A live admission refusal happens before any
+/// intent is journaled, so a witness that must READ the park seeds the very
+/// outcome the engine records when its own continuation refusal lands.
+fn seed_refused_attempt(state: &State, instance_id: &str, step: &str, key: &str, code: &str) {
+    let line = apply_request_line(instance_id, step, key);
+    let request_id = fresh_id(9);
+    state
+        .journal_intent(
+            "mutate.checkout",
+            &format!("{REPO}:{instance_id}:{step}"),
+            key,
+            &request_id,
+            "apply",
+            None,
+            None,
+            &line,
+        )
+        .expect("claim the refused attempt");
+    let outcome_line = canonical_text(&object(vec![
+        ("schema", string("hf-outcome/v1")),
+        ("plan_id", string("hf_plan_0000000000000000")),
+        ("step_id", string(step)),
+        ("status", string("refused")),
+        ("idempotency_key", string(key)),
+        ("observed_at", string(AT)),
+        ("result", Val::Null),
+        (
+            "error",
+            object(vec![
+                ("code", string(code)),
+                ("message", string("the host-resource proof is stale")),
+            ]),
+        ),
+    ]));
+    state
+        .resolve_claim(key, "apply", "spent", &outcome_line, Some("{}"))
+        .expect("resolve the refused attempt");
+}
+
+/// Issue #250, the whole slice: the artifact every named remedy for a parked
+/// run needed is PRODUCED by an exposed control, the act is audited, and a
+/// park no control can move escalates terminally instead of looking eligible.
+///
+/// Three runs of ONE fixture daemon, each parked at the same fan-out frontier
+/// (`p6`, a review leg) with a proof measured before the freshness window:
+/// (A) the ordinary dispatch refuses `refusal.admission.proof_stale` — the
+/// measured defect; (B) the audited operator pair makes the daemon MEASURE the
+/// host at the run's lane root and bind the measurement, recording the
+/// identity, the reason and the superseded instant in the hash-chained journal
+/// BEFORE presenting it, so the gate no longer decides on the lapsed proof;
+/// (C) a host that cannot be measured (the lane root does not exist) produces
+/// NOTHING and the same refusal stays typed — and once the retry budget is
+/// spent with no re-evaluable producer, `run status` names the terminal
+/// `escalation.run.owner_decision` instead of an eligible-looking park.
+#[test]
+fn the_audited_operator_measurement_produces_the_proof_a_parked_run_needs() {
+    let head = "aa".repeat(20);
+    let base = "bb".repeat(20);
+    let fixture = DaemonFixture::new("operator250");
+    let state = fixture.seed();
+    let steps = |issue: i64| {
+        vec![
+            step("p1", "checkout"),
+            step("p5", "collect_outcome"),
+            review_leg_step("p6", &format!("issues/{issue}"), 1),
+            step("p7", "merge"),
+        ]
+    };
+    // TWO runs: the fixture's admission caps admit two per repository, and the
+    // second carries every refusal leg.
+    let runs: Vec<String> = [(6, GRANT_6), (7, GRANT_7)]
+        .iter()
+        .map(|(number, grant)| {
+            let items = submit_with_steps(
+                &state,
+                &format!("qs_000000000000{number:04}"),
+                &[(*number, grant)],
+                steps(*number),
+            );
+            items[0].instance_id.clone().expect("admitted")
+        })
+        .collect();
+    let (plain, unmeasurable) = (runs[0].clone(), runs[1].clone());
+    // The audited leg addresses the SAME run as the plain leg: the plain
+    // dispatch refuses BEFORE any intent is journaled, so nothing is burned.
+    let audited = plain.clone();
+    // The lane root the daemon measures: a REAL directory for (A) and (B); its
+    // path is never created for (C), so the host cannot be observed there.
+    let lane_root =
+        std::env::temp_dir().join(format!("hf-run-250-lane-root-{}", std::process::id()));
+    std::fs::create_dir_all(&lane_root).expect("lane root");
+    let missing_root = std::env::temp_dir().join(format!(
+        "hf-run-250-absent-lane-root-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&missing_root);
+    let stale = canter::time::rfc3339_from_unix(
+        canter::time::unix_now() - canter::lifecycle::HOST_PROOF_FRESHNESS_SECS - 1,
+    );
+    for (run, root) in [(&plain, &lane_root), (&unmeasurable, &missing_root)] {
+        let stem = run.trim_start_matches("run-");
+        seed_topology_with_admission(
+            &state,
+            run,
+            "p1",
+            &format!("ik_{stem}-p1-250"),
+            &stale,
+            root,
+        );
+        seed_collection(
+            &state,
+            run,
+            "p5",
+            &format!("ik_{stem}-p5-250"),
+            &head,
+            &base,
+            "issue-6",
+        );
+    }
+    let daemon = fixture.spawn(None);
+    wait_ready(&fixture);
+
+    // (A) The measured defect: the frontier fan-out refuses the lapsed proof,
+    // and its remedy names an artifact no control emits.
+    let refused = rpc(
+        &fixture.socket,
+        &fresh_id(31),
+        "run.dispatch",
+        Some(canter::run_control::dispatch_params(
+            &idem_key("250-plain"),
+            &plain,
+            "p6",
+            None,
+            None,
+        )),
+    );
+    eprintln!(
+        "plain dispatch => {}",
+        canter::canonical::canonical_text(&refused)
+    );
+    let code = refused
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .and_then(Val::as_str)
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        code,
+        canter::lifecycle::code::PROOF_STALE,
+        "the ordinary dispatch refuses the lapsed proof: {}",
+        canter::canonical::canonical_text(&refused)
+    );
+
+    // (D) The park the ledger cannot see: the fan-out admission gate refuses
+    // BEFORE any intent is journaled, so the run carries no attempt row while
+    // the refusal's own text points the operator at `run status`. The decision
+    // is read from the run's OWN recorded admission — the same facts the gate
+    // reads — and names the ONE control that reaches the step: the audited
+    // operator dispatch, with its exact documented command for THIS run and
+    // step. A run whose proof is fresh is not parked this way and the block
+    // stays quiet (proved below, after the same run is re-measured).
+    let live_status = rpc(
+        &fixture.socket,
+        &fresh_id(37),
+        "run.status",
+        Some(canter::run_control::status_params(&plain)),
+    );
+    eprintln!(
+        "run.status (live admission park) => {}",
+        canter::canonical::canonical_text(&live_status)
+    );
+    let live_remedy = live_status
+        .get("result")
+        .and_then(|result| result.get("remedy"))
+        .cloned()
+        .expect("the control document carries the remedy decision");
+    assert_eq!(
+        live_remedy.get("state").and_then(Val::as_str),
+        Some("applicable"),
+        "a live proof park still names its control: {live_remedy:?}"
+    );
+    assert_eq!(
+        live_remedy.get("control").and_then(Val::as_str),
+        Some("run.dispatch"),
+        "{live_remedy:?}"
+    );
+    assert_eq!(
+        live_remedy.get("command").and_then(Val::as_str),
+        Some(
+            format!(
+                "canter run dispatch --run {plain} --step p6 --operator IDENTITY --reason TEXT"
+            )
+            .as_str()
+        ),
+        "the decision carries the documented command (issue #250): {live_remedy:?}"
+    );
+    // The decision names the SAME park the gate refused (the recorded
+    // admission's lapsed proof), read the way the gate's own parser reads it.
+    assert!(
+        live_remedy
+            .get("because")
+            .and_then(Val::as_str)
+            .unwrap_or_default()
+            .contains(&format!("code {}", canter::lifecycle::code::PROOF_STALE)),
+        "the decision names the refused precondition: {live_remedy:?}"
+    );
+
+    // (B) The audited operator pair: the proof is PRODUCED (measured at
+    // dispatch time at the run's lane root) and the act is recorded.
+    let operator = "operator-a";
+    let reason = "the named remedy needed a proof no control emitted";
+    let dispatch = rpc(
+        &fixture.socket,
+        &fresh_id(32),
+        "run.dispatch",
+        Some(canter::run_control::dispatch_params(
+            &idem_key("250-operator"),
+            &audited,
+            "p6",
+            None,
+            Some((operator, reason)),
+        )),
+    );
+    eprintln!(
+        "audited dispatch => {}",
+        canter::canonical::canonical_text(&dispatch)
+    );
+    let renewals = recorded_operator_renewals(&state);
+    assert_eq!(
+        renewals.len(),
+        1,
+        "exactly one operator-authorized measurement: {renewals:?}"
+    );
+    let target = renewals[0]
+        .get("target")
+        .and_then(Val::as_str)
+        .unwrap_or_default();
+    for needle in [
+        format!("operator:{operator}"),
+        format!("reason:{reason}"),
+        format!("superseded:{stale}"),
+    ] {
+        assert!(
+            target.contains(&needle),
+            "the audit names {needle:?} in {target}"
+        );
+    }
+    let key = renewals[0]
+        .get("idempotency_key")
+        .and_then(Val::as_str)
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        key,
+        idem_key("250-operator"),
+        "the measurement is attributed to the dispatch that authorized it"
+    );
+    let dispatch_code = dispatch
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .and_then(Val::as_str)
+        .unwrap_or_default();
+    assert_ne!(
+        dispatch_code,
+        canter::lifecycle::code::PROOF_STALE,
+        "the produced proof is what the gate decides on now: {}",
+        canter::canonical::canonical_text(&dispatch)
+    );
+
+    // (C) A host that cannot be measured produces nothing: the same refusal
+    // stays typed, and no measurement is invented.
+    let refused_unmeasurable = rpc(
+        &fixture.socket,
+        &fresh_id(33),
+        "run.dispatch",
+        Some(canter::run_control::dispatch_params(
+            &idem_key("250-unmeasurable"),
+            &unmeasurable,
+            "p6",
+            None,
+            Some(("operator-b", "the lane root is not there")),
+        )),
+    );
+    eprintln!(
+        "unmeasurable dispatch => {}",
+        canter::canonical::canonical_text(&refused_unmeasurable)
+    );
+    assert_eq!(
+        refused_unmeasurable
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Val::as_str)
+            .unwrap_or_default(),
+        canter::lifecycle::code::PROOF_STALE,
+        "an unmeasurable host keeps the typed refusal: {}",
+        canter::canonical::canonical_text(&refused_unmeasurable)
+    );
+    assert_eq!(
+        recorded_operator_renewals(&state).len(),
+        1,
+        "nothing was measured for the run whose lane root is absent"
+    );
+
+    // (E) Branch (3) exactly as the measured scenario reaches it: the ledger
+    // records the proof park, the bounded-retry budget is spent, and the host
+    // is measurable. The decision names the audited operator dispatch — and the
+    // NAMED control is EXECUTABLE: the run's own lapsed window is not a step
+    // diagnosis, so no bounded-retry authorization is demanded of the
+    // re-dispatch, and the measurement is bound BEFORE the admission gate
+    // decides (the fence refuses nothing, and the gate never decides on the
+    // lapsed proof).
+    seed_refused_attempt(
+        &state,
+        &plain,
+        "p6",
+        &idem_key("250-journaled-park"),
+        canter::lifecycle::code::PROOF_STALE,
+    );
+    for consumed in ["250-spent-1", "250-spent-2", "250-spent-3"] {
+        state
+            .record_run_retry(&plain, "p6", AT)
+            .expect("bounded retry authorization");
+        state
+            .claim_run_retry(&plain, "p6", &idem_key(consumed), AT)
+            .expect("consume the authorization");
+    }
+    let parked = rpc(
+        &fixture.socket,
+        &fresh_id(38),
+        "run.status",
+        Some(canter::run_control::status_params(&plain)),
+    );
+    eprintln!(
+        "run.status (journaled proof park, budget spent) => {}",
+        canter::canonical::canonical_text(&parked)
+    );
+    let remedy = parked
+        .get("result")
+        .and_then(|result| result.get("remedy"))
+        .cloned()
+        .expect("the control document carries the remedy decision");
+    assert_eq!(
+        remedy.get("state").and_then(Val::as_str),
+        Some("applicable"),
+        "{remedy:?}"
+    );
+    assert_eq!(
+        remedy.get("control").and_then(Val::as_str),
+        Some("run.dispatch"),
+        "the audited operator dispatch is the ONE control for a proof park: {remedy:?}"
+    );
+    assert_eq!(
+        remedy.get("command").and_then(Val::as_str),
+        Some(
+            format!(
+                "canter run dispatch --run {plain} --step p6 --operator IDENTITY --reason TEXT"
+            )
+            .as_str()
+        ),
+        "{remedy:?}"
+    );
+    // The NAMED control, executed through the real daemon: nothing fences it
+    // and the measurement it binds is what the gate decides on.
+    let executed = rpc(
+        &fixture.socket,
+        &fresh_id(39),
+        "run.dispatch",
+        Some(canter::run_control::dispatch_params(
+            &idem_key("250-named-control"),
+            &plain,
+            "p6",
+            None,
+            Some((operator, reason)),
+        )),
+    );
+    eprintln!(
+        "the NAMED control, executed => {}",
+        canter::canonical::canonical_text(&executed)
+    );
+    let executed_code = executed
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .and_then(Val::as_str)
+        .unwrap_or_default();
+    assert_ne!(
+        executed_code,
+        "refusal.run.retry_required",
+        "the named control is not fenced by the bounded retry: {}",
+        canter::canonical::canonical_text(&executed)
+    );
+    assert_ne!(
+        executed_code,
+        canter::lifecycle::code::PROOF_STALE,
+        "the named control reaches the gate with a fresh measurement: {}",
+        canter::canonical::canonical_text(&executed)
+    );
+    assert_eq!(
+        executed_code,
+        "refusal.session.unbound",
+        "the named control reached the NEXT, unrelated refusal past both fences: {}",
+        canter::canonical::canonical_text(&executed)
+    );
+
+    // The decision: while the bounded-retry budget is unspent, `run status`
+    // names the retry — ONE control, with its command; once it is spent and
+    // nothing else applies, the same read escalates terminally.
+    seed_refused_attempt(
+        &state,
+        &unmeasurable,
+        "p6",
+        &idem_key("250-refused"),
+        canter::mutation::code::WORKER_TIMEOUT,
+    );
+    state
+        .record_run_retry(&unmeasurable, "p6", AT)
+        .expect("first bounded retry");
+    // A HELD authorization is itself the applicable control: minting another
+    // refuses, and the ONE re-dispatch consumes it.
+    let status = rpc(
+        &fixture.socket,
+        &fresh_id(34),
+        "run.status",
+        Some(canter::run_control::status_params(&unmeasurable)),
+    );
+    eprintln!(
+        "run.status (authorization held) => {}",
+        canter::canonical::canonical_text(&status)
+    );
+    let remedy = status
+        .get("result")
+        .and_then(|result| result.get("remedy"))
+        .cloned()
+        .expect("the control document carries the remedy decision");
+    assert_eq!(
+        remedy.get("control").and_then(Val::as_str),
+        Some("run.dispatch"),
+        "the held authorization is consumed by the dispatch: {remedy:?}"
+    );
+    assert!(
+        remedy
+            .get("because")
+            .and_then(Val::as_str)
+            .unwrap_or_default()
+            .contains("HOLDS an unconsumed bounded-retry authorization"),
+        "the decision names WHY the others do not apply: {remedy:?}"
+    );
+    // Consume it: with budget left and nothing held, the retry is the ONE
+    // control, carrying the documented command.
+    state
+        .claim_run_retry(&unmeasurable, "p6", &idem_key("250-consumed-1"), AT)
+        .expect("consume the authorization");
+    let status = rpc(
+        &fixture.socket,
+        &fresh_id(35),
+        "run.status",
+        Some(canter::run_control::status_params(&unmeasurable)),
+    );
+    let remedy = status
+        .get("result")
+        .and_then(|result| result.get("remedy"))
+        .cloned()
+        .expect("the control document carries the remedy decision");
+    assert_eq!(
+        remedy.get("state").and_then(Val::as_str),
+        Some("applicable"),
+        "{remedy:?}"
+    );
+    assert_eq!(
+        remedy.get("control").and_then(Val::as_str),
+        Some("run.retry"),
+        "{remedy:?}"
+    );
+    assert_eq!(
+        remedy.get("command").and_then(Val::as_str),
+        Some(format!("canter run retry --run {unmeasurable} --step p6").as_str()),
+        "the decision carries the command `canter run retry` itself accepts (issue #250): \
+         {remedy:?}"
+    );
+    // Spend the rest of the bound: each authorization is CONSUMED by the ONE
+    // re-dispatch it authorizes before the next can be minted.
+    state
+        .record_run_retry(&unmeasurable, "p6", AT)
+        .expect("second bounded retry");
+    state
+        .claim_run_retry(&unmeasurable, "p6", &idem_key("250-consumed-2"), AT)
+        .expect("consume the second authorization");
+    state
+        .record_run_retry(&unmeasurable, "p6", AT)
+        .expect("third bounded retry");
+    state
+        .claim_run_retry(&unmeasurable, "p6", &idem_key("250-consumed-3"), AT)
+        .expect("consume the last authorization");
+    let escalated = rpc(
+        &fixture.socket,
+        &fresh_id(36),
+        "run.status",
+        Some(canter::run_control::status_params(&unmeasurable)),
+    );
+    eprintln!(
+        "run.status (budget spent) => {}",
+        canter::canonical::canonical_text(&escalated)
+    );
+    let remedy = escalated
+        .get("result")
+        .and_then(|result| result.get("remedy"))
+        .cloned()
+        .expect("the control document carries the remedy decision");
+    assert_eq!(
+        remedy.get("state").and_then(Val::as_str),
+        Some("terminal-escalation"),
+        "no control applies: {remedy:?}"
+    );
+    assert_eq!(
+        remedy.get("code").and_then(Val::as_str),
+        Some(canter::run_control::codes::ESCALATION),
+        "the escalation is TYPED: {remedy:?}"
+    );
+    assert!(remedy.get("control").is_some_and(Val::is_null));
+    shutdown(daemon);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #256: the fix-round handoff is read against the repair leg's OWN state
+// ---------------------------------------------------------------------------
+
+/// One `git` invocation in `cwd` (synthetic fixture checkouts only).
+fn git(cwd: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        // #226: copy nothing from the host's shared git templates.
+        .env("GIT_TEMPLATE_DIR", "")
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// Issue #256 fixture: a supervised run parked on a recorded review FAIL whose
+/// handoff names the run's own repair leg, plus that leg's OWN lane checkout —
+/// a REAL git checkout under the run's recorded `worktrees_root`, holding the
+/// certified head and (with `advance`) the repair commit the leg delivered one
+/// commit later.
+///
+/// The handoff shape is the LIVE one: the review step's own apply row keeps
+/// `result.fix_round` in its RESPONSE document (`outcome.result` null), and the
+/// handoff names both the leg's lane session and the lane checkout its own
+/// state lives in.
+struct FixLegFixture {
+    fixture: DaemonFixture,
+    run: String,
+    lane_root: PathBuf,
+    /// The head the FAIL was handed at (the head the handoff names).
+    certified: String,
+    /// The head the leg's own checkout holds after its repair commit.
+    delivered: String,
+    /// The fix leg's lane session the handoff records.
+    lane: String,
+    /// The control's inner re-dispatch key (`ik_<run>-<step>-r<round>`).
+    inner_key: String,
+}
+
+fn fix_leg_fixture(name: &str, submission: &str, advance: bool) -> FixLegFixture {
+    let fixture = DaemonFixture::new(name);
+    let state = fixture.seed();
+    let steps = vec![
+        step("p1", "checkout"),
+        step("p5", "collect_outcome"),
+        review_leg_step("p6", "issues/6", 1),
+        step("p7", "merge"),
+    ];
+    let (_, digest) = render_bound(
+        &state,
+        &request_with_steps(vec![selected("#6", REV_A)], steps.clone()),
+    );
+    let items = submit_with_steps(&state, submission, &[(6, GRANT_6)], steps);
+    let run = items[0].instance_id.clone().expect("admitted");
+    state
+        .arm_supervision(
+            &run,
+            &canter::state::SupervisionAuthorizationPlan {
+                desired: "armed".to_string(),
+                check_interval_secs: 10,
+                progress_timeout_secs: 900,
+            },
+            &digest,
+            "merge",
+            1,
+            AT,
+        )
+        .expect("arm");
+    // The lane root the run's own topology declares: a REAL directory, exactly
+    // as a live run's worktrees root is.
+    let lane_root = std::env::temp_dir().join(format!(
+        "hf-run-256-{name}-lane-root-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&lane_root);
+    let lane_relative = canter::lane::lane_checkout(6, "implementer", 2);
+    let lane = lane_root.join(&lane_relative);
+    std::fs::create_dir_all(&lane).expect("lane dir");
+    git(&lane, &["init", "-q", "-b", "issue-6"]);
+    git(&lane, &["config", "user.email", "fixture@example.test"]);
+    git(&lane, &["config", "user.name", "fixture"]);
+    std::fs::write(lane.join("delivery.txt"), "the reviewed delivery\n").expect("delivery");
+    git(&lane, &["add", "-A"]);
+    git(&lane, &["commit", "-qm", "the reviewed delivery"]);
+    let certified = git(&lane, &["rev-parse", "HEAD"]).trim().to_string();
+    // The repair the leg commits in its OWN checkout: a DESCENDANT of the
+    // certified head, never the head the FAIL was handed at.
+    std::fs::write(lane.join("repair.txt"), "the repair round 1\n").expect("repair");
+    git(&lane, &["add", "-A"]);
+    git(
+        &lane,
+        &["commit", "-qm", "queue intake: the repair (Refs #245)"],
+    );
+    let delivered = git(&lane, &["rev-parse", "HEAD"]).trim().to_string();
+    if !advance {
+        // The leg has delivered NOTHING: its own checkout is left exactly at
+        // the certified head, so the run is genuinely waiting on it.
+        git(&lane, &["reset", "-q", "--hard", &certified]);
+    }
+    let base = "bb".repeat(20);
+    let fix_lane = "lane-0123456789abcdef";
+    seed_topology_with_admission(
+        &state,
+        &run,
+        "p1",
+        &idem_key(&format!("256-p1-{name}")),
+        &canter::time::rfc3339_now(),
+        &lane_root,
+    );
+    seed_collection(
+        &state,
+        &run,
+        "p5",
+        &idem_key(&format!("256-p5-{name}")),
+        &certified,
+        &base,
+        "issue-6",
+    );
+    // The review step's OWN apply row, written the way the daemon writes it.
+    seed_fix_round_response(
+        &state,
+        &run,
+        "p6",
+        &idem_key(&format!("256-p6-{name}")),
+        (&certified, fix_lane, 1, 3),
+        &lane_relative,
+    );
+    state
+        .record_evidence(
+            &run,
+            REPO,
+            &certified,
+            &base,
+            WORKFLOW_HASH,
+            POLICY_HASH,
+            "fail",
+            "rev-6-r1",
+            &checks(&[
+                ("hosted-ci", "passed"),
+                ("local_full_suite_raw_101", "failed"),
+            ]),
+        )
+        .expect("the recorded FAIL");
+    let inner_key = format!(
+        "ik_{}-p6-r{}",
+        run.trim_start_matches("run-"),
+        canter::run_control::reevaluation_lane_round(1)
+    );
+    FixLegFixture {
+        fixture,
+        run,
+        lane_root,
+        certified,
+        delivered,
+        lane: fix_lane.to_string(),
+        inner_key,
+    }
+}
+
+/// Read the live observation the daemon's own `supervision.status` reports for
+/// one run (`evaluation.observed`: the read-time classification and its detail).
+fn status_observation(fixture: &DaemonFixture, run: &str, seed: u32) -> Val {
+    let status = rpc_ok(
+        &fixture.socket,
+        &fresh_id(seed),
+        "supervision.status",
+        Some(object(vec![("instance_id", string(run))])),
+    );
+    status
+        .get("evaluation")
+        .and_then(|evaluation| evaluation.get("observed"))
+        .cloned()
+        .expect("the status document carries the read-time observation")
+}
+
+/// Issue #256 (AC1, AC2, AC4): the fix-round disposition is derived from the
+/// repair leg's OWN recorded state — its own lane checkout — and the next
+/// review round is bound to the head that leg DELIVERED.
+///
+/// Witnessed over the LIVE daemon: the same recorded handoff (naming the head
+/// the FAIL was handed at) is read (0) the pre-#256 way — the stale wait the
+/// defect is made of, with no leg observation — and then (1) through the
+/// daemon's own observation of the leg's checkout, where the delivered
+/// descendant head is named. (2) The control's inner re-dispatch of the review
+/// producer — the SAME `run_dispatch` the driver's own bounded re-evaluation
+/// calls (the driver's thread-level drive is the unchanged #243/#254 slice) —
+/// records the DELIVERED head as the head the next round binds.
+///
+/// What this does NOT prove, and the round report states plainly: a live
+/// reviewer leg consuming a verdict at the delivered head (a synthetic fixture
+/// owns no harness) — the effect-side materialization of the bound head is the
+/// reviewer-lane creation the #210/#238 slices already prove.
+#[test]
+fn a_delivered_repair_leg_is_named_and_the_next_round_binds_the_delivered_head() {
+    let f = fix_leg_fixture("fr256d", "qs_0000000000000256", true);
+    assert_ne!(f.delivered, f.certified, "the fixture really advanced");
+
+    // (0) The pre-#256 read over the SAME recorded facts: the handoff names the
+    //     head the FAIL was handed at, so the run is reported as waiting on a
+    //     repair leg that has already delivered — never as moved.
+    let state = f.fixture.seed();
+    let evidence = state
+        .supervision_evidence(&f.run)
+        .expect("evidence read")
+        .expect("supervised run");
+    let row = state
+        .supervision_rows()
+        .expect("rows")
+        .into_iter()
+        .find(|row| row.instance_id == f.run)
+        .expect("the armed row");
+    let policy = canter::supervision::Policy {
+        check_interval_secs: row.check_interval_secs,
+        progress_timeout_secs: row.progress_timeout_secs,
+    };
+    let digest = evidence
+        .submission_digest
+        .clone()
+        .expect("the run is authorized");
+    let stale =
+        canter::supervision::classify(&evidence, &digest, &policy, canter::time::unix_now());
+    println!(
+        "PRE-#256 READ class={} reason={} detail={} eligible={}",
+        stale.class, stale.reason, stale.detail, stale.eligible
+    );
+    assert_eq!(stale.class, "waiting-workers");
+    assert_eq!(stale.reason, canter::supervision::codes::FIX_DISPATCHED);
+    assert_eq!(
+        stale.detail, f.lane,
+        "the unobserved read can only name the lane it recorded"
+    );
+
+    // (1) The daemon reads the recorded handoff's lane checkout: the leg's own
+    //     state holds a DESCENDANT head, so the disposition names the movement
+    //     — the remedy first, then both head prefixes.
+    let daemon = f.fixture.spawn(None);
+    wait_ready(&f.fixture);
+    let observed = status_observation(&f.fixture, &f.run, 61);
+    println!(
+        "supervision.status.observed => {}",
+        canonical_text(&observed)
+    );
+    assert_eq!(
+        observed.get("class").and_then(Val::as_str),
+        Some("needs-attention")
+    );
+    assert_eq!(
+        observed.get("reason").and_then(Val::as_str),
+        Some("supervision.fix_round_head_moved")
+    );
+    assert_ne!(
+        observed.get("reason").and_then(Val::as_str),
+        Some("supervision.fix_round_dispatched"),
+        "a leg that delivered is never reported as work in flight"
+    );
+    let detail = observed
+        .get("detail")
+        .and_then(Val::as_str)
+        .unwrap_or_default();
+    assert!(
+        detail.starts_with(&f.lane),
+        "the remedy (the recorded lane) is named first: {detail}"
+    );
+    assert!(
+        detail.contains(&f.certified[..12]) && detail.contains(&f.delivered[..12]),
+        "both heads are named: {detail}"
+    );
+    assert_eq!(observed.get("eligible").and_then(Val::as_bool), Some(false));
+
+    // (2) The next review round binds the DELIVERED head — driven with ZERO
+    //     operator control: the daemon's own armed driver re-evaluates the
+    //     recorded FAIL's check producer (the unchanged #243/#254 control), and
+    //     the run's own `run_dispatch` records the delivered head as the
+    //     observed head the reviewer leg's derived checkout materializes.
+    //     Nothing is asked of an operator here: the claim is polled for.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let claim = loop {
+        let state = f.fixture.seed();
+        if let Some(claim) = state.claim(&f.inner_key).expect("claim read") {
+            break claim;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the armed driver never re-dispatched the run's own review producer"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    println!("INNER DISPATCH request => {}", claim.request_line);
+    assert!(
+        claim
+            .request_line
+            .contains(&format!("\"feature_head\":\"{}\"", f.delivered)),
+        "the round binds the DELIVERED head: {}",
+        claim.request_line
+    );
+    assert!(
+        !claim
+            .request_line
+            .contains(&format!("\"feature_head\":\"{}\"", f.certified)),
+        "the round never rebinds the head the FAIL was handed at: {}",
+        claim.request_line
+    );
+    // ...and the same recorded evidence still drives that ONE recovery act:
+    // the producer, never the tail behind the FAIL. (Asserted on the
+    // PRE-dispatch shape by the #254 witness; here the driver has already
+    // taken the act, so the control's own gate has moved on.)
+
+    shutdown(daemon);
+    let _ = std::fs::remove_dir_all(&f.lane_root);
+}
+
+/// Issue #256 (AC3, AC4): the in-flight disposition keeps its current meaning.
+/// A handoff whose repair leg's OWN checkout has NOT advanced is still
+/// `waiting-workers` / `supervision.fix_round_dispatched` naming the leg's lane
+/// — the observation only ever reports a movement that is really there.
+#[test]
+fn a_repair_leg_that_did_not_advance_keeps_the_waiting_workers_disposition() {
+    let f = fix_leg_fixture("fr256w", "qs_0000000000000257", false);
+    let daemon = f.fixture.spawn(None);
+    wait_ready(&f.fixture);
+    let observed = status_observation(&f.fixture, &f.run, 63);
+    println!(
+        "supervision.status.observed => {}",
+        canonical_text(&observed)
+    );
+    assert_eq!(
+        observed.get("class").and_then(Val::as_str),
+        Some("waiting-workers")
+    );
+    assert_eq!(
+        observed.get("reason").and_then(Val::as_str),
+        Some("supervision.fix_round_dispatched")
+    );
+    assert_eq!(
+        observed.get("detail").and_then(Val::as_str),
+        Some(f.lane.as_str()),
+        "the wait still names the leg's recorded lane"
+    );
+    assert_eq!(observed.get("eligible").and_then(Val::as_bool), Some(false));
+    shutdown(daemon);
+    let _ = std::fs::remove_dir_all(&f.lane_root);
 }

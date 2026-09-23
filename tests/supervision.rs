@@ -110,6 +110,18 @@ fn armed(interval_secs: i64, timeout_secs: i64) -> supervision::Authorization {
     }
 }
 
+/// The explicit "do not supervise this run" decision (the other member of the
+/// closed desired-state vocabulary): a committed row that never dispatches.
+fn disabled(interval_secs: i64, timeout_secs: i64) -> supervision::Authorization {
+    supervision::Authorization {
+        desired: "disabled".to_string(),
+        policy: supervision::Policy {
+            check_interval_secs: interval_secs,
+            progress_timeout_secs: timeout_secs,
+        },
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fixtures (the tests/queue_submit.rs daemon pattern)
 // ---------------------------------------------------------------------------
@@ -1548,13 +1560,14 @@ fn attempts_for(fixture: &DaemonFixture, run: &str, step: &str) -> usize {
         .count()
 }
 
-/// The bounded quiet window every retry regression observes: the minted
-/// authorization must still be unconsumed and no attempt row may appear for
-/// the step. At 48e00df9 the armed driver re-dispatched the diagnosed step
-/// from the reconstructed (stale) params within this window and consumed the
-/// authorization (measured: authorized 14:13:17Z, consumed 14:13:22Z with the
-/// dispatch key `ik_run-<run>-p2-<unix>`).
-const RETRY_QUIET_WINDOW_SECS: u64 = 7;
+/// The bounded quiet window the SUPERVISION-DISABLED retry regressions
+/// observe: with no armed driver (the run's committed desired state is
+/// `disabled`), the minted authorization must stay unconsumed and no attempt
+/// row may appear for the step — minting it dispatches nothing by itself. (An
+/// ARMED run is a different contract since issue #241: its own supervision
+/// consumes the held authorization by re-dispatching the step, which the armed
+/// witness above observes directly.)
+const RETRY_QUIET_WINDOW_SECS: u64 = 2;
 
 /// Observe the quiet window after `run retry` and assert the authorization
 /// survives it untouched.
@@ -1577,12 +1590,96 @@ fn assert_retry_authorization_survives(fixture: &DaemonFixture, run: &str, step:
     }
 }
 
-/// The shared scenario of the three regressions: an armed run whose `p1`
+/// Observe the run's own armed supervision consuming ONE held authorization
+/// (by its own retry id): a bounded poll of the recorded rows, failing only
+/// after a documented no-progress ceiling (issue #232). The driver paces its
+/// attempts with its refused-dispatch ladder, so the wait covers several
+/// check intervals.
+fn wait_for_retry_consumed(
+    fixture: &DaemonFixture,
+    run: &str,
+    retry_id: &str,
+) -> canter::state::RunRetryRow {
+    let until = Instant::now() + Duration::from_secs(60);
+    loop {
+        let rows = fixture.seed().run_retries(run).expect("retries");
+        let row = rows
+            .iter()
+            .find(|row| row.retry_id == retry_id)
+            .cloned()
+            .unwrap_or_else(|| panic!("the authorization {retry_id} vanished: {}", rows.len()));
+        if !row.consumed_at.is_empty() {
+            return row;
+        }
+        if Instant::now() >= until {
+            let attempts = fixture.seed().run_step_attempts(run).expect("attempts");
+            panic!(
+                "the armed driver never consumed {retry_id}: {} attempt rows, log tail: {}",
+                attempts.len(),
+                daemon_log_tail(fixture)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The last daemon-log line (diagnostics for a failed witness).
+fn daemon_log_tail(fixture: &DaemonFixture) -> String {
+    std::fs::read_to_string(fixture.daemon_log())
+        .unwrap_or_default()
+        .lines()
+        .rev()
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// Observe one step's recorded attempt reaching `status` (the cursor
+/// before/after read of the retry witnesses).
+fn wait_for_attempt_status(fixture: &DaemonFixture, run: &str, step: &str, status: &str) {
+    let until = Instant::now() + Duration::from_secs(30);
+    loop {
+        let attempts = fixture.seed().run_step_attempts(run).expect("attempts");
+        let last = attempts
+            .iter()
+            .rfind(|(id, _)| id == step)
+            .map(|(_, outcome)| outcome.clone())
+            .unwrap_or_default();
+        if last == status {
+            return;
+        }
+        if Instant::now() >= until {
+            panic!("step {step} never reached {status}: {attempts:?}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The shared scenario of the retry regressions: an armed run whose `p1`
 /// succeeded (recording the durable dispatch context) and whose `p2` the
 /// driver dispatched once by itself. The committed request is complete, but
 /// its branch already exists, so the real effect records a diagnosed adapter
 /// failure that `run.retry` may address.
 fn retry_lane_scenario(name: &str) -> (DaemonFixture, GroupChild, String) {
+    retry_lane_scenario_with(name, Some(armed(5, 60)), false)
+}
+
+/// The SAME committed spine with supervision EXPLICITLY DISABLED (an
+/// `hf-supervision-authorization/v1` block whose desired state is `disabled`):
+/// the armed driver is the consumer of a held authorization (issue #241), so
+/// the operator's own `run dispatch` is the only consumer here — and the run
+/// still carries a supervision row, so `supervision status` reads its retry
+/// disposition back. The caller records the `p2` diagnosis itself — the same
+/// real, obstructed effect, dispatched by the caller that holds the topology.
+fn unsupervised_retry_lane_scenario(name: &str) -> (DaemonFixture, GroupChild, String) {
+    retry_lane_scenario_with(name, Some(disabled(5, 60)), true)
+}
+
+fn retry_lane_scenario_with(
+    name: &str,
+    supervision_block: Option<supervision::Authorization>,
+    caller_dispatches_p2: bool,
+) -> (DaemonFixture, GroupChild, String) {
     let fixture = DaemonFixture::new(name);
     let (bound, digest) = {
         let state = fixture.seed();
@@ -1610,7 +1707,7 @@ fn retry_lane_scenario(name: &str) -> (DaemonFixture, GroupChild, String) {
         &digest,
         &role_revision(),
         "gr_0000000000000095",
-        Some(armed(5, 60)),
+        supervision_block,
     );
     let result = rpc_ok(&fixture.socket, &fresh_id(1), "queue.submit", Some(params));
     let run = instance_of(&result, 5);
@@ -1637,29 +1734,67 @@ fn retry_lane_scenario(name: &str) -> (DaemonFixture, GroupChild, String) {
         canter::canonical::canonical_text(&applied)
     );
 
-    // The driver continues by itself: `p2` was never dispatched, so its
-    // contract-complete committed params are presented. The pre-existing
-    // branch makes the real adapter fail and records the diagnosis.
-    let attempts = wait_for_step_attempt(&fixture, &run, "p2");
-    let p2 = attempts
-        .iter()
-        .find(|(step, _)| step == "p2")
-        .unwrap_or_else(|| {
-            let log = std::fs::read_to_string(fixture.daemon_log()).unwrap_or_default();
-            panic!("the driver never dispatched p2: {attempts:?}\n{log}")
-        });
-    assert_eq!(
-        p2.1, "refused",
-        "the existing lane is refused (the diagnosis): {attempts:?}"
-    );
+    if caller_dispatches_p2 {
+        // The caller's own first dispatch of `p2` is never fenced: the
+        // pre-existing branch makes the real adapter fail and records the
+        // diagnosis `run.retry` may address.
+        let code = rpc_err(
+            &fixture.socket,
+            &fresh_id(3),
+            "apply",
+            Some(caller_apply_params(
+                &fixture,
+                &integration,
+                &bound,
+                &run,
+                "gr_0000000000000095",
+                ("p2", 5),
+                &idem_key("lane-apply-p2"),
+            )),
+        );
+        assert_ne!(
+            code, "refusal.run.retry_required",
+            "a first dispatch is never fenced"
+        );
+    } else {
+        // The driver continues by itself: `p2` was never dispatched, so its
+        // contract-complete committed params are presented. The pre-existing
+        // branch makes the real adapter fail and records the diagnosis.
+        let attempts = wait_for_step_attempt(&fixture, &run, "p2");
+        let p2 = attempts
+            .iter()
+            .find(|(step, _)| step == "p2")
+            .unwrap_or_else(|| {
+                let log = std::fs::read_to_string(fixture.daemon_log()).unwrap_or_default();
+                panic!("the driver never dispatched p2: {attempts:?}\n{log}")
+            });
+        assert_eq!(
+            p2.1, "refused",
+            "the existing lane is refused (the diagnosis): {attempts:?}"
+        );
+    }
     std::fs::remove_dir(fixture.dir.join("worktrees/lane-p2"))
         .expect("remove the fixture obstruction before the corrected retry");
     (fixture, daemon, run)
 }
 
+/// Issue #241 (AC1) at the REAL daemon: `run retry` mints the bounded
+/// authorization and the run's own armed supervision consumes it — the driver
+/// re-dispatches the exact diagnosed step with its COMMITTED params, and no
+/// operator dispatch exists anywhere. (Before the change the pending
+/// authorization parked the frontier until an operator dispatched by hand.)
 #[test]
-fn run_retry_authorizes_only_and_the_operators_dispatch_consumes_it_once() {
-    let (fixture, daemon, run) = retry_lane_scenario("retry-only");
+fn an_authorized_retry_is_consumed_by_the_armed_driver_without_any_operator_dispatch() {
+    let (fixture, daemon, run) = retry_lane_scenario("retry-consumed");
+
+    // The obstruction is cleared BEFORE the authorization exists: the ONE
+    // re-dispatch the authorization pays for is the one that lands the step.
+    let status = Command::new("git")
+        .args(["branch", "-D", "issue-92-original"])
+        .current_dir(fixture.dir.join("integration"))
+        .status()
+        .expect("git removes the conflicting branch");
+    assert!(status.success(), "the obstructing branch is gone");
 
     // `run retry` mints the bounded authorization — and nothing else.
     let (exit, stdout, stderr) = run_cli(&fixture, &["retry", "--run", &run, "--step", "p2"]);
@@ -1670,122 +1805,64 @@ fn run_retry_authorizes_only_and_the_operators_dispatch_consumes_it_once() {
         "the minted authorization is unconsumed: {stdout}"
     );
 
-    // Bounded quiet window: the armed driver must NOT re-dispatch the
-    // diagnosed step (at 48e00df9 it consumed the authorization within the
-    // window, with the stale reconstruction).
-    assert_retry_authorization_survives(&fixture, &run, "p2");
-
-    let log = std::fs::read_to_string(fixture.daemon_log()).unwrap_or_default();
-    assert_eq!(
-        log.matches("\"event\":\"supervision.dispatch_refused\"")
-            .count(),
-        1,
-        "exactly the one continuation dispatch, none from the retry:\n{log}"
+    // The run's own armed supervision consumes THAT authorization by
+    // re-dispatching the exact step: the recorded row carries the automatic
+    // dispatch's journaled key.
+    let held = fixture
+        .seed()
+        .run_retries(&run)
+        .expect("retries")
+        .into_iter()
+        .find(|row| row.consumed_at.is_empty())
+        .expect("the minted authorization is held");
+    assert_eq!(held.step_id, "p2");
+    let consumed = wait_for_retry_consumed(&fixture, &run, &held.retry_id);
+    assert_eq!(consumed.retry_id, held.retry_id);
+    assert!(
+        consumed.consumed_key.starts_with("ik_run-"),
+        "{}",
+        consumed.consumed_key
     );
 
-    // The journal-timestamped probe of the confirmed mechanism: the retry's
-    // own committed entries (`mutate.run.retry`) are the LAST thing it wrote,
-    // so no `mutate.worktree_create` attempt follows in the same second. At
-    // 48e00df9 the authorizing call was followed by seq57/58
-    // `mutate.worktree_create` (the reconstruction with no branch slug),
-    // which burned the authorization.
+    // The step landed on the COMMITTED branch (the driver presents the
+    // committed params; no operator presented any) and the frontier moved on.
+    wait_for_attempt_status(&fixture, &run, "p2", "succeeded");
+    let worktree = fixture.dir.join("worktrees").join("lane-p2");
+    let head = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(&worktree)
+        .output()
+        .expect("git runs");
+    assert!(head.status.success(), "the worktree exists: {worktree:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&head.stdout).trim(),
+        "issue-92-original",
+        "the committed branch is the one supervision dispatched"
+    );
+
+    // Zero operator dispatch: the journal carries no `run.dispatch` control.
     let journal = rpc_ok(
         &fixture.socket,
-        &fresh_id(21),
+        &fresh_id(22),
         "journal.tail",
         Some(object(vec![
             ("after_seq", integer(0)),
             ("limit", integer(500)),
         ])),
     );
-    let records = journal
+    let actions: Vec<String> = journal
         .get("records")
         .and_then(Val::as_array)
-        .cloned()
+        .map(|records| {
+            records
+                .iter()
+                .filter_map(|row| row.get("action").and_then(Val::as_str).map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
-    let seq_of = |row: &Val, action: &str| -> Option<i64> {
-        (row.get("action").and_then(Val::as_str) == Some(action))
-            .then(|| row.get("seq").and_then(Val::as_int))
-            .flatten()
-    };
-    let retry_seq = records
-        .iter()
-        .filter_map(|row| seq_of(row, "mutate.run.retry"))
-        .max()
-        .expect("the retry journaled its intent");
-    let earlier_attempts: Vec<i64> = records
-        .iter()
-        .filter_map(|row| seq_of(row, "mutate.worktree_create"))
-        .filter(|seq| *seq < retry_seq)
-        .collect();
     assert!(
-        !earlier_attempts.is_empty(),
-        "the driver's one continuation attempt is on record BEFORE the retry (the \
-         probe is not vacuous): {earlier_attempts:?} < {retry_seq}"
-    );
-    let later_attempts: Vec<i64> = records
-        .iter()
-        .filter_map(|row| seq_of(row, "mutate.worktree_create"))
-        .filter(|seq| *seq > retry_seq)
-        .collect();
-    assert!(
-        later_attempts.is_empty(),
-        "the retry produces no same-second worktree_create attempt (retry seq \
-         {retry_seq}, later worktree seqs {later_attempts:?})"
-    );
-
-    // A second retry while one authorization is pending refuses typed.
-    let (exit, stdout, stderr) = run_cli(&fixture, &["retry", "--run", &run, "--step", "p2"]);
-    assert_eq!(
-        exit, 4,
-        "second retry exit; stdout: {stdout}; stderr: {stderr}"
-    );
-    assert!(
-        stderr.contains("refusal.run.retry_pending"),
-        "the duplicate is refused typed: {stderr}"
-    );
-
-    // The operator's own corrected dispatch consumes exactly one.
-    let (exit, stdout, stderr) = run_cli(
-        &fixture,
-        &[
-            "dispatch",
-            "--run",
-            &run,
-            "--step",
-            "p2",
-            "--param",
-            "branch=issue-92-retry-lane",
-        ],
-    );
-    assert_eq!(exit, 0, "dispatch exit; stdout: {stdout}; stderr: {stderr}");
-    let retries = fixture.seed().run_retries(&run).expect("retries");
-    assert_eq!(retries.len(), 1, "still exactly one authorization");
-    assert!(
-        !retries[0].consumed_at.is_empty(),
-        "consumed by the operator's dispatch: {retries:?}"
-    );
-
-    // ...and a SECOND dispatch of the same step is refused: single use.
-    let (exit, stdout, stderr) = run_cli(
-        &fixture,
-        &[
-            "dispatch",
-            "--run",
-            &run,
-            "--step",
-            "p2",
-            "--param",
-            "branch=issue-92-again",
-        ],
-    );
-    assert_eq!(
-        exit, 4,
-        "second dispatch exit; stdout: {stdout}; stderr: {stderr}"
-    );
-    assert!(
-        stderr.contains("refusal.run.step_done"),
-        "the completed step refuses any duplicate effect: {stderr}"
+        !actions.iter().any(|action| action == "mutate.run.dispatch"),
+        "no operator dispatch exists"
     );
 
     shutdown(daemon);
@@ -1793,11 +1870,42 @@ fn run_retry_authorizes_only_and_the_operators_dispatch_consumes_it_once() {
 
 #[test]
 fn retry_redispatch_carries_the_operators_corrected_params() {
-    let (fixture, daemon, run) = retry_lane_scenario("retry-fix");
+    // Supervision is EXPLICITLY DISABLED here: the operator's own dispatch is
+    // the ONE consumer of the held authorization (an armed run's supervision
+    // consumes it itself — issue #241, witnessed by the test above).
+    let (fixture, daemon, run) = unsupervised_retry_lane_scenario("retry-fix");
+
+    // The status read distinguishes the disposition: nothing is authorized
+    // yet, and the driver cannot act (no armed supervision).
+    let status = rpc_ok(
+        &fixture.socket,
+        &fresh_id(41),
+        "supervision.status",
+        Some(supervision::status_params(&run)),
+    );
+    assert_eq!(
+        picked(&status, &["evaluation", "retry", "state"]),
+        "awaiting-authorization",
+        "a diagnosed frontier with nothing authorized awaits an operator authorization"
+    );
 
     let (exit, stdout, stderr) = run_cli(&fixture, &["retry", "--run", &run, "--step", "p2"]);
     assert_eq!(exit, 0, "retry exit; stdout: {stdout}; stderr: {stderr}");
     assert_retry_authorization_survives(&fixture, &run, "p2");
+    // ...and once it exists, the read names it as HELD, never as a park.
+    let status = rpc_ok(
+        &fixture.socket,
+        &fresh_id(42),
+        "supervision.status",
+        Some(supervision::status_params(&run)),
+    );
+    assert_eq!(
+        picked(&status, &["evaluation", "retry", "state"]),
+        "authorized-awaiting-dispatch",
+        "the held authorization is named: {}",
+        canter::canonical::canonical_text(&status)
+    );
+    assert_eq!(picked(&status, &["evaluation", "retry", "step"]), "p2");
 
     // The operator presents ONLY the corrected `branch`; the plan document,
     // the spine, the grant and the topology are derived daemon-side.
@@ -1848,7 +1956,10 @@ fn retry_redispatch_carries_the_operators_corrected_params() {
 
 #[test]
 fn a_malformed_dispatch_refuses_typed_and_keeps_the_authorization_unconsumed() {
-    let (fixture, daemon, run) = retry_lane_scenario("retry-bad");
+    // Supervision is explicitly disabled: nothing but the operator's own
+    // dispatch can consume the held authorization, so the malformed request's
+    // "burns nothing" assertion is deterministic.
+    let (fixture, daemon, run) = unsupervised_retry_lane_scenario("retry-bad");
     let before = attempts_for(&fixture, &run, "p2");
 
     let (exit, stdout, stderr) = run_cli(&fixture, &["retry", "--run", &run, "--step", "p2"]);

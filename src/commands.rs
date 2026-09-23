@@ -68,6 +68,7 @@ USAGE:
     canter queue submit --request FILE --confirm-digest HEX64 [--epoch N] [--grant REF=GRANT_ID]... [--resume INSTANCE=DIGEST]... [--host-available yes|no|unknown] [--harness-lanes N|unknown] [--supervise arm|off] [--topology FILE] [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter queue status --submission QS_ID [--socket PATH] [--config PATH] [--json]
     canter queue preview --repository KEY --harness KEY [--reviewer-harness KEY] --host HOST --issue N=HEX40... --caps G/R/H [--host-available yes|no|unknown] [--harness-lanes N|unknown] [--boundary-phase PHASE] [--integration-branch B] [--completion-branch B] [--execution herdr|headless] [--out FILE] [--socket PATH] [--config PATH] [--json]
+    canter queue intake --repository KEY --harness KEY --host HOST --caps G/R/H [--label L] [--pin N=HEX40]... [--max-items N] [--dry-run] [--out FILE] [--integration-branch B] [--host-available yes|no|unknown] [--harness-lanes N|unknown] [--supervise arm|off] [--topology FILE] [--socket PATH] [--config PATH] [--json]
     canter run pause --run RUN_ID --reason TEXT [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run resume --run RUN_ID --digest HEX64 [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run retry --run RUN_ID --step STEP [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
@@ -293,6 +294,12 @@ pub struct RunDispatchArgs {
     pub topology: Option<PathBuf>,
     /// Optional fresh admission attestation document.
     pub admission: Option<PathBuf>,
+    /// Issue #250: the audited operator identity that authorizes the daemon's
+    /// OWN host-resource measurement at dispatch time. Presented with a
+    /// reason or not at all.
+    pub operator: Option<String>,
+    /// Issue #250: the bounded reason recorded with that measurement.
+    pub reason: Option<String>,
     /// `--idempotency-key`: replay-safe automation key.
     pub idempotency_key: Option<String>,
     /// Explicit daemon socket override.
@@ -324,6 +331,54 @@ pub enum QueueAction {
     /// bound-input document (read-only; the plan producer of the operator
     /// path, issue #91): `queue preview`.
     Preview(QueuePreviewArgs),
+    /// Turn the repository's own issue state into ONE bound-input submission,
+    /// deterministically and idempotently (issue #245): `queue intake`.
+    Intake(QueueIntakeArgs),
+}
+
+/// `queue intake` (issue #245): the deterministic feeder. Selection reads the
+/// repository's own issue surface (open issues carrying the ready label),
+/// revisions resolve by the documented rule, items already owned are never
+/// re-submitted, and the rendered document goes through the SAME preview,
+/// grant and submission surfaces the operator path uses — intake adds a rule,
+/// never a shortcut around admission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueueIntakeArgs {
+    /// Configured repository key or `owner/name` identity.
+    pub repository: String,
+    /// The ready label an open issue must carry to be selected
+    /// ([`crate::intake::READY_LABEL`] by default).
+    pub label: String,
+    /// Configured harness key whose reviewed role binding is re-observed.
+    pub harness: String,
+    /// Explicit target host identity token.
+    pub host: String,
+    /// Presented host availability; `None` = unknown (a hold). Intake never
+    /// assumes capacity.
+    pub host_available: Option<bool>,
+    /// Presented same-harness occupancy; `None` = unknown (a hold).
+    pub harness_lanes: Option<i64>,
+    /// The integration branch whose head is the default revision rule.
+    pub integration_branch: Option<String>,
+    /// Tracker declared revision pins (`--pin N=HEX40`): a declared pin wins
+    /// over the default rule.
+    pub pins: Vec<(u64, String)>,
+    /// The declared item bound of one invocation.
+    pub max_items: usize,
+    /// `--dry-run`: print the exact submission and mutate nothing.
+    pub dry_run: bool,
+    /// Path the bound-input document is written to (required unless
+    /// `--dry-run`).
+    pub out: Option<PathBuf>,
+    /// Presented fan-out concurrency caps (the admission axes).
+    pub caps: crate::lifecycle::ConcurrencyCaps,
+    /// `--supervise arm|off`: whether the submission arms supervision.
+    /// `arm` requires `--topology`.
+    pub supervise: String,
+    /// Dispatch topology committed with an armed submission.
+    pub topology: Option<PathBuf>,
+    /// Explicit daemon socket override.
+    pub socket: Option<String>,
 }
 
 /// Supervision subcommands (issue #95): the versioned status read of
@@ -1680,17 +1735,17 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
                 }
                 recorder = Some(value);
             }
-            "--operator" if action.as_str() == "reevaluate" => {
+            "--operator" if action.as_str() == "reevaluate" || action.as_str() == "dispatch" => {
                 let value = flag_value(rest, &mut index, command, "--operator")?;
                 if value.is_empty()
                     || value.len() > 128
                     || value.contains(':')
                     || value.chars().any(char::is_control)
                 {
-                    return Err(ParseError::Usage(
-                        "run reevaluate: --operator must be 1-128 printable characters without ':'"
-                            .to_string(),
-                    ));
+                    return Err(ParseError::Usage(format!(
+                        "run {}: --operator must be 1-128 printable characters without ':'",
+                        action.as_str()
+                    )));
                 }
                 operator = Some(value);
             }
@@ -1882,9 +1937,11 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
             })
         }
         "dispatch" => {
-            if reason.is_some() || digest.is_some() {
+            if digest.is_some() {
                 return Err(ParseError::Usage(
-                    "run dispatch takes --run, --step and --param only".to_string(),
+                    "run dispatch takes --run, --step, --param and the audited --operator/--reason \
+                     pair only"
+                        .to_string(),
                 ));
             }
             let Some(step) = step else {
@@ -1892,12 +1949,22 @@ fn parse_run(args: &[&String]) -> Result<Invocation, ParseError> {
                     "run dispatch: --step STEP is required (the committed-spine step)".to_string(),
                 ));
             };
+            // Issue #250: the audited operator measurement is a PAIR.
+            if operator.is_some() != reason.is_some() {
+                return Err(ParseError::Usage(
+                    "run dispatch: present BOTH --operator IDENTITY and --reason TEXT (the audited \
+                     pair that authorizes the daemon's own host-resource measurement), or neither"
+                        .to_string(),
+                ));
+            }
             RunAction::Dispatch(RunDispatchArgs {
                 run,
                 step,
                 params: step_params,
                 topology,
                 admission,
+                operator,
+                reason,
                 idempotency_key,
                 socket,
             })
@@ -2143,6 +2210,235 @@ fn parse_grant(args: &[&String]) -> Result<Invocation, ParseError> {
 /// the value lives once, in the mutation engine's window table.
 const GRANT_EXPIRY_MAX_SECS: i64 = crate::mutation::GRANT_WINDOW_MAX_SECS;
 
+/// Parse `queue intake` (issue #245).
+///
+/// The ready-label and ordering contract documented with the decision core
+/// ([`crate::intake`]) is what this surface exposes: `--label` (ready label),
+/// `--pin N=HEX40` (a tracker-declared revision that wins over the default
+/// rule), `--max-items` (the declared item bound), `--dry-run` (mutate
+/// nothing) and `--out` (where the rendered bound-input document goes).
+fn parse_queue_intake(rest: &[&String]) -> Result<Invocation, ParseError> {
+    let mut json = false;
+    let mut config_path: Option<PathBuf> = None;
+    let mut socket: Option<String> = None;
+    let mut repository: Option<String> = None;
+    let mut label = crate::intake::READY_LABEL.to_string();
+    let mut harness: Option<String> = None;
+    let mut host: Option<String> = None;
+    let mut host_available: Option<bool> = None;
+    let mut harness_lanes: Option<i64> = None;
+    let mut integration_branch: Option<String> = None;
+    let mut pins: Vec<(u64, String)> = Vec::new();
+    let mut max_items = crate::intake::max_items_default();
+    let mut dry_run = false;
+    let mut out: Option<PathBuf> = None;
+    // Intake adds a rule, never a shortcut: the submission it renders goes
+    // through the same caps/supervision presentation the operator path uses.
+    let mut caps: Option<crate::lifecycle::ConcurrencyCaps> = None;
+    let mut supervise = "disabled".to_string();
+    let mut topology: Option<PathBuf> = None;
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index].as_str() {
+            "--json" => json = true,
+            "--config" => {
+                config_path = Some(PathBuf::from(flag_value(
+                    rest, &mut index, "queue", "--config",
+                )?))
+            }
+            "--socket" => socket = Some(flag_value(rest, &mut index, "queue", "--socket")?),
+            "--repository" => {
+                let raw = flag_value(rest, &mut index, "queue", "--repository")?;
+                if raw.trim().is_empty() {
+                    return Err(ParseError::Usage(
+                        "queue intake: --repository requires a non-empty configured repository \
+                         key"
+                        .to_string(),
+                    ));
+                }
+                repository = Some(raw);
+            }
+            "--label" => {
+                let raw = flag_value(rest, &mut index, "queue", "--label")?;
+                if raw.trim().is_empty() {
+                    return Err(ParseError::Usage(
+                        "queue intake: --label requires the ready label an open issue must carry"
+                            .to_string(),
+                    ));
+                }
+                label = raw;
+            }
+            "--harness" => harness = Some(flag_value(rest, &mut index, "queue", "--harness")?),
+            "--host" => host = Some(flag_value(rest, &mut index, "queue", "--host")?),
+            "--host-available" => {
+                let raw = flag_value(rest, &mut index, "queue", "--host-available")?;
+                host_available = parse_host_available_argument("queue intake", &raw)?;
+            }
+            "--harness-lanes" => {
+                let raw = flag_value(rest, &mut index, "queue", "--harness-lanes")?;
+                harness_lanes = parse_harness_lanes_argument("queue intake", &raw)?;
+            }
+            "--integration-branch" => {
+                integration_branch = Some(flag_value(
+                    rest,
+                    &mut index,
+                    "queue",
+                    "--integration-branch",
+                )?);
+            }
+            "--pin" => {
+                let raw = flag_value(rest, &mut index, "queue", "--pin")?;
+                pins.push(parse_pin_argument(&raw)?);
+            }
+            "--max-items" => {
+                let raw = flag_value(rest, &mut index, "queue", "--max-items")?;
+                match raw.parse::<usize>() {
+                    Ok(parsed) if parsed > 0 => max_items = parsed,
+                    _ => {
+                        return Err(ParseError::Usage(format!(
+                            "queue intake: --max-items takes a positive integer (the declared \
+                             item bound), got {raw:?}"
+                        )));
+                    }
+                }
+            }
+            "--dry-run" => dry_run = true,
+            "--out" => {
+                out = Some(PathBuf::from(flag_value(
+                    rest, &mut index, "queue", "--out",
+                )?))
+            }
+            "--caps" => {
+                let raw = flag_value(rest, &mut index, "queue", "--caps")?;
+                caps = Some(parse_caps_argument("queue intake", &raw)?);
+            }
+            "--supervise" => {
+                let raw = flag_value(rest, &mut index, "queue", "--supervise")?;
+                match raw.as_str() {
+                    "arm" => supervise = "armed".to_string(),
+                    "off" => supervise = "disabled".to_string(),
+                    other => {
+                        return Err(ParseError::Usage(format!(
+                            "queue intake: --supervise takes arm|off, got {other:?} (supervision \
+                             is disabled unless it is explicitly authorized)"
+                        )));
+                    }
+                }
+            }
+            "--topology" => {
+                topology = Some(PathBuf::from(flag_value(
+                    rest,
+                    &mut index,
+                    "queue",
+                    "--topology",
+                )?))
+            }
+            "-h" | "--help" => return Err(ParseError::Help(help_request("queue"))),
+            flag => {
+                return Err(ParseError::Usage(format!(
+                    "queue intake: unknown flag {flag:?}; run `canter queue --help`"
+                )));
+            }
+        }
+        index += 1;
+    }
+    let repository = repository.ok_or_else(|| {
+        ParseError::Usage(
+            "queue intake: --repository KEY is required (the repository whose issue state is \
+             read)"
+                .to_string(),
+        )
+    })?;
+    let harness = harness.ok_or_else(|| {
+        ParseError::Usage(
+            "queue intake: --harness KEY is required (the reviewed role binding the run \
+             dispatches)"
+                .to_string(),
+        )
+    })?;
+    let host =
+        host.ok_or_else(|| ParseError::Usage("queue intake: --host HOST is required".to_string()))?;
+    let caps = caps.ok_or_else(|| {
+        ParseError::Usage(
+            "queue intake: --caps GLOBAL/REPOSITORY/HARNESS is required (the presented admission \
+             axes; unknown capacity is never assumed)"
+                .to_string(),
+        )
+    })?;
+    if supervise == "armed" && topology.is_none() {
+        return Err(ParseError::Usage(
+            "queue intake: --supervise arm requires --topology FILE so the supervisor can \
+             dispatch the first step without an operator nudge"
+                .to_string(),
+        ));
+    }
+    if !dry_run && out.is_none() {
+        return Err(ParseError::Usage(
+            "queue intake: --out FILE is required unless --dry-run is presented (the rendered \
+             bound-input document is the material the submission binds)"
+                .to_string(),
+        ));
+    }
+    Ok(Invocation {
+        command: "queue intake".to_string(),
+        json,
+        config_path,
+        board: None,
+        plan: None,
+        config_action: None,
+        daemon_action: None,
+        service_action: None,
+        lane_action: None,
+        queue_action: Some(QueueAction::Intake(QueueIntakeArgs {
+            repository,
+            label,
+            harness,
+            host,
+            host_available,
+            harness_lanes,
+            integration_branch,
+            pins,
+            max_items,
+            dry_run,
+            out,
+            caps,
+            supervise,
+            topology,
+            socket,
+        })),
+        run_action: None,
+        supervision_action: None,
+        grant_action: None,
+    })
+}
+
+/// Parse one `--pin N=HEX40` tracker-declared revision.
+fn parse_pin_argument(raw: &str) -> Result<(u64, String), ParseError> {
+    let (number, revision) = raw.split_once('=').ok_or_else(|| {
+        ParseError::Usage(format!(
+            "queue intake: --pin takes N=HEX40 (the issue and the revision its tracker \
+                 declares), got {raw:?}"
+        ))
+    })?;
+    let number: u64 = number.parse().map_err(|_| {
+        ParseError::Usage(format!(
+            "queue intake: --pin takes N=HEX40, got {raw:?} (N must be a positive integer)"
+        ))
+    })?;
+    if number == 0 {
+        return Err(ParseError::Usage(format!(
+            "queue intake: --pin takes N=HEX40, got {raw:?} (N must be a positive integer)"
+        )));
+    }
+    if !crate::intake::is_revision(revision) {
+        return Err(ParseError::Usage(format!(
+            "queue intake: --pin takes N=HEX40, got {raw:?} (the revision must be 40 lowercase \
+             hex)"
+        )));
+    }
+    Ok((number, revision.to_string()))
+}
+
 /// Parse `queue <submit|status|preview>` (issue #85; `preview` is the
 /// plan producer of the operator path, issue #91).
 fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
@@ -2152,18 +2448,19 @@ fn parse_queue(args: &[&String]) -> Result<Invocation, ParseError> {
     if action.as_str() == "-h" || action.as_str() == "--help" {
         return Err(ParseError::Help(help_request("queue")));
     }
+    let rest: Vec<&String> = args[1..].to_vec();
     let command = match action.as_str() {
         "submit" => "queue submit",
         "status" => "queue status",
         "redrive" => "queue redrive",
         "preview" => "queue preview",
+        "intake" => return parse_queue_intake(&rest),
         other => {
             return Err(ParseError::Usage(format!(
                 "queue: unknown subcommand {other:?}; run `canter queue --help`"
             )));
         }
     };
-    let rest: Vec<&String> = args[1..].to_vec();
     let mut json = false;
     let mut config_path: Option<PathBuf> = None;
     let mut socket: Option<String> = None;
@@ -4298,6 +4595,7 @@ fn execute_queue(action: QueueAction, invocation: &Invocation) -> CmdResult {
         QueueAction::Status(args) => execute_queue_status(&args, invocation),
         QueueAction::Redrive(args) => execute_queue_redrive(&args, invocation),
         QueueAction::Preview(args) => execute_queue_preview(&args, invocation),
+        QueueAction::Intake(args) => execute_queue_intake(&args, invocation),
     }
 }
 
@@ -4809,6 +5107,360 @@ fn render_grant_issue_human(data: &Val) -> String {
 /// `queue submit`: authorize and commit ONE approved selected-issue run.
 /// The local preflight is exactly the digest check plus the config
 /// re-observation; every durable fact is the daemon's to revalidate.
+/// `queue intake` (issue #245): the deterministic feeder.
+///
+/// One invocation turns the repository's OWN issue state into one bound-input
+/// submission: the open issues carrying the ready label are selected in
+/// ascending issue-number order, each revision resolves by the documented
+/// rule (a tracker-declared `--pin` wins; otherwise the repository's
+/// integration head at intake time), an issue that is already owned or queued
+/// is never re-submitted, items beyond the declared bound wait instead of
+/// bypassing admission, and an unresolvable revision refuses typed without
+/// submitting anything. `--dry-run` renders the decision and mutates nothing.
+///
+/// The document, the grants and the submission are the SAME surfaces the
+/// operator path uses (`queue preview` → `grant issue` per item →
+/// `queue submit`); intake never invents a submission path of its own.
+fn execute_queue_intake(args: &QueueIntakeArgs, invocation: &Invocation) -> CmdResult {
+    let config = match required_config(&invocation.config_path) {
+        Ok(config) => config,
+        Err(result) => return *result,
+    };
+    let repository = match resolve_repository(&config, &args.repository) {
+        Ok(repository) => repository,
+        Err(message) => {
+            return error_result(
+                2,
+                "usage.error",
+                format!("queue intake: {message}; run `canter queue intake --help`"),
+                false,
+            );
+        }
+    };
+    let identity = repository.identity();
+    // The reviewed role configuration is re-observed from the CURRENT config
+    // (never free-form argv): an unknown or unbound harness refuses before
+    // anything is read or rendered.
+    let Some(harness) = config
+        .harnesses
+        .iter()
+        .find(|harness| harness.key == args.harness)
+    else {
+        return error_result(
+            5,
+            "config.harness",
+            format!(
+                "queue intake: no configured harness {:?}; --harness names a configured \
+                 harness key (see `canter config show --json`)",
+                args.harness
+            ),
+            false,
+        );
+    };
+    if crate::config::ProfileBinding::from_config(
+        &config,
+        &args.harness,
+        &crate::config::credential_environment(harness),
+    )
+    .is_none()
+    {
+        return error_result(
+            5,
+            "config.harness",
+            format!(
+                "queue intake: harness {:?} declares no provider/model binding; there is no \
+                 re-observed role configuration to bind",
+                args.harness
+            ),
+            false,
+        );
+    }
+    // The ready issue set, read from the repository's own API surface (no
+    // model, no agent, no third-party service).
+    let env = crate::config::adapter_environment();
+    let gh_args = vec![
+        "api".to_string(),
+        format!(
+            "repos/{identity}/issues?state=open&labels={}&per_page=100",
+            args.label
+        ),
+    ];
+    let listed = crate::process::run(crate::process::ProcSpec {
+        program: "gh",
+        args: &gh_args,
+        env: &env,
+        cwd: None,
+        timeout: std::time::Duration::from_secs(30),
+    });
+    if listed.status.exit_code() != Some(0) {
+        // The refusal names the cause — status, program and argv as recorded,
+        // and the first stderr line — never the captured payload (#258 AC2).
+        return lane_error(
+            crate::intake::code::ISSUES_UNAVAILABLE,
+            format!(
+                "queue intake: the repository's own issue surface could not be read: {}",
+                listed.failure_detail("gh", &gh_args)
+            ),
+            false,
+        );
+    }
+    let listed_text = crate::redact::redact(&listed.stdout);
+    let listed_doc = match Val::parse_json(&listed_text) {
+        Ok(doc) => doc,
+        Err(err) => {
+            return lane_error(
+                crate::intake::code::ISSUES_UNAVAILABLE,
+                format!("queue intake: the issue surface returned unparsable JSON: {err}"),
+                false,
+            );
+        }
+    };
+    let Some(entries) = listed_doc.as_array() else {
+        return lane_error(
+            crate::intake::code::ISSUES_UNAVAILABLE,
+            "queue intake: the issue surface did not return one JSON array of issues".to_string(),
+            false,
+        );
+    };
+    // Selection is a rule: OPEN, carrying the ready label, and never a pull
+    // request (the issues surface carries both).
+    let mut candidates: Vec<crate::intake::Candidate> = Vec::new();
+    for entry in entries {
+        if entry.get("pull_request").is_some() {
+            continue;
+        }
+        if entry.get("state").and_then(Val::as_str) != Some("open") {
+            continue;
+        }
+        let labelled = entry
+            .get("labels")
+            .and_then(Val::as_array)
+            .map(|labels| {
+                labels.iter().any(|label| {
+                    label.get("name").and_then(Val::as_str) == Some(args.label.as_str())
+                })
+            })
+            .unwrap_or(false);
+        if !labelled {
+            continue;
+        }
+        if let Some(number) = entry.get("number").and_then(Val::as_int)
+            && number > 0
+        {
+            candidates.push(crate::intake::Candidate {
+                number: number as u64,
+                pin: args
+                    .pins
+                    .iter()
+                    .find(|(pinned, _)| *pinned == number as u64)
+                    .map(|(_, revision)| revision.clone()),
+            });
+        }
+    }
+    // The default revision rule: the repository's integration head at intake
+    // time, read from the remote (never from a stale local ref).
+    let integration = args
+        .integration_branch
+        .clone()
+        .or_else(|| repository.branch.clone())
+        .unwrap_or_else(|| "staging".to_string());
+    let integration_head = match crate::observe::ls_remote_head(&env, &integration) {
+        Ok(head) => head,
+        Err(detail) => {
+            return lane_error(
+                crate::intake::code::INTEGRATION_UNRESOLVED,
+                format!(
+                    "queue intake: the integration head of {integration:?} could not be resolved \
+                     from the repository remote: {detail}"
+                ),
+                false,
+            );
+        }
+    };
+    // Dedupe before submit: live ownership is read from the recorded state
+    // store (the same store the daemon writes), never inferred.
+    let socket = effective_socket(args.socket.as_deref(), Some(&config));
+    let paths = match derive_paths(socket) {
+        Ok(paths) => paths,
+        Err(result) => return result,
+    };
+    if !paths.db_path.exists() {
+        return error_result(
+            1,
+            "queue.no_state",
+            format!(
+                "no daemon state store at {}; run `canter daemon run` first (intake only reads \
+                 recorded ownership to decide what is already queued)",
+                paths.db_path.display()
+            ),
+            false,
+        );
+    }
+    let state = match State::open(&paths.db_path, Retention::default()) {
+        Ok(state) => state,
+        Err(err) => {
+            return error_result(
+                1,
+                err.code,
+                format!("queue intake: state store unavailable: {}", err.message),
+                false,
+            );
+        }
+    };
+    let owned: std::collections::BTreeSet<u64> = match state.queue_ownership_rows() {
+        Ok(rows) => rows
+            .into_iter()
+            .filter(|row| row.repository == identity)
+            .map(|row| row.issue_number as u64)
+            .collect(),
+        Err(err) => {
+            return error_result(
+                1,
+                err.code,
+                format!("queue intake: ownership read failed: {}", err.message),
+                false,
+            );
+        }
+    };
+    let decision = match crate::intake::decide(
+        &candidates,
+        integration_head.as_deref(),
+        &owned,
+        args.max_items,
+    ) {
+        Ok(decision) => decision,
+        Err(err) => return lane_error(err.code, format!("queue intake: {}", err.message), false),
+    };
+    let mut data = crate::intake::render(&decision, &identity, &args.label);
+    let held = decision.held();
+    let mut human = format!(
+        "queue intake {identity} ({} selected of {} ready issue(s), label {:?}, order {})\n",
+        decision.selected.len(),
+        decision.items.len(),
+        args.label,
+        crate::intake::ORDER_RULE
+    );
+    human.push_str(&format!("plan digest sha256 {}\n", decision.digest));
+    for (number, code, message) in &held {
+        human.push_str(&format!("hold {number} {code}: {message}\n"));
+    }
+    if args.dry_run {
+        // AC3: the dry run prints the exact decision and mutates nothing —
+        // no submission, no grants, no run records, no journal entries and no
+        // written document.
+        human.push_str(
+            "dry-run: nothing was submitted, no grant was issued, no document was written\n",
+        );
+        if let Val::Obj(map) = &mut data {
+            map.insert("dry_run".to_string(), crate::value::bool_(true));
+        }
+        return ok_result(data, human);
+    }
+    let out_path = args
+        .out
+        .clone()
+        .expect("--out is required unless --dry-run (parse_queue_intake)");
+    if decision.selected.is_empty() {
+        return lane_error(
+            "refusal.intake.empty",
+            format!(
+                "queue intake: no issue is selectable in {identity} (every ready issue is \
+                 already owned, capped or absent); nothing was submitted"
+            ),
+            false,
+        );
+    }
+    // The bound-input document: the same render the operator path produces,
+    // written to `--out` and bound by the digest the submission confirms.
+    let rendered = execute_queue_preview(
+        &QueuePreviewArgs {
+            repository: args.repository.clone(),
+            selected: decision.selected.clone(),
+            harness: args.harness.clone(),
+            reviewer_harness: None,
+            host: args.host.clone(),
+            host_available: args.host_available,
+            harness_lanes: args.harness_lanes,
+            caps: args.caps,
+            boundary_phase: None,
+            integration_branch: Some(integration.clone()),
+            completion_branch: None,
+            out: Some(out_path.clone()),
+            execution: ExecutionMode::HerdrPane,
+            socket: args.socket.clone(),
+        },
+        invocation,
+    );
+    if rendered.exit_code != 0 {
+        return rendered;
+    }
+    let digest = rendered
+        .data
+        .as_ref()
+        .and_then(|doc| doc.get("digest"))
+        .and_then(Val::as_str)
+        .unwrap_or("")
+        .to_string();
+    // One grant per selected item, under the declared expiry policy: the
+    // same mint path the operator presents at the authorization point.
+    let mut grants: Vec<(String, String)> = Vec::new();
+    for (number, _) in &decision.selected {
+        let minted = execute_grant_issue(
+            &GrantIssueArgs {
+                request_path: out_path.clone(),
+                issue: *number as i64,
+                expires_in: GRANT_EXPIRY_MAX_SECS,
+                idempotency_key: None,
+                socket: args.socket.clone(),
+            },
+            invocation,
+        );
+        if minted.exit_code != 0 {
+            return minted;
+        }
+        let grant_id = minted
+            .data
+            .as_ref()
+            .and_then(|doc| doc.get("grant_id"))
+            .and_then(Val::as_str)
+            .unwrap_or("")
+            .to_string();
+        grants.push((number.to_string(), grant_id));
+    }
+    let submitted = execute_queue_submit(
+        &QueueSubmitArgs {
+            request_path: out_path.clone(),
+            confirm_digest: digest.clone(),
+            epoch: None,
+            grants,
+            resume: Vec::new(),
+            host_available: args.host_available,
+            harness_lanes: args.harness_lanes,
+            caps: args.caps,
+            supervise: args.supervise.clone(),
+            topology: args.topology.clone(),
+            idempotency_key: None,
+            socket: args.socket.clone(),
+        },
+        invocation,
+    );
+    if submitted.exit_code != 0 {
+        return submitted;
+    }
+    let mut submitted_data = submitted.data.clone().unwrap_or_else(crate::value::null);
+    if let Val::Obj(map) = &mut submitted_data {
+        map.insert("intake".to_string(), data);
+        map.insert("digest".to_string(), string(&digest));
+        map.insert("out".to_string(), string(&out_path.display().to_string()));
+    }
+    human.push_str(&format!(
+        "submitted: document {} bound by digest {digest}\n",
+        out_path.display()
+    ));
+    human.push_str(&submitted.human);
+    ok_result(submitted_data, human)
+}
+
 fn execute_queue_submit(args: &QueueSubmitArgs, invocation: &Invocation) -> CmdResult {
     let text = match std::fs::read_to_string(&args.request_path) {
         Ok(text) => text,
@@ -5640,7 +6292,16 @@ fn execute_run_dispatch(args: &RunDispatchArgs, invocation: &Invocation) -> CmdR
                 .collect(),
         ))
     };
-    let mut params = crate::run_control::dispatch_params(&key, &args.run, &args.step, supplied);
+    let mut params = crate::run_control::dispatch_params(
+        &key,
+        &args.run,
+        &args.step,
+        supplied,
+        match (&args.operator, &args.reason) {
+            (Some(operator), Some(reason)) => Some((operator.as_str(), reason.as_str())),
+            _ => None,
+        },
+    );
     for (name, path) in [("topology", &args.topology), ("admission", &args.admission)] {
         if let Some(path) = path {
             let value = std::fs::read_to_string(path)
@@ -6186,8 +6847,8 @@ USAGE:
     canter run resolve --run RUN_ID --step STEP --recorder IDENTITY \
 --evidence FILE [--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run dispatch --run RUN_ID --step STEP [--param KEY=VALUE]... \
-[--topology FILE] [--admission FILE] [--idempotency-key IK] [--socket PATH] \
-[--config PATH] [--json]
+[--topology FILE] [--admission FILE] [--operator IDENTITY --reason TEXT] \
+[--idempotency-key IK] [--socket PATH] [--config PATH] [--json]
     canter run status --run RUN_ID [--socket PATH] [--config PATH] [--json]
 
 The scope is the RUN only: --run names exactly one durable run record
@@ -6217,10 +6878,12 @@ retry authorizes exactly ONE bounded re-dispatch of ONE diagnosed step
 spine, its current unachieved frontier step, and must carry a recorded
 terminal non-success attempt. Invalid (unknown/undiagnosed/out-of-order),
 revoked (inactive grant), stale (moved epoch), already-succeeded and
-exhausted (bounded attempts used) retries refuse. The authorization is the
-WHOLE effect: nothing is dispatched, spawned or consumed by this command —
-the operator's own corrected dispatch of that exact step consumes it
-exactly once (single use).
+exhausted (bounded attempts used) retries refuse. The request dispatches
+nothing and spawns nothing by itself: the authorization is consumed by the
+ONE re-dispatch of that exact step — the run's own armed supervision
+performs it (issue #241), or the operator's own corrected dispatch of that
+exact step consumes it when it arrives first (single use: a second attempt
+needs its own authorization).
 
 reevaluate recomputes the checks a terminal-success producer already recorded
 (daemon `run.reevaluate`, issue #230): a check recorded `failed` inside the
@@ -6257,6 +6920,17 @@ committed submission. `--topology FILE` supplies the documented topology for
 the run's first dispatch; later dispatches reuse that immutable recorded
 topology. `--admission FILE` may provide a fresh caller-attested admission
 measurement. No `hf-plan/v1` is ever hand-built.
+--operator IDENTITY --reason TEXT (a PAIR: both or neither) is the audited
+operator's own measurement of the host-resource proof (issue #250): the
+daemon measures the host at the run's lane root at dispatch time and binds
+the measurement into the run's recorded admission (superseding a lapsed
+proof), recording the identity, the reason, the superseded proof and the
+measurement in the hash-chained journal BEFORE it presents them — so a
+remedy that needs a proof is executable by the party it is addressed to.
+The caps and occupancy stay the run's own recorded ones: the measurement
+supplies a proof, never a cap. A host that cannot be measured (or a run that
+recorded no admission to bind it into) produces nothing and the admission
+gate still refuses the absent or lapsed proof, typed.
 The operator's inputs are merged over the step's committed params and
 validated against the step kind's existing param contract BEFORE anything
 is journaled. That pre-screen is TOTAL over the step kinds: each kind's own
@@ -6293,7 +6967,14 @@ the issue can be submitted again on its own merits.
 
 status reads the control state back read-only (daemon `run.status`):
 active / pause_requested (request durable, in-flight work still running) /
-paused (the safe boundary has been reached).
+paused (the safe boundary has been reached). Its `remedy` block is the
+DECISION for a parked run (issue #250): the ONE control whose own gate will
+accept the run's diagnosed frontier step (with its exact documented command
+and the reason the others do not apply), or — when the bounded-retry budget
+is spent, the step carries no re-evaluable check and no proof can be
+produced — the terminal typed `escalation.run.owner_decision` naming the
+owner decision, never an eligible-looking park; the read claims, measures,
+journals and dispatches nothing.
 
 EXIT CODES: 0 ok · 1 daemon/transport error · 2 usage · 4 refusal
 (refusal.run.*, refusal.request.malformed, refusal.state.epoch,

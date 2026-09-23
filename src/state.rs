@@ -238,11 +238,40 @@ pub const DISPATCH_REFUSAL_REASON_MAX: usize = 300;
 /// frontier behind `refusal.run.retry_required`. One fact, three readers:
 /// the retry fence ([`State::claim_run_retry`]), the daemon's supervised
 /// dispatch decision and the supervision driver's own eligibility.
+///
+/// Issue #250: the fan-out admission gate's two host-resource-proof codes are
+/// the SAME class. The gate decides them BEFORE any intent is journaled (the
+/// recorded admission is the run's own authorization window, and its proof
+/// lapsed or was never recorded), so a record carrying one of them is never
+/// the step's own failure: it is the run's own lapsed window, and the ONE
+/// control that renews it — the run's own re-dispatch, or the audited
+/// operator's measurement — never needs a bounded retry authorization to
+/// reach the step (`run status`'s `remedy` decision names it, and the
+/// admission gate itself still decides the presented proof).
 pub fn step_attempt_diagnosed(status: &str, code: &str) -> bool {
     if !matches!(status, "failed" | "refused" | "ambiguous") {
         return false;
     }
     code != crate::mutation::code::GRANT_EXPIRED
+        && code != crate::lifecycle::code::PROOF_STALE
+        && code != crate::lifecycle::code::PROOF_MISSING
+}
+
+/// The NEWEST recorded attempt of ONE step of one run, out of the durable
+/// attempt rows ([`State::run_step_attempts_with_codes`], oldest first): the
+/// row every diagnosis reader keys on — the bounded-retry fence, the
+/// supervision driver's eligibility and the `run status` remedy decision
+/// (issue #250) — so a park that is the run's own lapsed window is never
+/// fenced by an OLDER, already-spent step failure. `None` when the step was
+/// never attempted (a first dispatch is never fenced).
+fn latest_step_attempt<'a>(
+    attempts: &'a [(String, String, String, String)],
+    step_id: &str,
+) -> Option<(&'a str, &'a str, &'a str)> {
+    attempts
+        .iter()
+        .rfind(|(step, _, _, _)| step == step_id)
+        .map(|(step, status, code, _)| (step.as_str(), status.as_str(), code.as_str()))
 }
 
 /// The journal action ONE recorded check re-evaluation is written under
@@ -2978,7 +3007,11 @@ impl State {
                 "refusal.run.retry_pending",
                 format!(
                     "run {instance_id} still holds the unconsumed retry authorization {retry_id} \
-                     for step {step_id:?}; a release never burns an authorization"
+                     for step {step_id:?}; a release never burns an authorization — the \
+                     authorization is spent by the ONE re-dispatch of that exact step, so the \
+                     run's own armed supervision consumes it at its next check, or `run dispatch \
+                     --run {instance_id} --step {step_id}` consumes it, and the release succeeds \
+                     once it is spent"
                 ),
             ));
         }
@@ -4005,8 +4038,15 @@ impl State {
         self.record_run_retry_inner(instance_id, step_id, at, "")
     }
 
-    /// Reserve and consume supervision's own retry in one write. A pending
-    /// operator retry refuses here, never becoming the automatic claim.
+    /// Reserve and consume the run's bounded retry in one write, under the
+    /// dispatching claim's own key (issue #86, issue #241).
+    ///
+    /// An authorization the run already HOLDS is the one consumed: a
+    /// `run.retry` authorization is spent by the very re-dispatch it
+    /// authorized, recorded with that dispatch's idempotency key — the row is
+    /// single use, so a second attempt still needs its own authorization. With
+    /// no authorization held, supervision mints its own in the same write (the
+    /// bounded automatic retry, issue #179).
     pub(crate) fn consume_supervised_retry(
         &self,
         instance_id: &str,
@@ -4014,7 +4054,51 @@ impl State {
         at: &str,
         claim_key: &str,
     ) -> Result<RunRetryRow, StateError> {
-        self.record_run_retry_inner(instance_id, step_id, at, claim_key)
+        self.ensure_writable()?;
+        let pending: Option<(String, i64, String)> = {
+            let conn = self.lock("consume_supervised_retry")?;
+            conn.query_row(
+                "SELECT retry_id, attempt, authorized_at FROM run_retries
+                  WHERE instance_id = ?1 AND step_id = ?2 AND consumed_at = ''
+                  ORDER BY attempt LIMIT 1",
+                params![instance_id, step_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("consume_supervised_retry: pending", err))?
+        };
+        let Some((retry_id, attempt, authorized_at)) = pending else {
+            return self.record_run_retry_inner(instance_id, step_id, at, claim_key);
+        };
+        let consumed = {
+            let conn = self.lock("consume_supervised_retry")?;
+            conn.execute(
+                "UPDATE run_retries SET consumed_at = ?3, consumed_key = ?4
+                  WHERE retry_id = ?1 AND instance_id = ?2 AND consumed_at = ''",
+                params![retry_id, instance_id, at, claim_key],
+            )
+            .map_err(|err| StateError::from_sqlite("consume_supervised_retry: consume", err))?
+        };
+        if consumed == 0 {
+            // Exactly one dispatch ever consumes one authorization: a
+            // concurrent (or reclaimed) consume already spent it.
+            return Err(state_error(
+                "refusal.run.retry_pending",
+                format!(
+                    "run {instance_id} already spent the bounded retry authorization {retry_id} \
+                     for step {step_id:?}; a second attempt needs its own authorization"
+                ),
+            ));
+        }
+        Ok(RunRetryRow {
+            retry_id,
+            instance_id: instance_id.to_string(),
+            step_id: step_id.to_string(),
+            attempt,
+            authorized_at,
+            consumed_at: at.to_string(),
+            consumed_key: claim_key.to_string(),
+        })
     }
 
     fn record_run_retry_inner(
@@ -4090,11 +4174,28 @@ impl State {
     /// Check one step dispatch against the bounded-retry fence (issue #86)
     /// and consume the single-use authorization when one is needed:
     /// a first dispatch of a step is never fenced; a re-dispatch of a step
-    /// whose recorded outcomes include a terminal non-success consumes one
+    /// whose NEWEST recorded outcome is a terminal non-success consumes one
     /// unconsumed authorization, and refuses (`RunRetryClaim::Missing`)
     /// when none exists. A recorded refusal of the run's OWN lapsed window
     /// is not a step diagnosis ([`step_attempt_diagnosed`], issue #184), so
     /// a lapse never demands a retry.
+    ///
+    /// Issue #250: the diagnosis is read from the step's NEWEST recorded
+    /// attempt — the same row the supervision readers and the `run status`
+    /// remedy decision key on — so a park that is the run's own lapsed window
+    /// (the fan-out admission's proof codes, a lapsed grant) is not fenced:
+    /// the ONE control that renews it (the run's own re-dispatch, which
+    /// re-measures the lane root, or the audited operator's measurement)
+    /// reaches the step, and the step's own diagnosis re-appears as the newest
+    /// row the moment that re-dispatch runs and fails again.
+    ///
+    /// The run's own authorization for THIS step is read FIRST, whatever the
+    /// diagnosis says — the authorization authorizes exactly ONE re-dispatch
+    /// of that exact step, so the dispatch that arrives spends it (single use)
+    /// instead of a lapsed-window park leaving it pending forever (which would
+    /// fence `run.release` on an authorization nothing can consume). `Missing`
+    /// is therefore only ever returned for a step whose newest attempt is a
+    /// diagnosis and which holds no authorization.
     pub fn claim_run_retry(
         &self,
         instance_id: &str,
@@ -4105,12 +4206,8 @@ impl State {
         self.ensure_writable()?;
         let conn = self.lock("claim_run_retry")?;
         let attempts = self.run_step_attempts_with_codes(&conn, instance_id)?;
-        let diagnosed = attempts
-            .iter()
-            .any(|(step, status, code, _)| step == step_id && step_attempt_diagnosed(status, code));
-        if !diagnosed {
-            return Ok(RunRetryClaim::NotRequired);
-        }
+        let diagnosed = latest_step_attempt(&attempts, step_id)
+            .is_some_and(|(_, status, code)| step_attempt_diagnosed(status, code));
         // Supervision reserved and consumed its own slot with the intent.
         let consumed: Option<String> = conn
             .query_row(
@@ -4136,7 +4233,11 @@ impl State {
             .optional()
             .map_err(|err| StateError::from_sqlite("claim_run_retry: pending", err))?;
         let Some((retry_id, attempt)) = pending else {
-            return Ok(RunRetryClaim::Missing);
+            return Ok(if diagnosed {
+                RunRetryClaim::Missing
+            } else {
+                RunRetryClaim::NotRequired
+            });
         };
         let affected = conn
             .execute(
@@ -4455,6 +4556,50 @@ impl State {
         )?;
         tx.commit()
             .map_err(|err| StateError::from_sqlite("record_host_proof_renewal: commit", err))?;
+        Ok(())
+    }
+
+    /// Record ONE host-resource proof produced on an audited operator's
+    /// behalf (issue #250) as an audited `host.proof.renewal.operator`
+    /// record.
+    ///
+    /// The operator authorized the daemon's own measurement of the host at
+    /// the run's lane root (the artifact every named remedy for a parked run
+    /// needed and no control emitted); this record makes the act
+    /// inspectable — the identity, the reason, the proof it superseded (or
+    /// its absence), the measurement it presents and what the host exposed —
+    /// without reading any daemon-internal log. It changes no durable row:
+    /// the proof is an observation the run's own dispatch presents, not a
+    /// mutation of control state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_operator_host_proof_renewal(
+        &self,
+        instance_id: &str,
+        key: &str,
+        operator: &str,
+        reason: &str,
+        superseded_at: &str,
+        measured_at: &str,
+        available_bytes: u64,
+    ) -> Result<(), StateError> {
+        self.ensure_writable()?;
+        let mut conn = self.lock("record_operator_host_proof_renewal")?;
+        let tx = conn.transaction().map_err(|err| {
+            StateError::from_sqlite("record_operator_host_proof_renewal: begin", err)
+        })?;
+        self.append_audit_locked(
+            &tx,
+            "host.proof.renewal.operator",
+            &format!(
+                "run:{instance_id}:operator:{operator}:reason:{reason}:superseded:{superseded_at}:replacement:{measured_at}:available_bytes:{available_bytes}"
+            ),
+            key,
+            None,
+            None,
+        )?;
+        tx.commit().map_err(|err| {
+            StateError::from_sqlite("record_operator_host_proof_renewal: commit", err)
+        })?;
         Ok(())
     }
 
@@ -9072,7 +9217,12 @@ impl State {
 
     /// Append an audit record inside an existing transaction. The caller
     /// decides the transaction boundary (intent + claim vs resolution).
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// ONE clock read for the record, bound here and handed to
+    /// [`Self::append_audit_at_locked`]: the stored `line` and the `at` column
+    /// must be the same instant, or the next open's chain verification refuses
+    /// the row (column/line mismatch) — two reads could straddle a second
+    /// boundary (issue #101).
     fn append_audit_locked(
         &self,
         conn: &rusqlite::Transaction<'_>,
@@ -9081,6 +9231,27 @@ impl State {
         key: &str,
         plan_hash: Option<&str>,
         grant_id: Option<&str>,
+    ) -> Result<AuditRow, StateError> {
+        let at = time::rfc3339_now();
+        self.append_audit_at_locked(conn, action, target, key, plan_hash, grant_id, &at)
+    }
+
+    /// [`Self::append_audit_locked`] with the record's instant supplied at the
+    /// call boundary: the SAME `at` builds the hashed canonical line and the
+    /// persisted column, so a second clock read anywhere in the append
+    /// disagrees with the row's own columns. Production passes one clock read;
+    /// the issue #101 regression test passes a fixed instant instead of
+    /// relying on a real second boundary.
+    #[allow(clippy::too_many_arguments)]
+    fn append_audit_at_locked(
+        &self,
+        conn: &rusqlite::Transaction<'_>,
+        action: &str,
+        target: &str,
+        key: &str,
+        plan_hash: Option<&str>,
+        grant_id: Option<&str>,
+        at: &str,
     ) -> Result<AuditRow, StateError> {
         let epoch: i64 = conn
             .query_row("SELECT COALESCE(MAX(epoch), 1) FROM epoch", [], |row| {
@@ -9101,11 +9272,6 @@ impl State {
             .optional()
             .map_err(|err| StateError::from_sqlite("append_audit: prev", err))?
             .unwrap_or_default();
-        // ONE clock read for the record: the stored `line` and the `at`
-        // column must be the same instant, or the next open's chain
-        // verification refuses the row (column/line mismatch) — two reads
-        // could straddle a second boundary.
-        let at = time::rfc3339_now();
         let doc = object(vec![
             ("schema", string("hf-audit/v1")),
             ("seq", integer(seq)),
@@ -9123,7 +9289,7 @@ impl State {
                 "recorded_before_mutation",
                 bool_(action.starts_with("mutate.")),
             ),
-            ("at", string(&at)),
+            ("at", string(at)),
         ]);
         let line = canonical_text(&doc);
         let record_hash = sha256_hex(&[line.as_bytes(), prev_hash.as_bytes()].concat());
@@ -9188,30 +9354,44 @@ pub(crate) fn dispatch_refusal_of(
 }
 
 /// The newest recorded fix-round dispatch of one run (issue #238), read from
-/// the run's own step outcomes: the review step that consumed a FAIL records
-/// the fix round it handed that FAIL to in its result document, so the round
+/// the run's own step records: the review step that consumed a FAIL records the
+/// fix round it handed that FAIL to in the document it returned, so the round
 /// the run is waiting on is a recorded fact and not a second ledger. `None`
 /// when no step of the run ever dispatched a fix round.
+///
+/// Issue #254: the daemon persists that returned document in the apply row's
+/// RESPONSE column (the canonical `hf-rpc-response/v1` line, `result.fix_round`),
+/// while the row's `outcome.result` is `null` — so the handoff is read from
+/// where it is ACTUALLY written, the same way the repository's other recorded
+/// read models read a dispatch's own result (`run_dispatch_context`,
+/// `delivery_certificate_locked`). The `outcome` shape stays readable beside it
+/// (a row written by a writer that kept the result in the outcome is the same
+/// document), and the validation is identical either way: an
+/// `hf-fix-round/v1` document with all four named fields, or nothing at all.
 fn newest_fix_round_locked(
     conn: &Connection,
     instance_id: &str,
 ) -> Result<Option<SupervisionFixRound>, StateError> {
     let mut statement = conn
         .prepare(
-            "SELECT request_line, outcome FROM idempotency
+            "SELECT request_line, outcome, COALESCE(response, '') FROM idempotency
               WHERE method = 'apply' AND outcome IS NOT NULL
-                AND outcome LIKE '%fix_round%'
+                AND (outcome LIKE '%fix_round%' OR response LIKE '%fix_round%')
               ORDER BY rowid",
         )
         .map_err(|err| StateError::from_sqlite("supervision fix round: prepare", err))?;
     let rows = statement
         .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })
         .map_err(|err| StateError::from_sqlite("supervision fix round: query", err))?;
     let mut newest: Option<SupervisionFixRound> = None;
     for row in rows {
-        let (line, outcome) =
+        let (line, outcome, response) =
             row.map_err(|err| StateError::from_sqlite("supervision fix round: row", err))?;
         let Some(outcome) = outcome else {
             continue;
@@ -9223,13 +9403,23 @@ fn newest_fix_round_locked(
         if params.get("instance_id").and_then(Val::as_str) != Some(instance_id) {
             continue;
         }
-        let Ok(outcome) = Val::parse_json(&outcome) else {
-            continue;
-        };
-        let Some(fix) = outcome
-            .get("result")
-            .and_then(|result| result.get("fix_round"))
-        else {
+        let recorded = Val::parse_json(&outcome)
+            .ok()
+            .and_then(|outcome| {
+                outcome
+                    .get("result")
+                    .and_then(|result| result.get("fix_round"))
+                    .cloned()
+            })
+            .or_else(|| {
+                Val::parse_json(&response).ok().and_then(|response| {
+                    response
+                        .get("result")
+                        .and_then(|result| result.get("fix_round"))
+                        .cloned()
+                })
+            });
+        let Some(fix) = recorded else {
             continue;
         };
         if fix.get("schema").and_then(Val::as_str) != Some("hf-fix-round/v1") {
@@ -9253,6 +9443,14 @@ fn newest_fix_round_locked(
             round,
             bound,
             lane: lane.to_string(),
+            // Issue #256: the leg's OWN lane checkout, recorded by the engine
+            // at dispatch. A record that names none (a row written before this
+            // slice) observes nothing and keeps its recorded disposition.
+            worktree: fix
+                .get("worktree")
+                .and_then(Val::as_str)
+                .unwrap_or("")
+                .to_string(),
         });
     }
     Ok(newest)
@@ -12648,6 +12846,12 @@ pub struct SupervisionEvidence {
     /// (issue #238), when one exists: the round of the automatic bound the
     /// recorded FAIL was handed to.
     pub fix_round: Option<SupervisionFixRound>,
+    /// The observed state of that handoff's OWN repair leg (issue #256): the
+    /// head its lane checkout holds, read from the leg's own checkout by the
+    /// caller that can observe the host. `None` = not observed (no recorded
+    /// handoff, no recorded lane, or an unreadable checkout), and an
+    /// unobserved leg is never reported as moved.
+    pub fix_leg: Option<FixLegState>,
     /// Every recorded check re-evaluation of this run as `(step, count)`
     /// (issue #243): the durable bound the driver reads before it drives the
     /// run's own bounded recovery control. Counted from the hash-chained
@@ -12697,6 +12901,30 @@ pub struct SupervisionFixRound {
     pub bound: i64,
     /// The fix leg's lane session (the identity the instruction reached).
     pub lane: String,
+    /// The fix leg's OWN lane checkout, relative to the run's worktrees root
+    /// (issue #256): the engine records where the leg's state lives, so the
+    /// classification can read the head the leg DELIVERED instead of the head
+    /// the FAIL was handed at. Empty when the recorded handoff names none (a
+    /// row written before this slice), in which case no leg is ever observed.
+    pub worktree: String,
+}
+
+/// The observed state of one run's repair leg (issue #256): the head the
+/// leg's OWN lane checkout holds.
+///
+/// The head a handoff was DISPATCHED for is the head the FAIL was handed at —
+/// it can never move by itself. A repair leg advances the branch in its own
+/// checkout, so the leg's own checkout is the only recorded state that names
+/// the delivered head; observing it is what lets a run stop waiting on a
+/// worker that has already delivered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FixLegState {
+    /// The head the leg's own lane checkout holds (40-hex).
+    pub head: String,
+    /// True when that head is a DESCENDANT of the certified head the recorded
+    /// handoff names (the leg committed a repair past the reviewed head, so
+    /// the branch it must push has moved).
+    pub delivered: bool,
 }
 
 /// The recorded dispatch context of one run: the first topology it bound,
@@ -14226,6 +14454,7 @@ impl State {
             newest_evidence,
             dispatch_refusal,
             fix_round,
+            fix_leg: None,
             reevaluations,
         }))
     }
@@ -14334,6 +14563,20 @@ impl State {
                     })
                 }
             }))
+    }
+
+    /// Whether ONE (run, step) carries a recorded step DIAGNOSIS — the SAME
+    /// fact the bounded-retry fence reads ([`State::claim_run_retry`]) and the
+    /// `run status` remedy decision is keyed on (issue #250): the step's
+    /// NEWEST recorded attempt is a diagnosis ([`step_attempt_diagnosed`]).
+    /// A step that was never attempted is not diagnosed — a first dispatch is
+    /// never fenced, and the ONE control that renews the run's own lapsed
+    /// window never needs a bounded retry authorization.
+    pub fn run_step_diagnosed(&self, instance_id: &str, step_id: &str) -> Result<bool, StateError> {
+        let conn = self.lock("run_step_diagnosed")?;
+        let attempts = self.run_step_attempts_with_codes(&conn, instance_id)?;
+        Ok(latest_step_attempt(&attempts, step_id)
+            .is_some_and(|(_, status, code)| step_attempt_diagnosed(status, code)))
     }
 
     /// Record ONE refused continuation dispatch of a supervised run (issue
@@ -15488,6 +15731,85 @@ mod tests {
         let reopened =
             State::open(&path, Retention::default()).expect_err("tamper must fail closed");
         assert_eq!(reopened.code, "state.audit_tampered");
+    }
+
+    /// Issue #101: `append_audit` binds ONE instant per record — the SAME value
+    /// builds the hashed canonical line and the persisted `at` column, so a
+    /// wall-clock tick between two reads can never leave a row whose own
+    /// columns disagree with its line (the reopen check the flake tripped:
+    /// `state.audit_tampered` / "column/line mismatch").
+    ///
+    /// The seam is the call boundary ([`State::append_audit_at_locked`]): the
+    /// instant supplied here is far from any wall-clock read, so a second read
+    /// anywhere in the append disagrees with the stored column. Mutation probe:
+    /// building the line's `at` from a fresh `time::rfc3339_now()` instead of
+    /// the bound value is RED on this test.
+    #[test]
+    fn audit_append_binds_one_instant_to_its_line_and_at_column() {
+        let path = temp_db("audit-one-instant.db");
+        let state = State::open(&path, Retention::default()).expect("open");
+        let instant = "2001-02-03T04:05:06Z";
+        let newest_row = || {
+            let conn = state.lock("test.audit.one-instant.row").expect("lock");
+            conn.query_row(
+                "SELECT at, line FROM audit ORDER BY seq DESC LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("stored row")
+        };
+        // The seam supplies the record's instant: both the column and the
+        // hashed line must carry it.
+        {
+            let mut conn = state.lock("test.audit.one-instant").expect("lock");
+            let tx = conn.transaction().expect("begin");
+            state
+                .append_audit_at_locked(
+                    &tx,
+                    "state.clock_probe",
+                    "example-org/widgets",
+                    "ik_one-instant-0001",
+                    None,
+                    None,
+                    instant,
+                )
+                .expect("append");
+            tx.commit().expect("commit");
+        }
+        let (column_at, line) = newest_row();
+        assert_eq!(column_at, instant, "the stored column is the bound instant");
+        let doc = Val::parse_json(&line).expect("the stored line parses");
+        assert_eq!(
+            doc.get("at").and_then(Val::as_str),
+            Some(instant),
+            "the hashed canonical line carries the same instant as the column"
+        );
+        // The production entry point binds one clock read the same way: its
+        // row's own column and line never disagree either.
+        state
+            .journal_intent(
+                "mutate.backup.create",
+                "example-org/widgets",
+                "ik_one-instant-0002",
+                &"a".repeat(16),
+                "backup.create",
+                None,
+                None,
+                &sample_request_line("ik_one-instant-0002"),
+            )
+            .expect("journal intent");
+        let (column_at, line) = newest_row();
+        let doc = Val::parse_json(&line).expect("the stored line parses");
+        assert_eq!(
+            doc.get("at").and_then(Val::as_str),
+            Some(column_at.as_str()),
+            "the production append's column and hashed line name the same instant"
+        );
+        // The reopen check rebuilds the document from the row's own columns and
+        // compares it to the stored line: it passes only if they agree.
+        drop(state);
+        let reopened = State::open(&path, Retention::default()).expect("reopen");
+        assert_eq!(reopened.verify_chain(), Ok(()));
     }
 
     #[test]
@@ -17909,41 +18231,63 @@ mod tests {
     }
 
     /// The fix-round read-back of issue #238: the review step's own apply
-    /// outcome carries the round a recorded FAIL was handed to, and the read
+    /// record carries the round a recorded FAIL was handed to, and the read
     /// returns exactly THIS run's newest one — another run's round and a
     /// non-fix outcome of the same run are never read as its handoff.
+    ///
+    /// Issue #254: the record is read from where the DAEMON persists it. An
+    /// apply row keeps the effect's returned document in its RESPONSE column
+    /// (`hf-rpc-response/v1`, `result.fix_round`) while `outcome.result` is
+    /// `null` — the two live shapes this repository's acceptance run recorded —
+    /// so both columns are read, and an unreadable/future-schema document in
+    /// either one is still never a handoff.
     #[test]
-    fn a_recorded_fix_round_is_read_back_from_the_runs_own_outcome() {
+    fn a_recorded_fix_round_is_read_back_from_the_runs_own_apply_row() {
         let conn = Connection::open_in_memory().expect("memory db");
         conn.execute_batch(
             "CREATE TABLE idempotency (key TEXT PRIMARY KEY, request_id TEXT NOT NULL,
                 method TEXT NOT NULL, status TEXT NOT NULL, epoch INTEGER NOT NULL,
-                request_line TEXT NOT NULL, outcome TEXT);",
+                request_line TEXT NOT NULL, outcome TEXT, response TEXT);",
         )
         .expect("idempotency schema");
+        let fix_round = |round: i64, lane: &str, schema: &str| {
+            object(vec![(
+                "fix_round",
+                object(vec![
+                    ("schema", string(schema)),
+                    ("round", integer(round)),
+                    ("bound", integer(3)),
+                    ("feature_head", string(&"a".repeat(40))),
+                    ("lane", string(lane)),
+                ]),
+            )])
+        };
         let insert = |key: &str, run: &str, step: &str, fix: Option<(i64, &str)>| {
             let request = object(vec![(
                 "params",
                 object(vec![("instance_id", string(run)), ("step", string(step))]),
             )]);
+            // The daemon's own split: the effect's facts live in the RESPONSE
+            // document and the outcome carries no `result` at all.
             let result = match fix {
-                Some((round, lane)) => object(vec![(
-                    "fix_round",
-                    object(vec![
-                        ("schema", string("hf-fix-round/v1")),
-                        ("round", integer(round)),
-                        ("bound", integer(3)),
-                        ("feature_head", string(&"a".repeat(40))),
-                        ("lane", string(lane)),
-                    ]),
-                )]),
+                Some((round, lane)) => fix_round(round, lane, "hf-fix-round/v1"),
                 None => object(vec![("verdict", string("pass"))]),
             };
-            let outcome = object(vec![("status", string("succeeded")), ("result", result)]);
+            let response = object(vec![
+                ("ok", crate::value::Val::Bool(true)),
+                ("schema", string("hf-rpc-response/v1")),
+                ("result", result.clone()),
+            ]);
+            let outcome = object(vec![("status", string("succeeded")), ("result", null())]);
             conn.execute(
                 "INSERT INTO idempotency (key, request_id, method, status, epoch,
-                    request_line, outcome) VALUES (?1, 'req', 'apply', 'spent', 1, ?2, ?3)",
-                params![key, canonical_text(&request), canonical_text(&outcome)],
+                    request_line, outcome, response) VALUES (?1, 'req', 'apply', 'spent', 1, ?2, ?3, ?4)",
+                params![
+                    key,
+                    canonical_text(&request),
+                    canonical_text(&outcome),
+                    canonical_text(&response)
+                ],
             )
             .expect("idempotency row");
         };
@@ -17965,6 +18309,41 @@ mod tests {
                 .expect("read")
                 .is_none(),
             "a run that never dispatched a fix round has none"
+        );
+
+        // The SAME row shape with a schema this reader does not validate FAILS
+        // CLOSED: a future document is not a handoff, and the round that DID
+        // validate is still the one read back.
+        let stale = object(vec![(
+            "params",
+            object(vec![
+                ("instance_id", string("run-d")),
+                ("step", string("p6-5")),
+            ]),
+        )]);
+        let response = object(vec![
+            ("ok", crate::value::Val::Bool(true)),
+            ("schema", string("hf-rpc-response/v1")),
+            ("result", fix_round(1, "lane-future", "hf-fix-round/v2")),
+        ]);
+        conn.execute(
+            "INSERT INTO idempotency (key, request_id, method, status, epoch,
+                request_line, outcome, response) VALUES ('ik-d-1', 'req', 'apply', 'spent', 1, ?1, ?2, ?3)",
+            params![
+                canonical_text(&stale),
+                canonical_text(&object(vec![
+                    ("status", string("succeeded")),
+                    ("result", null()),
+                ])),
+                canonical_text(&response)
+            ],
+        )
+        .expect("unvalidated row");
+        assert!(
+            newest_fix_round_locked(&conn, "run-d")
+                .expect("read")
+                .is_none(),
+            "an `hf-fix-round/v1` schema check is never weakened by the new column"
         );
     }
 

@@ -13,8 +13,10 @@
 //! - The driver **evaluates and reports** and dispatches an armed run's first
 //!   and next unattempted autonomous step through the daemon's existing apply
 //!   engine. That preserves the committed grant, capability, admission,
-//!   ownership, topology, journal and idempotency gates; diagnosed steps still
-//!   require the operator's explicit corrected retry dispatch.
+//!   ownership, topology, journal and idempotency gates; a diagnosed step is
+//!   re-dispatched only within the shared bounded retry budget (issue #179),
+//!   and an authorization the run already holds is consumed by that
+//!   re-dispatch, exactly once (issue #241).
 //! - It also drives the risk-classed TAIL of a run whose own committed queue
 //!   submission declares it (issue #152: the merge of its reviewed head, then
 //!   the cleanup of its lane worktree), so the spine that produced a verified
@@ -38,7 +40,8 @@
 //!   already-authorized queue cursor — once per delivered issue — and admits
 //!   the next eligible approved issue of the SAME committed submission under
 //!   the existing admission and ownership checks. It never resumes a pause,
-//!   authorizes a retry, retries a diagnosed step or clears a hold.
+//!   never retries a diagnosed step past the shared bounded retry budget and
+//!   never clears a hold.
 //! - A duplicate delivery event, a replayed check or a crash/restart never
 //!   duplicates a dispatch: the advance is keyed to the delivered issue
 //!   (one consumption per submission item, ever) and the cursor is derived
@@ -78,6 +81,7 @@
 //! the policy, the pure classification and the driver loop that takes the
 //! state guard only for short reads and writes (never across a wait).
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -135,7 +139,7 @@ pub const TRIGGERS: [&str; 7] = [
 
 /// The statement every supervision document carries: what this surface does
 /// and provably does NOT do.
-pub const STATEMENT: &str = "an explicitly armed run is classified from recorded evidence and each unattempted autonomous next step — plus the risk-classed merge then cleanup tail of a run whose own committed queue submission declares it after that run's verified delivery — is dispatched through the existing apply engine with the committed grant, capability, admission, ownership, topology, journal and idempotency gates; a continuation the engine refuses before any effect is reported with the engine's own code and is never presented as an eligible next step; a fresh verified reviewed-and-CI-green delivery advances its authorized queue cursor exactly once under the same admission and ownership checks; when the run's own newest recorded review evidence carries a non-passing check the driver drives the run's OWN bounded, attributed and journaled check re-evaluation — the producer is re-run on a fresh lane round, never adjudicated, and the tail behind the unverified delivery stays undriven; supervision never resumes a pause, authorizes or consumes a retry, retries a diagnosed step, invents missing inputs or clears a hold";
+pub const STATEMENT: &str = "an explicitly armed run is classified from recorded evidence and each unattempted autonomous next step — plus the risk-classed merge then cleanup tail of a run whose own committed queue submission declares it after that run's verified delivery — is dispatched through the existing apply engine with the committed grant, capability, admission, ownership, topology, journal and idempotency gates; a continuation the engine refuses before any effect is reported with the engine's own code and is never presented as an eligible next step; a fresh verified reviewed-and-CI-green delivery advances its authorized queue cursor exactly once under the same admission and ownership checks; when the run's own newest recorded review evidence carries a non-passing check the driver drives the run's OWN bounded, attributed and journaled check re-evaluation — the producer is re-run on a fresh lane round, never adjudicated, and the tail behind the unverified delivery stays undriven; supervision never resumes a pause, never retries a diagnosed step past the shared bounded retry budget (an authorization the run already holds is consumed by that re-dispatch, exactly once), invents missing inputs or clears a hold";
 
 /// Default bounded timer fallback cadence (seconds).
 pub const DEFAULT_CHECK_INTERVAL_SECS: i64 = 60;
@@ -373,6 +377,13 @@ pub mod codes {
     /// the fix leg carries the instruction: the run waits on its own repair
     /// round, and `detail` names the fix leg's lane.
     pub const FIX_DISPATCHED: &str = "supervision.fix_round_dispatched";
+    /// The newest recorded fix-round handoff names ANOTHER head than the run's
+    /// newest recorded review evidence (issue #254): the repair leg advanced
+    /// the branch past the head this FAIL was handed at, so the recorded round
+    /// is not the handoff of THIS evidence. The fix round's own recorded lane
+    /// is named as the remedy, with both head prefixes — the class is the
+    /// fix-round disposition, never a bare `supervision.review_failed`.
+    pub const FIX_HEAD_MOVED: &str = "supervision.fix_round_head_moved";
     /// The next step's latest attempt was refused for capacity.
     pub const CAPACITY_BLOCKED: &str = "supervision.capacity_blocked";
     /// A step dispatch is in flight: legitimate long-running work.
@@ -408,6 +419,9 @@ pub mod codes {
     /// check, so its verified-delivery consumer is refused (issue #230) and
     /// the driver drives the run's OWN bounded, audited recovery control —
     /// the check producer re-evaluated on a fresh lane round (issue #243).
+    /// Issue #254: the recorded FAIL the review step handed to the run's own
+    /// fix round is the SAME precondition ([`recorded_fail_refusal`]), so the
+    /// FAIL shape drives the same control instead of parking on it.
     /// The tail behind the unverified delivery is still never driven and the
     /// run is still never reported eligible.
     pub const REEVALUATION: &str = "supervision.reevaluation.next_round";
@@ -765,11 +779,17 @@ pub trait SupervisedDispatch: Send + Sync {
 ///   declares it — so the delivering run's own merge and cleanup are driven
 ///   to the end of its committed spine (issue #152).
 ///
-/// A diagnosed step may retry within the shared bounded budget. A pending
-/// operator authorization reserves the step for the operator's corrected
-/// dispatch: supervision never consumes it. The daemon backs off attempts
-/// and atomically records its own consumed authorization through the apply
-/// path, without bypassing any effect gate.
+/// A diagnosed step may retry within the shared bounded budget. An
+/// authorization the run ALREADY holds — the operator's `run.retry` row — is
+/// consumed by this very dispatch (issue #241): the intent is derived for the
+/// exact step it authorizes, the daemon's supervised apply path consumes it
+/// with the dispatch's own idempotency key, and the engine's fence sees the
+/// authorization spent by its own claim. It therefore never parks the
+/// frontier, and a second attempt still needs its own authorization. The ONE
+/// exception is the risk-classed committed TAIL (`merge` / `cleanup`), which
+/// keeps issue #152's rule verbatim: an ATTEMPTED tail stays the operator's,
+/// and a held authorization over it is spent by that operator's own
+/// `run.dispatch` — the release refusal names exactly that remedy.
 ///
 /// Non-armed/unknown supervision keeps its zero-effect guarantee: this
 /// function returns `None` for every row that is not explicitly armed.
@@ -806,6 +826,23 @@ pub fn dispatch_intent(
         // nothing else about the park changes.
         return reevaluation_intent(evidence, &step_id, &kind);
     }
+    let step_retries: Vec<&crate::state::RunRetryRow> = evidence
+        .retries
+        .iter()
+        .filter(|retry| retry.step_id == step_id)
+        .collect();
+    // Issue #241: the ONE authorization the run already holds is spent by the
+    // re-dispatch it authorizes, so it is not a park. The park codes below
+    // fence only the retries supervision MINTS for itself (a worker timeout,
+    // a moved certificate and a moved/unbound delivery are never
+    // re-dispatched on supervision's own initiative) — an explicit operator
+    // authorization is exactly the act that asks for one bounded re-dispatch
+    // of this diagnosed step.
+    let authorized = step_retries
+        .iter()
+        .any(|retry| retry.consumed_at.is_empty());
+    // The risk-classed committed TAIL keeps issue #152's own rule (see below).
+    let tail = COMMITTED_TAIL_STEP_KINDS.contains(&kind.as_str());
     match latest_attempt_for(evidence, &step_id) {
         // Never dispatched: the plain continuation of an armed run.
         None => {}
@@ -821,9 +858,7 @@ pub fn dispatch_intent(
             }
         }
         Some((_, status, code))
-            if matches!(status.as_str(), "failed" | "refused" | "ambiguous")
-                // A worker timeout is a wait/park, never a retryable failure.
-                && code != crate::mutation::code::WORKER_TIMEOUT
+            if crate::state::step_attempt_diagnosed(status, code)
                 // Issue #200: a review step whose recorded diagnosis is
                 // `refusal.evidence.verdict_stale` refuses because a head
                 // binding MOVED (the lane checkout is no longer the certified
@@ -833,7 +868,6 @@ pub fn dispatch_intent(
                 // It parks the frontier typed (the recorded code) with the
                 // bounded retries UNSPENT, instead of burning them on a step
                 // that can never succeed.
-                && code != crate::mutation::code::VERDICT_STALE
                 // Issue #202 (AC1): the same discipline for a delivery that
                 // moved past the head its recorded verdict names. The verdict
                 // is a recorded fact and the delivery branch's movement is
@@ -842,19 +876,22 @@ pub fn dispatch_intent(
                 // the moved head: the frontier parks typed with the bounded
                 // retries UNSPENT, and the run is never presented as a step
                 // that could still be retried into consumption.
-                && code != crate::mutation::code::DELIVERY_MOVED
-                && code != crate::mutation::code::DELIVERY_UNBOUND
                 && newest_verdict(evidence) != "fail"
-                && evidence
-                    .retries
-                    .iter()
-                    .filter(|retry| retry.step_id == step_id)
-                    .count()
-                    < crate::state::RUN_RETRY_MAX as usize
-                && !evidence
-                    .retries
-                    .iter()
-                    .any(|retry| retry.step_id == step_id && retry.consumed_at.is_empty()) => {}
+                // Issue #241: a held authorization is spent by the ONE
+                // re-dispatch it authorizes, so it is dispatchable — for the
+                // steps the driver already re-dispatches on its own within
+                // the bounded budget. The risk-classed committed TAIL
+                // (`merge` / `cleanup`) keeps issue #152's rule verbatim: an
+                // ATTEMPTED tail stays the operator's, and a held
+                // authorization over it is consumed by that operator's own
+                // `run.dispatch` (the release refusal names that remedy).
+                && ((authorized && !tail)
+                    || (!authorized
+                        && code != crate::mutation::code::WORKER_TIMEOUT
+                        && code != crate::mutation::code::VERDICT_STALE
+                        && code != crate::mutation::code::DELIVERY_MOVED
+                        && code != crate::mutation::code::DELIVERY_UNBOUND
+                        && step_retries.len() < crate::state::RUN_RETRY_MAX as usize)) => {}
         Some(_) => return None,
     }
     Some(DispatchIntent {
@@ -894,9 +931,11 @@ pub fn reevaluation_reason(step: &str) -> String {
 /// `Some` only in the exact recorded shape the deadlock is made of — the
 /// frontier is a committed tail step the run's own caps authorize, after the
 /// run's reviewed-evidence step, and the run's newest recorded review evidence
-/// is a `pass` bound to the run's own pins at one exact head whose named checks
-/// are NOT all `passed` ([`unverified_delivery_refusal`], the SAME derivation
-/// the classification reads) — and only while the recorded bound
+/// carries a non-passing check at one exact head bound to the run's own pins:
+/// the `pass` whose named checks are not all `passed` ([`unverified_delivery_refusal`],
+/// the SAME derivation the classification reads), or the recorded FAIL that
+/// evidence names and the review step handed to the run's own fix round
+/// (issue #254, [`recorded_fail_refusal`]) — and only while the recorded bound
 /// ([`crate::run_control::RUN_REEVALUATION_MAX`], counted from the durable
 /// journal) has NOT been spent.
 ///
@@ -910,7 +949,13 @@ fn reevaluation_intent(
     frontier: &str,
     frontier_kind: &str,
 ) -> Option<DispatchIntent> {
-    unverified_delivery_refusal(evidence, frontier, frontier_kind)?;
+    // The recorded precondition of the control (issue #230, extended by #254
+    // to the recorded FAIL the run's own fix round was handed): the run's
+    // newest recorded review evidence carries a non-passing check, so its
+    // verified-delivery consumer is refused while the check producer cannot be
+    // re-run by anything but this control.
+    unverified_delivery_refusal(evidence, frontier, frontier_kind)
+        .or_else(|| recorded_fail_refusal(evidence, frontier, frontier_kind))?;
     // The producer: the run's own check-producing step — the reviewed-evidence
     // step of the committed spine that declares its reviewer LEG (the only
     // shape that computes checks) and whose latest recorded attempt SUCCEEDED
@@ -1035,6 +1080,76 @@ fn delivery_held(evidence: &SupervisionEvidence) -> bool {
         || evidence.in_flight.is_some()
 }
 
+/// The recorded subject the tail's own refusal and the run's own recovery
+/// control are both derived from (issues #230, #243, #254): the run holds the
+/// capability of this committed TAIL step, the step comes AFTER the run's
+/// reviewed-evidence step, and the run's newest recorded review evidence is
+/// bound to the run's own pins at one exact head. The verdict is NOT decided
+/// here — each reader below says which one it accepts.
+fn delivery_evidence_subject(
+    evidence: &SupervisionEvidence,
+    step: &str,
+    kind: &str,
+) -> Option<(String, crate::mutation::EvidenceView)> {
+    // A run that is held, or that has a step in flight, is not a delivery at
+    // all — the SAME fact [`verified_delivery`] applies, from the SAME
+    // derivation, so the invariant is LOCAL here instead of positional in
+    // `classify`'s arm order (fix round F1, finding NB-1).
+    if delivery_held(evidence) {
+        return None;
+    }
+    if !COMMITTED_TAIL_STEP_KINDS.contains(&kind) {
+        return None;
+    }
+    evidence.item.as_ref()?;
+    let capability = crate::mutation::required_capability(kind)?;
+    if !run_caps(evidence).iter().any(|cap| cap == capability) {
+        return None;
+    }
+    if !after_delivery_step(evidence, step) {
+        return None;
+    }
+    let run = &evidence.run;
+    let newest = evidence.newest_evidence.as_ref()?;
+    if newest.workflow_hash != run.workflow_hash
+        || newest.policy_hash != run.policy_hash
+        || !crate::formats::is_hex40(&newest.feature_head)
+    {
+        return None;
+    }
+    Some((
+        newest.evidence_id.clone(),
+        crate::mutation::EvidenceView {
+            evidence_id: newest.evidence_id.clone(),
+            feature_head: newest.feature_head.clone(),
+            integration_base: newest.integration_base.clone(),
+            workflow_hash: newest.workflow_hash.clone(),
+            policy_hash: newest.policy_hash.clone(),
+            verdict: newest.verdict.clone(),
+            reviewer: newest.reviewer.clone(),
+            checks: newest.checks.clone(),
+            created_at: newest.created_at.clone(),
+        },
+    ))
+}
+
+/// The engine's own refusal of an already-bound record whose named checks are
+/// not all `passed` (issues #230, #254).
+fn non_passing_refusal(
+    step: &str,
+    subject: &(String, crate::mutation::EvidenceView),
+) -> Option<UnverifiedDelivery> {
+    let non_passing = crate::mutation::non_passing_checks(&subject.1).ok()?;
+    if non_passing.is_empty() {
+        return None;
+    }
+    Some(UnverifiedDelivery {
+        step: step.to_string(),
+        code: crate::mutation::code::EVIDENCE_FAILED.to_string(),
+        reason: crate::mutation::evidence_failed_message(&subject.0, &non_passing),
+    })
+}
+
 /// The engine's own refusal of the run's verified-delivery consumer, derived
 /// from the SAME recorded facts the dispatch gate reads (issue #230).
 ///
@@ -1059,53 +1174,33 @@ fn unverified_delivery_refusal(
     step: &str,
     kind: &str,
 ) -> Option<UnverifiedDelivery> {
-    // A run that is held, or that has a step in flight, is not a delivery at
-    // all — the SAME fact [`verified_delivery`] applies, from the SAME
-    // derivation, so the invariant is LOCAL here instead of positional in
-    // `classify`'s arm order (fix round F1, finding NB-1).
-    if delivery_held(evidence) {
+    let subject = delivery_evidence_subject(evidence, step, kind)?;
+    if subject.1.verdict != "pass" {
         return None;
     }
-    if !COMMITTED_TAIL_STEP_KINDS.contains(&kind) {
+    non_passing_refusal(step, &subject)
+}
+
+/// The SAME recorded subject in the OTHER verdict a FAIL handoff is made of
+/// (issue #254): the review step recorded a `fail` whose named checks are not
+/// all `passed`, so the run's newest recorded review evidence is exactly the
+/// non-passing record the run's own bounded check re-evaluation exists for.
+///
+/// Deliberately SEPARATE from [`unverified_delivery_refusal`]: the read-time
+/// refusal of the tail is the engine's own `pass`-keyed gate, and a recorded
+/// FAIL keeps its own documented classification (the fix-round disposition, or
+/// `supervision.review_failed` when no handoff was recorded). Only the
+/// driver's own recovery-control derivation reads this one.
+fn recorded_fail_refusal(
+    evidence: &SupervisionEvidence,
+    step: &str,
+    kind: &str,
+) -> Option<UnverifiedDelivery> {
+    let subject = delivery_evidence_subject(evidence, step, kind)?;
+    if subject.1.verdict != "fail" {
         return None;
     }
-    evidence.item.as_ref()?;
-    let capability = crate::mutation::required_capability(kind)?;
-    if !run_caps(evidence).iter().any(|cap| cap == capability) {
-        return None;
-    }
-    if !after_delivery_step(evidence, step) {
-        return None;
-    }
-    let run = &evidence.run;
-    let newest = evidence.newest_evidence.as_ref()?;
-    if newest.verdict != "pass"
-        || newest.workflow_hash != run.workflow_hash
-        || newest.policy_hash != run.policy_hash
-        || !crate::formats::is_hex40(&newest.feature_head)
-    {
-        return None;
-    }
-    let view = crate::mutation::EvidenceView {
-        evidence_id: newest.evidence_id.clone(),
-        feature_head: newest.feature_head.clone(),
-        integration_base: newest.integration_base.clone(),
-        workflow_hash: newest.workflow_hash.clone(),
-        policy_hash: newest.policy_hash.clone(),
-        verdict: newest.verdict.clone(),
-        reviewer: newest.reviewer.clone(),
-        checks: newest.checks.clone(),
-        created_at: newest.created_at.clone(),
-    };
-    let non_passing = crate::mutation::non_passing_checks(&view).ok()?;
-    if non_passing.is_empty() {
-        return None;
-    }
-    Some(UnverifiedDelivery {
-        step: step.to_string(),
-        code: crate::mutation::code::EVIDENCE_FAILED.to_string(),
-        reason: crate::mutation::evidence_failed_message(&newest.evidence_id, &non_passing),
-    })
+    non_passing_refusal(step, &subject)
 }
 
 /// ONE derived refusal of a frontier the driver may not dispatch (issue #230):
@@ -1232,13 +1327,49 @@ pub fn classify(
         );
     }
     if newest_verdict(evidence) == "fail" {
-        if let Some(fix) = &evidence.fix_round
-            && evidence
+        if let Some(fix) = &evidence.fix_round {
+            // Issue #256: the disposition is derived from the repair leg's OWN
+            // recorded state, not from the head the FAIL was handed at. The
+            // leg's own lane checkout holds the head it DELIVERED, so a leg
+            // that has already advanced the branch is never reported as work
+            // in flight: the movement is named, with the remedy (the recorded
+            // lane) first and both head prefixes, and the run is not left
+            // waiting on a worker that has already reported by moving its own
+            // head.
+            if let Some(delivered) = evidence
+                .fix_leg
+                .as_ref()
+                .filter(|leg| leg.delivered)
+                .map(|leg| leg.head.as_str())
+            {
+                return Verdict::new(
+                    "needs-attention",
+                    codes::FIX_HEAD_MOVED,
+                    false,
+                    &fix_round_delivered_detail(fix, delivered),
+                );
+            }
+            let newest_head = evidence
                 .newest_evidence
                 .as_ref()
-                .is_some_and(|newest| newest.feature_head == fix.feature_head)
-        {
-            return Verdict::new("waiting-workers", codes::FIX_DISPATCHED, false, &fix.lane);
+                .map(|newest| newest.feature_head.clone())
+                .unwrap_or_default();
+            if newest_head == fix.feature_head {
+                return Verdict::new("waiting-workers", codes::FIX_DISPATCHED, false, &fix.lane);
+            }
+            // Issue #254: the newest recorded handoff names ANOTHER head than
+            // the run's newest recorded review evidence — the repair leg
+            // advanced the branch past the head this evidence names, so the
+            // recorded round is not its handoff. The disposition is still the
+            // fix round's own (never a bare `review_failed`): the recorded lane
+            // IS the remedy, and both head prefixes are named so the movement
+            // is readable from the same read.
+            return Verdict::new(
+                "needs-attention",
+                codes::FIX_HEAD_MOVED,
+                false,
+                &fix_round_head_moved_detail(fix, &newest_head),
+            );
         }
         // A FAIL whose review step recorded no fix round at all — a plan that
         // presents its own review facts, or a run recorded before this
@@ -1413,6 +1544,75 @@ pub fn classify(
     }
 }
 
+/// Observe the run's recorded fix-round leg against its OWN lane checkout
+/// (issue #256).
+///
+/// The head a handoff was DISPATCHED for is the head the FAIL was handed at
+/// and can never move by itself; the leg's own checkout is the only recorded
+/// state that names the head it DELIVERED. The observation is a read (bounded
+/// git, allowlisted environment — no effect, no journal, no write): every
+/// failure to take it leaves `fix_leg` unset, and an unobserved leg is never
+/// reported as moved.
+pub fn observe_fix_leg(evidence: &mut SupervisionEvidence, worktrees_root: Option<&Path>) {
+    if evidence.fix_leg.is_some() {
+        return;
+    }
+    let (Some(root), Some(fix)) = (worktrees_root, evidence.fix_round.as_ref()) else {
+        return;
+    };
+    evidence.fix_leg =
+        crate::mutation::observe_fix_leg_checkout(root, &fix.worktree, &fix.feature_head);
+}
+
+/// The `worktrees_root` one run's own recorded topology declares (issue #256):
+/// the containment root the handoff's recorded lane checkout is read under.
+/// `None` when the run recorded no topology (or none that names a root) — the
+/// observation is then simply not taken.
+pub fn recorded_worktrees_root(state: &crate::state::State, instance_id: &str) -> Option<PathBuf> {
+    let context = state.run_dispatch_context(instance_id).ok().flatten()?;
+    context
+        .topology
+        .get("worktrees_root")
+        .and_then(Val::as_str)
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The bounded detail of a recorded handoff whose OWN leg DELIVERED a head
+/// past the one the FAIL was handed at (issue #256): the remedy FIRST — the
+/// fix leg's own lane — then both 12-character head prefixes: the head the
+/// verdict certified (the head the handoff was dispatched for) and the head
+/// the leg's own checkout delivered.
+fn fix_round_delivered_detail(
+    fix: &crate::state::SupervisionFixRound,
+    delivered_head: &str,
+) -> String {
+    let prefix = |head: &str| head.chars().take(12).collect::<String>();
+    format!(
+        "{} (reviewed at {}, delivered at {})",
+        fix.lane,
+        prefix(&fix.feature_head),
+        prefix(delivered_head)
+    )
+}
+
+/// The bounded detail of a recorded handoff that names a head the run's newest
+/// recorded review evidence does not name (issue #254): the remedy FIRST — the
+/// fix leg's own lane — then both 12-character head prefixes, so the movement
+/// the disposition reports is readable from the same status read.
+fn fix_round_head_moved_detail(
+    fix: &crate::state::SupervisionFixRound,
+    newest_head: &str,
+) -> String {
+    let prefix = |head: &str| head.chars().take(12).collect::<String>();
+    format!(
+        "{} (handoff recorded at {}, newest evidence at {})",
+        fix.lane,
+        prefix(&fix.feature_head),
+        prefix(newest_head)
+    )
+}
+
 /// The age (seconds) of an RFC3339 instant against `now_unix`; `None` when
 /// the instant is missing or unreadable. A future instant reports age 0
 /// (clock movement is never read as progress).
@@ -1539,6 +1739,50 @@ pub fn status_doc(
         String::new()
     } else {
         step_kind(evidence, &next_step).to_string()
+    };
+    // Issue #241: the retry disposition of the frontier step, read from the
+    // SAME durable rows the engine's own fence reads. It is what tells
+    // `awaiting an operator authorization` (nothing is authorized and the
+    // driver derives no dispatch) from `authorized, awaiting dispatch` (the
+    // run holds an unconsumed `run.retry` authorization, spent by the ONE
+    // re-dispatch it authorizes) from `driver dispatch` (no authorization is
+    // held yet: supervision mints and consumes its own on this check) from an
+    // exhausted bound — and a recorded dispatch refusal is already named by
+    // the block below, never confused with a held authorization.
+    let retry = {
+        let step_retries: Vec<&crate::state::RunRetryRow> = evidence
+            .retries
+            .iter()
+            .filter(|retry| retry.step_id == next_step)
+            .collect();
+        let consumed = step_retries
+            .iter()
+            .filter(|retry| !retry.consumed_at.is_empty())
+            .count();
+        let held = step_retries
+            .iter()
+            .any(|retry| retry.consumed_at.is_empty());
+        let diagnosed =
+            latest_attempt_for(evidence, &next_step).is_some_and(|(_, status, code)| {
+                status != "succeeded" && crate::state::step_attempt_diagnosed(status, code)
+            });
+        let state = if !diagnosed {
+            "none"
+        } else if held {
+            "authorized-awaiting-dispatch"
+        } else if dispatch_intent(row, evidence).is_some_and(|intent| intent.step_id == next_step) {
+            "driver-dispatch"
+        } else if step_retries.len() >= crate::state::RUN_RETRY_MAX as usize {
+            "exhausted"
+        } else {
+            "awaiting-authorization"
+        };
+        object(vec![
+            ("step", string(&next_step)),
+            ("state", string(state)),
+            ("consumed", integer(consumed as i64)),
+            ("bound", integer(crate::state::RUN_RETRY_MAX)),
+        ])
     };
     let steps: Vec<Val> = evidence
         .steps
@@ -1729,6 +1973,9 @@ pub fn status_doc(
                     "refusal",
                     refusal_doc(evidence, verdict, &next_step, &next_kind),
                 ),
+                // Issue #241: the retry disposition of this frontier (see
+                // `retry` above). Read-time only, exactly like `refusal`.
+                ("retry", retry),
                 (
                     "continuation",
                     object(vec![
@@ -2058,7 +2305,7 @@ impl SupervisorCore {
     /// ONE run-scoped reconciliation: short read, pure classification,
     /// short write. The state guard is released between the phases.
     fn reconcile(&self, instance_id: &str, boot: bool, now_unix: i64) -> bool {
-        let (row, evidence, trigger) = {
+        let (row, evidence, trigger, worktrees_root) = {
             let state = match self.state.lock() {
                 Ok(state) => state,
                 Err(_) => return false,
@@ -2072,8 +2319,14 @@ impl SupervisorCore {
                 _ => return false,
             };
             let trigger = state.supervision_trigger(instance_id).ok().flatten();
-            (row, evidence, trigger)
+            let worktrees_root = recorded_worktrees_root(&state, instance_id);
+            (row, evidence, trigger, worktrees_root)
         };
+        // Issue #256: the repair leg's OWN checkout is read AFTER the state
+        // guard is released — the classification reads a fact about the leg's
+        // own state, and that read never holds the state.
+        let mut evidence = evidence;
+        observe_fix_leg(&mut evidence, worktrees_root.as_deref());
         let plan = check_plan(&row, &evidence, trigger.as_ref(), boot, now_unix);
         let committed = {
             let state = match self.state.lock() {
@@ -2288,6 +2541,9 @@ pub fn render_human(doc: &Val) -> String {
     if reason.starts_with("supervision.fix_round") && !detail.is_empty() {
         lines.push(match reason.as_str() {
             codes::FIX_DISPATCHED => format!("fix round dispatched to lane {detail}"),
+            codes::FIX_HEAD_MOVED => {
+                format!("fix round recorded for another head (lane {detail})")
+            }
             codes::FIX_EXHAUSTED => {
                 format!("fix round refused: {detail} (the automatic bound is spent)")
             }
@@ -2304,6 +2560,25 @@ pub fn render_human(doc: &Val) -> String {
             text(&refusal, "step"),
             text(&refusal, "code"),
             text(&refusal, "reason")
+        ));
+    }
+    // Issue #241: the frontier's retry disposition in words — `awaiting an
+    // operator authorization` and `authorized, awaiting dispatch` are never
+    // the same read, and neither is a refused continuation.
+    let retry = evaluation.get("retry").cloned().unwrap_or_else(null);
+    let retry_label = match retry.get("state").and_then(Val::as_str).unwrap_or("") {
+        "awaiting-authorization" => "awaiting an operator authorization",
+        "authorized-awaiting-dispatch" => "authorized, awaiting dispatch",
+        "driver-dispatch" => "the driver's own bounded retry",
+        "exhausted" => "bound exhausted",
+        _ => "",
+    };
+    if !retry_label.is_empty() {
+        lines.push(format!(
+            "retry {retry_label}: step {} ({}/{} consumed)",
+            text(&retry, "step"),
+            number(&retry, "consumed"),
+            number(&retry, "bound")
         ));
     }
     lines.extend([
@@ -2470,6 +2745,7 @@ mod tests {
             newest_evidence: None,
             dispatch_refusal: None,
             fix_round: None,
+            fix_leg: None,
             reevaluations: Vec::new(),
         }
     }
@@ -2773,10 +3049,15 @@ mod tests {
         assert!(verdict.eligible);
     }
 
-    /// A diagnosed frontier may retry within the budget, but an operator
-    /// reservation fences it even when a continuation refusal is also recorded.
+    /// Issue #241: a diagnosed frontier retries within the budget, and an
+    /// operator authorization is the act that authorizes exactly that
+    /// re-dispatch — the intent is derived for the authorized step, so the
+    /// held row is consumed by the dispatch it pays for instead of parking the
+    /// frontier. Every recorded non-success status, with or without a
+    /// continuation refusal on record. A SPENT bound is the one park that
+    /// stays: it escalates typed, never as a silent wait.
     #[test]
-    fn a_diagnosed_frontier_retries_unless_reserved_by_the_operator() {
+    fn a_diagnosed_frontier_retries_with_a_held_authorization() {
         let state = temp_state("diagnosed-fence-refusal");
         let digest = "d".repeat(64);
         let run = "run-0123456789abcdef";
@@ -2830,14 +3111,36 @@ mod tests {
                 consumed_at: String::new(),
                 consumed_key: String::new(),
             });
-            assert!(
-                dispatch_intent(&row, &evidence).is_none(),
-                "operator reservation wins"
-            );
+            let intent = dispatch_intent(&row, &evidence)
+                .expect("a held authorization is consumed by its own re-dispatch");
+            assert_eq!(intent.step_id, "p2", "the intent is the authorized step");
             assert!(
                 !classify(&evidence, &digest, &policy, now_unix).eligible,
                 "a diagnosed frontier is never reported eligible"
             );
+            // The budget is still the budget: a spent bound parks typed.
+            let held = evidence.retries.last_mut().expect("the held row");
+            held.consumed_at = at.to_string();
+            held.consumed_key = "ik_spent-1".to_string();
+            for attempt in 2..=crate::state::RUN_RETRY_MAX {
+                evidence.retries.push(crate::state::RunRetryRow {
+                    retry_id: format!("rt_0123456789abcde{attempt}"),
+                    instance_id: run.into(),
+                    step_id: "p2".into(),
+                    attempt,
+                    authorized_at: at.into(),
+                    consumed_at: at.into(),
+                    consumed_key: format!("ik_spent-{attempt}"),
+                });
+            }
+            assert!(
+                dispatch_intent(&row, &evidence).is_none(),
+                "a spent bound is a park"
+            );
+            let verdict = classify(&evidence, &digest, &policy, now_unix);
+            assert_eq!(verdict.class, "needs-attention");
+            assert_eq!(verdict.reason, codes::STEP_DIAGNOSED);
+            assert!(!verdict.eligible);
         }
     }
 
@@ -3648,6 +3951,7 @@ mod tests {
             round: 1,
             bound: 3,
             lane: "lane-0123456789abcdef".to_string(),
+            worktree: "issues-5-impl2".to_string(),
         });
         let verdict = classify_at(dispatched.clone());
         assert_eq!(verdict.class, "waiting-workers");
@@ -3659,15 +3963,97 @@ mod tests {
             "a dispatched fix round is work in flight, never completion"
         );
 
-        // (2) The recorded round belongs to ANOTHER head (the certified head
-        //     moved past it): it is not this FAIL's handoff, and the FAIL
-        //     still names the review step it parks on.
+        // (2) The recorded round belongs to ANOTHER head (the repair leg
+        //     advanced the branch past the head this FAIL was handed at): it is
+        //     not this FAIL's handoff — and the disposition still is the fix
+        //     round's own, naming the remedy (the recorded lane) and both head
+        //     prefixes. Never a bare `supervision.review_failed` (issue #254).
         let mut stale = dispatched;
         stale.fix_round.as_mut().expect("recorded").feature_head = "f".repeat(40);
         let verdict = classify_at(stale);
         assert_eq!(verdict.class, "needs-attention");
-        assert_eq!(verdict.reason, codes::REVIEW_FAILED);
-        assert_eq!(verdict.detail, "p6");
+        assert_eq!(verdict.reason, codes::FIX_HEAD_MOVED);
+        assert_ne!(
+            verdict.reason,
+            codes::REVIEW_FAILED,
+            "a visible fix round is never reported as a bare review failure"
+        );
+        assert_eq!(
+            verdict.detail,
+            format!(
+                "lane-0123456789abcdef (handoff recorded at {}, newest evidence at {})",
+                "f".repeat(12),
+                head.chars().take(12).collect::<String>()
+            ),
+            "the remedy (the recorded lane) and the moved head are both named"
+        );
+        assert!(!verdict.eligible);
+        let human = render_human(&object(vec![(
+            "evaluation",
+            object(vec![
+                ("reason", string(codes::FIX_HEAD_MOVED)),
+                ("detail", string(&verdict.detail)),
+            ]),
+        )]));
+        assert!(
+            human.contains(
+                "fix round recorded for another head (lane lane-0123456789abcdef \
+                 (handoff recorded at"
+            ),
+            "the human read names the lane and the movement: {human}"
+        );
+
+        // (2b) The repair leg's OWN checkout has DELIVERED a descendant head
+        //      (issue #256): the disposition is derived from the LEG's own
+        //      recorded state, never from the head the FAIL was handed at — so
+        //      a leg that already advanced the branch is reported as moved (not
+        //      as a worker still in flight), naming the recorded lane and both
+        //      head prefixes.
+        let mut delivered =
+            evidence_with_failed_review(run_row("run-0123456789abcdef"), &steps, &head);
+        delivered.fix_round = Some(crate::state::SupervisionFixRound {
+            step: "p6".to_string(),
+            feature_head: head.clone(),
+            round: 1,
+            bound: 3,
+            lane: "lane-0123456789abcdef".to_string(),
+            worktree: "issues-5-impl2".to_string(),
+        });
+        let delivered_head = "a".repeat(40);
+        delivered.fix_leg = Some(crate::state::FixLegState {
+            head: delivered_head.clone(),
+            delivered: true,
+        });
+        let verdict = classify_at(delivered.clone());
+        assert_eq!(verdict.class, "needs-attention");
+        assert_eq!(
+            verdict.reason,
+            codes::FIX_HEAD_MOVED,
+            "a delivered leg is never reported as work in flight"
+        );
+        assert_eq!(
+            verdict.detail,
+            format!(
+                "lane-0123456789abcdef (reviewed at {}, delivered at {})",
+                head.chars().take(12).collect::<String>(),
+                delivered_head.chars().take(12).collect::<String>()
+            ),
+            "the remedy (the recorded lane) and both heads are named"
+        );
+        assert!(!verdict.eligible);
+
+        // (2c) The leg's own checkout has NOT advanced: the wait keeps its
+        //      current meaning (issue #256 AC3) — the in-flight disposition is
+        //      only for a leg that has not delivered a head.
+        let mut swimming = delivered;
+        swimming.fix_leg = Some(crate::state::FixLegState {
+            head: head.clone(),
+            delivered: false,
+        });
+        let verdict = classify_at(swimming);
+        assert_eq!(verdict.class, "waiting-workers");
+        assert_eq!(verdict.reason, codes::FIX_DISPATCHED);
+        assert_eq!(verdict.detail, "lane-0123456789abcdef");
 
         // (3) The handoff was REFUSED: the fix round's OWN engine code is the
         //     detail, so the missing piece is actionable — never a bare park.
