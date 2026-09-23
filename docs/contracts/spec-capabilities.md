@@ -121,6 +121,10 @@ can run with **no harness credentials** (AC7).
   `refusal.execution.unsupported` (the pane substrate: unavailable, a
   superseded lane generation or another lane's pane, and a kind with no
   documented pane row — issue #139),
+  `refusal.lane.busy` (the addressed lane is THIS generation's own and its
+  agent is still running, so its workspace is preserved; a caller that has
+  already certified the delivery waits, bounded, for the settled turn instead
+  of spending a retry on the timing — issue #224, `effect.lane_timeout`),
   `refusal.request.malformed`, `refusal.session.unbound` (a harness step
   addressed the run's bound session but the run bound none; issue #92 F2),
   `refusal.prompt.undelivered` (the pane substrate's prompt did not reach the
@@ -206,9 +210,11 @@ can run with **no harness credentials** (AC7).
     the durable start outcome. Operations resolve the public name from the
     lane token and recheck generation/cwd before delivery. Failed starts
     roll back only their newly allocated lane workspace; failures to confirm
-    rollback are reported, not hidden. p8 closes the owned, inactive lane
-    workspace before removing its clean, merged checkout; dirty, active,
-    foreign or superseded lanes are preserved.
+    rollback are reported, not hidden. p8 closes the owned lane workspace
+    before removing its clean, merged checkout; dirty, foreign or superseded
+    lanes are preserved, and an ACTIVE lane whose delivery is already verified
+    landed is waited for, bounded by the step's effective deadline, instead of
+    being refused into the retry budget (issue #224 — code list below).
   - **Prompt delivery is VERIFIED or refused (issue #148)**: a pane-substrate
     prompt reports success only when the agent's OWN read-back proves BOTH
     halves of a delivery (issue #148 round 1):

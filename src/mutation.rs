@@ -67,6 +67,21 @@ pub const PROMPT_DEADLINE_DEFAULT_SECS: u64 = 1800;
 /// it is bounded above the plain I/O default and far below the ceiling.
 pub const HARNESS_START_DEADLINE_DEFAULT_SECS: u64 = 300;
 
+/// Documented default deadline (seconds) for one `cleanup` step's bounded
+/// wait for the lane's own worker to settle (issue #224): the wait IS the
+/// worker's round trip — a lane may outlive its own publish by minutes while
+/// its turn finishes — so the cleanup kind carries the prompt tier's
+/// documented bound instead of the generic 60 s I/O row, which would park a
+/// run whose publish already SUCCEEDED. The wait only runs while the lane's
+/// agent is genuinely alive and only then costs wall clock.
+pub const CLEANUP_DEADLINE_DEFAULT_SECS: u64 = PROMPT_DEADLINE_DEFAULT_SECS;
+
+/// Cadence of ONE poll of the cleanup step's bounded lane-settle wait (issue
+/// #224): the same 100 ms the collection's worker wait polls at, so a lane
+/// that settles between two polls is closed promptly and a still-working one
+/// costs one bounded subprocess round trip per poll.
+const LANE_SETTLE_POLL: Duration = Duration::from_millis(100);
+
 /// Documented default deadline (seconds) for one review step's verdict wait
 /// (`review_evidence`): the reviewer's own round trip — read the certified
 /// head, review it, write the verdict — is the prompt tier's round trip, so
@@ -159,6 +174,7 @@ pub fn default_deadline_secs(kind: &str) -> u64 {
     match kind {
         "prompt" | "collect_outcome" => PROMPT_DEADLINE_DEFAULT_SECS,
         "review_evidence" => REVIEW_DEADLINE_DEFAULT_SECS,
+        "cleanup" => CLEANUP_DEADLINE_DEFAULT_SECS,
         "harness_start" => HARNESS_START_DEADLINE_DEFAULT_SECS,
         _ => EFFECT_DEADLINE_DEFAULT_SECS,
     }
@@ -377,6 +393,12 @@ pub mod code {
     pub const DELIVERY_MOVED: &str = "refusal.delivery.moved";
     /// The pane worker did not settle within the collection deadline.
     pub const WORKER_TIMEOUT: &str = "effect.worker_timeout";
+    /// The lane's own worker did not settle within the cleanup step's bounded
+    /// wait (issue #224). The delivery is already verified landed, so the
+    /// lane outliving its own publish is a TIMING condition: the workspace is
+    /// preserved, nothing is deleted, and the step is parked with the bounded
+    /// retries UNSPENT instead of being refused into the retry budget.
+    pub const LANE_TIMEOUT: &str = "effect.lane_timeout";
     /// An existing lane cannot safely be created at the recorded base.
     pub const WORKTREE_EXISTS: &str = "refusal.worktree.exists";
     /// A local lane branch already exists in the integration clone and is not
@@ -8079,6 +8101,13 @@ fn effect_cleanup(ctx: &EffectContext<'_>) -> EffectOutcome {
     let salvage = object(salvage_pairs);
     // p8 retires the owned workspace BEFORE deleting its checkout. Headless
     // plans have no pane; never probe or close unrelated fleet workspaces.
+    // Issue #224: the landing proof above already holds, so a lane that is
+    // still ALIVE is the worker outliving its own publish — a timing
+    // condition. Wait, bounded by the step's effective deadline, for the
+    // settled turn the worker produces on its own instead of refusing into
+    // the bounded retry budget (a genuinely stale or foreign workspace still
+    // refuses at once and is never waited on).
+    let mut lane_wait = None;
     let pane_start = ctx
         .plan
         .doc
@@ -8097,13 +8126,56 @@ fn effect_cleanup(ctx: &EffectContext<'_>) -> EffectOutcome {
             Ok(session) => session,
             Err(outcome) => return outcome,
         };
-        if let Err(err) = crate::adapters::close_lane_workspace(
-            &session,
-            &worktree,
-            ctx.env,
-            crate::adapters::ADAPTER_TIMEOUT,
-        ) {
-            return refusal(err.code, err.message);
+        let bound = match effect_deadline_secs(ctx.kind, ctx.params) {
+            Ok(secs) => secs,
+            Err(outcome) => return outcome,
+        };
+        let started = std::time::Instant::now();
+        loop {
+            match crate::adapters::close_lane_workspace(
+                &session,
+                &worktree,
+                ctx.env,
+                crate::adapters::ADAPTER_TIMEOUT,
+            ) {
+                Ok(()) => {
+                    lane_wait = Some(object(vec![
+                        ("bound_secs", integer(bound as i64)),
+                        ("waited_ms", integer(started.elapsed().as_millis() as i64)),
+                    ]));
+                    break;
+                }
+                // The lane is ALIVE (issue #224): the landing proof above
+                // already holds, so this is the worker outliving its own
+                // publish — a timing condition, not a refusal. Wait, bounded
+                // by the step's EFFECTIVE deadline, for the settled turn the
+                // worker produces on its own. Every other refusal — above all
+                // the generation/ownership mismatch — is never waited on.
+                Err(err) if err.code == crate::adapters::CODE_LANE_BUSY => {
+                    let waited = started.elapsed();
+                    let bound_duration = Duration::from_secs(bound);
+                    if waited >= bound_duration {
+                        return EffectOutcome {
+                            status: "ambiguous",
+                            code: Some(code::LANE_TIMEOUT.to_string()),
+                            message: Some(format!(
+                                "{}; the delivery is already verified landed, so the lane outliving \
+                                 its own publish is a timing condition: the bounded wait of {bound}s \
+                                 for a settled lane expired (waited {}ms); the workspace is preserved \
+                                 and cleanup parked without redispatch",
+                                err.message,
+                                waited.as_millis()
+                            )),
+                            result: object(vec![
+                                ("deadline_secs", integer(bound as i64)),
+                                ("waited_ms", integer(waited.as_millis() as i64)),
+                            ]),
+                        };
+                    }
+                    std::thread::sleep(LANE_SETTLE_POLL.min(bound_duration - waited));
+                }
+                Err(err) => return refusal(err.code, err.message),
+            }
         }
     }
     // Remove the worktree (clean, so no --force) then the local branch.
@@ -8132,12 +8204,19 @@ fn effect_cleanup(ctx: &EffectContext<'_>) -> EffectOutcome {
         Ok(out) => out.stdout.trim().is_empty(),
         Err(_) => false,
     };
-    ok(object(vec![
+    let mut result = vec![
         ("worktree", string(&worktree.to_string_lossy())),
         ("branch", string(&branch)),
         ("removed", bool_(branch_gone && !worktree.exists())),
         ("salvage", salvage),
-    ]))
+    ];
+    if let Some(wait) = lane_wait {
+        // Issue #224: the bounded wait that let a lane outliving its own
+        // publish settle before its workspace was closed is part of the
+        // recorded outcome, its bound included.
+        result.push(("lane_wait", wait));
+    }
+    ok(object(result))
 }
 
 /// `branch_delete`: delete a lane branch after its head is verified merged
@@ -8968,6 +9047,19 @@ mod tests {
             effect_deadline_secs("review_evidence", None).expect("default")
                 > EFFECT_DEADLINE_DEFAULT_SECS,
             "the review bound is never the generic I/O default"
+        );
+        // Issue #224: the cleanup step's bounded wait for a lane that outlived
+        // its own publish carries its own documented row at the prompt tier —
+        // the generic 60 s I/O row would park a run whose publish already
+        // SUCCEEDED.
+        assert_eq!(
+            effect_deadline_secs("cleanup", None).expect("default"),
+            CLEANUP_DEADLINE_DEFAULT_SECS
+        );
+        assert_eq!(CLEANUP_DEADLINE_DEFAULT_SECS, PROMPT_DEADLINE_DEFAULT_SECS);
+        assert!(
+            effect_deadline_secs("cleanup", None).expect("default") > EFFECT_DEADLINE_DEFAULT_SECS,
+            "the cleanup lane wait is never the generic I/O default"
         );
         assert_eq!(
             bounded_effect_deadline("review_evidence", None),

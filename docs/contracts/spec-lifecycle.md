@@ -207,6 +207,21 @@ keeps the gate's own message verbatim.
   `published_head` it was made against. The proof does not itself perform or
   claim a forge merge (the forge owns the policy merge); standalone
   `branch_delete` remains ancestry-only. Refs #132, #172.
+- A lane that OUTLIVES its own publish is waited for, bounded (issue #224):
+  the landing proof above runs before the lane's workspace is retired, so a
+  lane whose agent is still running at that point is a timing condition, not
+  an ownership problem. The step re-reads the lane (each read-back verifying
+  the lane token, the generation and the worktree as always) and waits up to
+  its own effective deadline for the settled turn the worker produces on its
+  own; the still-running read-back is `refusal.lane.busy`, the recorded
+  outcome carries the wait (`lane_wait`, with `bound_secs`), and the retry
+  budget is never spent on it — a wait that exhausts the bound records
+  `effect.lane_timeout` (`ambiguous`, bound and live state named) and leaves
+  the workspace, the checkout and the branch untouched. Every other outcome
+  is unchanged: a superseded generation's or another lane's workspace refuses
+  at once (`refusal.stale.generation`, `refusal.lane.name_collision`) and is
+  never waited on, and an unpublishable lane is refused
+  `refusal.cleanup.unmerged` before the workspace is ever probed.
 
 ## 6. Remote transport contract (AC5/AC6, capability C16)
 

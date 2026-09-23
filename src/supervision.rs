@@ -888,6 +888,14 @@ pub fn dispatch_intent(
                 && ((authorized && !tail)
                     || (!authorized
                         && code != crate::mutation::code::WORKER_TIMEOUT
+                        // Issue #224: the cleanup step's bounded wait for a
+                        // lane that outlived its own publish is the same
+                        // wait/park. The lane is ALIVE — a stale or foreign
+                        // workspace is never waited on — so a re-dispatch buys
+                        // nothing the first attempt's own bound did not
+                        // already spend: the frontier parks typed with the
+                        // bounded retries UNSPENT on the timing.
+                        && code != crate::mutation::code::LANE_TIMEOUT
                         && code != crate::mutation::code::VERDICT_STALE
                         && code != crate::mutation::code::DELIVERY_MOVED
                         && code != crate::mutation::code::DELIVERY_UNBOUND
@@ -3311,6 +3319,110 @@ mod tests {
             dispatch_intent(&row, &retryable).map(|intent| intent.step_id),
             Some("p7".to_string()),
             "a retryable diagnosis of the same merge frontier still retries"
+        );
+    }
+
+    /// Issue #224: a CLEANUP frontier whose recorded attempt is the step's own
+    /// bounded wait for a lane that outlived its publish timing out
+    /// (`effect.lane_timeout`) is a wait/park, not a retryable failure. The
+    /// lane was ALIVE when the whole bound was spent, so a re-dispatch buys
+    /// nothing the first attempt did not already spend: the frontier parks
+    /// typed (needs-attention, the recorded code as the detail) with the
+    /// bounded retries UNSPENT, exactly like the collection's worker timeout
+    /// (#200) — never a silent park and never a burn of the retry budget on
+    /// the timing. The same frontier shape with a retryable diagnosis still
+    /// takes its bounded retry.
+    #[test]
+    fn a_lane_wait_timeout_parks_the_cleanup_frontier_without_burning_a_bounded_retry() {
+        use crate::state::{EvidenceRow, QueueItemRef};
+        let state = temp_state("lane-timeout-park");
+        let digest = "f".repeat(64);
+        let run = "run-22404f5ac1de7b21";
+        let policy = Policy {
+            check_interval_secs: 10,
+            progress_timeout_secs: 60,
+        };
+        let at = "2026-09-20T03:31:57Z";
+        let now_unix = time::unix_from_rfc3339(at).expect("instant");
+        state
+            .arm_supervision_for_test(run, "armed", &digest, "merge", policy, at)
+            .expect("arm");
+        let row = state.supervision_by_id(run).expect("read").expect("row");
+        let steps = [
+            ("p5", "collect_outcome"),
+            ("p6", "review_evidence"),
+            ("p7", "merge"),
+            ("p8", "cleanup"),
+        ];
+        let scene = |code: &str| {
+            let pins = run_row(run);
+            let mut evidence = evidence_for(
+                pins.clone(),
+                Some(&digest),
+                &steps,
+                &[
+                    ("p5", "succeeded", ""),
+                    ("p6", "succeeded", ""),
+                    ("p7", "succeeded", ""),
+                    ("p8", "ambiguous", code),
+                ],
+                at,
+            );
+            // The frontier is the run's OWN committed tail step of a run whose
+            // reviewed delivery is verified: the `cleanup` cap, an admitted
+            // membership item and the newest recorded passing evidence.
+            evidence.run.caps = "[\"merge\",\"cleanup\"]".to_string();
+            evidence.item = Some(QueueItemRef {
+                submission_id: "qs_0123456789abcdef".to_string(),
+                ordinal: 0,
+                work_item: "wi_4aabf3ad5bea87b0".to_string(),
+                issue_number: 224,
+                status: "admitted".to_string(),
+            });
+            evidence.newest_evidence = Some(EvidenceRow {
+                evidence_id: "ev_22404f5ac1de7b21".to_string(),
+                instance_id: run.to_string(),
+                repository: "example-org/widgets".to_string(),
+                feature_head: "1".repeat(40),
+                integration_base: "2".repeat(40),
+                workflow_hash: pins.workflow_hash.clone(),
+                policy_hash: pins.policy_hash.clone(),
+                verdict: "pass".to_string(),
+                reviewer: "reviewer-1".to_string(),
+                checks: "[{\"name\":\"hosted-ci\",\"status\":\"passed\"}]".to_string(),
+                created_at: at.to_string(),
+            });
+            evidence
+        };
+        let waited = scene(crate::mutation::code::LANE_TIMEOUT);
+        assert!(
+            driver_dispatchable_kind(&waited, "p8", "cleanup"),
+            "the fixture frontier is a genuinely dispatchable committed tail step"
+        );
+        assert!(
+            dispatch_intent(&row, &waited).is_none(),
+            "the lane wait's own bound is never re-dispatched into a retry"
+        );
+        let verdict = classify(&waited, &digest, &policy, now_unix);
+        assert_eq!(verdict.class, "needs-attention");
+        assert_eq!(verdict.reason, codes::STEP_DIAGNOSED);
+        assert_eq!(verdict.detail, crate::mutation::code::LANE_TIMEOUT);
+        assert!(!verdict.eligible, "the parked frontier is never eligible");
+        assert!(
+            waited.retries.is_empty(),
+            "the bounded retries stay unspent on the lane wait's own timeout"
+        );
+        // The collection's worker timeout is the same park at its own kind.
+        let collecting = scene(crate::mutation::code::WORKER_TIMEOUT);
+        assert!(
+            dispatch_intent(&row, &collecting).is_none(),
+            "a worker timeout is a wait/park at every kind"
+        );
+        let retryable = scene("refusal.worktree.exists");
+        assert_eq!(
+            dispatch_intent(&row, &retryable).map(|intent| intent.step_id),
+            Some("p8".to_string()),
+            "a retryable diagnosis of the same cleanup frontier still retries"
         );
     }
 
