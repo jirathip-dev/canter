@@ -10,6 +10,15 @@ remote's own integration head, and the recorded state store.
 - An issue is **ready** when it is **open** and carries the configured ready
   label. The default ready label is `canter:ready` (`--label` overrides it for
   one invocation).
+- **Decision (issue #258): the compiled-in default stays `canter:ready`, and a
+  repository whose own tracker convention differs points `--label` at it.**
+  The default is a product-level name that no repository has to adopt; baking
+  one repository's convention in would make every other repository's default
+  wrong, and the override is one flag on the invocation that already carries
+  the repository. The first live use measured the exception the other way
+  round: a repository labelling its ready issues `ready-to-work` selected
+  nothing until `--label ready-to-work` was presented — the flag is the
+  contract, and the label in force is always reported (`label` in `--json`).
 - A **closed** issue is never selected. An **unlabelled** issue is never
   selected. A **pull request** is never selected (the issues surface carries
   both and intake excludes anything carrying `pull_request`).
@@ -75,6 +84,15 @@ remote's own integration head, and the recorded state store.
   repository, the ready label, the ordering rule, the item bound, the digest,
   the selected set and each item's status — so the whole decision is auditable
   from one output.
+- A refused read names its **cause**, not the payload (issue #258): the
+  refusal carries the recorded status, the program and the exact argv, and the
+  first non-empty stderr line (`gh api … exited with code 4; first stderr line:
+  gh: …`). A refusal that quotes captured stdout cannot be told from a success.
+- Every external read is drained while the child runs (issue #258): a payload
+  larger than one pipe buffer is read in full rather than deadlocking the child
+  until the deadline kills a complete result. The first live use measured this
+  at 246 KB of issue JSON against a 64 KB pipe — a bounded read is a read that
+  completes, not a read that waits for the writer to stop.
 
 ## Closed refusal vocabulary
 
