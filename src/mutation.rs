@@ -1595,19 +1595,51 @@ fn run_git(
     cwd: &Path,
     args: &[&str],
 ) -> Result<crate::process::ProcOut, EffectOutcome> {
-    let env = ctx.env;
+    run_git_on(&residue_host(ctx)?, cwd, args)
+}
+
+/// The integration-clone access a lane-residue retire runs against: the
+/// checkout the git reads target, the allowlisted child environment and the
+/// bounded deadline. ONE authority: the plan-step effects (#190/#222) and the
+/// operator `run.retire-lane` control (issue #236) run the same policy
+/// through this host, so an operator retire and a bind-time reclaim can never
+/// diverge.
+pub struct ResidueHost<'a> {
+    /// The integration checkout the retire operates on (absolute).
+    pub integration_repo: &'a Path,
+    /// Allowlisted environment for bounded children.
+    pub env: &'a BTreeMap<String, String>,
+    /// Bounded deadline of every context-relative git read the retire makes.
+    pub deadline: Duration,
+}
+
+/// The host one plan-step effect presents: the effect's own integration
+/// checkout, environment and per-kind deadline bound.
+fn residue_host<'a>(ctx: &'a EffectContext<'a>) -> Result<ResidueHost<'a>, EffectOutcome> {
+    Ok(ResidueHost {
+        integration_repo: ctx.integration_repo,
+        env: ctx.env,
+        deadline: Duration::from_secs(effect_deadline_secs(ctx.kind, ctx.params)?),
+    })
+}
+
+fn run_git_on(
+    host: &ResidueHost<'_>,
+    cwd: &Path,
+    args: &[&str],
+) -> Result<crate::process::ProcOut, EffectOutcome> {
+    let env = host.env;
     let git_env: BTreeMap<String, String> = if env.contains_key("PATH") {
         env.clone()
     } else {
         adapter_environment()
     };
-    let deadline = effect_deadline_secs(ctx.kind, ctx.params)?;
     let out = crate::adapters::run_grouped(ProcSpec {
         program: "git",
         args: &args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
         env: &git_env,
         cwd: Some(cwd),
-        timeout: Duration::from_secs(deadline),
+        timeout: host.deadline,
     });
     outcome_from_run(&out, &format!("git (cwd {})", cwd.display()))?;
     Ok(out)
@@ -3026,9 +3058,14 @@ fn effect_worktree_create(ctx: &EffectContext<'_>) -> EffectOutcome {
 /// The tip of one LOCAL ref in the integration clone (`None` when it does not
 /// exist): a pure read-back, never a fetch.
 fn local_ref_tip(ctx: &EffectContext<'_>, refname: &str) -> Option<String> {
-    let out = run_git(
-        ctx,
-        ctx.integration_repo,
+    let host = residue_host(ctx).ok()?;
+    local_ref_tip_on(&host, refname)
+}
+
+fn local_ref_tip_on(host: &ResidueHost<'_>, refname: &str) -> Option<String> {
+    let out = run_git_on(
+        host,
+        host.integration_repo,
         &["rev-parse", "--verify", "--quiet", refname],
     )
     .ok()?;
@@ -3036,14 +3073,11 @@ fn local_ref_tip(ctx: &EffectContext<'_>, refname: &str) -> Option<String> {
     is_hex40(&tip).then_some(tip)
 }
 
-/// The published tip of one lane branch on `origin` (`None` when the branch
-/// was never published): the reclaim's recoverability witness — the content of
-/// a local branch this read cannot recover is never destroyed.
-fn published_branch_tip(ctx: &EffectContext<'_>, branch: &str) -> Option<String> {
+fn published_branch_tip_on(host: &ResidueHost<'_>, branch: &str) -> Option<String> {
     let refname = format!("refs/heads/{branch}");
-    let out = run_git(
-        ctx,
-        ctx.integration_repo,
+    let out = run_git_on(
+        host,
+        host.integration_repo,
         &["ls-remote", "origin", &refname],
     )
     .ok()?;
@@ -3057,10 +3091,10 @@ fn published_branch_tip(ctx: &EffectContext<'_>, branch: &str) -> Option<String>
 /// canonicalized before they are compared: git reports resolved paths (on
 /// macOS `/private/var/...` for a `/var/...` root), and a byte comparison
 /// would miss the very registration this read exists for.
-fn registered_worktree_paths(ctx: &EffectContext<'_>) -> Vec<PathBuf> {
-    match run_git(
-        ctx,
-        ctx.integration_repo,
+fn registered_worktree_paths_on(host: &ResidueHost<'_>) -> Vec<PathBuf> {
+    match run_git_on(
+        host,
+        host.integration_repo,
         &["worktree", "list", "--porcelain"],
     ) {
         Ok(out) => out
@@ -3101,7 +3135,20 @@ fn reclaim_retired_lane_residue(
     relative: &str,
     worktree: &Path,
 ) -> Vec<Val> {
-    let registered = registered_worktree_paths(ctx);
+    match residue_host(ctx) {
+        Ok(host) => reclaim_lane_residue(&host, ctx.retired_run_ids, branch, relative, worktree),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn reclaim_lane_residue(
+    host: &ResidueHost<'_>,
+    generations: &[String],
+    branch: &str,
+    relative: &str,
+    worktree: &Path,
+) -> Vec<Val> {
+    let registered = registered_worktree_paths_on(host);
     let checkout = if !worktree.exists() {
         object(vec![
             ("checkout", string(relative)),
@@ -3111,7 +3158,7 @@ fn reclaim_retired_lane_residue(
     } else if is_registered_worktree(worktree, &registered) {
         let text = worktree.to_string_lossy().into_owned();
         failure_doc(
-            run_git(ctx, ctx.integration_repo, &["worktree", "remove", &text]),
+            run_git_on(host, host.integration_repo, &["worktree", "remove", &text]),
             &[("checkout", string(relative))],
         )
     } else {
@@ -3131,8 +3178,8 @@ fn reclaim_retired_lane_residue(
             ),
         ])
     };
-    let branch_tip = local_ref_tip(ctx, &format!("refs/heads/{branch}"));
-    let published = published_branch_tip(ctx, branch);
+    let branch_tip = local_ref_tip_on(host, &format!("refs/heads/{branch}"));
+    let published = published_branch_tip_on(host, branch);
     let lane_branch = match (branch_tip.as_deref(), published.as_deref()) {
         (None, _) => object(vec![
             ("branch", string(branch)),
@@ -3140,7 +3187,7 @@ fn reclaim_retired_lane_residue(
             ("message", string("no branch residue")),
         ]),
         (Some(tip), Some(published_tip)) if published_tip == tip => {
-            let removal = run_git(ctx, ctx.integration_repo, &["branch", "-D", branch]);
+            let removal = run_git_on(host, host.integration_repo, &["branch", "-D", branch]);
             failure_doc(
                 removal,
                 &[
@@ -3170,11 +3217,120 @@ fn reclaim_retired_lane_residue(
     vec![object(vec![
         (
             "generations",
-            Val::Arr(ctx.retired_run_ids.iter().map(|id| string(id)).collect()),
+            Val::Arr(generations.iter().map(|id| string(id)).collect()),
         ),
         ("checkout_residue", checkout),
         ("branch_residue", lane_branch),
     ])]
+}
+
+/// The default deadline (seconds) one operator lane retire presents: the
+/// documented effect default, the same bound class the p8 cleanup uses.
+pub fn lane_retirement_deadline_secs() -> u64 {
+    default_deadline_secs("cleanup")
+}
+
+/// Issue #236: retire the lane of ONE run the ledger records as terminal —
+/// the residue half of the bounded operator control `run.retire-lane`.
+///
+/// The run's lane is its own implementer leg: the branch and the checkout are
+/// the SAME derivation the plan producer renders (`crate::lane::lane_branch` /
+/// `lane_checkout`), never a caller-supplied path, and the checkout is
+/// contained under the run's own `worktrees_root`. Both halves are recorded:
+///
+/// 1. the run's linked lane workspace, retired FIRST (its registration is
+///    resolved FROM the checkout): the identity-verified #190 path closes
+///    exactly the run's own single-pane registration at that checkout — a
+///    different pane, another lane's binding, an unverifiable read-back or a
+///    foreign worktree is refused and left untouched, never adopted;
+/// 2. the registered lane checkout and the local lane branch in the
+///    integration clone, under the #222 policy: only a checkout this clone
+///    REGISTERS is removed, and a branch is deleted only when the published
+///    branch carries the same tip — a local-only delivery is never destroyed.
+///
+/// A refusal is recorded on the returned document (never forced, never
+/// retried implicitly). The caller has already proven the run is terminal:
+/// a LIVE lane still holds its issue's unique ownership and is never in the
+/// retired set, so this function is unreachable for one.
+pub fn retire_run_lane(
+    integration_repo: &Path,
+    worktrees_root: &Path,
+    run: &str,
+    issue_number: i64,
+    env: &BTreeMap<String, String>,
+) -> EffectOutcome {
+    if issue_number <= 0 {
+        return refusal(
+            code::LANE_IDENTITY,
+            format!(
+                "run {run} records no repository issue, so its lane cannot be derived; a lane is \
+                 addressed by its own issue, never by a guess"
+            ),
+        );
+    }
+    let issue = issue_number as u64;
+    let branch = crate::lane::lane_branch(issue);
+    let relative = crate::lane::lane_checkout(issue, "implementer", 1);
+    let lane = match contained_path(worktrees_root, &relative) {
+        Ok(path) => path,
+        Err(err) => return refusal(err.code, err.message),
+    };
+    let host = ResidueHost {
+        integration_repo,
+        env,
+        deadline: Duration::from_secs(lane_retirement_deadline_secs()),
+    };
+    // The lane's workspace is retired BEFORE its checkout: the registration
+    // is resolved from the checkout path, and an absent checkout has no
+    // registration left to retire (recorded, never forced).
+    let workspace = if !lane.exists() {
+        object(vec![
+            ("retired", bool_(false)),
+            ("message", string("no lane checkout residue")),
+        ])
+    } else {
+        let retired = match run_session_handle(run) {
+            Ok(session) => crate::adapters::retire_lane_workspace(
+                &session,
+                &lane,
+                env,
+                crate::adapters::ADAPTER_TIMEOUT,
+            )
+            .map_err(|err| (err.code.to_string(), err.message)),
+            Err(outcome) => Err((
+                outcome
+                    .code
+                    .unwrap_or_else(|| code::LANE_IDENTITY.to_string()),
+                outcome.message.unwrap_or_else(|| {
+                    "the run's own lane session handle is incomplete".to_string()
+                }),
+            )),
+        };
+        match retired {
+            Ok(Some(doc)) => doc,
+            Ok(None) => object(vec![
+                ("retired", bool_(false)),
+                (
+                    "message",
+                    string("no lane workspace registration to retire"),
+                ),
+            ]),
+            Err((code_text, message)) => object(vec![
+                ("retired", bool_(false)),
+                ("code", string(&code_text)),
+                ("message", string(&message)),
+            ]),
+        }
+    };
+    let generations = vec![run.to_string()];
+    let residue = reclaim_lane_residue(&host, &generations, &branch, &relative, &lane);
+    ok(object(vec![
+        ("run", string(run)),
+        ("branch", string(&branch)),
+        ("worktree", string(&relative)),
+        ("workspace", workspace),
+        ("residue", Val::Arr(residue)),
+    ]))
 }
 
 /// The compact record of a reclaim attempt, appended to a refusal message so

@@ -231,7 +231,7 @@ pub fn queue_run_steps(
         params: Some(object(vec![("ref", string(integration_branch))])),
     }];
     for number in issues {
-        let branch = format!("issue-{number}");
+        let branch = crate::lane::lane_branch(*number);
         // Issue #210: the lane identity is derived per leg, never re-spelled.
         // The implementer leg round 1 binds the run's own lane checkout.
         let worktree = crate::lane::lane_checkout(*number, "implementer", 1);

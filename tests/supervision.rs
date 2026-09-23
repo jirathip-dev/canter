@@ -3170,6 +3170,320 @@ fn a_released_generations_lane_residue_is_retired_by_the_next_submission() {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #236: the operator's OWN lane retirement control
+// ---------------------------------------------------------------------------
+
+/// Issue #236 end-to-end witness, the operator half of #190: a RELEASED run's
+/// lane residue — its linked lane workspace, its registered lane checkout and
+/// its local lane branch — is retired by ONE bounded, audited operator control
+/// (`run.retire-lane`) instead of hand-editing state or waiting for a
+/// successor bind, and the control refuses a LIVE lane TYPED without touching
+/// anything.
+#[test]
+fn the_operators_lane_retirement_retires_a_terminal_runs_lane_and_refuses_a_live_one() {
+    const GRANT: &str = "gr_00000000000000a1";
+    let fixture = DaemonFixture::new("retire-ctl");
+    let integration = fixture.dir.join("integration");
+    init_repo(&integration);
+    let fakebin_hermes = write_fake_hermes(&fixture.dir);
+    let fakebin_herdr = write_fake_herdr(&fixture.dir);
+    let host_path = std::env::var("PATH").unwrap_or_default();
+    let daemon = fixture.spawn_with_path(&format!(
+        "{}:{}:{host_path}",
+        fakebin_herdr.display(),
+        fakebin_hermes.display()
+    ));
+    wait_ready(&fixture);
+
+    // The ONE generation: grant, submission, lane worktree, lane bind. The
+    // spine stops at p2 (this witness never prompts).
+    let (bound, digest) = {
+        let state = fixture.seed();
+        seed_grant(&state, GRANT, 5);
+        let mut steps = harness_pane_steps(HARNESS);
+        steps.truncate(2);
+        let request = qp::QueueRequest {
+            steps,
+            role_config: harness_binding_doc(),
+            ..observation_request(vec![selected("#5", REV_A)])
+        };
+        render_bound(&state, &request)
+    };
+    let submitted = rpc_ok(
+        &fixture.socket,
+        &fresh_id(1),
+        "queue.submit",
+        Some(harness_submit_params(
+            &idem_key("retire-control-1"),
+            &bound,
+            &digest,
+            GRANT,
+        )),
+    );
+    let run = instance_of(&submitted, 5);
+    let lane = fixture.dir.join("worktrees/issues-5");
+    apply_step(
+        &fixture,
+        &integration,
+        &bound,
+        &run,
+        GRANT,
+        2,
+        "p1",
+        "retire-control-lane-0001",
+    );
+    let started = apply_step(
+        &fixture,
+        &integration,
+        &bound,
+        &run,
+        GRANT,
+        3,
+        "p2",
+        "retire-control-bind-0001",
+    );
+    assert_eq!(
+        started.get("session_id").and_then(Val::as_str),
+        Some(
+            canter::mutation::run_session_handle(&run)
+                .expect("the run session derives")
+                .session_id
+                .as_str()
+        ),
+        "the bind recorded the run's own lane session"
+    );
+    assert!(lane.is_dir(), "the lane checkout exists");
+    assert!(fixture.dir.join("herdr-state/pane").exists());
+    let lane_tip = git_output(&integration, &["rev-parse", "issue-5"])
+        .trim()
+        .to_string();
+
+    // A LIVE lane refuses TYPED and nothing is touched: the run's own recorded
+    // topology is read from durable state (never presented), the checkout
+    // stays registered, the branch keeps its tip and no workspace is closed.
+    let refused = rpc(
+        &fixture.socket,
+        &fresh_id(4),
+        "run.retire-lane",
+        Some(canter::run_control::lane_retirement_params(
+            &idem_key("retire-control-live"),
+            &run,
+            "the lane looks stale",
+            None,
+        )),
+    );
+    let error = refused.get("error").cloned().unwrap_or_else(null);
+    let code = error
+        .get("code")
+        .and_then(Val::as_str)
+        .unwrap_or("missing.code");
+    let message = error
+        .get("message")
+        .and_then(Val::as_str)
+        .unwrap_or("no message");
+    assert_eq!(code, "refusal.lane.live_run", "{message}");
+    assert!(
+        message.contains(&run),
+        "the refusal names the live run: {message}"
+    );
+    assert!(lane.is_dir(), "a refused retirement removes no checkout");
+    assert!(
+        fixture.dir.join("herdr-state/pane").exists(),
+        "a refused retirement closes no workspace"
+    );
+    assert_eq!(
+        git_output(&integration, &["rev-parse", "issue-5"]).trim(),
+        lane_tip,
+        "a refused retirement never moves a branch"
+    );
+
+    // The release retires the run, not its lane (a release is bookkeeping
+    // only — the measured defect this control exists for).
+    rpc_ok(
+        &fixture.socket,
+        &fresh_id(5),
+        "run.release",
+        Some(canter::run_control::release_params(
+            &idem_key("retire-control-release"),
+            &run,
+            "the generation is terminal",
+        )),
+    );
+    assert!(lane.is_dir() && fixture.dir.join("herdr-state/pane").exists());
+
+    // ONE bounded, audited operator control retires the whole lane: the run's
+    // own linked lane workspace, its REGISTERED checkout, and its local lane
+    // branch (a local-only delivery is preserved, never destroyed).
+    let retired = rpc_ok(
+        &fixture.socket,
+        &fresh_id(6),
+        "run.retire-lane",
+        Some(canter::run_control::lane_retirement_params(
+            &idem_key("retire-control-terminal"),
+            &run,
+            "the terminal generation's lane is stale",
+            None,
+        )),
+    );
+    assert_eq!(
+        retired.get("schema").and_then(Val::as_str),
+        Some("hf-run-lane-retirement/v1")
+    );
+    let retirement = retired.get("retirement").cloned().unwrap_or_else(null);
+    let residue = retirement.get("lane_residue").cloned().unwrap_or_else(null);
+    println!(
+        "LANE-RETIREMENT {}",
+        canter::canonical::canonical_text(&retired)
+    );
+    assert_eq!(
+        residue.get("branch").and_then(Val::as_str),
+        Some("issue-5"),
+        "the retired lane is the run's own: {}",
+        canter::canonical::canonical_text(&retired)
+    );
+    assert_eq!(
+        residue.get("worktree").and_then(Val::as_str),
+        Some("issues-5")
+    );
+    assert_eq!(
+        residue
+            .get("workspace")
+            .and_then(|workspace| workspace.get("retired"))
+            .and_then(Val::as_bool),
+        Some(true),
+        "the run's own linked lane workspace was retired: {}",
+        canter::canonical::canonical_text(&retired)
+    );
+    assert!(
+        !lane.exists(),
+        "the registered lane checkout was removed: {}",
+        canter::canonical::canonical_text(&retired)
+    );
+    assert!(
+        !fixture.dir.join("herdr-state/pane").exists(),
+        "the lane workspace was closed by the substrate"
+    );
+    let checkout_residue = residue
+        .get("residue")
+        .and_then(Val::as_array)
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get("checkout_residue"))
+        .cloned()
+        .unwrap_or_else(null);
+    assert_eq!(
+        checkout_residue.get("removed").and_then(Val::as_bool),
+        Some(true)
+    );
+    let branch_residue = residue
+        .get("residue")
+        .and_then(Val::as_array)
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get("branch_residue"))
+        .cloned()
+        .unwrap_or_else(null);
+    assert_eq!(
+        branch_residue.get("removed").and_then(Val::as_bool),
+        Some(true),
+        "this fixture's clone is its own origin, so the branch IS recoverable: {}",
+        canter::canonical::canonical_text(&retired)
+    );
+    assert!(
+        git_output(&integration, &["branch", "--list", "issue-5"])
+            .trim()
+            .is_empty(),
+        "the recoverable lane branch is gone"
+    );
+    assert!(
+        !git_output(&integration, &["worktree", "list", "--porcelain"]).contains("issues-5"),
+        "the lane registry row is gone"
+    );
+
+    // The policy's other half, witnessed on the SAME control: a lane branch
+    // whose content is NOT recoverable from the published branch is never
+    // destroyed (a local-only delivery). This fixture's clone is its own
+    // `origin`, so dropping the remote makes the re-created branch local-only.
+    git_output(&integration, &["remote", "remove", "origin"]);
+    git_output(
+        &integration,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "issue-5",
+            lane.to_str().unwrap(),
+            &lane_tip,
+        ],
+    );
+    let kept = rpc_ok(
+        &fixture.socket,
+        &fresh_id(7),
+        "run.retire-lane",
+        Some(canter::run_control::lane_retirement_params(
+            &idem_key("retire-control-local-only"),
+            &run,
+            "the lane branch is local-only",
+            None,
+        )),
+    );
+    let kept_residue = kept
+        .get("retirement")
+        .and_then(|retirement| retirement.get("lane_residue"))
+        .cloned()
+        .unwrap_or_else(null);
+    let kept_branch = kept_residue
+        .get("residue")
+        .and_then(Val::as_array)
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get("branch_residue"))
+        .cloned()
+        .unwrap_or_else(null);
+    assert_eq!(
+        kept_branch.get("removed").and_then(Val::as_bool),
+        Some(false),
+        "a local-only delivery is never destroyed: {}",
+        canter::canonical::canonical_text(&kept)
+    );
+    assert!(
+        !lane.exists(),
+        "the re-created registered checkout is retired"
+    );
+    assert_eq!(
+        git_output(&integration, &["rev-parse", "issue-5"]).trim(),
+        lane_tip,
+        "the unpublishable lane branch keeps its tip"
+    );
+
+    shutdown(daemon);
+
+    // Audited: the retirement is ONE hash-chained journal claim, and the
+    // report names the run it retired.
+    let state = fixture.seed();
+    let claim = state
+        .claim(&idem_key("retire-control-terminal"))
+        .expect("claim")
+        .expect("the retirement is journaled");
+    let outcome =
+        Val::parse_json(claim.outcome.as_deref().expect("journal outcome")).expect("outcome json");
+    assert_eq!(
+        outcome.get("status").and_then(Val::as_str),
+        Some("succeeded"),
+        "the retirement is one resolved journal claim: {outcome:?}"
+    );
+    assert_eq!(claim.method, "run.retire-lane");
+    let response = Val::parse_json(claim.response.as_deref().expect("recorded response"))
+        .expect("response json");
+    assert_eq!(
+        response
+            .get("result")
+            .and_then(|result| result.get("run"))
+            .and_then(|run| run.get("instance_id"))
+            .and_then(Val::as_str),
+        Some(run.as_str()),
+        "the recorded response carries the retirement document"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Issue #92 F2: the role-bound session lifecycle on the run's own path
 // ---------------------------------------------------------------------------
 

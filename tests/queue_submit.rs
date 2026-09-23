@@ -2055,3 +2055,211 @@ fn a_parked_submission_is_re_driven_by_the_operators_bounded_control() {
         .count();
     assert_eq!(redrives, 1, "one audited re-drive record: {lines:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Issue #236: the bounded, audited operator retirement of ONE terminal run's
+// stale lane records — never a live one
+// ---------------------------------------------------------------------------
+
+/// The operator control issue #236 asks for, over the real daemon socket:
+/// a LIVE run refuses TYPED (`refusal.lane.live_run`) with nothing read,
+/// claimed or touched — its ownership row still refuses a fresh submission
+/// for the same issue — and once the run is terminal ONE audited claim
+/// retires its stale lane records (the durable half plus the lane residue),
+/// replaying the recorded response for the same idempotency key.
+#[test]
+fn the_operator_retires_a_terminal_runs_stale_lane_records_and_a_live_run_refuses_typed() {
+    let fixture = DaemonFixture::new("lane-retire");
+    let (bound, digest) = {
+        let state = fixture.seed();
+        seed_grants(&state, &[("gr_0000000000000031", 31)]);
+        let request = request_with(vec![selected("#31", REV_A)]);
+        render_bound(&state, &request)
+    };
+    let daemon = fixture.spawn(None);
+    wait_ready(&fixture);
+
+    // ONE admitted run holds its issue's unique ownership: the durable lane
+    // record this control exists to retire for a terminal run.
+    let submitted = rpc_ok(
+        &fixture.socket,
+        &fresh_id(70),
+        "queue.submit",
+        Some(params_doc(
+            &idem_key("lane-retire"),
+            &bound,
+            &digest,
+            1,
+            &role_revision(),
+            &[("#31", "gr_0000000000000031")],
+            &[],
+            (Some(true), Some(0)),
+        )),
+    );
+    let run = submitted
+        .get("items")
+        .and_then(Val::as_array)
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("instance_id"))
+        .and_then(Val::as_str)
+        .expect("the admission names its run")
+        .to_string();
+    let topology = object(vec![
+        ("integration_branch", string("staging")),
+        ("production_branches", Val::Arr(vec![string("main")])),
+        (
+            "integration_repo",
+            string(&fixture.dir.join("integration").to_string_lossy()),
+        ),
+        (
+            "worktrees_root",
+            string(&fixture.dir.join("worktrees").to_string_lossy()),
+        ),
+    ]);
+
+    // "Never a live lane": the run is live, so the control refuses TYPED and
+    // writes nothing — the live lane still owns its issue, which is exactly
+    // what a fresh submission for the same issue reports.
+    let (code, message) = rpc_err(
+        &fixture.socket,
+        &fresh_id(71),
+        "run.retire-lane",
+        Some(canter::run_control::lane_retirement_params(
+            &idem_key("lane-retire-live"),
+            &run,
+            "the lane looks stale",
+            Some(topology.clone()),
+        )),
+    );
+    assert_eq!(code, "refusal.lane.live_run", "{message}");
+    assert!(
+        message.contains(&run),
+        "the refusal names the live run: {message}"
+    );
+    let owned = rpc_ok(
+        &fixture.socket,
+        &fresh_id(72),
+        "queue.submit",
+        Some(params_doc(
+            &idem_key("lane-retire-owned"),
+            &bound,
+            &digest,
+            1,
+            &role_revision(),
+            &[("#31", "gr_0000000000000031")],
+            &[],
+            (Some(true), Some(0)),
+        )),
+    );
+    assert_eq!(
+        item_status(&owned, 31),
+        (
+            "refused".to_string(),
+            Some("submission.already_owned".to_string())
+        ),
+        "a refused retirement writes nothing: the live lane still owns its issue"
+    );
+
+    // The run reaches the terminal state the field reaches: a released run
+    // that can never progress.
+    let released = rpc_ok(
+        &fixture.socket,
+        &fresh_id(73),
+        "run.release",
+        Some(canter::run_control::release_params(
+            &idem_key("lane-retire-release"),
+            &run,
+            "the run can never progress; its lane is stale now",
+        )),
+    );
+    assert_eq!(
+        released
+            .get("release")
+            .and_then(|release| release.get("status"))
+            .and_then(Val::as_str),
+        Some("invalidated")
+    );
+
+    // ONE bounded, audited control retires the terminal run's lane records:
+    // the durable half (leftover ownership rows) and the residue half (the
+    // run's own lane, under the #190/#222 policy), recorded as one claim.
+    let key = idem_key("lane-retire-terminal");
+    let params = canter::run_control::lane_retirement_params(
+        &key,
+        &run,
+        "the terminal run's lane records are stale",
+        Some(topology.clone()),
+    );
+    let retired = rpc_ok(
+        &fixture.socket,
+        &fresh_id(74),
+        "run.retire-lane",
+        Some(params.clone()),
+    );
+    assert_eq!(
+        retired.get("schema").and_then(Val::as_str),
+        Some("hf-run-lane-retirement/v1")
+    );
+    let retirement = retired.get("retirement").cloned().unwrap_or(Val::Null);
+    assert_eq!(
+        retirement.get("status").and_then(Val::as_str),
+        Some("invalidated"),
+        "the retirement names the terminal run: {}",
+        canter::canonical::canonical_text(&retired)
+    );
+    assert_eq!(
+        retirement
+            .get("ownership_rows_removed")
+            .and_then(Val::as_int),
+        Some(0),
+        "the release had already freed the run's ownership row"
+    );
+    let residue = retirement.get("lane_residue").cloned().unwrap_or(Val::Null);
+    assert_eq!(
+        residue.get("branch").and_then(Val::as_str),
+        Some("issue-31"),
+        "the retired lane is the run's own: {}",
+        canter::canonical::canonical_text(&retired)
+    );
+    assert_eq!(
+        residue.get("worktree").and_then(Val::as_str),
+        Some("issues-31")
+    );
+    assert_eq!(
+        residue
+            .get("workspace")
+            .and_then(|workspace| workspace.get("retired"))
+            .and_then(Val::as_bool),
+        Some(false),
+        "there is no lane checkout to retire here, and the document says so"
+    );
+
+    // The SAME idempotency key replays the recorded response: the retirement
+    // is a single audited act, never a second effect.
+    let replay = rpc_ok(
+        &fixture.socket,
+        &fresh_id(74),
+        "run.retire-lane",
+        Some(params),
+    );
+    assert_eq!(
+        canter::canonical::canonical_text(&replay),
+        canter::canonical::canonical_text(&retired),
+        "the same key replays the recorded response"
+    );
+
+    // An unknown run never fabricates a lane.
+    let (code, _) = rpc_err(
+        &fixture.socket,
+        &fresh_id(76),
+        "run.retire-lane",
+        Some(canter::run_control::lane_retirement_params(
+            &idem_key("lane-retire-unknown"),
+            "run-0000000000000000",
+            "unknown run",
+            None,
+        )),
+    );
+    assert_eq!(code, "state.not_found");
+    shutdown(daemon);
+}
