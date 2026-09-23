@@ -1206,15 +1206,44 @@ fn a_repaired_frontier_is_dispatched_by_the_driver_without_any_operator_dispatch
         p3.1, "succeeded",
         "the repaired frontier advanced by the driver alone: {attempts:?}"
     );
-    let doc = status_doc(&fixture.socket, &fresh_id(0x1420), &run);
+    // The driver keeps reconciling after the spine is exhausted; the
+    // classification lags the ledger by one driver wake. Wait for a recorded
+    // check committed AFTER the exhaustion (checks advanced past the count at
+    // the moment the frontier first read empty), then pin the invariants — a
+    // single read here raced the driver's in-flight wake on a loaded runner
+    // (macOS hosted leg: `eligible: true` while the tail was still being
+    // driven).
+    let checks_before = checks_of(&fixture, &run);
+    let started = Instant::now();
+    let settled = loop {
+        let doc = status_doc(&fixture.socket, &fresh_id(0x1420), &run);
+        let exhausted = picked(&doc, &["cursor", "next_step"]).is_empty();
+        let fresh_check = path_of(&doc, &["evaluation", "checks"])
+            .as_int()
+            .unwrap_or(0)
+            > checks_before;
+        if exhausted && fresh_check {
+            break doc;
+        }
+        let stalled = started.elapsed().as_secs();
+        assert!(
+            stalled < first_event_ceiling_secs(),
+            "the exhausted spine never settled: no fresh recorded check for {stalled}s of {}s \
+             waited (frontier {:?}): {}",
+            first_event_ceiling_secs(),
+            picked(&doc, &["cursor", "next_step"]),
+            canter::canonical::canonical_text(&doc)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
     assert_eq!(
-        picked(&doc, &["cursor", "next_step"]),
+        picked(&settled, &["cursor", "next_step"]),
         "",
         "the repaired spine advanced past p3 by the driver alone: {}",
-        canter::canonical::canonical_text(&doc)
+        canter::canonical::canonical_text(&settled)
     );
     assert_eq!(
-        path_of(&doc, &["evaluation", "eligible"]).as_bool(),
+        path_of(&settled, &["evaluation", "eligible"]).as_bool(),
         Some(false),
         "an exhausted spine is not an eligible continuation"
     );
