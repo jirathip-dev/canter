@@ -116,7 +116,15 @@ The leg runs, in order:
    spine uses (`Start`, then the bounded review brief as `Prompt`), in its own
    lane checkout, under the registry-resolved binding, with the reviewer lane
    identity (`rev-<issue>-r<round>`) the adapter verifies back;
-5. the engine then consumes the verdict the REVIEWER writes — as one
+5. the reviewed work is FENCED for the whole review window (issue #207): the
+   lane checkout was at the certified head when the reviewer started (item 2),
+   and it is read AGAIN after the reviewer's verdict arrives and before
+   anything is recorded. A checkout that moved while the review was open
+   refuses `refusal.evidence.verdict_stale` (naming both heads and the
+   re-entry requirement) exactly like the start-side check: a commit that
+   lands mid-review forces re-entry into review, instead of the verdict being
+   recorded for a delivery that moved under it;
+6. the engine then consumes the verdict the REVIEWER writes — as one
    `hf-evidence/v1` object at the daemon-owned verdict path named in the brief
    (`<state>/reviews/<lane session>-<step id>.json`), outside every lane
    worktree. Nothing is synthesised: a missing artifact at the deadline is
