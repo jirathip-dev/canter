@@ -6,6 +6,23 @@ release process activates (docs/RELEASING.md), then semver applies.
 
 ## [Unreleased]
 
+### Added (issue #245 — `queue intake`, the deterministic feeder)
+
+- `canter queue intake` turns the repository's own issue state into ONE
+  bound-input submission by rule: the open issues carrying the ready label
+  (default `canter:ready`) are selected in ascending issue-number order, each
+  revision resolves by the documented rule (a tracker-declared `--pin N=HEX40`
+  wins; otherwise the repository's integration head at intake time, read from
+  the remote), an issue already owned or queued is never re-submitted
+  (`intake.owned`), items beyond the declared `--max-items` bound wait
+  (`intake.cap`) instead of bypassing admission, and an unresolvable revision
+  refuses typed (`refusal.intake.revision`) without submitting anything.
+  `--dry-run` prints the exact decision and mutates nothing; `--json` names the
+  selected issues, revisions, caps, digest and each item's status. The rendered
+  document, the per-item grants and the submission are the SAME surfaces the
+  operator path uses (`queue preview` → `grant issue` → `queue submit`).
+  Contract: `docs/contracts/spec-intake.md`.
+
 ### Added (bootstrap)
 
 - Public repository foundation for canter (issue #2):

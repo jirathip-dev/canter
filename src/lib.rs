@@ -19,6 +19,7 @@ pub mod dirs;
 pub mod engine;
 pub mod formats;
 pub mod handoff;
+pub mod intake;
 pub mod lane;
 pub mod lifecycle;
 pub mod lock;

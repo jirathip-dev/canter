@@ -142,7 +142,45 @@ pub fn percentile_ms(samples: &[u64], percentile: f64) -> u64 {
 /// must land on a char boundary: truncating mid-char panics (review r1-1)
 /// and would destroy the hf-output/v1 framing. All call sites go through
 /// this one primitive.
-fn diagnostics(text: &str) -> String {
+/// The head of one remote branch, read with `git ls-remote` from the
+/// allowlisted environment. Never a stale local remote-tracking ref: the
+/// read is the remote's own answer, and `Ok(None)` means the branch does not
+/// exist there.
+pub fn ls_remote_head(
+    env: &BTreeMap<String, String>,
+    branch: &str,
+) -> Result<Option<String>, String> {
+    let refname = format!("refs/heads/{branch}");
+    let args = vec![
+        "ls-remote".to_string(),
+        "origin".to_string(),
+        refname.clone(),
+    ];
+    let (result, _) = adapter_run("git", &args, env, None);
+    let out = result.map_err(|message| {
+        if message == "timeout" {
+            "git ls-remote timed out".to_string()
+        } else {
+            format!("git unavailable: {message}")
+        }
+    })?;
+    if out.status.exit_code() != Some(0) {
+        return Err(diagnostics(&format!("{}\n{}", out.stderr, out.stdout)));
+    }
+    for line in out.stdout.lines() {
+        let mut parts = line.split_whitespace();
+        if let (Some(sha), Some(name)) = (parts.next(), parts.next())
+            && name == refname
+            && is_hex40(sha)
+        {
+            return Ok(Some(sha.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+/// Bounded one-line human stderr/stdout diagnostics, redacted at the boundary.
+pub fn diagnostics(text: &str) -> String {
     let redacted = redact(text);
     let mut lines = redacted.lines().map(str::trim).filter(|l| !l.is_empty());
     let mut out = String::new();
