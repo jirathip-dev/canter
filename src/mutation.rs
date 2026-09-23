@@ -327,6 +327,19 @@ pub mod code {
     pub const MERGE_NOT_FF: &str = "effect.merge.not_fast_forward";
     /// The integration merge failed (git-level).
     pub const MERGE_FAILED: &str = "effect.merge.failed";
+    /// The published integration ref moved past the base the certified
+    /// delivery was reviewed against AND the certified content cannot be
+    /// refreshed onto it (issue #263): the replay does not apply cleanly, or
+    /// it rewrites paths the review covered. It is a BASE MOVE, not a step
+    /// defect — the refreshed content was never reviewed, so no step may
+    /// consume it, and the run cannot resolve the condition by itself (a
+    /// re-dispatch refuses identically). Its OWN typed condition, naming the
+    /// certified base, the published head it moved to and the remedy, so
+    /// supervision parks the frontier on it with the bounded retries UNSPENT
+    /// instead of spending the whole budget on a condition the run can never
+    /// resolve — never a terminal `effect.merge.failed` and never a silent
+    /// consumption of unreviewed content.
+    pub const MERGE_BASE_MOVED: &str = "effect.merge.base_moved";
     /// The remote REJECTED the publish (issue #219): the ref is protected by
     /// repository rules, so the update can never be accepted by a direct push
     /// however the local checkout is shaped. Its own code, so an operator
@@ -6290,16 +6303,57 @@ fn branch_worktree(ctx: &EffectContext<'_>, branch: &str) -> Result<PathBuf, Eff
     Ok(worktree)
 }
 
+/// The typed BASE MOVE refusal (issue #263): the published integration ref
+/// moved past the reviewed base and the certified content cannot be refreshed
+/// onto it — the replay does not apply cleanly, or it rewrites content the
+/// review covered. Refreshed content that was never reviewed is never left
+/// behind as the delivery and never consumed, and a run cannot resolve a base
+/// move by itself (a re-dispatch refuses identically), so it is this step's
+/// OWN typed condition naming the reviewed base, the published head and the
+/// remedy: supervision parks the frontier on it with the bounded retries
+/// UNSPENT, never spending the budget on a condition the run cannot resolve.
+fn base_moved_refusal(
+    reviewed_base: &str,
+    target: &str,
+    branch: &str,
+    head: &str,
+    reason: &str,
+) -> EffectOutcome {
+    refusal(
+        code::MERGE_BASE_MOVED,
+        format!(
+            "the published integration ref {target} moved past the reviewed base {reviewed_base} and the certified content of {branch:?} (head {head}) cannot be refreshed onto it: {reason}; the refreshed content was never reviewed, so the delivery was left at {head} and nothing was published — it must be refreshed under a fresh review, and a new verdict must name the refreshed head, before any step consumes it"
+        ),
+    )
+}
+
+/// Withdraw a reconciliation that could not be proven to carry the certified
+/// content (issue #263): content that was never reviewed must never be left
+/// where a later step (or a publish route) could consume it as the delivery,
+/// and the delivery branch is left at the exact head its verdict names.
+/// Best-effort, exactly like the conflicted-rebase abort: the refusal is not.
+fn withdraw_reconcile(ctx: &EffectContext<'_>, branch: &str, head: &str) {
+    if let Ok(worktree) = branch_worktree(ctx, branch) {
+        let _ = run_git(ctx, &worktree, &["reset", "--hard", head]);
+    }
+}
+
 /// Reconcile the certified delivery onto the fetched published head (issue
 /// #178): replay exactly the delivered commits (`upstream..delivered`) onto
 /// `target` in the branch's own worktree, then prove the certified content
 /// survived byte-identically. Fails closed: a conflict, a dirty worktree or a
-/// content divergence refuses and never leaves a partial rewrite behind.
+/// content divergence refuses and never leaves a partial rewrite behind. A
+/// replay that cannot be carried out at all is the SAME base move as a replay
+/// that rewrites reviewed content (`effect.merge.base_moved`, issue #263):
+/// the delivery is left where the review left it and the run is parked on the
+/// condition instead of spending its bounded retries on it.
 fn reconcile_onto_published(
     ctx: &EffectContext<'_>,
     branch: &str,
     target: &str,
     upstream: &str,
+    reviewed_base: &str,
+    head: &str,
 ) -> Result<String, EffectOutcome> {
     let worktree = branch_worktree(ctx, branch)?;
     if let Err(outcome) = run_git(ctx, &worktree, &["rebase", "--onto", target, upstream]) {
@@ -6313,11 +6367,12 @@ fn reconcile_onto_published(
             .message
             .as_deref()
             .unwrap_or("the rebase failed without a message");
-        return Err(failed(
-            code::MERGE_FAILED,
-            format!(
-                "the certified content does not reconcile cleanly onto the published integration ref {target}: {detail}"
-            ),
+        return Err(base_moved_refusal(
+            reviewed_base,
+            target,
+            branch,
+            head,
+            &format!("the delivery's own commits do not replay cleanly onto it ({detail})"),
         ));
     }
     let reconciled = run_git(ctx, &worktree, &["rev-parse", "--verify", "HEAD"])?
@@ -6345,7 +6400,12 @@ fn reconcile_onto_published(
 /// and reported as the bounded `refusal.run.retry_required` this step's own
 /// next attempt re-certifies — never as a terminal failure. A published ref
 /// that moves again between those attempts is reconciled again (the same
-/// bounded loop), never merged unproven.
+/// bounded loop), never merged unproven. A delivery the moved ref CANNOT
+/// carry byte-identically (the replay conflicts, or it rewrites paths the
+/// review covered) is the typed `effect.merge.base_moved` (issue #263): the
+/// refresh is withdrawn, the delivery is left at the head its verdict names,
+/// and the run is parked on the condition with its bounded retries UNSPENT
+/// instead of spending them on a base move it can never resolve by itself.
 fn reconcile_moved_published(
     ctx: &EffectContext<'_>,
     inputs: &MergeInputs,
@@ -6417,8 +6477,45 @@ fn reconcile_moved_published(
             ),
         ));
     }
-    let reconciled = reconcile_onto_published(ctx, &inputs.branch, target, &fork)?;
-    prove_certified_content(ctx, reviewed_base, certified, &reconciled)?;
+    let reconciled = reconcile_onto_published(
+        ctx,
+        &inputs.branch,
+        target,
+        &fork,
+        reviewed_base,
+        &branch_head,
+    )?;
+    // Issue #263: content that was never reviewed is never consumed. A replay
+    // that rewrites reviewed content cannot be certified against the stale
+    // certified head, and the run cannot resolve that by itself, so the
+    // refresh is WITHDRAWN (the delivery is left at the exact head its
+    // verdict names) and the step reports the typed base-move park — never a
+    // terminal `effect.merge.failed` that spends the bounded retries on a
+    // condition no re-dispatch can repair.
+    match certified_content_differences(ctx, reviewed_base, certified, &reconciled) {
+        Ok((_, differing)) if differing.is_empty() => {}
+        Ok((paths, differing)) => {
+            withdraw_reconcile(ctx, &inputs.branch, &branch_head);
+            return Err(base_moved_refusal(
+                reviewed_base,
+                target,
+                &inputs.branch,
+                &branch_head,
+                &format!(
+                    "replaying the delivery's own commits onto it rewrites {} of the {} path(s) the review covered relative to {reviewed_base} (first {:?})",
+                    differing.len(),
+                    paths.len(),
+                    differing.first()
+                ),
+            ));
+        }
+        Err(outcome) => {
+            // The refreshed content could not even be PROVEN: the rewrite is
+            // withdrawn and the unprovable refresh fails closed.
+            withdraw_reconcile(ctx, &inputs.branch, &branch_head);
+            return Err(outcome);
+        }
+    }
     Err(refusal(
         code::RETRY_REQUIRED,
         format!(
@@ -7227,7 +7324,9 @@ fn effect_merge(ctx: &EffectContext<'_>) -> EffectOutcome {
     // run was in flight. Reconcile the certified delivery onto it, explicitly
     // and within the existing bounded retry budget, instead of failing
     // terminally (the old `not reviewed base` fence refused here and left a
-    // certified delivery stranded).
+    // certified delivery stranded). A moved ref the certified content cannot
+    // be refreshed onto is its OWN typed condition and parks the run with the
+    // bounded retries UNSPENT (`effect.merge.base_moved`, issue #263).
     if target != reviewed_base
         && let Err(outcome) = reconcile_moved_published(ctx, &inputs, &target, reviewed_base)
     {

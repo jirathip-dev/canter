@@ -2448,6 +2448,181 @@ fn cycle2_merge_reconciles_then_lands_a_delivery_behind_the_moved_published_ref(
     assert!(!lane.exists());
 }
 
+/// One world where the PUBLISHED integration ref moves while a reviewed
+/// delivery is in flight (issue #263): the base carries a multi-line file,
+/// the delivery edits its FIRST line, and a separate clone lands the
+/// concurrent edit named by `other_edit`. Returns the scenario, the certified
+/// head, the reviewed base, the moved published head and the delivery's own
+/// worktree.
+fn moved_base_world(name: &str, other_edit: &str) -> (Scenario, String, String, String, PathBuf) {
+    let scenario = Scenario::new(name, "2999-01-01T00:00:00Z", cycle2_merge_steps("squash"));
+    let checkout_git = Git::new(&scenario.repos.checkout);
+    std::fs::write(
+        scenario.repos.checkout.join("base.txt"),
+        "base\nalpha\nbeta\ngamma\n",
+    )
+    .expect("write");
+    checkout_git.run(&["add", "base.txt"]);
+    checkout_git.run(&["commit", "-q", "-m", "reviewed base content (synthetic)"]);
+    checkout_git.run(&["push", "-q", "origin", "staging"]);
+    let base = scenario.integration_base();
+
+    // The reviewed delivery: the lane's own commit, plus the delivery's edit
+    // of the base file's first line.
+    scenario.apply_ok(10, "w1", None, Some(&base));
+    scenario.apply_ok(11, "h1", None, None);
+    scenario.apply_ok(12, "p1", None, None);
+    let lane = scenario.repos.worktrees_root.join("issues-123");
+    let lane_git = Git::new(&lane);
+    std::fs::write(
+        lane.join("base.txt"),
+        "base (reviewed)\nalpha\nbeta\ngamma\n",
+    )
+    .expect("write");
+    lane_git.run(&["add", "base.txt"]);
+    lane_git.run(&[
+        "-c",
+        "user.name=Worker",
+        "-c",
+        "user.email=worker@example.invalid",
+        "commit",
+        "-q",
+        "-m",
+        "reviewed delivery (synthetic)",
+    ]);
+    let collected = scenario.apply_ok(13, "o1", None, Some(&base));
+    let feature = collected
+        .get("head")
+        .and_then(Val::as_str)
+        .expect("lane head")
+        .to_string();
+    scenario.apply_ok(14, "r1", Some(&feature), Some(&base));
+
+    // Another lane lands on the published integration branch from a separate
+    // clone: the published ref moves while this integration checkout stays at
+    // the reviewed base (a bare-remote move is invisible to its own refs).
+    let root = scenario
+        .repos
+        .checkout
+        .parent()
+        .expect("sandbox root")
+        .to_path_buf();
+    let other = root.join("other-lane");
+    Git::new(&root).run(&[
+        "clone",
+        "-q",
+        "--branch",
+        "staging",
+        scenario.origin().to_str().expect("origin path"),
+        other.to_str().expect("other lane path"),
+    ]);
+    let other_git = Git::new(&other);
+    other_git.run(&["config", "user.name", "other lane"]);
+    other_git.run(&["config", "user.email", "lane@example.invalid"]);
+    std::fs::write(other.join("base.txt"), other_edit).expect("write");
+    other_git.run(&["add", "base.txt"]);
+    other_git.run(&["commit", "-q", "-m", "another lane landed (synthetic)"]);
+    other_git.run(&["push", "-q", "origin", "staging"]);
+    let published = other_git.head("staging");
+    assert_ne!(published, base, "the published integration ref moved");
+    assert_eq!(
+        scenario.integration_base(),
+        base,
+        "the integration checkout was not fetched"
+    );
+    (scenario, feature, base, published, lane)
+}
+
+/// Witness (issue #263): a delivery certified at base B whose reviewed
+/// content the PUBLISHED integration ref cannot be refreshed onto (B') is a
+/// BASE MOVE, never a step defect. The step reports its OWN typed condition
+/// naming B AND B', withdraws the refresh so the delivery is left at the
+/// exact head its verdict names, and publishes nothing: the run parks on the
+/// condition instead of spending its whole bounded retry budget on a base
+/// move it can never resolve by itself. Two in-class shapes: a replay that
+/// stays clean and rewrites the reviewed content, and a replay that does not
+/// apply cleanly at all.
+#[test]
+fn cycle2_merge_parks_a_base_move_the_certified_content_cannot_survive() {
+    // (1) The replay applies cleanly, in a region the concurrent landing did
+    // not touch: it carries the certified delta PLUS the concurrent landing,
+    // so the reviewed path no longer carries the reviewed content.
+    let (scenario, feature, base, published, lane) =
+        moved_base_world("c2bm", "base\nalpha\nbeta\ngamma (other lane)\n");
+    let lane_git = Git::new(&lane);
+    let (code, message) = scenario.apply_err(15, "m1", Some(&feature), Some(&base));
+    assert_eq!(code, "effect.merge.base_moved", "{message}");
+    assert!(
+        message.contains(&base) && message.contains(&published),
+        "the refusal names the reviewed base and the published head it moved to: {message}"
+    );
+    assert!(
+        message.contains("base.txt"),
+        "the refusal names the reviewed path the refresh rewrites: {message}"
+    );
+    // Nothing was published, nothing moved in the integration checkout, and
+    // the refresh was WITHDRAWN: the delivery is left at the exact head its
+    // verdict names — content that was never reviewed is never left behind as
+    // the delivery.
+    assert_eq!(
+        Git::new(&scenario.origin()).head("staging"),
+        published,
+        "a base-move park publishes nothing"
+    );
+    assert_eq!(
+        scenario.integration_base(),
+        base,
+        "a base-move park moves no integration ref"
+    );
+    assert_eq!(
+        lane_git.head("HEAD"),
+        feature,
+        "the withdrawn refresh leaves the delivery as reviewed"
+    );
+    assert_eq!(
+        lane_git.run(&["status", "--porcelain"]),
+        "",
+        "the withdrawn refresh leaves the lane worktree clean"
+    );
+
+    // (2) The concurrent landing edited the SAME line: the replay does not
+    // apply cleanly at all. Same typed park, and the aborted replay leaves
+    // the delivery exactly as reviewed.
+    let (scenario, feature, base, published, lane) =
+        moved_base_world("c2bmc", "base (other lane)\nalpha\nbeta\ngamma\n");
+    let lane_git = Git::new(&lane);
+    let (code, message) = scenario.apply_err(15, "m1", Some(&feature), Some(&base));
+    assert_eq!(code, "effect.merge.base_moved", "{message}");
+    assert!(
+        message.contains(&base) && message.contains(&published),
+        "the refusal names the reviewed base and the published head it moved to: {message}"
+    );
+    assert!(
+        message.contains("cleanly"),
+        "the refusal names the replay that could not be carried out: {message}"
+    );
+    assert_eq!(
+        Git::new(&scenario.origin()).head("staging"),
+        published,
+        "an unplayable refresh publishes nothing"
+    );
+    assert_eq!(
+        scenario.integration_base(),
+        base,
+        "an unplayable refresh moves no integration ref"
+    );
+    assert_eq!(
+        lane_git.head("HEAD"),
+        feature,
+        "the aborted replay leaves the delivery as reviewed"
+    );
+    assert_eq!(
+        lane_git.run(&["status", "--porcelain"]),
+        "",
+        "the aborted replay leaves the lane worktree clean"
+    );
+}
+
 /// Witness (c) (issues #178, #156): an UNPUBLISHED local move refuses — the
 /// stale local view nobody else can see is never a merge target and never a
 /// reconciliation base, so nothing is landed or published from it. (The

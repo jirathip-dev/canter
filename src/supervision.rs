@@ -899,6 +899,16 @@ pub fn dispatch_intent(
                         && code != crate::mutation::code::VERDICT_STALE
                         && code != crate::mutation::code::DELIVERY_MOVED
                         && code != crate::mutation::code::DELIVERY_UNBOUND
+                        // Issue #263: a published ref that moved past the
+                        // base the delivery certified and cannot carry the
+                        // certified content byte-identically is a recorded
+                        // fact about the PUBLISHED ref, not a step defect: a
+                        // re-dispatch refuses identically (the refresh is
+                        // withdrawn), so the frontier parks typed with the
+                        // bounded retries UNSPENT instead of spending the
+                        // whole budget on a base move the run cannot resolve
+                        // by itself.
+                        && code != crate::mutation::code::MERGE_BASE_MOVED
                         && step_retries.len() < crate::state::RUN_RETRY_MAX as usize)) => {}
         Some(_) => return None,
     }
@@ -3234,7 +3244,11 @@ mod tests {
     /// detail) with the bounded retries UNSPENT — never a silent park, never
     /// `waiting-approval`, and never a retry into consuming a head no verdict
     /// names. The same frontier shape with a retryable diagnosis still takes
-    /// its bounded retry.
+    /// its bounded retry. Issue #263 adds the SAME park for the merge
+    /// frontier's own base move (`effect.merge.base_moved`: the published ref
+    /// moved past the base the delivery certified and cannot carry the
+    /// certified content byte-identically — a recorded fact about the
+    /// published ref, not a step defect).
     #[test]
     fn a_moved_delivery_diagnosis_parks_the_merge_frontier_typed_and_unspent() {
         use crate::state::{EvidenceRow, QueueItemRef};
@@ -3313,6 +3327,27 @@ mod tests {
         assert!(
             moved.retries.is_empty(),
             "the bounded retries stay unspent on an impossible step"
+        );
+        // Issue #263: the merge frontier's own base move is the same park —
+        // the published ref cannot carry the certified content and the run
+        // cannot resolve that by itself.
+        let base_moved = scene(crate::mutation::code::MERGE_BASE_MOVED);
+        assert!(
+            driver_dispatchable_kind(&base_moved, "p7", "merge"),
+            "the fixture frontier is a genuinely dispatchable committed tail step"
+        );
+        assert!(
+            dispatch_intent(&row, &base_moved).is_none(),
+            "a base move the run cannot resolve is never re-dispatched into the budget"
+        );
+        let verdict = classify(&base_moved, &digest, &policy, now_unix);
+        assert_eq!(verdict.class, "needs-attention");
+        assert_eq!(verdict.reason, codes::STEP_DIAGNOSED);
+        assert_eq!(verdict.detail, crate::mutation::code::MERGE_BASE_MOVED);
+        assert!(!verdict.eligible, "the parked frontier is never eligible");
+        assert!(
+            base_moved.retries.is_empty(),
+            "the bounded retries stay unspent on a base move"
         );
         let retryable = scene("refusal.worktree.exists");
         assert_eq!(

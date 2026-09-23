@@ -84,9 +84,18 @@ Normative rules:
   re-certifies the reconciled head against the fetched published ref, proving
   every path the review covered carries the reviewed head's exact content
   (the same fail-closed content fact as the cleanup landed proof — NUL-delimited
-  names, literal pathspecs, both rename endpoints; a conflict, a missing or
-  uncontained lane worktree, or any content divergence refuses with
-  diagnostics and never leaves a partial rewrite).
+  names, literal pathspecs, both rename endpoints). A replay that CANNOT be
+  carried out, or one that rewrites the paths the review covered, is never a
+  step failure and never content to consume: the refresh is withdrawn (the
+  delivery is left at the exact head its verdict names) and the step refuses
+  its OWN typed condition `effect.merge.base_moved`, naming the reviewed base,
+  the published head it moved to and the remedy (issue #263) — a base move is
+  a recorded fact about the PUBLISHED ref, so the run parks on it with the
+  bounded retries UNSPENT instead of spending the whole budget on a condition
+  it can never resolve by itself, and the delivery must be refreshed under a
+  fresh review whose new verdict names the refreshed head. A missing or
+  uncontained lane worktree still refuses with diagnostics and never leaves a
+  partial rewrite.
   The LANDING honours the declared policy: `squash` writes ONE new integration
   commit whose tree is the delivered tree and whose parent is the published
   head (the delivered commits are rewritten, so a squash landing is never an
