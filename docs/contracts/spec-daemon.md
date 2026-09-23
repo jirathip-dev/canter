@@ -695,8 +695,12 @@ clears a repository/fleet-level hold or bypasses a gate.
   presents the committed step's OWN params; the retry it spends is minted and
   consumed atomically through the apply path. The diagnoses a re-dispatch can
   never repair — `effect.worker_timeout`, `refusal.evidence.verdict_stale`,
-  `refusal.delivery.moved` / `refusal.delivery.unbound` — stay parked with
-  their bounded retries UNSPENT. An authorization the run already HOLDS (a
+  `refusal.delivery.moved` / `refusal.delivery.unbound`, and the merge's own
+  base move `effect.merge.base_moved` (issue #263: the published ref moved
+  past the base the delivery certified and cannot carry the certified content
+  byte-identically — the refresh is withdrawn, so a re-dispatch refuses
+  identically) — stay parked with their bounded retries UNSPENT. An
+  authorization the run already HOLDS (a
   `run.retry` row, issue #241) is consumed by that very re-dispatch, exactly
   once, recorded under the dispatch's own journaled idempotency key: the
   driver dispatches it, so a held authorization never parks the frontier and
