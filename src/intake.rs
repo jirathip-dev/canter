@@ -249,12 +249,15 @@ pub fn selected_doc(repository: &str, selected: &[(u64, String)]) -> Val {
     ])
 }
 
-/// The canonical text of one intake decision (`--out`, `--json`).
-pub fn render(decision: &Decision, repository: &str) -> Val {
+/// The canonical text of one intake decision (`--out`, `--json`). `label` is
+/// the ready label **in force** for this invocation (`--label` when
+/// presented), never the compiled-in default: the document must report the
+/// decision that was made, not the one the default would have made.
+pub fn render(decision: &Decision, repository: &str, label: &str) -> Val {
     object(vec![
         ("schema", string(SCHEMA)),
         ("repository", string(repository)),
-        ("label", string(READY_LABEL)),
+        ("label", string(label)),
         ("order", string(ORDER_RULE)),
         ("max_items", Val::Int(decision.items.len() as i64)),
         ("digest", string(&decision.digest)),
@@ -411,7 +414,7 @@ mod tests {
             1,
         )
         .expect("resolvable");
-        let doc = render(&decision, "owner/name");
+        let doc = render(&decision, "owner/name", READY_LABEL);
         assert_eq!(doc.get("schema").and_then(Val::as_str), Some(SCHEMA));
         assert_eq!(doc.get("label").and_then(Val::as_str), Some(READY_LABEL));
         assert_eq!(doc.get("order").and_then(Val::as_str), Some(ORDER_RULE));

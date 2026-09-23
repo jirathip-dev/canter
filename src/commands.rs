@@ -5193,12 +5193,13 @@ fn execute_queue_intake(args: &QueueIntakeArgs, invocation: &Invocation) -> CmdR
         timeout: std::time::Duration::from_secs(30),
     });
     if listed.status.exit_code() != Some(0) {
-        let detail = crate::observe::diagnostics(&format!("{}\n{}", listed.stderr, listed.stdout));
+        // The refusal names the cause — status, program and argv as recorded,
+        // and the first stderr line — never the captured payload (#258 AC2).
         return lane_error(
             crate::intake::code::ISSUES_UNAVAILABLE,
             format!(
-                "queue intake: the repository's own issue surface could not be read (gh api \
-                 {identity} issues): {detail}"
+                "queue intake: the repository's own issue surface could not be read: {}",
+                listed.failure_detail("gh", &gh_args)
             ),
             false,
         );
@@ -5330,7 +5331,7 @@ fn execute_queue_intake(args: &QueueIntakeArgs, invocation: &Invocation) -> CmdR
         Ok(decision) => decision,
         Err(err) => return lane_error(err.code, format!("queue intake: {}", err.message), false),
     };
-    let mut data = crate::intake::render(&decision, &identity);
+    let mut data = crate::intake::render(&decision, &identity, &args.label);
     let held = decision.held();
     let mut human = format!(
         "queue intake {identity} ({} selected of {} ready issue(s), label {:?}, order {})\n",
