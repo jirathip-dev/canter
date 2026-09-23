@@ -76,6 +76,45 @@ pub const HARNESS_START_DEADLINE_DEFAULT_SECS: u64 = 300;
 /// measured verdicts take tens of minutes on this host).
 pub const REVIEW_DEADLINE_DEFAULT_SECS: u64 = PROMPT_DEADLINE_DEFAULT_SECS;
 
+/// Issue #170 (N7): how many CONSECUTIVE non-working read-backs of a
+/// collection's pane worker — each separated by the real
+/// [`COLLECT_STOP_INTERVAL_SECS`] interval and corroborated by the lane's own
+/// row — make the worker's turn a CONFIRMED stop.
+///
+/// Two read-backs are not a stop. The measured live `p5-101` collection judged
+/// a still-working pane stopped from two reads ~100 ms apart of a status that
+/// flaps to `idle`/`done` mid-turn, refused `refusal.collect.empty_delta` four
+/// minutes into a 93-minute turn and consumed the run's retry; the retry then
+/// parked the run on the old wall clock while the worker kept working. Three
+/// read-backs span two real intervals in which a mid-turn flap has to hold,
+/// and a lane whose own lifecycle counter moved across them never confirms.
+pub const COLLECT_STOP_SAMPLES: usize = 3;
+
+/// Issue #170 (N7 and N3): the real interval (seconds) between two of those
+/// non-working read-backs — and therefore the collection wait's bounded poll
+/// cadence. The pre-change loop polled every ~100 ms with two subprocess rows
+/// per iteration (N3: ~600 read-backs/minute for a worker that runs for tens
+/// of minutes); this is 12, and it stays well inside the driver's own 60 s
+/// check interval, so a settled worker is noticed within one driver tick.
+///
+/// It is NOT a loop iteration: the wait sleeps this long between samples, so a
+/// confirmed stop spans at least `(COLLECT_STOP_SAMPLES - 1) × this` seconds
+/// of real time — the interval is measured off the wait's own clock.
+pub const COLLECT_STOP_INTERVAL_SECS: u64 = 5;
+
+/// Issue #170 (N8): the hard overall ceiling (seconds) of ONE collection wait.
+///
+/// The step's effective deadline is the wait's NO-PROGRESS window (seconds of
+/// no recorded progress — see [`poll_pane_worker`]); this constant is the
+/// absolute bound the window extensions may never leave. It is sized from the
+/// measured lane: the live `p5-101` pane worker's real turn ran ≈93 minutes
+/// (5580 s) and its delivery landed after the old 1800 s wall had already
+/// parked the run, so the ceiling is ≈4× that turn — generous enough that a
+/// real lane cannot be unconvergeable by construction, and still a hard bound:
+/// even a lane that keeps producing progress parks as the typed
+/// `effect.worker_timeout` once this is reached. The wait is never unbounded.
+pub const COLLECT_CEILING_SECS: u64 = 6 * 60 * 60;
+
 /// Upper bound (seconds) on any authorization window the engine mints or
 /// renews for a run: 30 days. A grant is the bounded authorization of ONE
 /// run's own committed work, so no derived window may exceed the documented
@@ -3618,7 +3657,8 @@ fn await_pane_worker(
     let start = std::time::Instant::now();
     poll_pane_worker(
         Duration::from_secs(seconds),
-        Duration::from_millis(100),
+        Duration::from_secs(COLLECT_STOP_INTERVAL_SECS),
+        Duration::from_secs(COLLECT_CEILING_SECS),
         |remaining| crate::adapters::observe_pane_worker(&session, worktree, remaining, ctx.env),
         || collect_worktree_outcome(ctx, inputs, worktree),
         || start.elapsed(),
@@ -3627,48 +3667,94 @@ fn await_pane_worker(
     .map(Some)
 }
 
-/// The production loop, with explicit deadline, cadence and clock/wait seams.
+/// The production loop, with explicit bounds, cadence and clock/wait seams.
 /// Tests advance a local clock; no environment override can shorten a real run.
 ///
 /// Issue #200: a delta head is certified only at a GENUINELY SETTLED pane
-/// turn — the stop state must be confirmed across two consecutive read-backs,
+/// turn — the stop state must be confirmed across consecutive read-backs,
 /// exactly like the empty-delta path — because a head read while the worker is
 /// still mid-turn can still move. The measured p4→p5 boundary certified
 /// `38fb0929` while the same worker was still mid-turn and committed
 /// `0d5e851b` 26 s later, wedging the spine on `refusal.evidence.verdict_stale`
 /// forever. A delivery collected while the worker is still live, like an empty
 /// delta while the worker is still live, therefore stays a WAIT/re-check until
-/// the stop is confirmed or the step deadline parks the collection as
-/// `effect.worker_timeout`. A collection failure that is not emptiness (a
-/// refusal of the collection itself, e.g. a diverged or mis-branched lane)
-/// certifies no head and stays actionable without waiting for the stop.
+/// the stop is confirmed or the wait parks as `effect.worker_timeout`. A
+/// collection failure that is not emptiness (a refusal of the collection
+/// itself, e.g. a diverged or mis-branched lane) certifies no head and stays
+/// actionable without waiting for the stop.
+///
+/// Issue #170 (N7): a stop is CONFIRMED only by [`COLLECT_STOP_SAMPLES`]
+/// consecutive read-backs — each separated by the real `interval` off the
+/// wait's own clock, not a loop iteration — in which BOTH views of the lane
+/// ([`crate::adapters::PaneSample`]: the lane's own row and its status row)
+/// report a non-working state AND the lane's own lifecycle counter did not
+/// move. `refusal.collect.empty_delta` is therefore only ever returned for a
+/// confirmed stop; while the worker is working, the wait keeps reading.
+///
+/// Issue #170 (N8): the wait is bounded by RECORDED PROGRESS, not by a fixed
+/// wall clock (the #232/#233 treatment for the frontier waits). `window` is
+/// the no-progress window — the step's effective deadline, unchanged — and
+/// progress is: the lane reports it is `working`, or its read-back MOVED
+/// (state changed, own counter advanced), or the delivery it collected MOVED
+/// (a new certified head / commit count). While progress is recorded the wait
+/// extends past `window`; a lane that records NONE for `window` parks as
+/// `effect.worker_timeout` naming the progress it last saw and when. `ceiling`
+/// is the hard overall bound no extension may leave, so a lane that keeps
+/// producing progress is still bounded and parks the same way.
 fn poll_pane_worker(
-    deadline: Duration,
+    window: Duration,
     interval: Duration,
-    mut observe: impl FnMut(Duration) -> Result<String, crate::adapters::ProcessFailure>,
+    ceiling: Duration,
+    mut observe: impl FnMut(
+        Duration,
+    ) -> Result<crate::adapters::PaneSample, crate::adapters::ProcessFailure>,
     mut collect: impl FnMut() -> EffectOutcome,
     elapsed: impl Fn() -> Duration,
     mut sleep: impl FnMut(Duration),
 ) -> Result<EffectOutcome, EffectOutcome> {
-    let seconds = deadline.as_secs();
-    let mut previous_stop = None;
+    let window_secs = window.as_secs();
+    let ceiling_secs = ceiling.as_secs();
+    let stop_run_span = interval * COLLECT_STOP_SAMPLES.saturating_sub(1) as u32;
+    let mut previous: Option<crate::adapters::PaneSample> = None;
+    let mut previous_delivery: Option<String> = None;
+    let mut stop_run: Option<(usize, Duration)> = None;
+    let mut last_progress_at = Duration::ZERO;
+    let mut last_progress = "no read-back yet".to_string();
     loop {
-        let remaining = deadline.saturating_sub(elapsed());
-        if remaining.is_zero() {
-            return Err(EffectOutcome {
-                status: "ambiguous",
-                code: Some(code::WORKER_TIMEOUT.to_string()),
-                message: Some(format!(
-                    "pane worker has no verified delivery or confirmed stop within {seconds}s; worker may still be running; collection parked without redispatch"
-                )),
-                result: object(vec![("deadline_secs", integer(seconds as i64))]),
-            });
+        let now = elapsed();
+        // Issue #170 (N8): the ceiling is the hard bound on ONE collection
+        // wait and is not a progress judgment, so it is decided before any
+        // further read-back is attempted.
+        if now >= ceiling {
+            return Err(collection_park(
+                format!(
+                    "pane worker was still producing progress at the {ceiling_secs}s overall \
+                     collection ceiling (waited {}s)",
+                    now.as_secs()
+                ),
+                window_secs,
+                ceiling_secs,
+                now,
+                now.saturating_sub(last_progress_at),
+                &last_progress,
+            ));
         }
-        let state = match observe(remaining) {
-            Ok(state) => state,
+        // Issue #170 (N8): the read-back is evidence for the no-progress
+        // window, so it may never outlive it: the row's own budget is what the
+        // window has left, floored at one second so a read is always given a
+        // real chance, and capped by what the overall ceiling has left.
+        let budget = window
+            .saturating_sub(now.saturating_sub(last_progress_at))
+            .max(Duration::from_secs(1))
+            .min(ceiling.saturating_sub(now));
+        let sample = match observe(budget) {
+            Ok(sample) => Some(sample),
             Err(err) if err.code == crate::adapters::CODE_TIMEOUT => {
-                previous_stop = None;
-                continue;
+                // A read-back that timed out carries no evidence at all: the
+                // stop run breaks, and the wait decides on its bounds below and
+                // re-reads at its own cadence.
+                stop_run = None;
+                None
             }
             Err(err) => {
                 return Err(EffectOutcome {
@@ -3679,21 +3765,185 @@ fn poll_pane_worker(
                 });
             }
         };
-        let outcome = collect();
-        // A stop report is a settled turn only once the SAME stop state is
-        // read back again: a worker may report idle/blocked between tool calls
-        // while its turn — and the head it commits — keeps moving.
-        let stopped = matches!(state.as_str(), "idle" | "done" | "blocked");
-        if stopped && previous_stop.as_deref() == Some(state.as_str()) {
-            return Ok(outcome);
+        if let Some(sample) = &sample {
+            let outcome = collect();
+            // Issue #170 (N8): the recorded progress this sample carries, in
+            // priority order — a lane that reports it is working is working, a
+            // read-back that moved is a lane that moved, and a delivery head
+            // that moved is committed work.
+            let delivery = certified_delivery(&outcome);
+            let mut progress: Option<String> = None;
+            if sample.lane_state == PANE_WORKING_STATE {
+                progress = Some(format!("the lane reports {:?}", sample.lane_state));
+            }
+            if let Some(previous) = &previous {
+                if previous.lane_state != sample.lane_state {
+                    progress = Some(format!(
+                        "the lane read-back moved {:?} -> {:?}",
+                        previous.lane_state, sample.lane_state
+                    ));
+                } else if previous.seq != sample.seq {
+                    progress = Some(format!(
+                        "the lane's own state counter advanced {:?} -> {:?}",
+                        previous.seq, sample.seq
+                    ));
+                }
+            }
+            if let (Some(before), Some(after)) = (&previous_delivery, &delivery)
+                && before != after
+            {
+                progress = Some(format!("the collected delivery moved {before} -> {after}"));
+            }
+            if let Some(evidence) = progress {
+                last_progress_at = now;
+                last_progress = evidence;
+            }
+            let counter_moved = previous
+                .as_ref()
+                .map(|previous| previous.seq != sample.seq)
+                .unwrap_or(false);
+            previous = Some(sample.clone());
+            previous_delivery = delivery;
+            // Issue #170 (N7): a stop sample needs the lane's own row AND its
+            // independent second view (the status row) to report a non-working
+            // state — a single status field is never enough — and a lane whose
+            // own counter moved is not a settled one.
+            let stop = pane_stop_state(&sample.lane_state)
+                && status_corroborates_stop(&sample.status_state)
+                && !counter_moved;
+            if stop {
+                let (samples, since) = match stop_run {
+                    Some((samples, since)) => (samples + 1, since),
+                    None => (1, now),
+                };
+                stop_run = Some((samples, since));
+                // Issue #170 (N8): the confirmation outranks the window — a
+                // pinned, correct-by-construction confirmation (N consecutive
+                // corroborated samples across the real interval) may never be
+                // cut by the no-progress park that the confirmation itself is
+                // about to answer. The CEILING still bounds even this: a run
+                // that cannot settle within it was never convergeable.
+                if samples >= COLLECT_STOP_SAMPLES && now.saturating_sub(since) >= stop_run_span {
+                    return Ok(outcome);
+                }
+            } else {
+                stop_run = None;
+            }
+            if outcome.status != "succeeded"
+                && outcome.code.as_deref() != Some(code::COLLECT_EMPTY_DELTA)
+            {
+                return Ok(outcome);
+            }
         }
-        if outcome.status != "succeeded"
-            && outcome.code.as_deref() != Some(code::COLLECT_EMPTY_DELTA)
-        {
-            return Ok(outcome);
+        // Issue #170 (N8): the bounds are decided on the progress RECORDED by
+        // the samples — after this sample's own evidence — so a read-back that
+        // carries progress at the window's boundary is never parked past, while
+        // a silent lane (or a substrate that cannot even answer) still fails
+        // typed: no recorded progress for the window, and never past the
+        // overall ceiling. A confirmation IN PROGRESS (at least one corroborated
+        // stop sample since the last recorded progress) defers the window park:
+        // the pinned confirmation is exactly what answers the "has it stopped?"
+        // question the window exists for, and it is bounded by its own shape
+        // (N samples across (N-1) intervals) plus the ceiling.
+        if now >= ceiling {
+            return Err(collection_park(
+                format!(
+                    "pane worker was still producing progress at the {ceiling_secs}s overall \
+                     collection ceiling (waited {}s)",
+                    now.as_secs()
+                ),
+                window_secs,
+                ceiling_secs,
+                now,
+                now.saturating_sub(last_progress_at),
+                &last_progress,
+            ));
         }
-        previous_stop = stopped.then_some(state);
-        sleep(interval.min(deadline.saturating_sub(elapsed())));
+        if now.saturating_sub(last_progress_at) >= window && stop_run.is_none() {
+            return Err(collection_park(
+                format!(
+                    "pane worker has no recorded progress for {}s of the {window_secs}s no-progress \
+                     window (waited {}s of the {ceiling_secs}s overall ceiling)",
+                    now.saturating_sub(last_progress_at).as_secs(),
+                    now.as_secs()
+                ),
+                window_secs,
+                ceiling_secs,
+                now,
+                now.saturating_sub(last_progress_at),
+                &last_progress,
+            ));
+        }
+        sleep(interval.min(ceiling.saturating_sub(elapsed())));
+    }
+}
+
+/// The state one read-back reports for a lane whose turn is WORKING: the
+/// lane's own state field, never inferred from the absence of a stop.
+const PANE_WORKING_STATE: &str = "working";
+
+/// Whether one read-back reports a lane whose turn is NOT working — the
+/// documented stop states (`idle|done|blocked`), unchanged by issue #170.
+fn pane_stop_state(state: &str) -> bool {
+    matches!(state, "idle" | "done" | "blocked")
+}
+
+/// Whether the sample's SECOND view (the lane's status row) corroborates a
+/// stop: it reports a non-working state — or it carries NO state field at all,
+/// which is never read as the negative (the same convention
+/// [`crate::adapters`] applies to a missing readiness signal: an older row
+/// that omits a field neither corroborates nor blocks). The stop then rests on
+/// the lane's own verified row plus the pinned sample count and the unmoved
+/// counter — never weaker than the pre-change rule, which read that row alone.
+fn status_corroborates_stop(state: &str) -> bool {
+    state.is_empty() || pane_stop_state(state)
+}
+
+/// The delivery a `succeeded` collection read (issue #170 N8 progress
+/// evidence): the certified head and the commit count it saw. An outcome that
+/// certified no head reports none — a refusal is never read as a movement.
+fn certified_delivery(outcome: &EffectOutcome) -> Option<String> {
+    if outcome.status != "succeeded" {
+        return None;
+    }
+    let head = outcome.result.get("head").and_then(Val::as_str)?;
+    let commits = outcome
+        .result
+        .get("commits")
+        .and_then(Val::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    Some(format!("{head} ({commits} commit(s))"))
+}
+
+/// The typed park of one collection wait (issue #170 N8): `ambiguous` with
+/// `effect.worker_timeout`, naming what fired (the no-progress window or the
+/// overall ceiling), the progress last observed and the elapsed time — the
+/// shape #232/#233 gave the frontier waits.
+fn collection_park(
+    reason: String,
+    window_secs: u64,
+    ceiling_secs: u64,
+    waited: Duration,
+    progress_age: Duration,
+    progress: &str,
+) -> EffectOutcome {
+    EffectOutcome {
+        status: "ambiguous",
+        code: Some(code::WORKER_TIMEOUT.to_string()),
+        message: Some(format!(
+            "{reason}; last progress {}s ago ({progress}); worker may still be running; \
+             collection parked without redispatch",
+            progress_age.as_secs()
+        )),
+        result: object(vec![
+            ("deadline_secs", integer(window_secs as i64)),
+            ("progress_window_secs", integer(window_secs as i64)),
+            ("ceiling_secs", integer(ceiling_secs as i64)),
+            ("waited_secs", integer(waited.as_secs() as i64)),
+            ("progress_secs", integer(progress_age.as_secs() as i64)),
+            ("progress", string(progress)),
+        ]),
     }
 }
 
@@ -8112,18 +8362,72 @@ mod tests {
         assert_eq!(rebound_reviewer_lane(5, None, 2), None);
     }
 
+    /// One synthetic pane sample (issue #170 N7): both views of the lane and
+    /// the lane's own lifecycle counter, all under the test's control.
+    fn pane_sample(lane: &str, status: &str, seq: Option<i64>) -> crate::adapters::PaneSample {
+        crate::adapters::PaneSample {
+            lane_state: lane.to_string(),
+            status_state: status.to_string(),
+            seq,
+        }
+    }
+
+    /// A read-back whose two views agree, the measured shape of one Herdr row.
+    fn pane(state: &str) -> crate::adapters::PaneSample {
+        pane_sample(state, state, None)
+    }
+
+    /// Issue #170 N7/N8: the documented numbers are pinned contract values —
+    /// the sample count a stop needs, the real interval between samples and
+    /// the hard overall ceiling. What each rule DOES is witnessed by the tests
+    /// above; this pins the numbers a future change may not move silently.
     #[test]
-    fn collection_live_mid_turn_at_deadline_is_worker_timeout() {
+    fn collection_bounds_are_pinned_contract_values() {
+        assert_eq!(COLLECT_STOP_SAMPLES, 3, "the confirmed-stop sample count");
+        assert_eq!(COLLECT_STOP_INTERVAL_SECS, 5, "the real sample interval");
+        assert_eq!(COLLECT_CEILING_SECS, 6 * 60 * 60, "the hard ceiling");
+        const {
+            assert!(
+                COLLECT_STOP_SAMPLES > 2,
+                "TWO read-backs is exactly the measured defect (a flap judged a stop)"
+            );
+            assert!(
+                COLLECT_STOP_INTERVAL_SECS > 1,
+                "an interval of loop iterations is exactly the measured defect"
+            );
+            assert!(
+                COLLECT_CEILING_SECS > 2 * 1800,
+                "the ceiling must be generous enough for a real lane (the measured \
+                 turn was ≈93 minutes against the old 1800 s wall)"
+            );
+        }
+    }
+
+    #[test]
+    fn collection_live_mid_turn_parks_worker_timeout_on_silence() {
         use std::cell::Cell;
+        // A lane that flaps between working and a stop state (the measured
+        // p5-101 shape) and then goes genuinely silent: no stop is ever
+        // confirmed — the run of stop samples never reaches
+        // COLLECT_STOP_SAMPLES — so the wait parks on the NO-PROGRESS window
+        // with `effect.worker_timeout`, naming the progress it last recorded.
         let elapsed = Cell::new(Duration::ZERO);
-        let mut states = [
+        let reads = Cell::new(0usize);
+        let flap = [
             "working", "idle", "working", "blocked", "working", "done", "working",
-        ]
-        .into_iter();
+        ];
         let outcome = poll_pane_worker(
-            Duration::from_millis(7),
-            Duration::from_millis(1),
-            |_| Ok(states.next().expect("bounded reads").to_string()),
+            Duration::from_secs(7),
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            |_| {
+                reads.set(reads.get() + 1);
+                let state = match flap.get(reads.get() - 1) {
+                    Some(state) => pane(state),
+                    None => pane("unknown"),
+                };
+                Ok(state)
+            },
             || refusal(code::COLLECT_EMPTY_DELTA, "no committed delta"),
             || elapsed.get(),
             |wait| elapsed.set(elapsed.get() + wait),
@@ -8131,44 +8435,69 @@ mod tests {
         .expect_err("a transient stop report is not a stopped worker");
         assert_eq!(outcome.status, "ambiguous");
         assert_eq!(outcome.code.as_deref(), Some(code::WORKER_TIMEOUT));
-        assert_eq!(elapsed.get(), Duration::from_millis(7));
+        assert_eq!(
+            elapsed.get(),
+            Duration::from_secs(14),
+            "the window is 7s of silence after the last progress at 6s"
+        );
+        assert_eq!(
+            outcome.result.get("progress_secs"),
+            Some(&integer(7)),
+            "the park names how long ago progress was last recorded: {:?}",
+            outcome.result
+        );
+        let message = outcome.message.unwrap_or_default();
+        assert!(
+            message.contains("no recorded progress for 7s of the 7s no-progress window")
+                && message.contains("the lane read-back moved"),
+            "the park names the bound that fired and the progress observed: {message}"
+        );
     }
 
     #[test]
     fn collection_polling_uses_injected_time_and_live_state() {
         use std::cell::Cell;
+        // A lane whose read-back carries no progress at all (`unknown`) is
+        // sampled at the pinned interval, each read-back gets exactly what the
+        // no-progress window has left, and the wait parks at the window.
         let elapsed = Cell::new(Duration::ZERO);
         let mut reads = Vec::new();
-        let mut states = ["working", "working", "done", "done"].into_iter();
-        let stopped = poll_pane_worker(
-            Duration::from_millis(4),
-            Duration::from_millis(1),
+        let outcome = poll_pane_worker(
+            Duration::from_secs(6),
+            Duration::from_secs(1),
+            Duration::from_secs(60),
             |remaining| {
-                reads.push(remaining.as_millis());
-                Ok(states.next().expect("bounded reads").to_string())
+                reads.push(remaining.as_secs());
+                Ok(pane("unknown"))
             },
             || refusal(code::COLLECT_EMPTY_DELTA, "no committed delta"),
             || elapsed.get(),
             |wait| elapsed.set(elapsed.get() + wait),
         )
-        .unwrap();
+        .unwrap_err();
         assert_eq!(
             reads,
-            [4, 3, 2, 1],
-            "consult live state until the worker stops"
+            [6, 5, 4, 3, 2, 1, 1],
+            "consult live state until the worker stops; the read at the window's \
+             edge is still given a real (1s) budget before the wait parks"
         );
-        assert_eq!(elapsed.get(), Duration::from_millis(3));
-        assert_eq!(stopped.code.as_deref(), Some(code::COLLECT_EMPTY_DELTA));
+        assert_eq!(elapsed.get(), Duration::from_secs(6));
+        assert_eq!(outcome.status, "ambiguous");
+        assert_eq!(outcome.code.as_deref(), Some(code::WORKER_TIMEOUT));
 
+        // A lane that never stops is still BOUNDED: the hard ceiling ends the
+        // wait, and each read-back budget is what the window has left, floored
+        // at one second and never more than the ceiling has left.
         reads.clear();
         elapsed.set(Duration::ZERO);
         let outcome = poll_pane_worker(
-            Duration::from_millis(3),
-            Duration::from_millis(2),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+            Duration::from_secs(3),
             |remaining| {
-                assert!(reads.len() < 3, "deadline must bound polling");
-                reads.push(remaining.as_millis());
-                Ok("working".to_string())
+                assert!(reads.len() < 3, "the ceiling must bound polling");
+                reads.push(remaining.as_secs());
+                Ok(pane("working"))
             },
             || refusal(code::COLLECT_EMPTY_DELTA, "no committed delta"),
             || elapsed.get(),
@@ -8176,13 +8505,17 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(reads, [3, 1]);
-        assert_eq!(
-            elapsed.get(),
-            Duration::from_millis(3),
-            "last wait is capped"
-        );
+        assert_eq!(elapsed.get(), Duration::from_secs(3), "last wait is capped");
         assert_eq!(outcome.status, "ambiguous");
         assert_eq!(outcome.code.as_deref(), Some(code::WORKER_TIMEOUT));
+        assert_eq!(outcome.result.get("ceiling_secs"), Some(&integer(3)));
+        assert!(
+            outcome
+                .message
+                .unwrap_or_default()
+                .contains("still producing progress at the 3s overall collection ceiling"),
+            "the park names the ceiling and the progress it was still recording"
+        );
     }
 
     /// Issue #202 (AC2): a collection's observation binds only when it names a
@@ -8216,10 +8549,270 @@ mod tests {
         }
     }
 
+    /// Issue #170 (N7) — the measured defect as a unit witness: the worker's
+    /// status flaps to `done` for TWO consecutive read-backs while the worker
+    /// is still working and nothing has been committed (the live `p5-101`
+    /// collection read a flapping status twice, ~100 ms apart, judged the
+    /// working pane stopped and refused `refusal.collect.empty_delta` four
+    /// minutes into a 93-minute turn).
+    ///
+    /// The flap never confirms a stop: the wait keeps reading, the delivery
+    /// that lands mid-turn is collected, and the emptiness refusal is never
+    /// produced for a working worker.
+    #[test]
+    fn collection_status_flap_mid_turn_is_never_a_confirmed_stop() {
+        use std::cell::Cell;
+        let elapsed = Cell::new(Duration::ZERO);
+        let reads = Cell::new(0usize);
+        // (lane state, delivery present).
+        let table = [
+            ("working", false),
+            ("done", false), // the flap ...
+            ("done", false), // ... two stop read-backs, still mid-turn
+            ("working", false),
+            ("working", true), // the delivery lands MID-TURN
+            ("done", true),
+            ("done", true),
+            ("done", true), // the settled turn
+        ];
+        let outcome = poll_pane_worker(
+            Duration::from_millis(3),
+            Duration::from_millis(1),
+            Duration::from_millis(60),
+            |_| {
+                let (state, _) = table[reads.get().min(table.len() - 1)];
+                reads.set(reads.get() + 1);
+                Ok(pane(state))
+            },
+            || {
+                let (_, delivered) = table[reads.get().saturating_sub(1).min(table.len() - 1)];
+                if delivered {
+                    ok(object(vec![
+                        ("head", string(&"d".repeat(40))),
+                        ("commits", Val::Arr(vec![string(&"d".repeat(40))])),
+                    ]))
+                } else {
+                    refusal(code::COLLECT_EMPTY_DELTA, "no committed delta")
+                }
+            },
+            || elapsed.get(),
+            |wait| elapsed.set(elapsed.get() + wait),
+        )
+        .expect("the flap is not a stop and the delivery is collected at the settled turn");
+        assert_eq!(outcome.status, "succeeded");
+        assert_eq!(
+            outcome.result.get("head"),
+            Some(&string(&"d".repeat(40))),
+            "the settled delivery is certified, never an empty refusal"
+        );
+        assert_eq!(
+            reads.get(),
+            8,
+            "the two flap read-backs never satisfy the pinned sample count"
+        );
+    }
+
+    /// Issue #170 (N7) witness (b): the number of non-working read-backs a stop
+    /// needs is PINNED — [`COLLECT_STOP_SAMPLES`], each separated by the real
+    /// interval off the wait's own clock, corroborated by the second view of
+    /// the lane.
+    #[test]
+    fn collection_stop_needs_the_pinned_sample_count() {
+        use std::cell::Cell;
+        // One read-back fewer than the pinned count, then back to working and
+        // then silent: the stop never confirms, so the emptiness refusal is
+        // NEVER returned — the wait parks on the no-progress window instead.
+        let elapsed = Cell::new(Duration::ZERO);
+        let reads = Cell::new(0usize);
+        let outcome = poll_pane_worker(
+            Duration::from_millis(6),
+            Duration::from_millis(1),
+            Duration::from_millis(60),
+            |_| {
+                reads.set(reads.get() + 1);
+                Ok(match reads.get() {
+                    read if read < COLLECT_STOP_SAMPLES => pane("done"),
+                    read if read == COLLECT_STOP_SAMPLES => pane("working"),
+                    _ => pane("unknown"),
+                })
+            },
+            || refusal(code::COLLECT_EMPTY_DELTA, "no committed delta"),
+            || elapsed.get(),
+            |wait| elapsed.set(elapsed.get() + wait),
+        )
+        .expect_err("fewer samples than the pinned count never confirm a stop");
+        assert_eq!(
+            outcome.code.as_deref(),
+            Some(code::WORKER_TIMEOUT),
+            "the emptiness refusal is only ever a CONFIRMED stop's outcome"
+        );
+        assert!(
+            reads.get() >= COLLECT_STOP_SAMPLES,
+            "the pinned count is what the wait reads for"
+        );
+
+        // The pinned count in a row — and the second view disagreeing on any
+        // of them — never confirms either.
+        let elapsed = Cell::new(Duration::ZERO);
+        let reads = Cell::new(0usize);
+        let outcome = poll_pane_worker(
+            Duration::from_millis(6),
+            Duration::from_millis(1),
+            Duration::from_millis(60),
+            |_| {
+                reads.set(reads.get() + 1);
+                // The lane's own row says `done`; its status row still says the
+                // lane is working. One status field is never a stop.
+                Ok(pane_sample("done", "working", None))
+            },
+            || refusal(code::COLLECT_EMPTY_DELTA, "no committed delta"),
+            || elapsed.get(),
+            |wait| elapsed.set(elapsed.get() + wait),
+        )
+        .expect_err("a disagreeing second view never confirms a stop");
+        assert_eq!(outcome.code.as_deref(), Some(code::WORKER_TIMEOUT));
+        assert!(
+            reads.get() > COLLECT_STOP_SAMPLES,
+            "both views must agree on every sample of the run"
+        );
+
+        // A lane whose own lifecycle counter is still moving is not settled
+        // either, however many non-working read-backs it reports.
+        let elapsed = Cell::new(Duration::ZERO);
+        let reads = Cell::new(0usize);
+        let outcome = poll_pane_worker(
+            Duration::from_millis(6),
+            Duration::from_millis(1),
+            Duration::from_millis(60),
+            |_| {
+                let seq = reads.get() as i64;
+                reads.set(reads.get() + 1);
+                Ok(pane_sample("done", "done", Some(seq)))
+            },
+            || refusal(code::COLLECT_EMPTY_DELTA, "no committed delta"),
+            || elapsed.get(),
+            |wait| elapsed.set(elapsed.get() + wait),
+        )
+        .expect_err("a moving lane is not a settled one");
+        assert_eq!(outcome.code.as_deref(), Some(code::WORKER_TIMEOUT));
+        assert!(
+            reads.get() > COLLECT_STOP_SAMPLES,
+            "a counter that keeps moving restarts the stop run"
+        );
+
+        // An OLDER row shape that carries no state on the second view
+        // corroborates nothing and blocks nothing (the same convention the
+        // adapter applies to a missing readiness signal): the stop then rests
+        // on the lane's own verified row, the pinned count and the unmoved
+        // counter.
+        let elapsed = Cell::new(Duration::ZERO);
+        let reads = Cell::new(0);
+        let outcome = poll_pane_worker(
+            Duration::from_secs(6),
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+            |_| {
+                reads.set(reads.get() + 1);
+                Ok(pane_sample("done", "", None))
+            },
+            || refusal(code::COLLECT_EMPTY_DELTA, "no committed delta"),
+            || elapsed.get(),
+            |wait| elapsed.set(elapsed.get() + wait),
+        )
+        .expect("a stop still confirms without the second view's field");
+        assert_eq!(outcome.code.as_deref(), Some(code::COLLECT_EMPTY_DELTA));
+        assert_eq!(reads.get(), COLLECT_STOP_SAMPLES as i32);
+    }
+
+    /// Issue #170 (N8) witness (c): the wait is bounded by RECORDED PROGRESS,
+    /// not a fixed wall clock — a still-working lane past the old 1800 s wall
+    /// is NOT parked, and a genuinely silent lane still parks typed within the
+    /// no-progress window, naming the progress observed and the elapsed time.
+    #[test]
+    fn collection_wait_extends_past_the_wall_on_progress_and_parks_a_silent_lane() {
+        use std::cell::Cell;
+        // The lane keeps working past the whole 1800 s no-progress window (the
+        // measured real turn ran ≈93 minutes against exactly this wall) and is
+        // still collected at its settled turn.
+        let elapsed = Cell::new(Duration::ZERO);
+        let reads = Cell::new(0usize);
+        let outcome = poll_pane_worker(
+            Duration::from_secs(1800),
+            Duration::from_secs(10),
+            Duration::from_secs(COLLECT_CEILING_SECS),
+            |_| {
+                reads.set(reads.get() + 1);
+                // Working, flapping the way the measured pane did, until the
+                // 190th read (t = 1890 s, past the old wall), then settled:
+                // a settled lane's own counter stops moving.
+                Ok(if reads.get() < 190 {
+                    let state = if reads.get().is_multiple_of(2) {
+                        "working"
+                    } else {
+                        "idle"
+                    };
+                    pane_sample(state, state, Some(reads.get() as i64))
+                } else {
+                    pane_sample("done", "done", Some(189))
+                })
+            },
+            || {
+                if reads.get() < 190 {
+                    refusal(code::COLLECT_EMPTY_DELTA, "no committed delta")
+                } else {
+                    ok(object(vec![
+                        ("head", string(&"f".repeat(40))),
+                        ("commits", Val::Arr(vec![string(&"f".repeat(40))])),
+                    ]))
+                }
+            },
+            || elapsed.get(),
+            |wait| elapsed.set(elapsed.get() + wait),
+        )
+        .expect("a still-working lane past the old wall is not parked");
+        assert_eq!(outcome.status, "succeeded");
+        assert_eq!(outcome.result.get("head"), Some(&string(&"f".repeat(40))));
+        assert!(
+            elapsed.get() > Duration::from_secs(1800),
+            "the wait must have crossed the old wall: {:?}",
+            elapsed.get()
+        );
+
+        // A lane that records no progress at all parks within the window.
+        let elapsed = Cell::new(Duration::ZERO);
+        let reads = Cell::new(0usize);
+        let outcome = poll_pane_worker(
+            Duration::from_secs(1800),
+            Duration::from_secs(10),
+            Duration::from_secs(COLLECT_CEILING_SECS),
+            |_| {
+                reads.set(reads.get() + 1);
+                Ok(pane("unknown"))
+            },
+            || refusal(code::COLLECT_EMPTY_DELTA, "no committed delta"),
+            || elapsed.get(),
+            |wait| elapsed.set(elapsed.get() + wait),
+        )
+        .expect_err("a genuinely silent lane parks typed within the window");
+        assert_eq!(outcome.status, "ambiguous");
+        assert_eq!(outcome.code.as_deref(), Some(code::WORKER_TIMEOUT));
+        assert_eq!(elapsed.get(), Duration::from_secs(1800));
+        assert_eq!(outcome.result.get("progress_secs"), Some(&integer(1800)));
+        assert_eq!(
+            outcome.result.get("ceiling_secs"),
+            Some(&integer(COLLECT_CEILING_SECS as i64))
+        );
+        let message = outcome.message.unwrap_or_default();
+        assert!(
+            message.contains("no recorded progress for 1800s of the 1800s no-progress window"),
+            "the park names the window and the elapsed silence: {message}"
+        );
+    }
+
     /// Issue #200: a delivery read while the worker is still live is a
     /// WAIT/re-check, never a certification — the unchanged #147 rule for an
     /// empty delta now holds for a delivery too — and the delivery is still
-    /// collected once the SAME stop state settles across the read-back.
+    /// collected once the SAME stop state settles across the pinned read-backs.
     #[test]
     fn collection_delivery_while_live_waits_and_is_collected_once_settled() {
         use std::cell::Cell;
@@ -8229,9 +8822,10 @@ mod tests {
         let outcome = poll_pane_worker(
             Duration::from_millis(6),
             Duration::from_millis(1),
+            Duration::from_millis(60),
             |_| {
                 reads.set(reads.get() + 1);
-                Ok(if reads.get() <= 3 { "working" } else { "idle" }.to_string())
+                Ok(pane(if reads.get() <= 3 { "working" } else { "idle" }))
             },
             || {
                 collections.set(collections.get() + 1);
@@ -8255,11 +8849,11 @@ mod tests {
         );
         assert_eq!(
             reads.get(),
-            5,
+            6,
             "the delivery read while working (read 3) never certifies"
         );
-        assert_eq!(collections.get(), 5, "no deadline is consumed by waiting");
-        assert_eq!(elapsed.get(), Duration::from_millis(4));
+        assert_eq!(collections.get(), 6, "no bound is consumed by waiting");
+        assert_eq!(elapsed.get(), Duration::from_millis(5));
     }
 
     /// Issue #200 (a): a worker that commits AFTER the outcome is read (the
@@ -8275,9 +8869,10 @@ mod tests {
         let outcome = poll_pane_worker(
             Duration::from_millis(8),
             Duration::from_millis(1),
+            Duration::from_millis(60),
             |_| {
                 reads.set(reads.get() + 1);
-                Ok(if reads.get() <= 3 { "working" } else { "done" }.to_string())
+                Ok(pane(if reads.get() <= 3 { "working" } else { "done" }))
             },
             || {
                 // Head A is read while the worker is still mid-turn; the
@@ -8303,8 +8898,8 @@ mod tests {
             heads.contains(&"a".repeat(40)),
             "the earlier head was genuinely read while the worker was still live"
         );
-        assert_eq!(reads.get(), 5, "a live read is never a certification");
-        assert_eq!(elapsed.get(), Duration::from_millis(4));
+        assert_eq!(reads.get(), 6, "a live read is never a certification");
+        assert_eq!(elapsed.get(), Duration::from_millis(5));
     }
 
     #[test]
@@ -8314,25 +8909,30 @@ mod tests {
             let elapsed = Cell::new(Duration::ZERO);
             let reads = Cell::new(0);
             let outcome = poll_pane_worker(
-                Duration::from_millis(3),
+                Duration::from_millis(6),
                 Duration::from_millis(1),
+                Duration::from_millis(60),
                 |_| {
                     reads.set(reads.get() + 1);
-                    Ok(state.to_string())
+                    Ok(pane(state))
                 },
                 || refusal(code::COLLECT_EMPTY_DELTA, "no committed delta"),
                 || elapsed.get(),
                 |wait| elapsed.set(elapsed.get() + wait),
             )
-            .expect("a confirmed stopped worker settles before the deadline");
+            .expect("a confirmed stopped worker settles before the window");
             assert_eq!(outcome.status, "refused");
             assert_eq!(outcome.code.as_deref(), Some(code::COLLECT_EMPTY_DELTA));
             assert_eq!(
                 reads.get(),
-                2,
-                "confirm the stop across collection read-back"
+                COLLECT_STOP_SAMPLES as i32,
+                "the stop is confirmed across the PINNED number of read-backs"
             );
-            assert_eq!(elapsed.get(), Duration::from_millis(1));
+            assert_eq!(
+                elapsed.get(),
+                Duration::from_millis(COLLECT_STOP_SAMPLES as u64 - 1),
+                "the samples are separated by the real interval, not by iterations"
+            );
         }
     }
 

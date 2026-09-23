@@ -368,7 +368,7 @@ pub fn serve(paths: &DaemonPaths) -> Result<(), DaemonError> {
     let dispatch = Arc::new(DaemonDispatch {
         shared: std::sync::OnceLock::new(),
         refusals: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
-        collecting: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
+        collecting: Arc::new(Mutex::new(Collections::default())),
     });
     let supervisor = crate::supervision::start(
         Arc::clone(&state),
@@ -400,7 +400,20 @@ pub fn serve(paths: &DaemonPaths) -> Result<(), DaemonError> {
 
     let result = serve_loop(&shared, &listener);
     // Shutdown: cancel and JOIN the supervision driver before the lease is
-    // dropped, so no reconciliation can journal into a closing daemon.
+    // dropped.
+    //
+    // Issue #170 (N4) — the invariant, stated exactly: NO RECONCILIATION runs
+    // after the lease is dropped. It is deliberately not "no thread outlives
+    // the lease": a bounded collection the driver dispatched runs on its own
+    // `canter-collect` thread (see the spawn below) and is NEVER joined —
+    // a collection can wait on a pane worker for hours, and shutdown neither
+    // blocks on it nor cancels the wait that is the run's own recorded
+    // evidence. A collection still in flight here is abandoned exactly like a
+    // daemon killed mid-request: its apply claim is already journaled and the
+    // next start reconciles it as ambiguous (the modelled path, never a second
+    // claim). The driver itself is the only thread whose writes were
+    // lease-unsynchronized reconciliation, so joining it is what the lease
+    // boundary needs.
     shared.supervisor.signal_stop();
     let mut supervisor = supervisor;
     let joined = supervisor.join();
@@ -1469,7 +1482,38 @@ struct DaemonDispatch {
     /// The refused-continuation ladder per run (item 4a of issue #144).
     refusals: Arc<Mutex<std::collections::BTreeMap<String, RefusedDispatch>>>,
     /// Reserve before spawning; the durable claim then fences later ticks.
-    collecting: Arc<Mutex<std::collections::BTreeSet<String>>>,
+    collecting: Arc<Mutex<Collections>>,
+}
+
+/// The in-flight collection reservations (issue #170 N5): the `(run, step)`
+/// pairs whose collection currently holds the daemon's in-memory slot.
+///
+/// Keyed by the PAIR, not by the run: the slot guards ONE dispatch of ONE
+/// collection step, so a spine with two collection steps in the same run never
+/// has the second silently answered `awaiting <the other step>`.
+#[derive(Default)]
+struct Collections {
+    in_flight: std::collections::BTreeSet<(String, String)>,
+}
+
+impl Collections {
+    /// Reserve `(run, step)`: `Err(step)` when THIS step already holds the
+    /// slot (the duplicate dispatch the reservation exists for), `Ok(())`
+    /// otherwise — including for a DIFFERENT step of the same run.
+    fn begin(&mut self, instance_id: &str, step_id: &str) -> Result<(), String> {
+        let key = (instance_id.to_string(), step_id.to_string());
+        if self.in_flight.insert(key) {
+            Ok(())
+        } else {
+            Err(step_id.to_string())
+        }
+    }
+
+    /// Release the slot of one finished collection.
+    fn finish(&mut self, instance_id: &str, step_id: &str) {
+        self.in_flight
+            .remove(&(instance_id.to_string(), step_id.to_string()));
+    }
 }
 
 /// One run's refused-continuation ladder (item 4a of issue #144): the step
@@ -1660,13 +1704,19 @@ impl DaemonDispatch {
                 .collecting
                 .lock()
                 .map_err(|_| "collection mutex poisoned")?;
-            if !collecting.insert(intent.instance_id.clone()) {
-                return Ok(format!("awaiting {}", intent.step_id));
+            // Issue #170 (N5): the in-memory reservation is keyed by
+            // `(run, step)`, not by run. It exists to keep ONE dispatch of ONE
+            // collection step from being spawned twice (the durable claim
+            // fences later ticks); keying it by run would silently answer a
+            // SECOND collection step of the same run with `awaiting <other>`
+            // and never dispatch it.
+            if let Err(step) = collecting.begin(&intent.instance_id, &intent.step_id) {
+                return Ok(format!("awaiting {step}"));
             }
             let dispatcher = self.clone();
             let shared = Arc::clone(shared);
             let worker_intent = intent.clone();
-            let run = intent.instance_id.clone();
+            let reservation = (intent.instance_id.clone(), intent.step_id.clone());
             let spawn = std::thread::Builder::new()
                 .name("canter-collect".to_string())
                 .spawn(move || {
@@ -1678,12 +1728,12 @@ impl DaemonDispatch {
                         now_unix,
                     );
                     if let Ok(mut collecting) = dispatcher.collecting.lock() {
-                        collecting.remove(&run);
+                        collecting.finish(&reservation.0, &reservation.1);
                     }
                     shared.wake_supervisor();
                 });
             if let Err(err) = spawn {
-                collecting.remove(&intent.instance_id);
+                collecting.finish(&intent.instance_id, &intent.step_id);
                 return Err(format!("cannot start bounded collection: {err}"));
             }
             return Ok("collection started".to_string());
@@ -10879,6 +10929,35 @@ mod renewal_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #170 (N5): the in-memory collection reservation is keyed by
+    /// `(run, step)`. A SECOND collection step of the same run reserves its own
+    /// slot — it is never silently answered `awaiting <the other step>` — while
+    /// the same step twice is exactly the duplicate the slot exists for, and a
+    /// finished collection releases only its own slot.
+    #[test]
+    fn the_collection_reservation_is_keyed_by_run_and_step() {
+        let mut collecting = Collections::default();
+        assert_eq!(collecting.begin("run-a", "p5"), Ok(()));
+        assert_eq!(
+            collecting.begin("run-a", "p5"),
+            Err("p5".to_string()),
+            "the SAME step twice is the duplicate the slot guards"
+        );
+        assert_eq!(
+            collecting.begin("run-a", "p9"),
+            Ok(()),
+            "a second collection step of the same run is a different reservation"
+        );
+        assert_eq!(collecting.begin("run-b", "p5"), Ok(()));
+        collecting.finish("run-a", "p5");
+        assert_eq!(
+            collecting.begin("run-a", "p5"),
+            Ok(()),
+            "a finished collection releases only its own slot"
+        );
+        assert_eq!(collecting.begin("run-a", "p9"), Err("p9".to_string()));
+    }
 
     #[test]
     fn crash_point_env_alias_prefers_canonical_and_honors_legacy() {
