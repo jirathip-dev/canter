@@ -13163,6 +13163,13 @@ pub struct SupervisionEvidence {
     /// run's own bounded recovery control. Counted from the hash-chained
     /// journal, never from a second bookkeeping row.
     pub reevaluations: Vec<(String, i64)>,
+    /// The run's own certified delivery binding (issue #202 AC2), when its own
+    /// collection observed one (issue #272): the branch + head + base the
+    /// run's own newest successful `collect_outcome` step certified. `None`
+    /// when no collection of this run ever certified a bindable head — the
+    /// classification then knows that no head is consumable at all, instead of
+    /// inferring one from a neighbouring effect.
+    pub delivery: Option<DeliveryCertificate>,
 }
 
 /// One recorded refusal of a supervised continuation dispatch (issue #141).
@@ -14911,6 +14918,12 @@ impl State {
         // driver reads the SAME durable bound the control itself enforces
         // before it derives a recovery intent.
         let reevaluations = run_reevaluation_counts_locked(&conn, instance_id)?;
+        // Issue #272: the run's own certified delivery binding, read from the
+        // SAME recorded rows the consumption gate reads. The driver needs it to
+        // tell a delivery its own collection observed from a head nothing ever
+        // collected — a repair leg's delivered head is only consumable once
+        // this names it.
+        let delivery = self.delivery_certificate_locked(&conn, instance_id)?;
         Ok(Some(SupervisionEvidence {
             run,
             has_dispatch_context,
@@ -14931,6 +14944,7 @@ impl State {
             fix_round,
             fix_leg: None,
             reevaluations,
+            delivery,
         }))
     }
 
