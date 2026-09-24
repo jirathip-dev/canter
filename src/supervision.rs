@@ -1771,8 +1771,12 @@ pub fn observe_fix_leg(evidence: &mut SupervisionEvidence, worktrees_root: Optio
 /// the containment root the handoff's recorded lane checkout is read under.
 /// `None` when the run recorded no topology (or none that names a root) — the
 /// observation is then simply not taken.
-pub fn recorded_worktrees_root(state: &crate::state::State, instance_id: &str) -> Option<PathBuf> {
-    let context = state.run_dispatch_context(instance_id).ok().flatten()?;
+///
+/// Issue #268: derived from the run's recorded rows, which every caller
+/// already read for its own question (the driver's pass, the daemon's
+/// review-head binding) instead of re-reading the run to answer this one.
+pub(crate) fn recorded_worktrees_root_of(records: &crate::state::RunRecords) -> Option<PathBuf> {
+    let context = records.dispatch_context().ok().flatten()?;
     context
         .topology
         .get("worktrees_root")
@@ -2517,12 +2521,20 @@ impl SupervisorCore {
                 Ok(Some(row)) if row.desired == "armed" => row,
                 _ => return false,
             };
-            let evidence = match state.supervision_evidence(instance_id) {
+            // Issue #268: the run's recorded rows are read ONCE here — the
+            // evidence snapshot and the recorded worktrees root below are
+            // derived from this one read instead of each re-scanning and
+            // re-parsing the journal for itself.
+            let records = match state.run_records(instance_id) {
+                Ok(records) => records,
+                Err(_) => return false,
+            };
+            let evidence = match state.supervision_evidence_from(&records) {
                 Ok(Some(evidence)) => evidence,
                 _ => return false,
             };
             let trigger = state.supervision_trigger(instance_id).ok().flatten();
-            let worktrees_root = recorded_worktrees_root(&state, instance_id);
+            let worktrees_root = recorded_worktrees_root_of(&records);
             (row, evidence, trigger, worktrees_root)
         };
         // Issue #256: the repair leg's OWN checkout is read AFTER the state

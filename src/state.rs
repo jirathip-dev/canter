@@ -3761,6 +3761,15 @@ impl State {
         Ok(Some(steps))
     }
 
+    /// The recorded control rows ONE run's read path classifies, read under ONE
+    /// guard (issue #268): the rows are selected by the run's own durable
+    /// identity and parsed once, so a pass reads the rows it names instead of
+    /// re-scanning (and re-parsing) the whole journal per call site.
+    pub(crate) fn run_records(&self, instance_id: &str) -> Result<RunRecords, StateError> {
+        let conn = self.lock("run_records")?;
+        RunRecords::read(&conn, instance_id)
+    }
+
     /// The recorded dispatch context of one run: its first immutable topology,
     /// newest explicit admission attestation and successful worker heads.
     /// These are caller-observed durable facts; continuation never invents a
@@ -3774,146 +3783,17 @@ impl State {
     /// the base a `worktree_create`/`checkout` response carries — is never a
     /// certified feature head: a run whose collection never observed a
     /// delivery binds NOTHING here.
+    ///
+    /// Issue #268: the run's recorded rows are selected by the run's own
+    /// durable identity and parsed ONCE per read, so this read costs the rows
+    /// the caller names instead of the whole journal.
     pub fn run_dispatch_context(
         &self,
         instance_id: &str,
     ) -> Result<Option<RecordedDispatch>, StateError> {
         let conn = self.lock("run_dispatch_context")?;
-        let delivery = self.delivery_certificate_locked(&conn, instance_id)?;
-        let submissions: Vec<String> = {
-            let mut statement = conn
-                .prepare(
-                    "SELECT submission_id FROM queue_submission_items
-                      WHERE instance_id = ?1 AND status = 'admitted' ORDER BY rowid",
-                )
-                .map_err(|err| {
-                    StateError::from_sqlite("run_dispatch_context: submissions prepare", err)
-                })?;
-            let rows = statement
-                .query_map(params![instance_id], |row| row.get::<_, String>(0))
-                .map_err(|err| {
-                    StateError::from_sqlite("run_dispatch_context: submissions query", err)
-                })?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row.map_err(|err| {
-                    StateError::from_sqlite("run_dispatch_context: submission row", err)
-                })?);
-            }
-            out
-        };
-        let mut statement = conn
-            .prepare(
-                "SELECT method, key, request_line, COALESCE(response, '') FROM idempotency
-                  WHERE method IN ('queue.submit', 'apply') AND outcome IS NOT NULL
-                  ORDER BY rowid",
-            )
-            .map_err(|err| StateError::from_sqlite("run_dispatch_context: prepare", err))?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })
-            .map_err(|err| StateError::from_sqlite("run_dispatch_context: query", err))?;
-        let mut topology: Option<Val> = None;
-        let mut admission: Option<Val> = None;
-        let mut integration_base: Option<String> = None;
-        // Issue #202 (AC2): the collection's own certified head is the ONLY
-        // head this context starts from; the loop below may only override it
-        // with a response that NAMES a reviewed head explicitly.
-        let mut feature_head: Option<String> = delivery
-            .as_ref()
-            .map(|certificate| certificate.head.clone());
-        for row in rows {
-            let (method, key, line, response_line) =
-                row.map_err(|err| StateError::from_sqlite("run_dispatch_context: row", err))?;
-            let Ok(request) = Val::parse_json(&line) else {
-                continue;
-            };
-            let params = request.get("params").cloned().unwrap_or_else(null);
-            if method == "queue.submit" {
-                let digest = params
-                    .get("digest")
-                    .and_then(Val::as_str)
-                    .unwrap_or_default();
-                let submission = crate::queue_executor::submission_id(digest, &key);
-                if !submissions.iter().any(|known| known == &submission) {
-                    continue;
-                }
-                if let Some(dispatch @ Val::Obj(_)) = params.get("dispatch") {
-                    if let Some(presented @ Val::Obj(_)) = dispatch.get("topology") {
-                        match &topology {
-                            Some(bound) if bound != presented => {
-                                return Err(state_error(
-                                    "state.corrupt",
-                                    format!(
-                                        "run {instance_id} recorded conflicting dispatch topologies"
-                                    ),
-                                ));
-                            }
-                            None => topology = Some(presented.clone()),
-                            _ => {}
-                        }
-                    }
-                    if let Some(presented @ Val::Obj(_)) = dispatch.get("admission") {
-                        admission = Some(presented.clone());
-                    }
-                }
-                continue;
-            }
-            if params.get("instance_id").and_then(Val::as_str) != Some(instance_id) {
-                continue;
-            }
-            if let Some(presented @ Val::Obj(_)) = params.get("topology") {
-                match &topology {
-                    Some(bound) if bound != presented => {
-                        return Err(state_error(
-                            "state.corrupt",
-                            format!("run {instance_id} recorded conflicting dispatch topologies"),
-                        ));
-                    }
-                    None => topology = Some(presented.clone()),
-                    _ => {}
-                }
-            }
-            if let Some(presented @ Val::Obj(_)) =
-                params.get("flags").and_then(|flags| flags.get("admission"))
-            {
-                admission = Some(presented.clone());
-            }
-            if let Ok(response) = Val::parse_json(&response_line)
-                && response.get("ok").and_then(Val::as_bool) == Some(true)
-                && let Some(result) = response.get("result")
-            {
-                if integration_base.is_none()
-                    && let Some(base) = result
-                        .get("integration_base")
-                        .or_else(|| result.get("base_head"))
-                        .and_then(Val::as_str)
-                        .filter(|base| crate::formats::is_hex40(base))
-                {
-                    integration_base = Some(base.to_string());
-                }
-                if let Some(head) = result
-                    .get("feature_head")
-                    .and_then(Val::as_str)
-                    .filter(|head| crate::formats::is_hex40(head))
-                {
-                    feature_head = Some(head.to_string());
-                }
-            }
-        }
-        Ok(topology.map(|topology| RecordedDispatch {
-            topology,
-            admission,
-            integration_base,
-            feature_head,
-            delivery,
-        }))
+        let records = RunRecords::read(&conn, instance_id)?;
+        dispatch_context_of(&records)
     }
 
     /// The certified delivery of one run (issue #202 AC2): the delivery
@@ -3923,97 +3803,15 @@ impl State {
     /// head): a run whose collection never certified a bindable head has
     /// `None` here, so no later step can consume a head the run never
     /// observed.
+    ///
+    /// Issue #268: derived from the rows this run's own identity selects.
     fn delivery_certificate_locked(
         &self,
         conn: &Connection,
         instance_id: &str,
     ) -> Result<Option<DeliveryCertificate>, StateError> {
-        let mut statement = conn
-            .prepare(
-                "SELECT key, request_line, COALESCE(response, '') FROM idempotency
-                  WHERE method = 'apply' AND outcome IS NOT NULL
-                  ORDER BY rowid",
-            )
-            .map_err(|err| StateError::from_sqlite("run_delivery_certificate: prepare", err))?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .map_err(|err| StateError::from_sqlite("run_delivery_certificate: query", err))?;
-        let mut certificate: Option<DeliveryCertificate> = None;
-        for row in rows {
-            let (key, line, response_line) =
-                row.map_err(|err| StateError::from_sqlite("run_delivery_certificate: row", err))?;
-            let Ok(request) = Val::parse_json(&line) else {
-                continue;
-            };
-            let params = request.get("params").cloned().unwrap_or_else(null);
-            if params.get("instance_id").and_then(Val::as_str) != Some(instance_id) {
-                continue;
-            }
-            let Some(step_id) = params.get("step").and_then(Val::as_str) else {
-                continue;
-            };
-            // Only the run's own collection certifies a delivery head: the
-            // step KIND is the committed plan step's own kind, never a name
-            // heuristic on the step id.
-            let kind = params
-                .get("plan")
-                .and_then(|plan| plan.get("steps"))
-                .and_then(Val::as_array)
-                .and_then(|steps| {
-                    steps
-                        .iter()
-                        .find(|step| step.get("id").and_then(Val::as_str) == Some(step_id))
-                })
-                .and_then(|step| step.get("kind"))
-                .and_then(Val::as_str)
-                .unwrap_or("");
-            if kind != "collect_outcome" {
-                continue;
-            }
-            let Ok(response) = Val::parse_json(&response_line) else {
-                continue;
-            };
-            if response.get("ok").and_then(Val::as_bool) != Some(true) {
-                continue;
-            }
-            let Some(result) = response.get("result") else {
-                continue;
-            };
-            let head = match result
-                .get("head")
-                .and_then(Val::as_str)
-                .filter(|head| crate::formats::is_hex40(head))
-            {
-                Some(head) => head.to_string(),
-                None => continue,
-            };
-            let branch = match result
-                .get("branch")
-                .and_then(Val::as_str)
-                .filter(|branch| crate::formats::is_slug(branch))
-            {
-                Some(branch) => branch.to_string(),
-                None => continue,
-            };
-            certificate = Some(DeliveryCertificate {
-                step_id: step_id.to_string(),
-                key: key.clone(),
-                branch,
-                head,
-                base_head: result
-                    .get("base_head")
-                    .and_then(Val::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            });
-        }
-        Ok(certificate)
+        let records = RunRecords::read(conn, instance_id)?;
+        Ok(delivery_certificate_of(&records))
     }
 
     /// The certified delivery of one run (the locked helper above, read-only).
@@ -9632,31 +9430,382 @@ impl State {
     }
 }
 
-/// Parse one recorded dispatch-refusal target (`<run>:<step>:<code>`, with the
-/// engine's own message appended as `:reason:<message>` when one was recorded —
-/// issue #230) into its typed record. A target that does not belong to
-/// `instance_id` or does not carry all three parts is not readable evidence and
-/// yields `None` (never a guessed step, code or reason).
-pub(crate) fn dispatch_refusal_of(
-    instance_id: &str,
-    target: &str,
-    at: &str,
-) -> Option<SupervisionDispatchRefusal> {
-    let rest = target.strip_prefix(instance_id)?.strip_prefix(':')?;
-    let (step, rest) = rest.split_once(':')?;
-    let (code, reason) = match rest.split_once(":reason:") {
-        Some((code, reason)) => (code, reason),
-        None => (rest, ""),
-    };
-    if step.is_empty() || code.is_empty() {
-        return None;
+/// One recorded control row of a run, parsed at most ONCE per read
+/// (issue #268). `response`/`outcome` are `None` when that recorded line is
+/// absent or unreadable — exactly the rows the parsed readers skipped.
+struct RecordedRow {
+    method: String,
+    key: String,
+    request: Val,
+    response: Option<Val>,
+    outcome: Option<Val>,
+}
+
+/// The recorded control rows ONE run's read path classifies (issue #268): the
+/// run's own `apply`/`run.resolve` rows, and the `queue.submit` rows of the
+/// submissions that admitted it.
+///
+/// The identity predicate is evaluated by SQLite against the recorded JSON, so
+/// a read never even parses a row that belongs to another run; every row this
+/// run does name is parsed exactly ONCE and reused by all of the run's readers
+/// (the dispatch context, the delivery certificate, the dispatch-context
+/// presence check, the attempt ledger and the recorded fix round) instead of
+/// being re-parsed per call site. Nothing survives the read: every read is a
+/// fresh SQL read of the rows its caller names, so no reader can be served a
+/// verdict from evidence that moved since it was read.
+pub(crate) struct RunRecords {
+    instance_id: String,
+    /// The committed submissions that admitted this run: its `queue.submit`
+    /// rows are exactly the rows those submissions name.
+    submissions: Vec<String>,
+    rows: Vec<RecordedRow>,
+}
+
+impl RunRecords {
+    /// Read the rows one run's classification reads, on the caller's guard.
+    fn read(conn: &Connection, instance_id: &str) -> Result<RunRecords, StateError> {
+        let submissions = admitted_submissions_locked(conn, instance_id)?;
+        let mut statement = conn
+            .prepare(
+                "SELECT i.method, i.key, i.request_line, i.response, i.outcome
+                   FROM idempotency i
+                  WHERE i.outcome IS NOT NULL
+                    AND ((i.method IN ('apply', 'run.resolve')
+                          AND (CASE WHEN json_valid(i.request_line)
+                                    THEN json_extract(i.request_line, '$.params.instance_id')
+                               END) = ?1)
+                      OR (i.method = 'queue.submit'
+                          AND (CASE WHEN json_valid(i.request_line)
+                                    THEN json_extract(i.request_line, '$.params.digest')
+                               END) IN (
+                                SELECT s.digest FROM queue_submissions s
+                                 WHERE s.submission_id IN (
+                                       SELECT item.submission_id
+                                         FROM queue_submission_items item
+                                        WHERE item.instance_id = ?1
+                                          AND item.status = 'admitted'))))
+                  ORDER BY i.rowid",
+            )
+            .map_err(|err| StateError::from_sqlite("run_records: prepare", err))?;
+        let rows = statement
+            .query_map(params![instance_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })
+            .map_err(|err| StateError::from_sqlite("run_records: query", err))?;
+        let mut recorded = Vec::new();
+        for row in rows {
+            let (method, key, line, response, outcome) =
+                row.map_err(|err| StateError::from_sqlite("run_records: row", err))?;
+            // An unreadable request line is not evidence: the parsed readers
+            // skipped exactly these rows, and so does this one.
+            let Ok(request) = Val::parse_json(&line) else {
+                continue;
+            };
+            recorded.push(RecordedRow {
+                method,
+                key,
+                request,
+                response: response
+                    .filter(|line| !line.is_empty())
+                    .and_then(|line| Val::parse_json(&line).ok()),
+                outcome: outcome.and_then(|line| Val::parse_json(&line).ok()),
+            });
+        }
+        Ok(RunRecords {
+            instance_id: instance_id.to_string(),
+            submissions,
+            rows: recorded,
+        })
     }
-    Some(SupervisionDispatchRefusal {
-        step: step.to_string(),
-        code: code.to_string(),
-        reason: reason.to_string(),
-        at: at.to_string(),
-    })
+
+    /// The recorded dispatch context of this run (issue #268): derived from the
+    /// rows read above, so a reader that already read them never re-parses.
+    pub(crate) fn dispatch_context(&self) -> Result<Option<RecordedDispatch>, StateError> {
+        dispatch_context_of(self)
+    }
+}
+
+/// The committed submissions that admitted one run, in commit order.
+fn admitted_submissions_locked(
+    conn: &Connection,
+    instance_id: &str,
+) -> Result<Vec<String>, StateError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT submission_id FROM queue_submission_items
+              WHERE instance_id = ?1 AND status = 'admitted' ORDER BY rowid",
+        )
+        .map_err(|err| StateError::from_sqlite("run_records: submissions prepare", err))?;
+    let rows = statement
+        .query_map(params![instance_id], |row| row.get::<_, String>(0))
+        .map_err(|err| StateError::from_sqlite("run_records: submissions query", err))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|err| StateError::from_sqlite("run_records: submission row", err))?);
+    }
+    Ok(out)
+}
+
+/// The certified delivery of one run (issue #202 AC2) from the run's own
+/// recorded rows: the newest successful `collect_outcome` response of the run's
+/// OWN applies that names a 40-hex head and a branch. Derived from the rows the
+/// caller already read — never from another run's row, and never re-parsed.
+fn delivery_certificate_of(records: &RunRecords) -> Option<DeliveryCertificate> {
+    let mut certificate: Option<DeliveryCertificate> = None;
+    for row in &records.rows {
+        if row.method != "apply" {
+            continue;
+        }
+        let params = row.request.get("params").cloned().unwrap_or_else(null);
+        let Some(step_id) = params.get("step").and_then(Val::as_str) else {
+            continue;
+        };
+        // Only the run's own collection certifies a delivery head: the
+        // step KIND is the committed plan step's own kind, never a name
+        // heuristic on the step id.
+        let kind = params
+            .get("plan")
+            .and_then(|plan| plan.get("steps"))
+            .and_then(Val::as_array)
+            .and_then(|steps| {
+                steps
+                    .iter()
+                    .find(|step| step.get("id").and_then(Val::as_str) == Some(step_id))
+            })
+            .and_then(|step| step.get("kind"))
+            .and_then(Val::as_str)
+            .unwrap_or("");
+        if kind != "collect_outcome" {
+            continue;
+        }
+        let Some(response) = row.response.as_ref() else {
+            continue;
+        };
+        if response.get("ok").and_then(Val::as_bool) != Some(true) {
+            continue;
+        }
+        let Some(result) = response.get("result") else {
+            continue;
+        };
+        let head = match result
+            .get("head")
+            .and_then(Val::as_str)
+            .filter(|head| crate::formats::is_hex40(head))
+        {
+            Some(head) => head.to_string(),
+            None => continue,
+        };
+        let branch = match result
+            .get("branch")
+            .and_then(Val::as_str)
+            .filter(|branch| crate::formats::is_slug(branch))
+        {
+            Some(branch) => branch.to_string(),
+            None => continue,
+        };
+        certificate = Some(DeliveryCertificate {
+            step_id: step_id.to_string(),
+            key: row.key.clone(),
+            branch,
+            head,
+            base_head: result
+                .get("base_head")
+                .and_then(Val::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        });
+    }
+    certificate
+}
+
+/// The recorded dispatch context of one run from its own recorded rows: its
+/// first immutable topology, newest explicit admission attestation and
+/// successful worker heads. These are caller-observed durable facts;
+/// continuation never invents a topology, resource measurement, or repository
+/// head.
+///
+/// Issue #202 (AC2): the run's `feature_head` is bound by the run's own
+/// COLLECTION alone (the [`DeliveryCertificate`] above, derived from the newest
+/// successful `collect_outcome` step response) or by a response that NAMES a
+/// reviewed head explicitly (the review-evidence and post-merge-verify
+/// records). A `head` echoed by any other effect — e.g. the base a
+/// `worktree_create`/`checkout` response carries — is never a certified feature
+/// head: a run whose collection never observed a delivery binds NOTHING here.
+fn dispatch_context_of(records: &RunRecords) -> Result<Option<RecordedDispatch>, StateError> {
+    let instance_id = records.instance_id.as_str();
+    let delivery = delivery_certificate_of(records);
+    let mut topology: Option<Val> = None;
+    let mut admission: Option<Val> = None;
+    let mut integration_base: Option<String> = None;
+    let mut feature_head: Option<String> = delivery
+        .as_ref()
+        .map(|certificate| certificate.head.clone());
+    for row in &records.rows {
+        if row.method == "queue.submit" {
+            let params = row.request.get("params").cloned().unwrap_or_else(null);
+            let digest = params
+                .get("digest")
+                .and_then(Val::as_str)
+                .unwrap_or_default();
+            let submission = crate::queue_executor::submission_id(digest, &row.key);
+            if !records.submissions.iter().any(|known| known == &submission) {
+                continue;
+            }
+            if let Some(dispatch @ Val::Obj(_)) = params.get("dispatch") {
+                if let Some(presented @ Val::Obj(_)) = dispatch.get("topology") {
+                    match &topology {
+                        Some(bound) if bound != presented => {
+                            return Err(state_error(
+                                "state.corrupt",
+                                format!(
+                                    "run {instance_id} recorded conflicting dispatch topologies"
+                                ),
+                            ));
+                        }
+                        None => topology = Some(presented.clone()),
+                        _ => {}
+                    }
+                }
+                if let Some(presented @ Val::Obj(_)) = dispatch.get("admission") {
+                    admission = Some(presented.clone());
+                }
+            }
+            continue;
+        }
+        if row.method != "apply" {
+            continue;
+        }
+        let params = row.request.get("params").cloned().unwrap_or_else(null);
+        if params.get("instance_id").and_then(Val::as_str) != Some(instance_id) {
+            continue;
+        }
+        if let Some(presented @ Val::Obj(_)) = params.get("topology") {
+            match &topology {
+                Some(bound) if bound != presented => {
+                    return Err(state_error(
+                        "state.corrupt",
+                        format!("run {instance_id} recorded conflicting dispatch topologies"),
+                    ));
+                }
+                None => topology = Some(presented.clone()),
+                _ => {}
+            }
+        }
+        if let Some(presented @ Val::Obj(_)) =
+            params.get("flags").and_then(|flags| flags.get("admission"))
+        {
+            admission = Some(presented.clone());
+        }
+        if let Some(response) = row.response.as_ref()
+            && response.get("ok").and_then(Val::as_bool) == Some(true)
+            && let Some(result) = response.get("result")
+        {
+            if integration_base.is_none()
+                && let Some(base) = result
+                    .get("integration_base")
+                    .or_else(|| result.get("base_head"))
+                    .and_then(Val::as_str)
+                    .filter(|base| crate::formats::is_hex40(base))
+            {
+                integration_base = Some(base.to_string());
+            }
+            if let Some(head) = result
+                .get("feature_head")
+                .and_then(Val::as_str)
+                .filter(|head| crate::formats::is_hex40(head))
+            {
+                feature_head = Some(head.to_string());
+            }
+        }
+    }
+    Ok(topology.map(|topology| RecordedDispatch {
+        topology,
+        admission,
+        integration_base,
+        feature_head,
+        delivery,
+    }))
+}
+
+/// Whether ONE committed submission/apply claim of the run carries the
+/// topology and admission material required to dispatch the next supported
+/// step, read from the rows the caller already read.
+fn has_dispatch_context_of(records: &RunRecords, submission: Option<&str>) -> bool {
+    let instance_id = records.instance_id.as_str();
+    for row in &records.rows {
+        let params = row.request.get("params").cloned().unwrap_or_else(null);
+        if row.method == "apply"
+            && params.get("instance_id").and_then(Val::as_str) == Some(instance_id)
+            && matches!(params.get("topology"), Some(Val::Obj(_)))
+        {
+            return true;
+        }
+        if row.method != "queue.submit" || !matches!(params.get("dispatch"), Some(Val::Obj(_))) {
+            continue;
+        }
+        let Some(digest) = params.get("digest").and_then(Val::as_str) else {
+            continue;
+        };
+        if submission == Some(crate::queue_executor::submission_id(digest, &row.key).as_str()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The recorded step attempts of one run as `(step, status, error code, error
+/// message)` in claim order, read from the rows the caller already read. Never
+/// inferred: an unreadable outcome is skipped, and an attempt without a
+/// recorded outcome is not an attempt yet (the claim is still in flight).
+///
+/// The MESSAGE is the raw one the effect recorded (issue #219): the durable
+/// outcome carries the underlying diagnostics (git/gh stderr included), so an
+/// operator can read WHY a step failed back read-only instead of being left
+/// with a bare code.
+fn run_step_attempts_of(records: &RunRecords) -> Vec<(String, String, String, String)> {
+    let mut out = Vec::new();
+    for row in &records.rows {
+        if row.method != "apply" && row.method != "run.resolve" {
+            continue;
+        }
+        let Some(outcome) = row.outcome.as_ref() else {
+            continue;
+        };
+        let params = row.request.get("params").cloned().unwrap_or_else(null);
+        let step = params
+            .get("step")
+            .and_then(Val::as_str)
+            .unwrap_or("")
+            .to_string();
+        let status = outcome
+            .get("status")
+            .and_then(Val::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        if row.method == "run.resolve" && status != "succeeded" {
+            continue;
+        }
+        let code = outcome
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Val::as_str)
+            .unwrap_or("")
+            .to_string();
+        let message = outcome
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Val::as_str)
+            .unwrap_or("")
+            .to_string();
+        out.push((step, status, code, message));
+    }
+    out
 }
 
 /// The newest recorded fix-round dispatch of one run (issue #238), read from
@@ -9668,49 +9817,21 @@ pub(crate) fn dispatch_refusal_of(
 /// Issue #254: the daemon persists that returned document in the apply row's
 /// RESPONSE column (the canonical `hf-rpc-response/v1` line, `result.fix_round`),
 /// while the row's `outcome.result` is `null` — so the handoff is read from
-/// where it is ACTUALLY written, the same way the repository's other recorded
-/// read models read a dispatch's own result (`run_dispatch_context`,
-/// `delivery_certificate_locked`). The `outcome` shape stays readable beside it
-/// (a row written by a writer that kept the result in the outcome is the same
-/// document), and the validation is identical either way: an
-/// `hf-fix-round/v1` document with all four named fields, or nothing at all.
-fn newest_fix_round_locked(
-    conn: &Connection,
-    instance_id: &str,
-) -> Result<Option<SupervisionFixRound>, StateError> {
-    let mut statement = conn
-        .prepare(
-            "SELECT request_line, outcome, COALESCE(response, '') FROM idempotency
-              WHERE method = 'apply' AND outcome IS NOT NULL
-                AND (outcome LIKE '%fix_round%' OR response LIKE '%fix_round%')
-              ORDER BY rowid",
-        )
-        .map_err(|err| StateError::from_sqlite("supervision fix round: prepare", err))?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })
-        .map_err(|err| StateError::from_sqlite("supervision fix round: query", err))?;
+/// whichever of the two carries it.
+fn newest_fix_round_of(records: &RunRecords) -> Option<SupervisionFixRound> {
+    let instance_id = records.instance_id.as_str();
     let mut newest: Option<SupervisionFixRound> = None;
-    for row in rows {
-        let (line, outcome, response) =
-            row.map_err(|err| StateError::from_sqlite("supervision fix round: row", err))?;
-        let Some(outcome) = outcome else {
+    for row in &records.rows {
+        if row.method != "apply" {
             continue;
-        };
-        let Ok(request) = Val::parse_json(&line) else {
-            continue;
-        };
-        let params = request.get("params").cloned().unwrap_or_else(null);
+        }
+        let params = row.request.get("params").cloned().unwrap_or_else(null);
         if params.get("instance_id").and_then(Val::as_str) != Some(instance_id) {
             continue;
         }
-        let recorded = Val::parse_json(&outcome)
-            .ok()
+        let recorded = row
+            .outcome
+            .as_ref()
             .and_then(|outcome| {
                 outcome
                     .get("result")
@@ -9718,7 +9839,7 @@ fn newest_fix_round_locked(
                     .cloned()
             })
             .or_else(|| {
-                Val::parse_json(&response).ok().and_then(|response| {
+                row.response.as_ref().and_then(|response| {
                     response
                         .get("result")
                         .and_then(|result| result.get("fix_round"))
@@ -9759,9 +9880,35 @@ fn newest_fix_round_locked(
                 .to_string(),
         });
     }
-    Ok(newest)
+    newest
 }
 
+/// Parse one recorded dispatch-refusal target (`<run>:<step>:<code>`, with the
+/// engine's own message appended as `:reason:<message>` when one was recorded —
+/// issue #230) into its typed record. A target that does not belong to
+/// `instance_id` or does not carry all three parts is not readable evidence and
+/// yields `None` (never a guessed step, code or reason).
+pub(crate) fn dispatch_refusal_of(
+    instance_id: &str,
+    target: &str,
+    at: &str,
+) -> Option<SupervisionDispatchRefusal> {
+    let rest = target.strip_prefix(instance_id)?.strip_prefix(':')?;
+    let (step, rest) = rest.split_once(':')?;
+    let (code, reason) = match rest.split_once(":reason:") {
+        Some((code, reason)) => (code, reason),
+        None => (rest, ""),
+    };
+    if step.is_empty() || code.is_empty() {
+        return None;
+    }
+    Some(SupervisionDispatchRefusal {
+        step: step.to_string(),
+        code: code.to_string(),
+        reason: reason.to_string(),
+        at: at.to_string(),
+    })
+}
 /// Read a grant row out of an `hf-grant/v1` document (validated by the
 /// caller through [`crate::schema::validate_doc`]).
 fn grant_row_from_doc(doc: &Val) -> Result<GrantRow, StateError> {
@@ -14675,68 +14822,42 @@ impl State {
         Ok(next.map(|unix| (unix - now_unix).max(0)))
     }
 
-    /// Whether this run has committed host-local material for autonomous
-    /// dispatch. Queue submission context belongs only to its exact durable
-    /// submission; apply context belongs only to its exact run.
-    fn has_dispatch_context_locked(
-        &self,
-        conn: &Connection,
-        instance_id: &str,
-        submission: Option<&str>,
-    ) -> Result<bool, StateError> {
-        let mut statement = conn
-            .prepare(
-                "SELECT method, key, request_line FROM idempotency
-                  WHERE method IN ('apply', 'queue.submit') AND outcome IS NOT NULL
-                  ORDER BY rowid DESC",
-            )
-            .map_err(|err| StateError::from_sqlite("supervision dispatch context: prepare", err))?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .map_err(|err| StateError::from_sqlite("supervision dispatch context: query", err))?;
-        for row in rows {
-            let (method, key, line) = row
-                .map_err(|err| StateError::from_sqlite("supervision dispatch context: row", err))?;
-            let Ok(request) = Val::parse_json(&line) else {
-                continue;
-            };
-            let Some(params) = request.get("params") else {
-                continue;
-            };
-            if method == "apply"
-                && params.get("instance_id").and_then(Val::as_str) == Some(instance_id)
-                && matches!(params.get("topology"), Some(Val::Obj(_)))
-            {
-                return Ok(true);
-            }
-            if method != "queue.submit" || !matches!(params.get("dispatch"), Some(Val::Obj(_))) {
-                continue;
-            }
-            let Some(digest) = params.get("digest").and_then(Val::as_str) else {
-                continue;
-            };
-            if submission == Some(crate::queue_executor::submission_id(digest, &key).as_str()) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
     /// The recorded-evidence snapshot of one supervised run, read under ONE
     /// guard. `None` when no supervision row exists (a run that was never
     /// authorized is never evaluated).
+    ///
+    /// Issue #268: the run's recorded rows are selected by the run's own
+    /// durable identity and parsed ONCE per read, and every reader below
+    /// reuses that one read.
     pub fn supervision_evidence(
         &self,
         instance_id: &str,
     ) -> Result<Option<SupervisionEvidence>, StateError> {
         let conn = self.lock("supervision_evidence")?;
-        let row = match self.supervision_row_locked(&conn, instance_id)? {
+        let records = RunRecords::read(&conn, instance_id)?;
+        self.supervision_evidence_locked(&conn, &records)
+    }
+
+    /// [`State::supervision_evidence`] over an ALREADY READ set of the run's
+    /// recorded rows (issue #268): a caller that read the rows to answer its
+    /// own question (the supervisor's pass, the daemon's review-head binding)
+    /// hands them over instead of making the read pay for a second scan and a
+    /// second parse of the same journal.
+    pub(crate) fn supervision_evidence_from(
+        &self,
+        records: &RunRecords,
+    ) -> Result<Option<SupervisionEvidence>, StateError> {
+        let conn = self.lock("supervision_evidence")?;
+        self.supervision_evidence_locked(&conn, records)
+    }
+
+    fn supervision_evidence_locked(
+        &self,
+        conn: &Connection,
+        records: &RunRecords,
+    ) -> Result<Option<SupervisionEvidence>, StateError> {
+        let instance_id = records.instance_id.as_str();
+        let row = match self.supervision_row_locked(conn, instance_id)? {
             Some(row) => row,
             None => return Ok(None),
         };
@@ -14800,8 +14921,7 @@ impl State {
             ),
             None => (None, None, Vec::new(), Vec::new(), None),
         };
-        let has_dispatch_context =
-            self.has_dispatch_context_locked(&conn, instance_id, submission_id.as_deref())?;
+        let has_dispatch_context = has_dispatch_context_of(records, submission_id.as_deref());
         let ownership_instance: Option<String> = conn
             .query_row(
                 "SELECT instance_id FROM queue_ownership WHERE instance_id = ?1",
@@ -14827,7 +14947,7 @@ impl State {
             );
         }
         drop(statement);
-        let attempts_with_messages = self.run_step_attempts_with_codes(&conn, instance_id)?;
+        let attempts_with_messages = run_step_attempts_of(records);
         // Issue #219: the newest recorded NON-succeeded attempt's raw message
         // is read back with the same rows the classification reads, so an
         // operator sees WHY the frontier is parked (a rejected push, a refused
@@ -14863,7 +14983,7 @@ impl State {
             );
         }
         drop(statement);
-        let in_flight = in_flight_steps_locked(&conn)?
+        let in_flight = in_flight_steps_locked(conn)?
             .into_iter()
             .find(|(run, _)| run == instance_id || run == "*")
             .map(|(_, step)| step);
@@ -14906,11 +15026,11 @@ impl State {
         // bound, the fix leg's lane, the certified head it was handed), so the
         // classification reads the FAIL handoff from the same records it
         // classifies the step from — never from a second bookkeeping row.
-        let fix_round = newest_fix_round_locked(&conn, instance_id)?;
+        let fix_round = newest_fix_round_of(records);
         // Issue #243: every recorded check re-evaluation of this run, so the
         // driver reads the SAME durable bound the control itself enforces
         // before it derives a recovery intent.
-        let reevaluations = run_reevaluation_counts_locked(&conn, instance_id)?;
+        let reevaluations = run_reevaluation_counts_locked(conn, instance_id)?;
         Ok(Some(SupervisionEvidence {
             run,
             has_dispatch_context,
@@ -14943,72 +15063,16 @@ impl State {
     /// durable outcome carries the underlying diagnostics (git/gh stderr
     /// included), so an operator can read WHY a step failed back read-only
     /// instead of being left with a bare code.
+    ///
+    /// Issue #268: read from the rows this run's own identity selects, parsed
+    /// once.
     fn run_step_attempts_with_codes(
         &self,
         conn: &Connection,
         instance_id: &str,
     ) -> Result<Vec<(String, String, String, String)>, StateError> {
-        let mut statement = conn
-            .prepare(
-                "SELECT method, request_line, outcome FROM idempotency
-                  WHERE method IN ('apply', 'run.resolve') AND outcome IS NOT NULL
-                  ORDER BY rowid",
-            )
-            .map_err(|err| StateError::from_sqlite("supervision attempts: prepare", err))?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            })
-            .map_err(|err| StateError::from_sqlite("supervision attempts: query", err))?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (method, line, outcome) =
-                row.map_err(|err| StateError::from_sqlite("supervision attempts: row", err))?;
-            let Some(outcome) = outcome else {
-                continue;
-            };
-            let Ok(request) = Val::parse_json(&line) else {
-                continue;
-            };
-            let params = request.get("params").cloned().unwrap_or_else(null);
-            if params.get("instance_id").and_then(Val::as_str) != Some(instance_id) {
-                continue;
-            }
-            let step = params
-                .get("step")
-                .and_then(Val::as_str)
-                .unwrap_or("")
-                .to_string();
-            let Ok(outcome) = Val::parse_json(&outcome) else {
-                continue;
-            };
-            let status = outcome
-                .get("status")
-                .and_then(Val::as_str)
-                .unwrap_or("unknown")
-                .to_string();
-            if method == "run.resolve" && status != "succeeded" {
-                continue;
-            }
-            let code = outcome
-                .get("error")
-                .and_then(|error| error.get("code"))
-                .and_then(Val::as_str)
-                .unwrap_or("")
-                .to_string();
-            let message = outcome
-                .get("error")
-                .and_then(|error| error.get("message"))
-                .and_then(Val::as_str)
-                .unwrap_or("")
-                .to_string();
-            out.push((step, status, code, message));
-        }
-        Ok(out)
+        let records = RunRecords::read(conn, instance_id)?;
+        Ok(run_step_attempts_of(&records))
     }
 
     /// The newest recorded NON-succeeded step attempt of one run, with the raw
@@ -18846,7 +18910,10 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE idempotency (key TEXT PRIMARY KEY, request_id TEXT NOT NULL,
                 method TEXT NOT NULL, status TEXT NOT NULL, epoch INTEGER NOT NULL,
-                request_line TEXT NOT NULL, outcome TEXT, response TEXT);",
+                request_line TEXT NOT NULL, outcome TEXT, response TEXT);
+             CREATE TABLE queue_submissions (submission_id TEXT PRIMARY KEY, digest TEXT NOT NULL);
+             CREATE TABLE queue_submission_items (submission_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
+                instance_id TEXT, status TEXT NOT NULL, PRIMARY KEY (submission_id, ordinal));",
         )
         .expect("idempotency schema");
         let fix_round = |round: i64, lane: &str, schema: &str| {
@@ -18895,8 +18962,7 @@ mod tests {
         insert("ik-a-2", "run-a", "p6-5", Some((1, "lane-first")));
         insert("ik-a-3", "run-a", "p6-5", Some((2, "lane-second")));
 
-        let read = newest_fix_round_locked(&conn, "run-a")
-            .expect("read")
+        let read = newest_fix_round_of(&RunRecords::read(&conn, "run-a").expect("records"))
             .expect("this run's recorded fix round");
         assert_eq!(read.step, "p6-5");
         assert_eq!(read.round, 2, "the NEWEST recorded round is read");
@@ -18904,9 +18970,7 @@ mod tests {
         assert_eq!(read.lane, "lane-second");
         assert_eq!(read.feature_head, "a".repeat(40));
         assert!(
-            newest_fix_round_locked(&conn, "run-c")
-                .expect("read")
-                .is_none(),
+            newest_fix_round_of(&RunRecords::read(&conn, "run-c").expect("records")).is_none(),
             "a run that never dispatched a fix round has none"
         );
 
@@ -18939,9 +19003,7 @@ mod tests {
         )
         .expect("unvalidated row");
         assert!(
-            newest_fix_round_locked(&conn, "run-d")
-                .expect("read")
-                .is_none(),
+            newest_fix_round_of(&RunRecords::read(&conn, "run-d").expect("records")).is_none(),
             "an `hf-fix-round/v1` schema check is never weakened by the new column"
         );
     }
