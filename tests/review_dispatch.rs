@@ -45,6 +45,24 @@ const IMPLEMENTER_MODEL: &str = "model-impl";
 const BASE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const WORKFLOW_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+/// The declared review budget the deadline witnesses of this file use (issue
+/// #260, NB-1).
+///
+/// The engine bounds BOTH the adapter ops one review step dispatches and its
+/// verdict wait with the step's effective deadline, so a declared budget has
+/// to exceed one adapter call's fork/exec. A one-second budget raced that
+/// spawn on a contended host: the same four witnesses intermittently recorded
+/// the coarser `adapter.timeout` instead of the typed `effect.review_timeout`
+/// (measured here: 4 failed / 20 passed, twice, at 1-minute load 16.3 and
+/// 10.9; the same suite is green serially, 24 passed in 52.8 s). Ten seconds
+/// is the repository's own bound for one bounded adapter call
+/// (`canter::adapters::ADAPTER_TIMEOUT`, 10 s) and an order of magnitude above
+/// the worst fork/exec chain measured on this host (~0.85 s at 24-way
+/// parallelism), so the declared budget cannot race a subprocess spawn while
+/// the verdict wait it drives still expires well inside the 30 s upper bound
+/// the no-verdict witness pins.
+const WITNESS_DEADLINE_SECS: i64 = 10;
+
 // ---------------------------------------------------------------------------
 // Fixture
 // ---------------------------------------------------------------------------
@@ -531,7 +549,7 @@ fn a_review_step_without_a_declared_deadline_waits_under_the_documented_review_b
 #[test]
 fn a_reviewer_that_writes_no_verdict_parks_the_frontier_with_a_typed_timeout() {
     let fixture = Fixture::new("no-verdict");
-    let params = reviewer_leg_params(&reviewer_binding_doc(), 1);
+    let params = reviewer_leg_params(&reviewer_binding_doc(), WITNESS_DEADLINE_SECS);
     let plan = plan_with_review_step(params.clone());
     let head = fixture.head.clone();
     let base = fixture.base.clone();
@@ -544,9 +562,11 @@ fn a_reviewer_that_writes_no_verdict_parks_the_frontier_with_a_typed_timeout() {
         Some(canter::mutation::code::REVIEW_TIMEOUT)
     );
     // The window the reviewer cannot satisfy ends TYPED and bounded — the
-    // declared one second was really waited, and the wait never hangs.
+    // declared window was really waited (the same budget bounds the adapter
+    // ops, which is why it is no longer one second; issue #260 NB-1), and the
+    // wait never hangs.
     assert!(
-        elapsed >= Duration::from_secs(1),
+        elapsed >= Duration::from_secs(WITNESS_DEADLINE_SECS as u64),
         "the declared window was actually waited: {elapsed:?}"
     );
     assert!(
@@ -1486,7 +1506,7 @@ fn a_re_attempted_review_step_consumes_the_late_verdict_without_re_prompting_the
     fixture.seed_run_lane();
     // The reviewer's turn does not settle inside one attempt's wait.
     std::fs::write(fixture.state.join("long-turns"), "").expect("the reviewer is mid-turn");
-    let params = lane_review_params(&format!("issues-{ISSUE}-rev1"), 1);
+    let params = lane_review_params(&format!("issues-{ISSUE}-rev1"), WITNESS_DEADLINE_SECS);
     let plan = plan_with_review_step(params.clone());
     let reviewer = reviewer_session_handle(&fixture.session, 1).expect("the reviewer session");
     let verdict_path = review_verdict_path(&fixture.review_root, &fixture.session, STEP);
@@ -1610,6 +1630,18 @@ fn a_re_attempted_review_step_consumes_the_late_verdict_without_re_prompting_the
         Some(false),
         "an unfinished reviewer turn is never closed: {cleanup:?}"
     );
+    // Issue #260 (NB-2): the refusal CODE this path records is pinned as the
+    // LITERAL wire string a consumer reads — deliberately not the adapter's
+    // `CODE_LANE_BUSY` constant, which would rename away with it — so
+    // altering `refusal.lane.busy` makes this witness RED.
+    assert_eq!(
+        cleanup
+            .get("workspace")
+            .and_then(|workspace| workspace.get("code"))
+            .and_then(Val::as_str),
+        Some("refusal.lane.busy"),
+        "a still-running reviewer turn keeps its own busy refusal code: {cleanup:?}"
+    );
     let reason = cleanup
         .get("workspace")
         .and_then(|workspace| workspace.get("message"))
@@ -1640,7 +1672,7 @@ fn an_ambiguous_review_timeout_never_resolves_into_a_terminal_prompt_refusal() {
     let fixture = LaneFixture::new("timeout-chain");
     fixture.seed_run_lane();
     std::fs::write(fixture.state.join("long-turns"), "").expect("the reviewer is mid-turn");
-    let params = lane_review_params(&format!("issues-{ISSUE}-rev1"), 1);
+    let params = lane_review_params(&format!("issues-{ISSUE}-rev1"), WITNESS_DEADLINE_SECS);
     let plan = plan_with_review_step(params.clone());
     let reviewer = reviewer_session_handle(&fixture.session, 1).expect("the reviewer session");
 
@@ -1698,7 +1730,7 @@ fn a_review_row_the_agent_never_took_is_never_a_proven_delivery() {
     let fixture = LaneFixture::new("no-take");
     fixture.seed_run_lane();
     std::fs::write(fixture.state.join("no-take"), "").expect("the agent never takes");
-    let params = lane_review_params(&format!("issues-{ISSUE}-rev1"), 1);
+    let params = lane_review_params(&format!("issues-{ISSUE}-rev1"), WITNESS_DEADLINE_SECS);
     let plan = plan_with_review_step(params.clone());
 
     let outcome = run_lane_review_step(&fixture, &plan, &params, &[]);
