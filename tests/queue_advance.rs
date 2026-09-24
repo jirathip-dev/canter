@@ -3489,8 +3489,24 @@ fn a_fix_rounds_delivered_head_is_re_bound_by_the_runs_own_machinery() {
     );
 
     // (5) The run ADVANCED to its committed tail by the driver's own acts, and
-    //     the daemon's own log names them.
-    let log = std::fs::read_to_string(fixture.daemon_log()).unwrap_or_default();
+    //     the daemon's own log names them. The log writer batches its appends,
+    //     so the record of an act is POLLED for: the assertion is about the
+    //     driver's act, never about the flusher's timing (a single read raced
+    //     the append under a parallel suite and read a stale file).
+    let log = {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let text = std::fs::read_to_string(fixture.daemon_log()).unwrap_or_default();
+            if text.contains("dispatched step o1") && text.contains("re-evaluated step r1") {
+                break text;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the driver's own acts are never written to the daemon's log:\n{text}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
     assert!(
         log.contains("dispatched step o1"),
         "the driver dispatched the re-collect itself:\n{log}"
