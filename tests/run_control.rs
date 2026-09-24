@@ -80,6 +80,7 @@ fn binding_doc() -> Val {
         configured_limits: Vec::new(),
         introspection: false,
         secrets: Vec::new(),
+        skills: Vec::new(),
         revision: String::new(),
     };
     binding.revision = binding.revision_of();

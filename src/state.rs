@@ -1763,6 +1763,36 @@ pub struct LaneCheckpointRow {
     pub created_at: String,
 }
 
+/// One declared leg of one run's committed plan (issue #267): the leg's role
+/// and the role skills the lane is given, as the durable bound-input line
+/// declares them. `run status` and the board render these so the given
+/// procedure is readable without the raw submission line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanLeg {
+    /// `implementer` | `reviewer` (the closed lane role set).
+    pub role: String,
+    /// Declared role skill names, in declaration order (may be empty).
+    pub skills: Vec<String>,
+}
+
+/// Render one run's declared legs as the `legs` document (`role` + `skills`
+/// per leg) that the run/board read models publish (issue #267).
+pub fn plan_legs_doc(legs: &[PlanLeg]) -> Val {
+    Val::Arr(
+        legs.iter()
+            .map(|leg| {
+                object(vec![
+                    ("role", string(&leg.role)),
+                    (
+                        "skills",
+                        Val::Arr(leg.skills.iter().map(|skill| string(skill)).collect()),
+                    ),
+                ])
+            })
+            .collect(),
+    )
+}
+
 /// One validated lane retirement plan (issue #75): the durable binding a
 /// retirement effect may act on. The plan is produced by validating the
 /// presented binding (lane generation, source session/process identity,
@@ -3549,6 +3579,75 @@ impl State {
             }
             _ => Ok(None),
         }
+    }
+
+    /// The declared legs of one run's committed plan (issue #267): each leg's
+    /// role and the role skills the lane is given, read from the durable
+    /// bound-input line — the same document the run's steps were admitted
+    /// from, never from a caller. `None` when the run has no committed
+    /// submission, or when its plan declares no legs (a plan committed before
+    /// the legs existed is never re-interpreted).
+    pub fn run_plan_legs(&self, instance_id: &str) -> Result<Option<Vec<PlanLeg>>, StateError> {
+        let Some(line) = self.committed_bound_input(instance_id)? else {
+            return Ok(None);
+        };
+        let doc = Val::parse_json(&line).map_err(|message| {
+            state_error(
+                "state.corrupt",
+                format!("the committed bound-input line of {instance_id} is unreadable: {message}"),
+            )
+        })?;
+        let Some(Val::Arr(legs)) = doc.get("legs") else {
+            return Ok(None);
+        };
+        let mut declared: Vec<PlanLeg> = Vec::new();
+        for leg in legs {
+            let Some(role) = leg.get("role").and_then(Val::as_str) else {
+                return Err(state_error(
+                    "state.corrupt",
+                    format!(
+                        "the committed bound-input line of {instance_id} declares a leg without a \
+                         role"
+                    ),
+                ));
+            };
+            let skills = match leg.get("skills") {
+                Some(Val::Arr(items)) => {
+                    let mut names = Vec::new();
+                    for item in items {
+                        let Some(name) = item.as_str() else {
+                            return Err(state_error(
+                                "state.corrupt",
+                                format!(
+                                    "the committed bound-input line of {instance_id} declares a \
+                                     non-string skill name"
+                                ),
+                            ));
+                        };
+                        names.push(name.to_string());
+                    }
+                    names
+                }
+                None | Some(Val::Null) => Vec::new(),
+                Some(_) => {
+                    return Err(state_error(
+                        "state.corrupt",
+                        format!(
+                            "the committed bound-input line of {instance_id} declares a leg whose \
+                             skills are not an array"
+                        ),
+                    ));
+                }
+            };
+            declared.push(PlanLeg {
+                role: role.to_string(),
+                skills,
+            });
+        }
+        if declared.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(declared))
     }
 
     /// Recover the full reviewed binding from the submission's durable claim.
@@ -18032,6 +18131,7 @@ mod tests {
                 "EXAMPLE_PROVIDER_KEY".to_string(),
                 crate::config::PROFILE_SECRET_UNSET.to_string(),
             )],
+            skills: Vec::new(),
             revision: String::new(),
         };
         binding.revision = binding.revision_of();

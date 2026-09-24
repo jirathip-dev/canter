@@ -69,6 +69,15 @@ def run_discrimination(probe) -> None:
     _check(code == probe.REFUSE_MALFORMED,
            "config unknown table must refuse-malformed, got " + code)
 
+    # 1a2. Config role skills (issue #267): shape only in the document
+    #      rules; a non-array declaration is refused.
+    p = _tamper_copy("config/config.valid.toml",
+                     lambda b: b.replace(b'skills = ["lane-impl"]',
+                                         b'skills = "lane-impl"'))
+    code, _msg = probe.validate_file(p, "hf-config")
+    _check(code == probe.REFUSE_MALFORMED,
+           "config harness non-array skills must refuse-malformed, got " + code)
+
     # 1b. Config harness binding (issue #80): the optional provider/model
     #     pair is a string pair in the document rules; a non-string token is
     #     refused. (Bare-token / both-or-neither rules live in the decoder.)

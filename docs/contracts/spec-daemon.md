@@ -287,7 +287,13 @@ outcome after the effect transaction commits.
 - `queue.submit` requires `params`: `idempotency_key`, `digest` (the
   approved 64-hex preview digest), `epoch` (the presented state epoch the
   approval was rendered against), `preview` (the exact bound-input
-  document the #84 preview rendered), `binding` (the reviewed
+  document the #84 preview rendered — its closed key set is `schema`,
+  `repository`, `host`, `workflow`, `role_config`, `boundary`, `steps`,
+  `selected` and, since issue #267, `legs`, where `legs` is the
+  deterministic per-leg derivation of the role bindings and the step spine:
+  one `{issue, role, round, agent, workspace, checkout, skills}` entry per
+  declared leg, so a document whose legs disagree with its bindings moves
+  the digest and refuses), `binding` (the reviewed
   `hf-profile-binding/v1` document), `role_revision` (the 64-hex revision
   of the CURRENT profile configuration, re-observed by the caller),
   `caps` `{global, repository, harness}` and `observations`
@@ -621,7 +627,11 @@ clears a repository/fleet-level hold or bypasses a gate.
 - `run.status` requires `params.instance_id` and renders the control state
   read-only: `active` / `pause_requested` / `paused`, the durable request
   fields, the live boundary and the scope block. No claim and no journal
-  write.
+  write. Issue #267 adds `legs` (present only when the run's committed plan
+  declares legs): one entry per declared leg, `{role, skills}`, read from the
+  run's own committed bound-input line via `State::run_plan_legs` — the SAME
+  per-leg declaration the plan carries, so the procedure a lane was given is
+  readable without re-reading the raw submission line.
 - Restart reconciliation reads each interrupted `run.*` claim's commit
   marker (the run's control rows) and logs whether the control committed
   (`reconcile.run-control`); no control is ever repeated.

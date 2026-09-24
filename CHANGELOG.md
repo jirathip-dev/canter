@@ -6,6 +6,42 @@ release process activates (docs/RELEASING.md), then semver applies.
 
 ## [Unreleased]
 
+### Added (issue #267 — role skills are declared per leg, bound by the plan digest, and resolved against the installation's own inventory)
+
+- A plan now names, **per leg**, the role skills the lane is given: the
+  bound-input document's `role_config.skills` carries the implementer leg's
+  resolved procedure pins and each self-dispatching review step's
+  `params.reviewer_profile.skills` carries the reviewer leg's, while the new
+  top-level `legs` array lists every declared leg (`role` + `skills`) so the
+  per-leg declaration is readable in the raw plan JSON. The role binding is
+  what decides a lane's procedure, so the resolution rides the plan digest:
+  changing the role→skill binding changes the digest (the binding revision
+  fingerprints the resolved pins).
+- Configuration is where the binding lives (`hf-config/v1`):
+  `harness.<key>.skills` declares the role skills one role binding gives its
+  lane, and a new `skill.<key>` table declares the installation's own
+  resolvable inventory (each entry pins the installed procedure's 64-hex
+  content identity). A binding that declares a skill the inventory does not
+  resolve refuses typed `refusal.skill.unresolved` **before** any lane
+  exists — no run, no worktree, no pane — instead of starting a lane short of
+  its declared procedure. `canter config show` reports each harness row's
+  declared skills and the identity (or the missing resolution) alongside the
+  profile revision.
+- The three role contracts are committed as portable procedure sources
+  (`skills/lane-implementer`, `skills/lane-reviewer`,
+  `skills/lane-orchestrator`): the implementer works only in its given
+  worktree, commits in the repository's own wording, pushes the branch and
+  never merges; the reviewer judges the exact certified head, refuses a stale
+  head (the rule the engine already enforces with
+  `refusal.evidence.verdict_stale`) and never self-approves; the orchestrator
+  drives the control plane through typed operations only and never nudges a
+  pane or merges ad hoc. Worker lanes stay canter-agnostic: no worker lane
+  receives — or is required to use — the control-plane socket, and a
+  repository unrelated to canter is never required to carry a canter-named
+  skill.
+- `canter run status` shows the run's committed plan legs (role + skills per
+  leg) with the rest of the control document.
+
 ### Added (issue #236 — `run retire-lane`, the bounded operator retirement of ONE terminal run's stale lane records)
 
 - `canter run retire-lane --run RUN_ID --reason TEXT [--topology FILE]`

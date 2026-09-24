@@ -1098,6 +1098,7 @@ fn unknown_harness_kind_fails_typed_and_independent_probes_keep_working() {
         secret_env: vec![],
         limits: vec![],
         binding_introspection: false,
+        skills: Vec::new(),
     };
     let err = Profile::from_config(&unknown).expect_err("unknown kind refused");
     assert_eq!(err.code, CODE_UNKNOWN_HARNESS);
@@ -1116,6 +1117,7 @@ fn unknown_harness_kind_fails_typed_and_independent_probes_keep_working() {
         secret_env: vec![],
         limits: vec![],
         binding_introspection: false,
+        skills: Vec::new(),
     };
     let profile = Profile::from_config(&known)
         .expect("known kind parses")

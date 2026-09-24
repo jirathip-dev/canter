@@ -499,7 +499,7 @@ fn issue_shaped(value: &Val) -> Rule {
 // contradict these rules).
 // ---------------------------------------------------------------------------
 
-const CONFIG_TOP_KEYS: [&str; 7] = [
+const CONFIG_TOP_KEYS: [&str; 8] = [
     "schema",
     "daemon",
     "policy",
@@ -507,6 +507,7 @@ const CONFIG_TOP_KEYS: [&str; 7] = [
     "harness",
     "workflow",
     "role",
+    "skill",
 ];
 const POLICY_TOP_KEYS: [&str; 4] = ["schema", "repositories", "production_confirmation", "role"];
 
@@ -524,6 +525,7 @@ fn validate_config(obj: &Val) -> Verdict {
         "harness",
         "workflow",
         "role",
+        "skill",
     ] {
         if obj.get(key).is_some()
             && let Err(verdict) = table(obj.get(key).expect("present"), &format!("config.{key}"))
@@ -609,6 +611,7 @@ fn validate_config(obj: &Val) -> Verdict {
                     "kind",
                     "executable",
                     "env_allow",
+                    "skills",
                     "provider",
                     "model",
                     "fallback",
@@ -634,7 +637,7 @@ fn validate_config(obj: &Val) -> Verdict {
             }
             // Issue #77 profile-planning keys: shape only (the decoder in
             // config.rs validates the bare-token/allowlist semantics).
-            for key in ["fallback", "secret_env"] {
+            for key in ["fallback", "secret_env", "skills"] {
                 match entry.get(key) {
                     None => {}
                     Some(Val::Arr(items)) => {
@@ -704,8 +707,13 @@ fn validate_config(obj: &Val) -> Verdict {
             }
         }
     }
-    // workflow.<key>: {id: non-empty string, hash: 64-hex}; role.<key>: {hash}
-    for (table_key, allowed) in [("workflow", &["id", "hash"][..]), ("role", &["hash"][..])] {
+    // workflow.<key>: {id: non-empty string, hash: 64-hex}; role.<key>: {hash};
+    // skill.<key>: {hash} (issue #267 — the declared resolvable inventory)
+    for (table_key, allowed) in [
+        ("workflow", &["id", "hash"][..]),
+        ("role", &["hash"][..]),
+        ("skill", &["hash"][..]),
+    ] {
         if let Some(entries) = obj.get(table_key) {
             let Val::Obj(map) = entries else {
                 return Verdict::refuse(

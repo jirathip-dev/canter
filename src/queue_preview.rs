@@ -387,6 +387,55 @@ fn lane_leg_doc(leg: &LaneLeg) -> Val {
     ])
 }
 
+/// The declared lanes of one plan and the role skills each is given (issue
+/// #267): the implementer leg of every selected issue (round 1 — the run's
+/// own lane) and the reviewer leg of every self-dispatching review step. The
+/// legs are derived from the SAME facts the per-step lane render uses, so a
+/// rendered lane and a declared leg can never disagree about which lane a
+/// leg holds; the skills are the leg's role binding's resolved pins (the
+/// implementer leg's from the run's reviewed role binding, the reviewer
+/// leg's from the registry-resolved binding its review step declares).
+fn legs_doc(request: &Validated) -> Val {
+    let mut legs: Vec<Val> = Vec::new();
+    for issue in &request.selected {
+        let Some(leg) = lane_leg(issue.id.number as u64, "implementer", 1) else {
+            continue;
+        };
+        legs.push(object(vec![
+            ("issue", integer(leg.issue as i64)),
+            ("role", string(&leg.role)),
+            ("round", integer(leg.round as i64)),
+            ("agent", string(&leg.agent)),
+            ("workspace", string(&leg.workspace)),
+            ("checkout", string(&leg.checkout)),
+            ("skills", skill_names(&request.role.skills)),
+        ]));
+    }
+    for (step_id, leg) in &request.reviewer_lanes {
+        let pins = request
+            .reviewer_skills
+            .iter()
+            .find(|(id, _)| id == step_id)
+            .map(|(_, pins)| pins.as_slice())
+            .unwrap_or_default();
+        legs.push(object(vec![
+            ("issue", integer(leg.issue as i64)),
+            ("role", string(&leg.role)),
+            ("round", integer(leg.round as i64)),
+            ("agent", string(&leg.agent)),
+            ("workspace", string(&leg.workspace)),
+            ("checkout", string(&leg.checkout)),
+            ("skills", skill_names(pins)),
+        ]));
+    }
+    Val::Arr(legs)
+}
+
+/// The plan-visible NAMES of one leg's role skills (issue #267).
+fn skill_names(pins: &[crate::config::SkillPin]) -> Val {
+    Val::Arr(pins.iter().map(|pin| string(&pin.key)).collect())
+}
+
 /// The lane leg one step binds, for the rendered plan (issue #210): the
 /// validated reviewer lane of a self-dispatching review step, otherwise the
 /// implementer leg whose checkout the step declares — or, for the bind step
@@ -567,6 +616,9 @@ struct Validated {
     /// The reviewer lane each self-dispatching review step binds (issue #210),
     /// validated at preview time.
     reviewer_lanes: Vec<(String, LaneLeg)>,
+    /// The reviewer leg's declared role skills (issue #267), read from the
+    /// registry-resolved binding the review step declares: `(step id, pins)`.
+    reviewer_skills: Vec<(String, Vec<crate::config::SkillPin>)>,
 }
 
 /// A bounded branch name: non-empty, no whitespace/control characters, no
@@ -672,6 +724,7 @@ fn validate_request(request: &QueueRequest) -> Result<Validated, PreviewError> {
         ));
     }
     let mut step_ids: BTreeSet<&str> = BTreeSet::new();
+    let mut reviewer_skills: Vec<(String, Vec<crate::config::SkillPin>)> = Vec::new();
     for step in &request.steps {
         if !formats::is_slug(&step.id) {
             return Err(PreviewError::new(
@@ -714,16 +767,23 @@ fn validate_request(request: &QueueRequest) -> Result<Validated, PreviewError> {
                     ),
                 ));
             }
-            if let Err(err) = crate::config::ProfileBinding::from_doc(binding) {
-                return Err(PreviewError::new(
-                    "usage.queue_reviewer",
-                    format!(
-                        "step {:?} presents a reviewer binding that is not a valid \
-                         hf-profile-binding/v1 document: {}",
-                        step.id,
-                        err.message()
-                    ),
-                ));
+            // Issue #267: the reviewer leg's declared role skills ride the
+            // registry-resolved binding the step declares — the SAME document
+            // the engine dispatches, so the plan names exactly what the lane
+            // is given.
+            match crate::config::ProfileBinding::from_doc(binding) {
+                Ok(profile) => reviewer_skills.push((step.id.clone(), profile.skills)),
+                Err(err) => {
+                    return Err(PreviewError::new(
+                        "usage.queue_reviewer",
+                        format!(
+                            "step {:?} presents a reviewer binding that is not a valid \
+                             hf-profile-binding/v1 document: {}",
+                            step.id,
+                            err.message()
+                        ),
+                    ));
+                }
             }
         }
     }
@@ -832,6 +892,7 @@ fn validate_request(request: &QueueRequest) -> Result<Validated, PreviewError> {
         steps,
         selected,
         reviewer_lanes,
+        reviewer_skills,
     })
 }
 
@@ -1083,6 +1144,25 @@ fn digest_document(request: &Validated) -> Val {
             object(vec![
                 ("key", string(&request.role.key)),
                 ("revision", string(&request.role.revision)),
+                // Issue #267: the plan names, per leg, the role skills the
+                // lane is given — the implementer leg's declared procedure
+                // pins ride the run's reviewed role binding, resolved against
+                // the installation's own inventory (the reviewer leg's ride
+                // the review step's registry-resolved binding, which is part
+                // of the step params in this same document).
+                (
+                    "skills",
+                    Val::Arr(
+                        request
+                            .role
+                            .skills
+                            .iter()
+                            .map(|pin| {
+                                object(vec![("key", string(&pin.key)), ("hash", string(&pin.hash))])
+                            })
+                            .collect(),
+                    ),
+                ),
             ]),
         ),
         (
@@ -1152,6 +1232,10 @@ fn digest_document(request: &Validated) -> Val {
                     .collect(),
             ),
         ),
+        // Issue #267: the plan names, per leg, the role skills the lane is
+        // given — the binding that decides a lane's procedure is
+        // configuration, and its resolution rides the digest.
+        ("legs", legs_doc(request)),
     ])
 }
 
@@ -1380,6 +1464,16 @@ pub fn preview_queue(state: &State, request: &QueueRequest) -> Result<QueuePrevi
             step.params.as_ref(),
             &request.selected,
         );
+        let lane_skills = match lane.as_ref().map(|leg| leg.role.as_str()) {
+            Some("reviewer") => request
+                .reviewer_skills
+                .iter()
+                .find(|(id, _)| id == &step.id)
+                .map(|(_, pins)| skill_names(pins))
+                .unwrap_or_else(|| skill_names(&[])),
+            Some(_) => skill_names(&request.role.skills),
+            None => skill_names(&[]),
+        };
         steps_doc.push(object(vec![
             ("id", string(&step.id)),
             ("kind", string(&step.kind)),
@@ -1387,6 +1481,7 @@ pub fn preview_queue(state: &State, request: &QueueRequest) -> Result<QueuePrevi
             ("resolved", bool_(resolved)),
             ("params", step.params.clone().unwrap_or_else(null)),
             ("lane", lane.as_ref().map(lane_leg_doc).unwrap_or_else(null)),
+            ("skills", lane_skills),
         ]));
     }
 

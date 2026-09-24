@@ -59,13 +59,16 @@ fn config() -> Config {
             secret_env: Vec::new(),
             limits: Vec::new(),
             binding_introspection: false,
+            skills: Vec::new(),
         }],
         workflows: Vec::new(),
+        skills: Vec::new(),
     }
 }
 
 fn binding_doc() -> Val {
     ProfileBinding::from_config(&config(), "lane-1", &std::collections::BTreeMap::new())
+        .expect("the role skills resolve")
         .expect("binding")
         .to_doc()
 }

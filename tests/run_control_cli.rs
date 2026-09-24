@@ -37,6 +37,13 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_canter")
 }
 
+/// The one role skill the fixture's role binding declares (issue #267): its
+/// content identity is a synthetic 64-hex pin, and no inventory is consulted
+/// here because the binding is built directly (the configuration path is
+/// covered by `tests/role_skills.rs`).
+const LANE_SKILL: &str = "lane-impl";
+const LANE_SKILL_HASH: &str = "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4";
+
 fn binding_doc() -> Val {
     let mut binding = ProfileBinding {
         key: HARNESS.to_string(),
@@ -47,6 +54,10 @@ fn binding_doc() -> Val {
         configured_limits: Vec::new(),
         introspection: false,
         secrets: Vec::new(),
+        skills: vec![canter::config::SkillPin {
+            key: LANE_SKILL.to_string(),
+            hash: LANE_SKILL_HASH.to_string(),
+        }],
         revision: String::new(),
     };
     binding.revision = binding.revision_of();
@@ -353,6 +364,22 @@ fn cli_run_controls_round_trip_through_the_real_daemon() {
         Some(canter::run_control::RUN_CONTROL_SCHEMA)
     );
     assert_eq!(control_state(&status), "active");
+    // Issue #267: the run's committed plan legs ride the status document —
+    // per leg, the role and the role skills the lane is given.
+    let legs = status
+        .get("legs")
+        .and_then(Val::as_array)
+        .expect("run status shows the plan's legs");
+    assert_eq!(legs.len(), 1, "one implementer leg: {legs:?}");
+    assert_eq!(
+        legs[0].get("role").and_then(Val::as_str),
+        Some("implementer")
+    );
+    assert_eq!(
+        legs[0].get("skills").and_then(Val::as_array),
+        Some(&vec![string(LANE_SKILL)]),
+        "the leg names the role skill it was given: {legs:?}"
+    );
 
     // Pause: no in-flight step, so the safe boundary is reached at once.
     let (exit, stdout, stderr) = fixture.cli(&[

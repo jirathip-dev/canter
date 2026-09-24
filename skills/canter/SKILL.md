@@ -329,6 +329,38 @@ documented `run` row, and the lane reads the referenced repository files
 itself. This repository keeps exactly one canonical copy of the skill
 (here); nothing is duplicated for jcode.
 
+## Role procedures: what a lane is given (issue #267)
+
+A worker lane is judged by its artifacts, not by what it was told: the plan
+declares, **per leg**, the role skills the lane is given
+(`role_config.skills` / `legs` in the bound-input document,
+`steps[].params.reviewer_profile.skills` for the reviewer leg), and the
+role→skill binding is configuration (`harness.<key>.skills` resolved against
+the `skill.<key>` inventory). A declared skill the installation does not
+resolve refuses the plan typed (`refusal.skill.unresolved`) before any lane
+exists.
+
+The three doctrine role contracts ship here as installable procedure
+sources — the same "one canonical copy, linked not duplicated" rule as this
+skill:
+
+- [`skills/lane-implementer`](../lane-implementer/SKILL.md) — work only in
+  the given worktree, commit in the repository's own wording, push the
+  branch and never merge, run the repository's gates and record raw exit
+  codes, never touch the control plane.
+- [`skills/lane-reviewer`](../lane-reviewer/SKILL.md) — review the exact
+  certified head, refuse a stale head (the rule the engine enforces with
+  `refusal.evidence.verdict_stale`), write the verdict in the form the
+  engine consumes, no self-approval.
+- [`skills/lane-orchestrator`](../lane-orchestrator/SKILL.md) — drive the
+  control plane through typed operations only (`queue` / `run` /
+  `supervision` / `grant` / the bounded re-drive); never nudge a pane, never
+  merge ad hoc.
+
+Nothing requires a worker lane to carry a skill named after this repository:
+a repository unrelated to canter binds its own skill names, and no worker
+lane is given — or needs — the control-plane socket.
+
 ## Repository rules that bind work here
 
 - Public-data rule: never commit host paths, private repository names,

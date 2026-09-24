@@ -896,15 +896,17 @@ impl<'a> OperatorConsole<'a> {
             ));
         };
         let env: BTreeMap<String, String> = credential_environment(harness);
-        ProfileBinding::from_config(config, harness_key, &env).ok_or_else(|| {
-            Notice::new(
+        match ProfileBinding::from_config(config, harness_key, &env) {
+            Ok(Some(binding)) => Ok(binding),
+            Ok(None) => Err(Notice::new(
                 "config.harness",
                 format!(
                     "harness {harness_key:?} declares no provider/model binding; there is no \
                      re-observed role configuration to submit against"
                 ),
-            )
-        })
+            )),
+            Err(err) => Err(Notice::new(err.code(), err.message().to_string())),
+        }
     }
 
     /// Display lines of the current screen, bounded to `width` columns.
@@ -1563,6 +1565,7 @@ mod tests {
             secret_env: Vec::new(),
             limits: Vec::new(),
             binding_introspection: false,
+            skills: Vec::new(),
         }
     }
 
@@ -1575,6 +1578,7 @@ mod tests {
             repositories: Vec::new(),
             harnesses: vec![harness()],
             workflows: Vec::new(),
+            skills: Vec::new(),
         }
     }
 
@@ -1593,6 +1597,7 @@ mod tests {
             workflow_id: DOCTRINE_WORKFLOW_ID.to_string(),
             workflow_hash: WORKFLOW_HASH.to_string(),
             role_config: ProfileBinding::from_config(&config(), "lane-1", &BTreeMap::new())
+                .expect("the role skills resolve")
                 .expect("binding")
                 .to_doc(),
             boundary: Boundary {

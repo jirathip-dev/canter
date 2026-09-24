@@ -73,6 +73,7 @@ fn binding_doc(secrets: &[(&str, &str)]) -> Val {
             .iter()
             .map(|(name, digest)| ((*name).to_string(), (*digest).to_string()))
             .collect(),
+        skills: Vec::new(),
         revision: String::new(),
     };
     binding.revision = binding.revision_of();
@@ -867,6 +868,7 @@ fn reviewer_leg_step(worktree: &str, execution: &str) -> PlannedStep {
         configured_limits: Vec::new(),
         introspection: false,
         secrets: Vec::new(),
+        skills: Vec::new(),
         revision: String::new(),
     };
     binding.revision = binding.revision_of();

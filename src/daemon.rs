@@ -6406,16 +6406,24 @@ fn method_run_status(shared: &Arc<Shared>, request: &Request) -> String {
                 // control's own gate reads (read-only; nothing is measured
                 // into durable state, claimed or dispatched).
                 let remedy = remedy_for_run(&state, &row);
-                ok_response(
-                    &request.id,
-                    crate::run_control::control_doc(
-                        &row,
-                        in_flight.as_deref(),
-                        digest.as_deref(),
-                        last_failure.as_ref(),
-                        remedy.as_ref(),
-                    ),
-                )
+                // Issue #267: the run's committed plan declares, per leg, the
+                // role and the role skills the lane is given — a status read
+                // shows them without re-reading the submission's raw line.
+                let legs = match state.run_plan_legs(&instance_id) {
+                    Ok(legs) => legs,
+                    Err(err) => return err_response(&request.id, err.code, err.message),
+                };
+                let mut status = crate::run_control::control_doc(
+                    &row,
+                    in_flight.as_deref(),
+                    digest.as_deref(),
+                    last_failure.as_ref(),
+                    remedy.as_ref(),
+                );
+                if let (Val::Obj(map), Some(legs)) = (&mut status, legs) {
+                    map.insert("legs".to_string(), crate::state::plan_legs_doc(&legs));
+                }
+                ok_response(&request.id, status)
             }
             Ok(None) => err_response(
                 &request.id,

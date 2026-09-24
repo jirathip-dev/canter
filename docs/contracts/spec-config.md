@@ -32,9 +32,10 @@ stack").
 | `daemon.socket` | string | no | explicit socket path override; default derives from the XDG runtime dir — portable default only |
 | `policy.overlay` | string | no | explicit relative/absolute path of the optional policy overlay; no implicit discovery |
 | `repository.<key>` | table | no | one configured repository per key (slug); `origin` (string URL) required; `branch`, `enabled` optional |
-| `harness.<key>` | table | no | adapter profile per configured harness: `kind` (string; e.g. `argv`), `executable` (name resolved via PATH, never an absolute path), `env_allow` (array of environment variable names — the explicit allowlist), and the optional `provider`/`model` binding pair: bare tokens, declared together, used by the official prompt rows that carry the pair on argv (`pi`, `jcode`). Without the binding the terminal prompt refuses (`refusal.binding.missing`) — there is no default and no substitution. Issue #77 adds the optional profile-planning keys `fallback` (array of authorized `"provider/model"` bare-token pairs), `secret_env` (credential environment NAMES, each already declared in `env_allow`), `limits` (a table of string/integer metadata overrides — reported as configured limits, never as proof of provider support) and `binding_introspection` (boolean: the profile can report the bound provider/model back) |
+| `harness.<key>` | table | no | adapter profile per configured harness: `kind` (string; e.g. `argv`), `executable` (name resolved via PATH, never an absolute path), `env_allow` (array of environment variable names — the explicit allowlist), and the optional `provider`/`model` binding pair: bare tokens, declared together, used by the official prompt rows that carry the pair on argv (`pi`, `jcode`). Without the binding the terminal prompt refuses (`refusal.binding.missing`) — there is no default and no substitution. Issue #77 adds the optional profile-planning keys `fallback` (array of authorized `"provider/model"` bare-token pairs), `secret_env` (credential environment NAMES, each already declared in `env_allow`), `limits` (a table of string/integer metadata overrides — reported as configured limits, never as proof of provider support) and `binding_introspection` (boolean: the profile can report the bound provider/model back). Issue #267 adds `skills` (array of skill keys): the **role skills this role binding gives its lane**, each resolved against the `skill.<key>` inventory |
 | `workflow.<key>` | table | no | pinned workflow selection: `id` + `hash` (64-hex sha256 over the canonical workflow document) |
 | `role.<key>` | table | no | custom roles only, explicit and hash-pinned: `hash` (64-hex) |
+| `skill.<key>` | table | no | the declared **resolvable skill inventory** (issue #267): `hash` (64-hex content identity of the installed procedure, the install readback). A role binding that declares a skill the inventory does not name refuses typed (`refusal.skill.unresolved`) wherever a plan binds the role — never a lane started without its role procedure |
 
 Synthetic valid example: `config/config.valid.toml` (one repository
 `example-org/widgets`, one harness, one workflow pin — all values fictional).
@@ -80,6 +81,33 @@ and invalidates a previously reviewed plan: a daemon start under a changed
 revision refuses (`refusal.profile.revision`) and a newly reviewed plan is
 required, while a revision that does not fingerprint its own material is
 refused at the boundary. A plan under an unchanged revision keeps binding.
+
+## Role skills: declared per leg, resolved against the installation's inventory (issue #267)
+
+- A lane is an untrusted worker judged by its artifacts; what procedure it is
+  given is **configuration**, never an accident of the profile it happens to
+  run under. `harness.<key>.skills` declares the role skills one role binding
+  gives its lane, and the `hf-profile-binding/v1` material carries them
+  resolved: one `{"key", "hash"}` pin per declared skill, where `hash` is the
+  `skill.<key>` inventory's content identity for that procedure. The binding
+  revision fingerprints the pins, so a moved procedure (or a moved binding)
+  moves the revision and every plan that bound it.
+- Resolution is **total and fail-closed**: one declared key the `skill.<key>`
+  inventory does not resolve refuses the whole binding with the typed
+  `refusal.skill.unresolved` (exit 4) at the plan boundary — `queue preview`,
+  `queue submit`, `queue intake`, `grant issue` and the operator surface all
+  derive their binding from the same configuration — and the refusal happens
+  BEFORE any run, worktree or pane exists.
+- The canonical procedure sources for the three doctrine role contracts ship
+  in this repository as installable skills (`skills/lane-implementer`,
+  `skills/lane-reviewer`, `skills/lane-orchestrator`). They are sources, not
+  requirements: a repository unrelated to canter binds its own skill names,
+  and nothing in the engine requires a canter-named skill of any lane. The
+  per-hand-install adapters that place these sources in a harness's native
+  location remain issue #203's scope.
+- `canter config show` reports, per harness row, the declared skills with the
+  identity each resolves to (`hash: null` marks an unresolved declaration) so
+  the operator can fix the configuration before a plan refuses.
 
 ## Compatibility and refusal
 
