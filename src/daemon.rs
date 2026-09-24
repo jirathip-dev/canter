@@ -3136,8 +3136,8 @@ fn method_apply_from(shared: &Arc<Shared>, request: &Request, supervised: bool) 
                 // intent is re-derived: a dispatch the driver derived is never
                 // refused for a fact the driver read.
                 let mut evidence = evidence;
-                let worktrees_root =
-                    crate::supervision::recorded_worktrees_root(&state, &parsed.instance_id);
+                let records = state.run_records(&parsed.instance_id)?;
+                let worktrees_root = crate::supervision::recorded_worktrees_root_of(&records);
                 crate::supervision::observe_fix_leg(&mut evidence, worktrees_root.as_deref());
                 // Issue #184: only a DIAGNOSED step attempt reserves and
                 // consumes supervision's own bounded retry. A recorded
