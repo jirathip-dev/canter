@@ -6,6 +6,31 @@ release process activates (docs/RELEASING.md), then semver applies.
 
 ## [Unreleased]
 
+### Fixed (issue #276 — a fix-round wait ends when the leg's own lane is gone, and the run re-dispatches itself)
+
+- A fix-round wait is no longer exempt from the policy's progress timeout: the
+  repair leg's OWN lane checkout is observed (`FixLegState.lane`), and a leg
+  whose checkout is GONE — the measured dead-lane shape, where the leg's
+  worktree no longer exists on the host — is reported class `needs-attention`,
+  reason `supervision.fix_round_lane_lost` (detail: the recorded lane and the
+  window that was read), `eligible:true`, instead of `waiting-workers` /
+  `supervision.fix_round_dispatched` forever. A LIVE leg (its checkout present,
+  at the certified head) keeps the unchanged wait, and an UNOBSERVED leg is
+  never a lost one, so nothing is inferred from a read that could not be taken.
+- The SAME derivation is the driver's ONE continuation: the recorded handoff's
+  own step is re-dispatched through the apply engine, so the bounded-retry
+  authorization the run already holds is spent by the run's own supervision —
+  `consumed_at` recorded under the dispatch's own journaled key, exactly once —
+  rather than parked. Nothing is loosened: the run consumes no head its own
+  collection did not observe, and the tail behind an uncertified delivery stays
+  undriven.
+- The engine's own fix-round record follows the same fact: a recorded round is
+  reused only while its leg's lane checkout still exists, so a DEAD round is
+  superseded by the next round of the same bound — whose lane the engine creates
+  at the certified head and whose instruction is delivered to a leg that can
+  still work — instead of the FAIL being re-handed to a leg that carries no
+  state. A record naming no checkout keeps the unchanged reuse rule.
+
 ### Added (issue #267 — role skills are declared per leg, bound by the plan digest, and resolved against the installation's own inventory)
 
 - A plan now names, **per leg**, the role skills the lane is given: the

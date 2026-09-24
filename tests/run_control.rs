@@ -4632,6 +4632,137 @@ fn status_observation(fixture: &DaemonFixture, run: &str, seed: u32) -> Val {
         .expect("the status document carries the read-time observation")
 }
 
+/// Issue #276 (AC1, AC3, AC4; AC5 witnessed on this fixture only): over the
+/// LIVE daemon, a run whose recorded fix-round leg has NO lane checkout left is
+/// reported with the actionable, ELIGIBLE fix-round code, and the engine's OWN
+/// pass re-dispatches the handoff's own step — spending the bounded retry the
+/// run already holds, under the dispatch's own journaled key.
+///
+/// The recorded checkout is ABSENT (the measured live shape: the repair leg's
+/// checkout no longer exists on the host) and, after the mint, NOTHING is
+/// driven by an operator: the mint only authorizes the re-dispatch, which the
+/// run's own supervision performs and the engine records.
+#[test]
+fn a_fix_round_whose_lane_checkout_is_gone_is_redispatched_by_the_engine_itself() {
+    let f = fix_leg_fixture("fr276", "qs_0000000000000276", false);
+    let recorded_lane = f
+        .lane_root
+        .join(canter::lane::lane_checkout(6, "implementer", 2));
+    assert!(
+        recorded_lane.is_dir(),
+        "the fixture built the leg's own checkout"
+    );
+    std::fs::remove_dir_all(&recorded_lane).expect("the recorded checkout is gone");
+    // The recorded ledger BEFORE the daemon runs: the re-dispatch must add its
+    // own attempt, never be read from the fixture's seed.
+    let attempts_before = f
+        .fixture
+        .seed()
+        .run_step_attempts(&f.run)
+        .expect("attempts")
+        .len();
+    // The bounded retry authorization the run ALREADY holds (the live runs hold
+    // theirs the same way): recorded before the daemon starts, so no operator
+    // control exists anywhere in this test — the run's own supervision is what
+    // spends it below.
+    let held = f
+        .fixture
+        .seed()
+        .record_run_retry(&f.run, "p6", AT)
+        .expect("the held authorization");
+    println!(
+        "HELD {} step={} authorized_at={} consumed_at={:?}",
+        held.retry_id, held.step_id, held.authorized_at, held.consumed_at
+    );
+    assert!(
+        held.consumed_at.is_empty(),
+        "a minted authorization is unspent"
+    );
+    let daemon = f.fixture.spawn(None);
+    wait_ready(&f.fixture);
+
+    // AC1: the run is no longer reported as waiting on a leg that cannot
+    // deliver — actionable and ELIGIBLE on the product surface.
+    let observed = status_observation(&f.fixture, &f.run, 276);
+    println!(
+        "supervision.status.observed => {}",
+        canter::canonical::canonical_text(&observed)
+    );
+    assert_eq!(
+        observed.get("class").and_then(Val::as_str),
+        Some("needs-attention")
+    );
+    assert_eq!(
+        observed.get("reason").and_then(Val::as_str),
+        Some(canter::supervision::codes::FIX_LANE_LOST)
+    );
+    assert_eq!(
+        observed.get("eligible").and_then(Val::as_bool),
+        Some(true),
+        "{observed:?}"
+    );
+    assert!(
+        observed
+            .get("detail")
+            .and_then(Val::as_str)
+            .unwrap_or_default()
+            .starts_with(&f.lane),
+        "{observed:?}"
+    );
+
+    // AC3: the engine's OWN pass spends the held authorization on the single
+    // re-dispatch of the handoff's own step, and the dispatch is journaled.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let spent = loop {
+        let retries = f.fixture.seed().run_retries(&f.run).expect("retries");
+        if retries
+            .first()
+            .is_some_and(|row| !row.consumed_at.is_empty())
+        {
+            break retries;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the engine's own pass never spent the held authorization: {retries:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    println!(
+        "SPENT {} consumed_at={} consumed_by={}",
+        spent[0].retry_id, spent[0].consumed_at, spent[0].consumed_key
+    );
+    assert!(spent[0].consumed_key.starts_with("ik_run-"), "{spent:?}");
+    let state = f.fixture.seed();
+    let claim = state
+        .claim(&spent[0].consumed_key)
+        .expect("claim read")
+        .expect("the dispatch was claimed");
+    assert_eq!(claim.method, "apply");
+    assert!(claim.request_line.contains("p6"), "{}", claim.request_line);
+    // The re-dispatch REACHES the engine: the step records an attempt of its
+    // own (the effect's own typed outcome), so the run is no longer parked on
+    // a frontier nothing drives.
+    let attempts = loop {
+        let attempts = f
+            .fixture
+            .seed()
+            .run_step_attempts(&f.run)
+            .expect("attempts");
+        if attempts.len() > attempts_before {
+            break attempts;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the re-dispatch never reached the engine: {attempts:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    println!(
+        "ATTEMPTS {attempts:?} (ZERO_OPERATOR_CONTROL: the run's own supervision and the engine advanced this run)"
+    );
+    shutdown(daemon);
+}
+
 /// Issue #256 (AC1, AC2, AC4): the fix-round disposition is derived from the
 /// repair leg's OWN recorded state — its own lane checkout — and the next
 /// review round is bound to the head that leg DELIVERED.
