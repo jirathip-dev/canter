@@ -721,6 +721,13 @@ fn method_status(shared: &Arc<Shared>, request: &Request) -> String {
         Ok(summary) => summary,
         Err(err) => return err_response(&request.id, err.code, err.message),
     };
+    // Issue #270: the supervision driver's OWN pass progress. The daemon keeps
+    // answering while a pass is stuck (that is exactly the shape the issue
+    // measured: every run's tick frozen, `daemon status` still reading
+    // healthy), so this block — and the `freshness` below it — is what says the
+    // supervision plane is NOT advancing instead of a bare `fresh`.
+    let supervision = shared.supervisor.pass_doc(time::unix_now());
+    let stalled = supervision.get("state").and_then(Val::as_str) == Some("stalled");
     let result = object(vec![
         (
             "daemon",
@@ -742,7 +749,13 @@ fn method_status(shared: &Arc<Shared>, request: &Request) -> String {
                 ("poisoned", bool_(summary.poisoned)),
             ]),
         ),
-        ("freshness", string("fresh")),
+        ("supervision", supervision),
+        // The pass is the fleet's single driver: a pass whose wait was
+        // abandoned and has not resolved reads `stalled`, never `fresh`.
+        (
+            "freshness",
+            string(if stalled { "stalled" } else { "fresh" }),
+        ),
     ]);
     ok_response(&request.id, result)
 }
@@ -6600,16 +6613,21 @@ fn method_supervision_status(shared: &Arc<Shared>, request: &Request) -> String 
                 &policy,
                 now_unix,
             );
-            ok_response(
-                &request.id,
-                crate::supervision::status_doc(
-                    &row,
-                    &evidence,
-                    trigger.as_ref(),
-                    &verdict,
-                    now_unix,
-                ),
-            )
+            // Issue #270: the driver's own pass progress rides on EVERY
+            // supervision read: a stalled pass freezes every run's tick, so the
+            // per-run read names the pass, its run/step and its age instead of
+            // leaving the operator to notice frozen `last_check` stamps.
+            let mut doc = crate::supervision::status_doc(
+                &row,
+                &evidence,
+                trigger.as_ref(),
+                &verdict,
+                now_unix,
+            );
+            if let Val::Obj(fields) = &mut doc {
+                fields.insert("driver".to_string(), shared.supervisor.pass_doc(now_unix));
+            }
+            ok_response(&request.id, doc)
         }
         Err(message) => err_response(&request.id, "state.unavailable", message),
     }

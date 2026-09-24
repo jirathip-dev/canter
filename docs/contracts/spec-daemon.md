@@ -794,6 +794,30 @@ clears a repository/fleet-level hold or bypasses a gate.
   independent evidence is presented. Non-armed/unknown supervision keeps its
   classification-only, zero-effect guarantee verbatim: without a row the run
   is never even read.
+- **The pass deadline (issue #270)**: the driver performs NO effect work on
+  its own thread. A step dispatch is handed to its own
+  `canter-supervision-effect` thread and waited on for at most
+  `PASS_DEADLINE_SECS` (30 s), lowered by the run's OWN recorded
+  `check_interval_secs`: a lane close (or any Herdr call inside an effect)
+  that sleeps can therefore never hold the ONLY driver thread while every
+  other supervised run's tick freezes. An effect still unresolved at that
+  bound is ABANDONED — the pass is released and the remaining due runs are
+  still classified — and nothing is cancelled, retried or duplicated: the
+  effect keeps its own apply claim, which resolves exactly once, typed and
+  journaled, on its own thread, and the run's recorded in-flight step fences
+  every later pass from re-dispatching it. Both reads name the stall
+  instead of leaving frozen `last_check` stamps as the only symptom:
+  `supervision.status` carries a top-level `driver` block and `daemon
+  status` carries the same document as top-level `supervision` —
+  `{state: idle|in-flight|stalled, abandoned_passes, pass: {run, step,
+  age_secs, started_at, bound_secs, abandoned} | null}`, where `stalled`
+  means the wait was abandoned and that effect has not resolved yet, and the
+  named `pass` is the OLDEST such effect. `daemon status`'s top-level
+  `freshness` reads `stalled` for exactly that state — never `fresh` while a
+  pass cannot finish — and `fresh` otherwise. A lane checkout that is GONE
+  is never addressed at all: a close at a worktree whose directory no longer
+  exists refuses `refusal.identity.incomplete` with no Herdr call, and the
+  matching retire is the bounded no-op of "no lane checkout residue".
 - **Committed-tail dispatch (issue #152)**: the frontier is also dispatched
   when it is the risk-classed TAIL of that run's OWN committed queue spine —
   `merge` (the closed-policy LANDING of the reviewed head: it lands it on the

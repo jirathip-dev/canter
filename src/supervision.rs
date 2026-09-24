@@ -46,6 +46,16 @@
 //!   duplicates a dispatch: the advance is keyed to the delivered issue
 //!   (one consumption per submission item, ever) and the cursor is derived
 //!   from the durable advance rows.
+//! - ONE pass has ONE deadline ([`PASS_DEADLINE_SECS`], issue #270). The
+//!   driver never performs effect work on its own thread: a step dispatch is
+//!   handed to its own `canter-supervision-effect` thread and waited on for
+//!   at most the deadline, so a lane close (or any Herdr call inside an
+//!   effect) that sleeps can never hold the plane — the remaining due runs are
+//!   still classified. An effect unresolved when the deadline passes is
+//!   ABANDONED typed: the wait is released, the effect's own claim keeps
+//!   resolving exactly once on its own thread, and the pass is named as
+//!   stalled on `daemon status` / `supervision status` until that effect
+//!   resolves.
 //! - Every classification is derived from **recorded evidence** re-read from
 //!   the daemon state (run row, ownership, committed submission, bound step
 //!   spine, recorded step attempts with their typed outcome codes, review
@@ -143,6 +153,26 @@ pub const STATEMENT: &str = "an explicitly armed run is classified from recorded
 
 /// Default bounded timer fallback cadence (seconds).
 pub const DEFAULT_CHECK_INTERVAL_SECS: i64 = 60;
+
+/// The pass deadline (seconds, issue #270): the longest ONE pass waits for the
+/// effect work it dispatched.
+///
+/// `SupervisorCore::pass` is the fleet's single driver. While it waits on a
+/// dispatched effect no run is classified and no verdict is consumed, so a
+/// lane close (or any Herdr call inside an effect) that sleeps must never hold
+/// the driver thread: the effect is handed to its own
+/// `canter-supervision-effect` thread — exactly like a bounded collection
+/// already is — and the driver waits at most this long, and never longer than
+/// the run's OWN recorded check cadence.
+///
+/// An effect still unresolved at the bound is ABANDONED: the pass is released
+/// (the remaining due runs are classified), the stall is named on the product
+/// surface ([`SupervisorWake::pass_doc`] — read by `daemon status` and
+/// `supervision status`) until that effect resolves, and NOTHING is cancelled,
+/// retried or duplicated: the effect keeps its own apply claim, which resolves
+/// exactly once, typed and journaled, on its own thread, and the run's
+/// recorded in-flight step fences every later pass from re-dispatching it.
+pub const PASS_DEADLINE_SECS: i64 = 30;
 
 /// Default meaningful-progress window (seconds).
 pub const DEFAULT_PROGRESS_TIMEOUT_SECS: i64 = 900;
@@ -2290,6 +2320,11 @@ pub fn status_doc(
 pub struct SupervisorOptions {
     /// Upper bound on one wait between ticks (seconds).
     pub max_wait_secs: i64,
+    /// The deadline of ONE pass (seconds, issue #270): the longest the driver
+    /// waits for an effect it dispatched, before abandoning the wait and
+    /// classifying the remaining runs ([`PASS_DEADLINE_SECS`]). Lowered by the
+    /// run's OWN recorded check cadence at the effect, never raised.
+    pub pass_deadline_secs: i64,
     /// The dispatch hook of an armed run's continuation (issue #92 F4). The
     /// daemon implements it with the merged apply engine; `None` keeps the
     /// driver classification-only.
@@ -2300,9 +2335,45 @@ impl Default for SupervisorOptions {
     fn default() -> SupervisorOptions {
         SupervisorOptions {
             max_wait_secs: DEFAULT_MAX_WAIT_SECS,
+            pass_deadline_secs: PASS_DEADLINE_SECS,
             dispatch: None,
         }
     }
+}
+
+/// ONE effect a pass dispatched and waits for (issue #270): the identity the
+/// product surface names while a pass cannot finish.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PassEffect {
+    /// Monotonic identity of this dispatch inside this daemon (never reused).
+    id: u64,
+    /// The run whose step the pass dispatched.
+    run: String,
+    /// The step the pass dispatched.
+    step: String,
+    /// When the pass took the effect on (unix seconds).
+    started_unix: i64,
+    /// When the pass took the effect on (RFC 3339, for the read).
+    started_at: String,
+    /// The bound the pass obeyed for THIS effect (seconds): the pass deadline,
+    /// lowered by the run's own check cadence.
+    bound_secs: i64,
+}
+
+/// What the driver's ONE pass is doing RIGHT NOW (issue #270): the effect it
+/// is waiting on, and the oldest effect whose wait it already abandoned.
+/// Written by the driver and by the effect threads, read by `daemon status` /
+/// `supervision status`. This is deliberately NOT behind the state guard: the
+/// whole point is that the surface answers while a pass cannot finish.
+#[derive(Default)]
+struct PassProgress {
+    /// The effect the driver is waiting on right now, when one is.
+    in_flight: Option<PassEffect>,
+    /// The OLDEST abandoned effect that has not resolved yet, when one is: the
+    /// stalled pass the product surface names.
+    stalled: Option<PassEffect>,
+    /// How many pass waits were abandoned (monotonic).
+    abandoned: u64,
 }
 
 /// The wait/stop half of the driver, shared with the daemon's request
@@ -2323,6 +2394,12 @@ pub struct SupervisorWake {
     /// chose to hold, so an observer that sees `true` sees the driver's
     /// real waiting state).
     waiting: AtomicBool,
+    /// Dispatch identity sequence of the effects the driver hands to their own
+    /// threads (issue #270).
+    effects: AtomicU64,
+    /// The pass in flight / the stalled pass (issue #270). Never behind the
+    /// state guard, so `daemon status` answers while a pass is stuck.
+    progress: Mutex<PassProgress>,
 }
 
 impl SupervisorWake {
@@ -2337,6 +2414,8 @@ impl SupervisorWake {
             checks: AtomicU64::new(0),
             dispatches: AtomicU64::new(0),
             waiting: AtomicBool::new(false),
+            effects: AtomicU64::new(0),
+            progress: Mutex::new(PassProgress::default()),
         }
     }
 
@@ -2382,6 +2461,113 @@ impl SupervisorWake {
     /// taken every guard it intends to hold).
     pub fn waiting(&self) -> bool {
         self.waiting.load(Ordering::SeqCst)
+    }
+
+    /// The driver block of the product surface (issue #270): which pass is in
+    /// flight — or which pass's wait was ABANDONED at the deadline and has not
+    /// resolved yet — with its age and the run/step it is on.
+    ///
+    /// `state` is `idle` (no pass in flight), `in-flight` (the driver is
+    /// waiting on an effect inside its bound) or `stalled` (the driver
+    /// released a pass whose effect is still unresolved: the shape the issue
+    /// measured, where EVERY run's `last_check` froze while the daemon kept
+    /// reading healthy). `pass` carries that effect — run, step, `age_secs`,
+    /// when the pass took it on and the bound it obeyed — and
+    /// `abandoned_passes` counts the waits abandoned since this daemon
+    /// started. Both `daemon status` and `supervision status` render this.
+    ///
+    /// This is a read of the driver's live progress only: it never moves a
+    /// recorded fact and it never blocks (no state guard, no subprocess).
+    pub fn pass_doc(&self, now_unix: i64) -> Val {
+        let progress = match self.progress.lock() {
+            Ok(progress) => progress,
+            Err(_) => return object(vec![("state", string("unknown"))]),
+        };
+        // The STALLED pass is the one an operator needs: it is the oldest
+        // unfinished effect, and it is the one whose wait the driver gave up.
+        let (state, named) = match (&progress.stalled, &progress.in_flight) {
+            (Some(stalled), _) => ("stalled", Some(stalled)),
+            (None, Some(in_flight)) => ("in-flight", Some(in_flight)),
+            (None, None) => ("idle", None),
+        };
+        let pass = match named {
+            Some(effect) => object(vec![
+                ("run", string(&effect.run)),
+                ("step", string(&effect.step)),
+                ("age_secs", integer((now_unix - effect.started_unix).max(0))),
+                ("started_at", string(&effect.started_at)),
+                ("bound_secs", integer(effect.bound_secs)),
+                ("abandoned", bool_(state == "stalled")),
+            ]),
+            None => null(),
+        };
+        object(vec![
+            ("state", string(state)),
+            (
+                "abandoned_passes",
+                integer(progress.abandoned.min(i64::MAX as u64) as i64),
+            ),
+            ("pass", pass),
+        ])
+    }
+
+    /// Take ONE dispatched effect on (issue #270): from here the surface names
+    /// this pass's run/step while the driver waits for it.
+    fn pass_effect(&self, run: &str, step: &str, bound_secs: i64) -> PassEffect {
+        let effect = PassEffect {
+            id: self.effects.fetch_add(1, Ordering::SeqCst) + 1,
+            run: run.to_string(),
+            step: step.to_string(),
+            started_unix: time::unix_now(),
+            started_at: time::rfc3339_now(),
+            bound_secs,
+        };
+        if let Ok(mut progress) = self.progress.lock() {
+            progress.in_flight = Some(effect.clone());
+        }
+        effect
+    }
+
+    /// The effect RESOLVED on its own thread (or its worker never ran): the
+    /// wait is over exactly once, so the in-flight slot and any stall the
+    /// effect named clear together.
+    fn effect_resolved(&self, id: u64) {
+        if let Ok(mut progress) = self.progress.lock() {
+            if progress
+                .in_flight
+                .as_ref()
+                .is_some_and(|held| held.id == id)
+            {
+                progress.in_flight = None;
+            }
+            if progress.stalled.as_ref().is_some_and(|held| held.id == id) {
+                progress.stalled = None;
+            }
+        }
+    }
+
+    /// The pass ABANDONED its wait for this effect: the deadline passed with
+    /// the effect still unresolved. The pass is released (the driver classifies
+    /// the remaining runs) and the stall is named — with the OLDEST abandoned
+    /// effect when several are in flight — until the effect resolves.
+    fn abandon_pass(&self, effect: PassEffect) {
+        if let Ok(mut progress) = self.progress.lock() {
+            progress.abandoned = progress.abandoned.saturating_add(1);
+            let older = progress
+                .stalled
+                .as_ref()
+                .is_some_and(|stalled| stalled.started_unix <= effect.started_unix);
+            if !older {
+                progress.stalled = Some(effect.clone());
+            }
+            if progress
+                .in_flight
+                .as_ref()
+                .is_some_and(|held| held.id == effect.id)
+            {
+                progress.in_flight = None;
+            }
+        }
     }
 
     /// Block until a wake is signalled, `deadline` passes, or a stop is
@@ -2500,8 +2686,15 @@ impl SupervisorCore {
             }
         };
         let mut checks = 0u64;
+        // Issue #270: ONE pass has ONE deadline, and the driver never performs
+        // effect work on its own thread. Every dispatch below is handed to its
+        // own thread and waited on for at most what is left of this bound, so a
+        // lane close (or any Herdr call inside an effect) that sleeps leaves
+        // this loop free to classify the remaining due runs.
+        let deadline =
+            Instant::now() + Duration::from_secs(self.options.pass_deadline_secs.max(0) as u64);
         for instance_id in due {
-            if self.reconcile(&instance_id, boot, now_unix) {
+            if self.reconcile(&instance_id, boot, now_unix, deadline) {
                 checks += 1;
             }
         }
@@ -2511,7 +2704,7 @@ impl SupervisorCore {
 
     /// ONE run-scoped reconciliation: short read, pure classification,
     /// short write. The state guard is released between the phases.
-    fn reconcile(&self, instance_id: &str, boot: bool, now_unix: i64) -> bool {
+    fn reconcile(&self, instance_id: &str, boot: bool, now_unix: i64, deadline: Instant) -> bool {
         let (row, evidence, trigger, worktrees_root) = {
             let state = match self.state.lock() {
                 Ok(state) => state,
@@ -2558,11 +2751,83 @@ impl SupervisorCore {
         // re-derives there) AFTER the check is durable and OUTSIDE the state
         // guard; a refused or failed dispatch is the daemon's record — the
         // driver never retries it inside the same check.
+        //
+        // Issue #270: it also runs OUTSIDE this thread. A lane close (or any
+        // Herdr call inside an effect) can sleep far past anything this pass
+        // should tolerate, so the effect gets its own thread and the pass waits
+        // for it only for the rest of its deadline.
         if let (Some(intent), Some(dispatcher)) = (&plan.dispatch, self.options.dispatch.as_ref()) {
-            let _ = dispatcher.dispatch(intent);
-            self.wake.dispatches.fetch_add(1, Ordering::SeqCst);
+            self.dispatch_bounded(intent, dispatcher, deadline, row.check_interval_secs);
         }
         true
+    }
+
+    /// Hand ONE dispatched effect to its own thread and wait at most until the
+    /// pass deadline for it (issue #270).
+    ///
+    /// The bound is the pass deadline, lowered by the run's OWN recorded check
+    /// cadence: a run whose authorization asks to be re-examined every 5 s is
+    /// never held behind one effect for 30 s. An effect still unresolved when
+    /// the bound passes is ABANDONED — the run/step/age is named on the product
+    /// surface ([`SupervisorWake::pass_doc`]) and this pass keeps going — while
+    /// the effect keeps its own apply claim on its own thread: it resolves
+    /// exactly once, typed and journaled, and the run's recorded in-flight step
+    /// fences every later pass from re-dispatching it. Nothing is cancelled,
+    /// nothing is retried here.
+    fn dispatch_bounded(
+        &self,
+        intent: &DispatchIntent,
+        dispatcher: &Arc<dyn SupervisedDispatch>,
+        deadline: Instant,
+        check_interval_secs: i64,
+    ) {
+        let budget = deadline.saturating_duration_since(Instant::now());
+        let cadence = Duration::from_secs(check_interval_secs.max(0) as u64);
+        let bound = budget.min(cadence);
+        // The surface reports WHOLE seconds of the bound the pass obeyed, so a
+        // sub-second remainder is never rendered as `0s` (a bound of "0s" would
+        // read as if the driver had not waited at all).
+        let bound_secs =
+            (bound.as_secs().min(i64::MAX as u64) as i64) + i64::from(bound.subsec_millis() > 0);
+        let effect = self
+            .wake
+            .pass_effect(&intent.instance_id, &intent.step_id, bound_secs);
+        let (sender, receiver) = std::sync::mpsc::channel::<Result<String, String>>();
+        let worker = Arc::clone(dispatcher);
+        let worker_intent = intent.clone();
+        let wake = Arc::clone(&self.wake);
+        let worker_effect = effect.id;
+        let spawn = std::thread::Builder::new()
+            .name("canter-supervision-effect".to_string())
+            .spawn(move || {
+                let outcome = worker.dispatch(&worker_intent);
+                // The effect RESOLVED: this is the ONE place a resolution is
+                // observed, whatever its outcome, so the stall it named clears
+                // here and the driver re-evaluates promptly. The thread is
+                // never joined (exactly like `canter-collect`): an effect can
+                // wait on a substrate for as long as its own step bound allows.
+                wake.effect_resolved(worker_effect);
+                wake.wake();
+                let _ = sender.send(outcome);
+            });
+        if spawn.is_err() {
+            // No effect runs and none was dispatched: nothing is left behind.
+            self.wake.effect_resolved(effect.id);
+            return;
+        }
+        match receiver.recv_timeout(bound) {
+            Ok(outcome) => {
+                if outcome.is_ok() {
+                    self.wake.dispatches.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            // The deadline passed with the effect unresolved: abandon the WAIT.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => self.wake.abandon_pass(effect),
+            // The effect thread died without ever resolving.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                self.wake.effect_resolved(effect.id)
+            }
+        }
     }
 
     /// The nearest wake instant: the smallest scheduled check (bounded).
@@ -2828,8 +3093,54 @@ pub fn render_human(doc: &Val) -> String {
         ),
         text(doc, "statement"),
     ]);
+    // Issue #270: the driver's own pass progress — the line that says the
+    // supervision plane is stalled, instead of leaving frozen `last_check`
+    // stamps as the operator's only symptom.
+    let driver = doc.get("driver").cloned().unwrap_or_else(null);
+    if driver.get("state").and_then(Val::as_str).is_some() {
+        lines.push(render_pass(&driver));
+    }
     lines.push(String::new());
     lines.join("\n").trim_end().to_string()
+}
+
+/// The ONE human line of the driver's pass progress (issue #270), from the
+/// `driver` block of a supervision read (or the `supervision` block of
+/// `daemon status`): `idle`, a pass in flight, or the STALLED pass — named
+/// with the run/step it is on, how long it has been there and the bound it
+/// obeyed.
+pub fn render_pass(driver: &Val) -> String {
+    let state = driver.get("state").and_then(Val::as_str).unwrap_or("");
+    let pass = driver.get("pass").cloned().unwrap_or_else(null);
+    let field = |key: &str| -> String {
+        pass.get(key)
+            .and_then(Val::as_str)
+            .unwrap_or("unknown")
+            .to_string()
+    };
+    match state {
+        "idle" => "pass idle (no effect in flight)".to_string(),
+        "in-flight" => format!(
+            "pass in flight on run {} step {} for {}s (bound {}s)",
+            field("run"),
+            field("step"),
+            pass.get("age_secs").and_then(Val::as_int).unwrap_or(0),
+            pass.get("bound_secs").and_then(Val::as_int).unwrap_or(0),
+        ),
+        "stalled" => format!(
+            "pass STALLED on run {} step {} for {}s (bound {}s, abandoned {} pass(es)); the \
+             driver released the pass and keeps classifying the other runs",
+            field("run"),
+            field("step"),
+            pass.get("age_secs").and_then(Val::as_int).unwrap_or(0),
+            pass.get("bound_secs").and_then(Val::as_int).unwrap_or(0),
+            driver
+                .get("abandoned_passes")
+                .and_then(Val::as_int)
+                .unwrap_or(0),
+        ),
+        _ => String::new(),
+    }
 }
 
 /// One typed state error mapped from a supervision refusal (the daemon
@@ -5287,6 +5598,7 @@ mod tests {
             state,
             SupervisorOptions {
                 max_wait_secs: 0,
+                pass_deadline_secs: PASS_DEADLINE_SECS,
                 dispatch: None,
             },
         );
@@ -5333,6 +5645,7 @@ mod tests {
             Arc::clone(&state),
             SupervisorOptions {
                 max_wait_secs: 3600,
+                pass_deadline_secs: PASS_DEADLINE_SECS,
                 dispatch: None,
             },
         );
@@ -5373,5 +5686,234 @@ mod tests {
             "the driver held the state guard while waiting: timer work would monopolize RPC"
         );
         assert!(joined, "shutdown cancels and joins the driver");
+    }
+
+    /// A fake `herdr` whose workspace read-back SLEEPS before it answers: the
+    /// measured shape of the defect (a lane close that sleeps in a subprocess).
+    /// Every row is recorded, so a double close is visible.
+    fn sleeping_fake_herdr(name: &str, sleep_secs: u64) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("hf-pass-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create fake bin dir");
+        let rows = dir.join("rows.txt");
+        let path = dir.join(crate::adapters::WORKSPACE_EXECUTABLE);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nPATH=/usr/bin:/bin\nprintf '%s\\n' \"$*\" >> \"{}\"\n\
+                 case \"$1 $2\" in\n\
+                 \x20 \"workspace list\")\n\
+                 \x20   sleep {sleep_secs}\n\
+                 \x20   printf '{{\"id\":\"cli:workspace:list\",\"result\":{{\"workspaces\":[]}}}}\\n'\n\
+                 \x20   ;;\n\
+                 \x20 *)\n\
+                 \x20   printf 'unexpected row: %s\\n' \"$*\" >&2\n\
+                 \x20   exit 9\n\
+                 \x20   ;;\n\
+                 esac\n",
+                rows.display()
+            ),
+        )
+        .expect("write fake executable");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).expect("chmod");
+        }
+        (dir, rows)
+    }
+
+    /// The dispatcher of the witness below: the REAL lane close, run against a
+    /// substrate that sleeps. It records its OWN outcome, so "the effect
+    /// resolved exactly once, typed" is read back rather than assumed.
+    struct CloseLaneDispatch {
+        session: crate::adapters::SessionHandle,
+        worktree: PathBuf,
+        env: std::collections::BTreeMap<String, String>,
+        outcome: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl SupervisedDispatch for CloseLaneDispatch {
+        fn dispatch(&self, _intent: &DispatchIntent) -> Result<String, String> {
+            let outcome = crate::adapters::close_lane_workspace(
+                &self.session,
+                &self.worktree,
+                &self.env,
+                crate::adapters::ADAPTER_TIMEOUT,
+            );
+            let word = match &outcome {
+                Ok(()) => "closed".to_string(),
+                Err(err) => format!("refused {}: {}", err.code, err.message),
+            };
+            self.outcome
+                .lock()
+                .expect("outcome lock")
+                .push(word.clone());
+            outcome.map(|_| word).map_err(|err| err.message)
+        }
+    }
+
+    #[test]
+    fn a_close_lane_call_that_sleeps_past_the_pass_deadline_is_abandoned_typed() {
+        // Issue #270: the measured wedge was a pass blocked in
+        // `close_lane_workspace` → `herdr` → `process::run` → sleep, holding the
+        // ONLY driver thread while every supervised run's tick froze. The call
+        // must be abandoned at the pass deadline, named on the surface, and its
+        // own claim must still resolve exactly once.
+        const SLEEP_SECS: u64 = 3;
+        let (bin, rows) = sleeping_fake_herdr("close-lane-sleep", SLEEP_SECS);
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("PATH".to_string(), bin.to_string_lossy().into_owned());
+        let worktree = std::env::temp_dir().join(format!("hf-pass-lane-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&worktree);
+        std::fs::create_dir_all(&worktree).expect("lane dir");
+        let identity = crate::adapters::bind_identity("ws-session-9", "tty-9-main", 3)
+            .expect("bound identity");
+        let session =
+            crate::adapters::new_session("sess-20260924-0001", identity).expect("session handle");
+        let dispatcher = Arc::new(CloseLaneDispatch {
+            session,
+            worktree: worktree.clone(),
+            env,
+            outcome: Arc::new(Mutex::new(Vec::new())),
+        });
+        let state = Arc::new(Mutex::new(temp_state("pass-deadline")));
+        let wake = Arc::new(SupervisorWake::new());
+        let core = SupervisorCore {
+            state,
+            wake: Arc::clone(&wake),
+            options: SupervisorOptions {
+                max_wait_secs: DEFAULT_MAX_WAIT_SECS,
+                pass_deadline_secs: 1,
+                dispatch: None,
+            },
+        };
+        let lane_dispatch: Arc<dyn SupervisedDispatch> = dispatcher.clone();
+        let intent = DispatchIntent {
+            instance_id: "run-0123456789abcdef".to_string(),
+            step_id: "p8".to_string(),
+            kind: "cleanup".to_string(),
+            reason: codes::DISPATCH,
+        };
+
+        let started = Instant::now();
+        core.dispatch_bounded(
+            &intent,
+            &lane_dispatch,
+            Instant::now() + Duration::from_secs(1),
+            3600,
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_millis(1500),
+            "the pass must not wait for a close that sleeps: waited {waited:?}"
+        );
+
+        // The stall is named on the surface the daemon renders: the run, the
+        // step and the age of the unfinished pass.
+        let doc = wake.pass_doc(time::unix_now());
+        assert_eq!(
+            doc.get("state").and_then(Val::as_str),
+            Some("stalled"),
+            "a pass over its deadline reads stalled: {doc:?}"
+        );
+        assert_eq!(
+            doc.get("pass")
+                .and_then(|pass| pass.get("run"))
+                .and_then(Val::as_str),
+            Some("run-0123456789abcdef")
+        );
+        assert_eq!(
+            doc.get("pass")
+                .and_then(|pass| pass.get("step"))
+                .and_then(Val::as_str),
+            Some("p8")
+        );
+        assert_eq!(
+            doc.get("pass")
+                .and_then(|pass| pass.get("abandoned"))
+                .and_then(Val::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            doc.get("abandoned_passes").and_then(Val::as_int),
+            Some(1),
+            "ONE wait was abandoned: {doc:?}"
+        );
+        let words = render_pass(&doc);
+        assert!(
+            words.starts_with("pass STALLED on run run-0123456789abcdef step p8 for "),
+            "{words}"
+        );
+        assert!(
+            words.ends_with(
+                "(bound 1s, abandoned 1 pass(es)); the driver released the pass and keeps \
+                 classifying the other runs"
+            ),
+            "{words}"
+        );
+
+        // The abandoned effect still RESOLVES, exactly once: the stall clears
+        // when its own thread finishes, and the substrate saw ONE close.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while wake
+            .pass_doc(time::unix_now())
+            .get("state")
+            .and_then(Val::as_str)
+            == Some("stalled")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the abandoned close never resolved: {rows:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let rows = std::fs::read_to_string(&rows).expect("the close reached the substrate");
+        assert_eq!(
+            rows.lines().filter(|row| *row == "workspace list").count(),
+            1,
+            "no double close: {rows}"
+        );
+        assert_eq!(
+            dispatcher.outcome.lock().expect("outcome lock").as_slice(),
+            ["closed".to_string()],
+            "the effect resolved exactly once, typed"
+        );
+        let _ = std::fs::remove_dir_all(&bin);
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    #[test]
+    fn a_pass_with_no_effect_in_flight_reads_idle_on_the_surface() {
+        // The surface the daemon renders must not invent a stall: an idle
+        // driver reads `idle` with no pass, and a resolved effect leaves
+        // nothing behind.
+        let wake = SupervisorWake::new();
+        let doc = wake.pass_doc(time::unix_now());
+        assert_eq!(doc.get("state").and_then(Val::as_str), Some("idle"));
+        assert_eq!(doc.get("abandoned_passes").and_then(Val::as_int), Some(0));
+        assert!(matches!(doc.get("pass"), Some(Val::Null)));
+        assert_eq!(render_pass(&doc), "pass idle (no effect in flight)");
+
+        let effect = wake.pass_effect("run-0123456789abcdef", "p2", 5);
+        let doc = wake.pass_doc(time::unix_now());
+        assert_eq!(doc.get("state").and_then(Val::as_str), Some("in-flight"));
+        assert_eq!(
+            doc.get("pass")
+                .and_then(|pass| pass.get("bound_secs"))
+                .and_then(Val::as_int),
+            Some(5)
+        );
+        assert!(
+            render_pass(&doc).starts_with("pass in flight on run run-0123456789abcdef step p2")
+        );
+
+        // The effect resolves: the surface clears, once.
+        wake.effect_resolved(effect.id);
+        let doc = wake.pass_doc(time::unix_now());
+        assert_eq!(doc.get("state").and_then(Val::as_str), Some("idle"));
+        assert_eq!(doc.get("abandoned_passes").and_then(Val::as_int), Some(0));
     }
 }

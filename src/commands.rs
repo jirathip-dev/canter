@@ -7410,7 +7410,12 @@ fn execute_daemon_status(socket_flag: Option<&str>, invocation: &Invocation) -> 
                         .and_then(Val::as_str)
                         .unwrap_or("unknown");
                     let human = format!(
-                        "daemon: running (pid {pid}, started {started_at})\nstate: epoch {epoch}, journal seq {journal_seq}\nsocket: {}\n",
+                        "daemon: running (pid {pid}, started {started_at})\nstate: epoch {epoch}, journal seq {journal_seq}\nsupervision: {}\nsocket: {}\n",
+                        crate::supervision::render_pass(
+                            &doc.get("supervision")
+                                .cloned()
+                                .unwrap_or_else(crate::value::null)
+                        ),
                         paths.socket_path.display()
                     );
                     ok_result(doc, human)
