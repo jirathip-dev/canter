@@ -13402,12 +13402,20 @@ pub struct SupervisionFixRound {
 /// worker that has already delivered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FixLegState {
-    /// The head the leg's own lane checkout holds (40-hex).
+    /// The head the leg's own lane checkout holds (40-hex; empty when the
+    /// checkout is gone).
     pub head: String,
     /// True when that head is a DESCENDANT of the certified head the recorded
     /// handoff names (the leg committed a repair past the reviewed head, so
     /// the branch it must push has moved).
     pub delivered: bool,
+    /// True when the leg's own recorded lane checkout still EXISTS — the
+    /// lane's state is present, so the leg can still deliver a repair from it.
+    /// False when the recorded checkout is gone (issue #276): the leg's own
+    /// state holds no head at all, so nothing more can ever be delivered from
+    /// it and a wait on it has no end. The fact is OBSERVED, never inferred:
+    /// an unobserved leg is `None`, never a lost one.
+    pub lane: bool,
 }
 
 /// The recorded dispatch context of one run: the first topology it bound,

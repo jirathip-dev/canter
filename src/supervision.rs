@@ -428,6 +428,28 @@ pub mod codes {
     /// is named as the remedy, with both head prefixes — the class is the
     /// fix-round disposition, never a bare `supervision.review_failed`.
     pub const FIX_HEAD_MOVED: &str = "supervision.fix_round_head_moved";
+    /// The run's recorded fix-round handoff can no longer deliver (issue
+    /// #276): the leg has not delivered and its OWN lane checkout is GONE —
+    /// observed, never inferred — so nothing more can be delivered from it and
+    /// the wait this branch reports as live work would never end. The class is
+    /// actionable and the run is reported ELIGIBLE: the handoff's own step is
+    /// re-dispatched through the apply engine (the authorization the run
+    /// already holds is spent by that ONE re-dispatch, exactly like any other
+    /// bounded re-dispatch), and the detail names the fix leg's lane with the
+    /// elapsed window that was read. A LIVE leg (its lane checkout present, at
+    /// the certified head) keeps the unchanged `waiting-workers` /
+    /// [`FIX_DISPATCHED`] read — a wait is only ended once its lane cannot
+    /// deliver.
+    pub const FIX_LANE_LOST: &str = "supervision.fix_round_lane_lost";
+    /// The ONE continuation of a run whose fix-round lane is gone (issue
+    /// #276): a re-dispatch of the recorded handoff's OWN step through the
+    /// apply engine, which re-enters the review effect — the failing evidence
+    /// is re-produced at the certified head and the FAIL is handed to a fix
+    /// round whose lane can still work — instead of the run parking forever on
+    /// a leg that carries no state. It is the same re-dispatch an operator's
+    /// held `run.retry` pays for, derived and spent by the run's own
+    /// supervision; nothing else is derived while it holds.
+    pub const FIX_REDISPATCH: &str = "supervision.fix_round_redispatched";
     /// The next step's latest attempt was refused for capacity.
     pub const CAPACITY_BLOCKED: &str = "supervision.capacity_blocked";
     /// A step dispatch is in flight: legitimate long-running work.
@@ -1050,6 +1072,15 @@ pub fn dispatch_intent(
     if let Some(intent) = fix_recollect_intent(evidence) {
         return Some(intent);
     }
+    // Issue #276: the run's own fix round can no longer deliver — its leg's
+    // lane checkout is GONE — so the ONE continuation is the re-dispatch of the
+    // handoff's own step (the same re-dispatch an operator's held `run.retry`
+    // pays for). Nothing else is derived while that holds: the report and this
+    // derivation are the SAME predicate ([`fix_round_lane_lost`]), so a run
+    // reported eligible is exactly a run the driver may dispatch.
+    if let Some(intent) = fix_redispatched_intent(evidence) {
+        return Some(intent);
+    }
     let (step_id, kind) = next_unachieved_step(evidence)?;
     if !driver_dispatchable_kind(evidence, &step_id, &kind) {
         // Issue #243: the driver may not drive THIS frontier, but when the
@@ -1274,6 +1305,77 @@ fn reevaluation_intent(
         step_id: producer.clone(),
         kind: producer_kind.clone(),
         reason: codes::REEVALUATION,
+    })
+}
+
+/// Whether the run's recorded fix-round handoff can no longer deliver (issue
+/// #276): the shape is the fix-round wait itself — the newest recorded verdict
+/// is the FAIL whose handoff this run is waiting on, and the run's newest
+/// recorded review evidence still names the head that handoff was dispatched
+/// for — and the handoff's OWN leg is OBSERVED to have no lane checkout left.
+///
+/// The leg's checkout is the only state a repair can be committed in, so once
+/// it is gone nothing more can ever be delivered from that leg and a wait on it
+/// has no end: this is the fact the fix-round wait must not be exempt from.
+/// Nothing is inferred here — an UNOBSERVED leg (`fix_leg` is `None`) is never
+/// a lost one, and a checkout that is present (at the certified head or moved)
+/// keeps the wait exactly as it was.
+///
+/// One derivation, two readers: the classification reports from it, and the
+/// driver derives its ONE continuation (the re-dispatch of the handoff's own
+/// step, [`codes::FIX_REDISPATCH`]) from the same predicate — so a
+/// reported-eligible run is exactly a dispatchable one (issue #152).
+fn fix_round_lane_lost(
+    evidence: &SupervisionEvidence,
+) -> Option<&crate::state::SupervisionFixRound> {
+    if newest_verdict(evidence) != "fail" {
+        return None;
+    }
+    let fix = evidence.fix_round.as_ref()?;
+    let newest_head = evidence
+        .newest_evidence
+        .as_ref()
+        .map(|newest| newest.feature_head.as_str())
+        .unwrap_or_default();
+    if newest_head != fix.feature_head {
+        return None;
+    }
+    let leg = evidence.fix_leg.as_ref()?;
+    if leg.delivered || leg.lane {
+        return None;
+    }
+    Some(fix)
+}
+
+/// The driver's ONE continuation while the run's fix-round leg has no lane
+/// checkout left (issue #276): a re-dispatch of the recorded handoff's OWN
+/// step through the apply engine.
+///
+/// The handoff's step is where the FAIL was handed to the run's fix round, so
+/// re-dispatching it re-enters that effect: the failing evidence is
+/// re-produced at the certified head and the FAIL is handed to a fix round
+/// whose lane the engine re-creates at that head — the only shape in which the
+/// repair leg can deliver again. It is the re-dispatch the run's held
+/// authorization pays for (the apply path spends it exactly once, issue #241),
+/// and the step's own committed params are presented verbatim (this function
+/// invents no input). The driver's own authority decides: a step the run's
+/// committed caps and role bindings do not authorize is never dispatched, and
+/// the classification reports that run actionable with `eligible: false` (the
+/// reported eligibility IS this derivation's existence, issue #152).
+fn fix_redispatched_intent(evidence: &SupervisionEvidence) -> Option<DispatchIntent> {
+    let fix = fix_round_lane_lost(evidence)?;
+    if fix.step.is_empty() {
+        return None;
+    }
+    let kind = step_kind(evidence, &fix.step);
+    if !driver_dispatchable_kind(evidence, &fix.step, kind) {
+        return None;
+    }
+    Some(DispatchIntent {
+        instance_id: evidence.run.instance_id.clone(),
+        step_id: fix.step.clone(),
+        kind: kind.to_string(),
+        reason: codes::FIX_REDISPATCH,
     })
 }
 
@@ -1732,6 +1834,30 @@ pub fn classify(
                 .map(|newest| newest.feature_head.clone())
                 .unwrap_or_default();
             if newest_head == fix.feature_head {
+                // Issue #276: a fix-round wait is NOT exempt from the policy's
+                // progress timeout once the leg behind it can no longer
+                // deliver. The handoff's own lane checkout is gone (observed),
+                // so the head this run waits on can never move: the run is
+                // reported with the actionable fix-round code — ELIGIBLE
+                // exactly while the ONE continuation exists, so the reported
+                // eligibility and the derivation are one predicate (issue
+                // #152). The continuation is the re-dispatch of the handoff's
+                // own step ([`fix_redispatched_intent`]), which is what spends
+                // the authorization the run already holds. A live leg (its
+                // checkout present) keeps the unchanged wait below: a worker
+                // that can still deliver is never reported over.
+                if let Some(lost) = fix_round_lane_lost(evidence) {
+                    return Verdict::new(
+                        "needs-attention",
+                        codes::FIX_LANE_LOST,
+                        fix_redispatched_intent(evidence).is_some(),
+                        &fix_round_lane_lost_detail(
+                            lost,
+                            progress_age_secs(&evidence.progress_at, now_unix),
+                            policy.progress_timeout_secs,
+                        ),
+                    );
+                }
                 return Verdict::new("waiting-workers", codes::FIX_DISPATCHED, false, &fix.lane);
             }
             // Issue #254: the newest recorded handoff names ANOTHER head than
@@ -1991,6 +2117,23 @@ fn fix_round_head_moved_detail(
         fix.lane,
         prefix(&fix.feature_head),
         prefix(newest_head)
+    )
+}
+
+/// The bounded detail of a recorded handoff whose OWN leg's lane checkout is
+/// gone (issue #276): the remedy FIRST — the fix leg's own lane — then the two
+/// values the read is made of (the elapsed recorded progress against the
+/// policy's own timeout), so a dead wait is readable from the same status read.
+fn fix_round_lane_lost_detail(
+    fix: &crate::state::SupervisionFixRound,
+    age_secs: Option<i64>,
+    window_secs: i64,
+) -> String {
+    format!(
+        "{} (lane checkout gone; recorded progress {}s old against a {}s window)",
+        fix.lane,
+        age_secs.unwrap_or(0),
+        window_secs
     )
 }
 
@@ -3171,6 +3314,10 @@ pub fn render_human(doc: &Val) -> String {
             codes::FIX_EXHAUSTED => {
                 format!("fix round refused: {detail} (the automatic bound is spent)")
             }
+            // Issue #276: the leg's own lane checkout is gone, so the run is
+            // no longer reported as waiting on it: the disposition says the
+            // lane is gone and the driver re-dispatches the handoff's step.
+            codes::FIX_LANE_LOST => format!("fix round lane gone: {detail}"),
             _ => format!("fix round refused: {detail}"),
         });
     }
@@ -4823,6 +4970,7 @@ mod tests {
         delivered.fix_leg = Some(crate::state::FixLegState {
             head: delivered_head.clone(),
             delivered: true,
+            lane: true,
         });
         let verdict = classify_at(delivered.clone());
         assert_eq!(verdict.class, "needs-attention");
@@ -4849,6 +4997,7 @@ mod tests {
         swimming.fix_leg = Some(crate::state::FixLegState {
             head: head.clone(),
             delivered: false,
+            lane: true,
         });
         let verdict = classify_at(swimming);
         assert_eq!(verdict.class, "waiting-workers");
@@ -4944,6 +5093,233 @@ mod tests {
         );
     }
 
+    /// Issue #276 (AC1, AC2, AC3, AC4, AC6): a run whose fix-round leg has NO
+    /// lane checkout left is not reported as waiting on it — the wait is ended
+    /// by the leg's own OBSERVED state — and the ONE continuation is the
+    /// re-dispatch of the handoff's own step, which is the re-dispatch a held
+    /// bounded retry pays for. The measured live shape is reproduced exactly:
+    /// the leg is recorded not-delivered, its checkout is ABSENT (nothing can
+    /// be re-observed from it), and a bounded retry is held.
+    ///
+    /// Three controls BITE alongside it: a LIVE leg (its checkout present, at
+    /// the certified head) keeps `waiting-workers` / `supervision.fix_round_dispatched`
+    /// and is never re-dispatched over, an UNOBSERVED leg is never a lost one,
+    /// and a leg whose lane is present but MOVED keeps the moved-head
+    /// disposition ([`codes::FIX_HEAD_MOVED`], issue #256).
+    #[test]
+    fn a_fix_round_lane_that_is_gone_is_reported_eligible_and_redispatched() {
+        let state = temp_state("fix-lane-gone");
+        let digest = "d".repeat(64);
+        let run = "run-0123456789abcdef";
+        let policy = Policy {
+            check_interval_secs: 10,
+            progress_timeout_secs: 60,
+        };
+        let at = "2026-09-25T00:40:00Z";
+        let now_unix = time::unix_from_rfc3339(at).expect("instant");
+        state
+            .arm_supervision_for_test(run, "armed", &digest, "merge", policy, at)
+            .expect("arm");
+        let row = state.supervision_by_id(run).expect("read").expect("row");
+        let steps = [
+            ("p1", "checkout"),
+            ("p5", "collect_outcome"),
+            ("p6", "review_evidence"),
+            ("p7", "merge"),
+        ];
+        let certified = "e".repeat(40);
+        let lane = "lane-0123456789abcdef";
+        // The shape at the park: the review step's LAST recorded attempt is the
+        // refused consumption of the head its own collection did not observe,
+        // the FAIL stands, the recorded handoff names the certified head, and
+        // the authorization the run holds is still UNSPENT.
+        let scene = |leg: Option<crate::state::FixLegState>| {
+            let mut evidence = evidence_with_failed_review(run_row(run), &steps, &certified);
+            evidence.attempts = vec![
+                ("p1".to_string(), "succeeded".to_string(), String::new()),
+                ("p5".to_string(), "succeeded".to_string(), String::new()),
+                (
+                    "p6".to_string(),
+                    "refused".to_string(),
+                    crate::mutation::code::DELIVERY_UNBOUND.to_string(),
+                ),
+            ];
+            evidence.run.caps = "[\"review\",\"merge\"]".to_string();
+            evidence.reviewer_leg_steps = vec!["p6".to_string()];
+            evidence.item = Some(crate::state::QueueItemRef {
+                submission_id: "qs_0123456789abcdef".to_string(),
+                ordinal: 0,
+                work_item: "wi_4aabf3ad5bea87b0".to_string(),
+                issue_number: 276,
+                status: "admitted".to_string(),
+            });
+            evidence.fix_round = Some(crate::state::SupervisionFixRound {
+                step: "p6".to_string(),
+                feature_head: certified.clone(),
+                round: 1,
+                bound: 3,
+                lane: lane.to_string(),
+                worktree: "issues-276-impl2".to_string(),
+            });
+            evidence.fix_leg = leg;
+            evidence.retries = vec![crate::state::RunRetryRow {
+                retry_id: "rt_0123456789abcdef".to_string(),
+                instance_id: run.to_string(),
+                step_id: "p6".to_string(),
+                attempt: 2,
+                authorized_at: "2026-09-24T03:33:50Z".to_string(),
+                consumed_at: String::new(),
+                consumed_key: String::new(),
+            }];
+            evidence.delivery = Some(crate::state::DeliveryCertificate {
+                step_id: "p5".to_string(),
+                key: "ik_run-0123456789abcdef-p5-1790208650".to_string(),
+                branch: "issue-276".to_string(),
+                head: certified.clone(),
+                base_head: "b".repeat(40),
+            });
+            evidence
+        };
+
+        // (1) AC2: the leg's own checkout is PRESENT and unmoved — a live
+        //     worker, whatever the recorded progress age, keeps the recorded
+        //     wait and is never re-dispatched over.
+        let swimming = scene(Some(crate::state::FixLegState {
+            head: certified.clone(),
+            delivered: false,
+            lane: true,
+        }));
+        let verdict = classify(&swimming, &digest, &policy, now_unix);
+        println!(
+            "LIVE LEG class={} reason={} detail={} eligible={}",
+            verdict.class, verdict.reason, verdict.detail, verdict.eligible
+        );
+        assert_eq!(verdict.class, "waiting-workers");
+        assert_eq!(verdict.reason, codes::FIX_DISPATCHED);
+        assert_eq!(verdict.detail, lane);
+        assert!(!verdict.eligible);
+        assert!(
+            dispatch_intent(&row, &swimming).is_none(),
+            "a leg whose checkout is present is never re-dispatched over"
+        );
+
+        // (1b) An UNOBSERVED leg is never a LOST one: no observation, no
+        //      escalation, nothing derived.
+        let unobserved = scene(None);
+        let verdict = classify(&unobserved, &digest, &policy, now_unix);
+        assert_eq!(verdict.reason, codes::FIX_DISPATCHED);
+        assert!(!verdict.eligible);
+        assert!(dispatch_intent(&row, &unobserved).is_none());
+
+        // (1c) A checkout that is present but MOVED keeps issue #256's own
+        //      disposition; the lane is not lost, and the ONE continuation is
+        //      issue #272's re-collect of the delivered head — never this
+        //      lane-lost re-dispatch.
+        let delivered = scene(Some(crate::state::FixLegState {
+            head: "a".repeat(40),
+            delivered: true,
+            lane: true,
+        }));
+        assert_eq!(
+            classify(&delivered, &digest, &policy, now_unix).reason,
+            codes::FIX_HEAD_MOVED
+        );
+        assert_eq!(
+            dispatch_intent(&row, &delivered).map(|intent| (intent.step_id, intent.reason)),
+            Some(("p5".to_string(), codes::RECOLLECT)),
+            "a delivered leg re-collects its own checkout; it is never a lost lane"
+        );
+
+        // (2) AC1/AC4: the recorded lane checkout is GONE (absent on disk, as
+        //     measured on the live runs) — the leg carries no state, so the
+        //     wait can never end by itself: the run is reported actionable
+        //     (`needs-attention`, never `waiting-workers`) and ELIGIBLE.
+        let gone = scene(Some(crate::state::FixLegState {
+            head: String::new(),
+            delivered: false,
+            lane: false,
+        }));
+        let verdict = classify(&gone, &digest, &policy, now_unix);
+        println!(
+            "LANE GONE class={} reason={} detail={} eligible={}",
+            verdict.class, verdict.reason, verdict.detail, verdict.eligible
+        );
+        assert_eq!(verdict.class, "needs-attention");
+        assert_eq!(verdict.reason, codes::FIX_LANE_LOST);
+        assert_ne!(verdict.reason, codes::FIX_DISPATCHED);
+        assert!(
+            verdict.eligible,
+            "the run is eligible for its own re-dispatch"
+        );
+        assert!(
+            verdict.detail.starts_with(lane),
+            "the remedy (the fix leg's own lane) is named first: {}",
+            verdict.detail
+        );
+        assert!(
+            verdict.detail.contains("lane checkout gone")
+                && verdict.detail.contains("against a 60s window"),
+            "the observed fact and the window that was read are named: {}",
+            verdict.detail
+        );
+
+        // (2b) The same dead lane on a run whose own committed authority does
+        //      NOT authorize the handoff's step is still reported actionable —
+        //      but never ELIGIBLE: the reported eligibility and the derivation
+        //      are one predicate (issue #152), so a run the driver may not
+        //      re-dispatch is never promised a continuation it cannot have.
+        let mut unbacked = gone.clone();
+        unbacked.item = None;
+        let verdict = classify(&unbacked, &digest, &policy, now_unix);
+        println!(
+            "LANE GONE, NO CONSENT class={} reason={} eligible={}",
+            verdict.class, verdict.reason, verdict.eligible
+        );
+        assert_eq!(verdict.class, "needs-attention");
+        assert_eq!(verdict.reason, codes::FIX_LANE_LOST);
+        assert!(
+            !verdict.eligible,
+            "a continuation the driver may not derive is never reported eligible"
+        );
+        assert!(dispatch_intent(&row, &unbacked).is_none());
+
+        // (3) AC3: the ONE continuation is the re-dispatch of the handoff's own
+        //     step — the exact step the held bounded retry authorizes, so the
+        //     engine's own pass spends it on that dispatch (issue #241).
+        let intent = dispatch_intent(&row, &gone).expect("the handoff's own step is re-dispatched");
+        println!(
+            "INTENT step={} kind={} reason={}",
+            intent.step_id, intent.kind, intent.reason
+        );
+        assert_eq!(intent.step_id, "p6");
+        assert_eq!(intent.kind, "review_evidence");
+        assert_eq!(intent.reason, codes::FIX_REDISPATCH);
+        assert_eq!(
+            gone.retries
+                .iter()
+                .filter(|retry| retry.consumed_at.is_empty())
+                .map(|retry| retry.step_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["p6"],
+            "the held authorization is the one this re-dispatch spends"
+        );
+
+        // (4) The human read says what happened: the lane is gone and the
+        //     disposition is the fix round's own — never "refused".
+        let human = render_human(&object(vec![(
+            "evaluation",
+            object(vec![
+                ("reason", string(codes::FIX_LANE_LOST)),
+                ("detail", string(&verdict.detail)),
+            ]),
+        )]));
+        println!("HUMAN {}", human.replace('\n', " | "));
+        assert!(
+            human.contains(&format!("fix round lane gone: {lane}")),
+            "the human read names the lane and the fact: {human}"
+        );
+    }
+
     /// Issue #272: the run's own fix round delivered a MOVED head its own
     /// collection never observed. The driver's ONE continuation is a bounded
     /// re-collect of the repair leg's own lane checkout through the run's OWN
@@ -5033,6 +5409,7 @@ mod tests {
             evidence.fix_leg = Some(crate::state::FixLegState {
                 head: delivered.clone(),
                 delivered: true,
+                lane: true,
             });
             evidence.delivery = Some(certificate(&certified));
             evidence
@@ -5126,6 +5503,7 @@ mod tests {
         swimming.fix_leg = Some(crate::state::FixLegState {
             head: certified.clone(),
             delivered: false,
+            lane: true,
         });
         assert!(
             dispatch_intent(&row, &swimming).is_none(),

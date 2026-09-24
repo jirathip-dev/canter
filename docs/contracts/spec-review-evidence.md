@@ -331,7 +331,14 @@ bare FAIL: `supervision.fix_round_dispatched` (class `waiting-workers`, detail:
 the fix leg's lane) while the repair leg works — the leg's OWN checkout is read
 for this, so a leg that has already delivered a descendant head is never
 reported as work in flight (issue #256, `supervision.fix_round_head_moved`
-below) — `supervision.fix_round_refused`
+below) — `supervision.fix_round_lane_lost` (class `needs-attention`, detail: the
+fix leg's lane and the window that was read) when the leg has NOT delivered and
+its own recorded lane checkout is GONE (issue #276), which is also `eligible:true`
+because the same fact is the driver's ONE continuation — the handoff's own step
+is re-dispatched by the run's own supervision (the re-dispatch a held
+`run.retry` authorization pays for), and the engine's own record then hands the
+FAIL to the next round of the same bound, whose lane it creates at the certified
+head — `supervision.fix_round_refused`
 with the fix round's OWN engine code as detail when the handoff was refused,
 and `supervision.fix_rounds_exhausted` when the budget is spent. The handoff is
 read from the review step's own apply row — the response document the daemon

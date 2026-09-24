@@ -1026,6 +1026,29 @@ clears a repository/fleet-level hold or bypasses a gate.
     collection has never certified is still never consumed, so the delivered
     head still has to be certified by that collection before a step consumes it
     (the gate's own message names exactly that precondition);
+  - the handoff's OWN repair leg can no longer deliver (issue #276): the leg has
+    not delivered and its recorded lane checkout is GONE — observed by the same
+    read the delivered arm uses, never inferred, so an unobserved leg and a
+    present checkout both keep the wait exactly as it was — class
+    `needs-attention`, reason `supervision.fix_round_lane_lost`, `eligible:true`
+    (the run is no longer reported as waiting on a leg that cannot deliver, and
+    a wait on it would never end). The detail names the fix leg's recorded lane
+    and the window that was read (the elapsed recorded progress against the
+    policy's `progress_timeout_secs`). The SAME derivation is the driver's ONE
+    continuation: the recorded handoff's own step is re-dispatched through the
+    apply engine (the re-dispatch an operator's held `run.retry` pays for, spent
+    by the run's own supervision — journaled like any other apply, exactly
+    once), so the run re-enters its own review effect and the FAIL is handed to
+    a fix round whose lane the engine creates at the certified head. Nothing
+    else is derived while that holds: the reported eligibility and the
+    derivation are one predicate, so a reported-eligible run is exactly a
+    dispatchable one. The engine's OWN fix-round record follows the same fact
+    (issue #276): a round is reused only while its leg's recorded lane checkout
+    still exists, so a DEAD round is superseded by the next round of the same
+    bound (never a re-prompt of a leg that carries no state, and never a round
+    counted for a leg that cannot work) — while a record naming no checkout
+    keeps the unchanged reuse rule, because a leg that cannot be observed to be
+    gone is never re-dispatched on a guess;
   - a FAIL whose review step recorded no fix round at all — a plan that
     presents its own review facts, or a run recorded before this handoff
     existed — keeps `supervision.review_failed`, now with the review step as

@@ -5329,6 +5329,13 @@ fn ensure_fix_lane(
 /// and can never move by itself. `None` when there is nothing to observe (no
 /// recorded lane, an unreadable or uncleanable checkout): an unobserved leg is
 /// never reported as moved. Read-only: no effect, no journal, no repair.
+///
+/// Issue #276: when the recorded lane checkout no longer EXISTS the leg is
+/// observed as such — `lane: false`, no head — instead of being left
+/// unobserved. The lane is the leg's own state and its absence is a fact
+/// about it: a repair leg whose checkout is gone cannot deliver anything more,
+/// and a run waiting on it has no end. A checkout that is present but cannot
+/// be read stays `None`: an unreadable read is never a lost lane.
 pub fn observe_fix_leg_checkout(
     root: &Path,
     worktree: &str,
@@ -5338,6 +5345,13 @@ pub fn observe_fix_leg_checkout(
         return None;
     }
     let lane = contained_path(root, worktree).ok()?;
+    if !lane.is_dir() {
+        return Some(crate::state::FixLegState {
+            head: String::new(),
+            delivered: false,
+            lane: false,
+        });
+    }
     let head = git_read_stdout(&lane, &["rev-parse", "--verify", "HEAD"])?;
     if !is_hex40(&head) {
         return None;
@@ -5346,7 +5360,11 @@ pub fn observe_fix_leg_checkout(
     // empty), so only the exit code is read here.
     let delivered = head != certified
         && git_read_stdout(&lane, &["merge-base", "--is-ancestor", certified, &head]).is_some();
-    Some(crate::state::FixLegState { head, delivered })
+    Some(crate::state::FixLegState {
+        head,
+        delivered,
+        lane: true,
+    })
 }
 
 /// One read-only `git` invocation in `cwd` (issue #256), through the SAME
@@ -5404,6 +5422,23 @@ fn fix_brief(
     )
 }
 
+/// Whether the recorded fix round's own lane checkout still EXISTS (issue
+/// #276): the leg's state is where a repair is committed, so a round whose
+/// lane is gone can hold no delivered head at all.
+///
+/// A record that names NO checkout (a row written before issue #256) is
+/// reported PRESENT: the recorded material does not say the leg is gone, and
+/// a round is never superseded on a guess. A checkout the lane root cannot
+/// address is treated the same way, for the same reason.
+fn fix_round_lane_present(ctx: &EffectContext<'_>, worktree: &str) -> bool {
+    if worktree.is_empty() {
+        return true;
+    }
+    contained_path(ctx.worktrees_root, worktree)
+        .map(|lane| lane.is_dir())
+        .unwrap_or(true)
+}
+
 /// Dispatch the run's fix round for ONE recorded review FAIL (issue #238):
 /// resolve the run's own committed implementer leg, keep or create the fix
 /// leg's lane at the certified head, start the leg through the same
@@ -5448,8 +5483,19 @@ fn dispatch_fix_round(
     // One fix round per certified head: re-dispatching the review step this
     // round was handed to REUSES it — the leg already carries the
     // instruction, and re-prompting it would burn the bound the workflow gave.
+    //
+    // Issue #276: the round is the leg's OWN running work only while that
+    // leg's recorded lane checkout still exists. A round whose lane is gone
+    // (the measured dead-lane shape: the leg's checkout was deleted, so the
+    // leg carries no state and can never deliver from it) is SUPERSEDED —
+    // the FAIL is handed to the next round of the same bound, whose lane is
+    // created at the certified head and whose instruction is delivered to a
+    // leg that can still work. A record that names no checkout (a row written
+    // before issue #256) is never superseded: the leg cannot be observed to
+    // be gone, and a round is never re-dispatched on a guess.
     if let Some(recorded) = &recorded
         && recorded.feature_head == inputs.feature_head
+        && fix_round_lane_present(ctx, &recorded.worktree)
     {
         return Ok(recorded.to_doc(&failures, true));
     }

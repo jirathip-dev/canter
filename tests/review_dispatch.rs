@@ -1877,6 +1877,100 @@ fn a_re_dispatch_of_the_same_head_reuses_the_recorded_fix_round() {
 }
 
 #[test]
+fn a_recorded_fix_round_whose_lane_checkout_is_gone_is_superseded_by_the_next_round() {
+    let fixture = Fixture::new("fix-supersede");
+    let params = reviewer_leg_params(&reviewer_binding_doc(), 20);
+    let plan = plan_with_fix_leg(params.clone());
+
+    // The recorded round 1 for THIS certified head whose OWN lane checkout is
+    // GONE — the measured live shape (`issues-261-impl2` and its sibling no
+    // longer exist on disk). The round is the leg's own work only while that
+    // checkout exists, so the FAIL must reach a leg that can still work.
+    assert!(
+        !fixture.fix_lane().is_dir(),
+        "the recorded checkout is absent, exactly as measured"
+    );
+    std::fs::create_dir_all(&fixture.review_root).expect("review root");
+    std::fs::write(
+        fixture.fix_receipt(),
+        canter::canonical::canonical_text(&object(vec![
+            ("schema", string("hf-fix-round/v1")),
+            ("round", integer(1)),
+            ("bound", integer(canter::mutation::FIX_ROUNDS_MAX as i64)),
+            ("feature_head", string(&fixture.head)),
+            ("lane", string("lane-0123456789abcdef")),
+            ("agent", string("")),
+            ("workspace", string("")),
+            ("pane", string("")),
+            (
+                "worktree",
+                string(&canter::lane::lane_checkout(ISSUE as u64, "implementer", 2)),
+            ),
+            ("delivery_attempts", integer(1)),
+        ])),
+    )
+    .expect("the recorded round");
+
+    let outcome = review_with_written_verdict(
+        &fixture,
+        &plan,
+        &params,
+        failed_verdict(&fixture, "AC1-cursor", "AC2-brief"),
+    );
+    assert_eq!(outcome.status, "succeeded", "{outcome:?}");
+    let fix = outcome
+        .result
+        .get("fix_round")
+        .cloned()
+        .expect("the FAIL reached a fix round");
+    println!(
+        "SUPERSEDE fix_round={}",
+        canter::canonical::canonical_text(&fix)
+    );
+    assert_eq!(
+        fix.get("reused").and_then(Val::as_bool),
+        Some(false),
+        "a leg whose lane is gone is never reused: {fix:?}"
+    );
+    assert_eq!(
+        fix.get("round").and_then(Val::as_int),
+        Some(2),
+        "the dead round is superseded by the NEXT round of the same bound: {fix:?}"
+    );
+    assert_eq!(
+        fix.get("bound").and_then(Val::as_int),
+        Some(canter::mutation::FIX_ROUNDS_MAX as i64)
+    );
+
+    // The remedy does NOT depend on the recorded checkout: the engine created
+    // the next round's own lane at the certified head and delivered the
+    // instruction to it, so a live leg holds the FAIL again.
+    let next_lane =
+        fixture
+            .worktrees_root
+            .join(canter::lane::lane_checkout(ISSUE as u64, "implementer", 3));
+    assert!(next_lane.is_dir(), "the next round's lane was created");
+    assert_eq!(
+        git(&next_lane, &["rev-parse", "--verify", "HEAD"]).trim(),
+        fixture.head,
+        "the next leg starts at the certified reviewed head"
+    );
+    let prompted =
+        std::fs::read_to_string(next_lane.join("argv.txt")).expect("the next leg was prompted");
+    assert!(
+        prompted.contains(&format!(
+            "Automatic fix round 2 of {}",
+            canter::mutation::FIX_ROUNDS_MAX
+        )),
+        "{prompted}"
+    );
+    // The engine's own record now names round 2, whose lane is present again —
+    // so the classification reads a handoff the run can wait on.
+    let receipt = std::fs::read_to_string(fixture.fix_receipt()).expect("the round was recorded");
+    assert!(receipt.contains("\"round\":2"), "{receipt}");
+}
+
+#[test]
 fn an_exhausted_fix_round_bound_escalates_and_names_the_failures() {
     let fixture = Fixture::new("fix-bound");
     let params = reviewer_leg_params(&reviewer_binding_doc(), 20);
