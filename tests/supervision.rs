@@ -571,6 +571,72 @@ fn supervision_is_disabled_by_default_and_a_foreign_target_refuses() {
 }
 
 #[test]
+fn the_arm_control_refuses_typed_on_every_run_that_must_not_be_armed() {
+    let fixture = DaemonFixture::new("arm-refusals");
+    let (bound, digest) = {
+        let state = fixture.seed();
+        seed_grant(&state, "gr_0000000000000098", 5);
+        render_bound(&state, &observation_request(vec![selected("#5", REV_A)]))
+    };
+    let daemon = fixture.spawn();
+    wait_ready(&fixture);
+    let socket = fixture.socket.display().to_string();
+    // The submission presents NO supervision authorization, so its admitted
+    // run has no arming authorization bound to it and nothing can be
+    // re-applied: the operator control refuses typed (issue #261 AC3) and
+    // writes nothing.
+    let key = idem_key("arm-refusals");
+    let params = params_doc(
+        &key,
+        &bound,
+        &digest,
+        &role_revision(),
+        "gr_0000000000000098",
+        None,
+    );
+    let result = rpc_ok(&fixture.socket, &fresh_id(1), "queue.submit", Some(params));
+    let run = instance_of(&result, 5);
+    assert!(
+        fixture
+            .seed()
+            .supervision_by_id(&run)
+            .expect("read")
+            .is_none(),
+        "an unarmed submission arms nothing"
+    );
+    let (exit, stdout, stderr) = cli(
+        &fixture,
+        &[
+            "supervision",
+            "arm",
+            "--run",
+            &run,
+            "--socket",
+            &socket,
+            "--json",
+        ],
+    );
+    assert_ne!(
+        exit, 0,
+        "a run with no arming authorization refuses: {stdout}{stderr}"
+    );
+    let text = format!("{stdout}{stderr}");
+    assert!(
+        text.contains(canter::supervision::codes::ARM_UNARMED),
+        "the typed code names the missing authorization: {text}"
+    );
+    assert!(
+        fixture
+            .seed()
+            .supervision_by_id(&run)
+            .expect("read")
+            .is_none(),
+        "the refused arm writes no row"
+    );
+    shutdown(daemon);
+}
+
+#[test]
 fn restart_preserves_the_pause_hold_and_yields_one_fresh_reconciliation() {
     let fixture = DaemonFixture::new("restart");
     let (bound, digest) = {
