@@ -366,6 +366,7 @@ jobs:
           "--test supervision_collection",
           "--test supervision_collection_b",
           "--test supervision_dispatch_refusal",
+          "--test supervision_reparse",
           "--test tui_board",
           "--test tui_live_wiring",
           "--test tui_operator",
