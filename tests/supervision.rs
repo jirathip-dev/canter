@@ -480,15 +480,41 @@ fn supervision_is_disabled_by_default_and_a_foreign_target_refuses() {
     );
     let result = rpc_ok(&fixture.socket, &fresh_id(1), "queue.submit", Some(params));
     let run = instance_of(&result, 5);
-    // AC1: absent authorization = disabled. There is no row to read, and the
-    // run is never evaluated.
-    let code = rpc_err(
+    // AC1: absent authorization = disabled. There is no row to read and the
+    // run is never evaluated. Issue #261 AC4: an ADMITTED run with no
+    // supervision row is a READABLE state — admitted, unarmed, nothing will
+    // drive it — not a bare not-found, and the read invents no row.
+    let unarmed = rpc_ok(
         &fixture.socket,
         &fresh_id(2),
         "supervision.status",
         Some(supervision::status_params(&run)),
     );
-    assert_eq!(code, "state.not_found");
+    assert_eq!(
+        unarmed
+            .get("supervision")
+            .and_then(|supervision| supervision.get("state"))
+            .and_then(Val::as_str),
+        Some("unarmed"),
+        "an admitted run with no authorization reads unarmed: {}",
+        canter::canonical::canonical_text(&unarmed)
+    );
+    assert_eq!(
+        unarmed
+            .get("evaluation")
+            .and_then(|evaluation| evaluation.get("reason"))
+            .and_then(Val::as_str),
+        Some(canter::supervision::codes::UNARMED_INERT),
+        "the read names WHY nothing drives it"
+    );
+    assert_eq!(
+        unarmed
+            .get("evaluation")
+            .and_then(|evaluation| evaluation.get("eligible"))
+            .and_then(Val::as_bool),
+        Some(false),
+        "an unarmed run is never eligible"
+    );
     // Force a semantic wake on the run (a control mutation notifies the
     // driver) and settle on its committed result: the un-authorized run is
     // still never evaluated, because the driver has no authority over it.
@@ -506,15 +532,27 @@ fn supervision_is_disabled_by_default_and_a_foreign_target_refuses() {
         Some("paused"),
         "the pause reached its safe boundary"
     );
-    let code = rpc_err(
+    let still_unarmed = rpc_ok(
         &fixture.socket,
         &fresh_id(4),
         "supervision.status",
         Some(supervision::status_params(&run)),
     );
     assert_eq!(
-        code, "state.not_found",
+        still_unarmed
+            .get("supervision")
+            .and_then(|supervision| supervision.get("state"))
+            .and_then(Val::as_str),
+        Some("unarmed"),
         "a wake never evaluates a run without an authorization"
+    );
+    assert_eq!(
+        still_unarmed
+            .get("supervision")
+            .and_then(|supervision| supervision.get("armed_at"))
+            .and_then(Val::as_str),
+        Some(""),
+        "the read invents no arming instant"
     );
     // The target is exactly one run identity.
     let code = rpc_err(
