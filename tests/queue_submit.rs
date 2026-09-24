@@ -2003,58 +2003,428 @@ fn a_parked_submission_is_re_driven_by_the_operators_bounded_control() {
         0,
         "the released holders no longer count against the cap"
     );
-    let outcome = state
+    // Issue #261: this submission committed NO arming authorization, so the
+    // re-drive refuses the WHOLE control typed and admits nothing — it never
+    // creates a run nothing can drive. The parked items keep their hold.
+    let err = state
         .redrive_queue_submission(
             "qs_0000000000000012",
             "ik-redrive-parked",
             "2026-09-06T02:07:00Z",
         )
-        .expect("the re-drive commits");
-    assert_eq!(outcome.submission_id, "qs_0000000000000012");
+        .expect_err("a submission with no arming authorization refuses");
     assert_eq!(
-        outcome.admitted.len(),
-        2,
-        "both parked items are admitted: {outcome:?}"
+        err.code,
+        canter::queue_executor::codes::SUPERVISION_UNARMED,
+        "{}",
+        err.message
     );
-    assert!(outcome.waiting.is_empty(), "{outcome:?}");
-    assert!(outcome.refused.is_empty(), "{outcome:?}");
-    let admitted_runs: Vec<&str> = outcome
-        .admitted
-        .iter()
-        .map(|(_, _, run)| run.as_str())
-        .collect();
-    assert_ne!(
-        admitted_runs[0], admitted_runs[1],
-        "each admitted item gets its own run"
-    );
-
-    // Durable readback: the item rows name their runs, and each re-driven run
-    // owns its issue.
-    let (_, reread) = state
+    let (_, still_parked) = state
         .queue_submission_by_id("qs_0000000000000012")
         .expect("read")
         .expect("the submission exists");
-    for (index, item) in reread.iter().enumerate() {
-        assert_eq!(item.status, "admitted");
-        assert_eq!(
-            item.instance_id.as_deref(),
-            Some(admitted_runs[index]),
-            "the item names the run the re-drive created"
-        );
+    for item in &still_parked {
+        assert_eq!(item.status, "waiting", "nothing is admitted: {item:?}");
+        assert!(item.instance_id.is_none(), "no run is created: {item:?}");
     }
-    assert_eq!(
-        state.queue_ownership_rows().expect("ownership").len(),
-        2,
-        "each re-driven run owns its issue"
+    assert!(
+        state
+            .list_instances()
+            .expect("instances")
+            .iter()
+            .all(|row| !matches!(
+                row.status.as_str(),
+                "new" | "running" | "human_queue" | "blocked"
+            )),
+        "the re-drive created no run"
     );
+    // The ARMED submission of the SAME parked items is re-driven and armed —
+    // the positive half lives in `a_re_drive_arms_what_it_admits` below.
+    let unsettled = state
+        .redrive_queue_submission(
+            "qs_0000000000000012",
+            "ik-redrive-parked-2",
+            "2026-09-06T02:07:30Z",
+        )
+        .expect_err("the refusal is deterministic");
+    assert_eq!(
+        unsettled.code,
+        canter::queue_executor::codes::SUPERVISION_UNARMED
+    );
+    // A refused re-drive commits NOTHING at all: no run, no item flip and no
+    // `queue.redrive` audit record (a re-drive is audited only when it runs;
+    // the daemon records the refusal as its claim outcome).
+    let (_, lines_after) = state.journal_tail(0, 500).expect("journal");
+    assert_eq!(
+        lines_after
+            .iter()
+            .filter(|line| line.contains("queue.redrive"))
+            .count(),
+        0,
+        "the refused re-drive touches no journal record: {lines_after:?}"
+    );
+}
 
+// ---------------------------------------------------------------------------
+// Issue #261: a re-drive ARMS what it admits, the bounded arm control
+// recovers an inert admitted run, and every refusal is typed.
+// ---------------------------------------------------------------------------
+
+/// The explicit authorization a submission presents: armed with the bounded
+/// default policy the operator surface uses.
+fn armed_supervision() -> canter::state::SupervisionAuthorizationPlan {
+    canter::state::SupervisionAuthorizationPlan {
+        desired: "armed".to_string(),
+        check_interval_secs: 60,
+        progress_timeout_secs: 900,
+    }
+}
+
+/// `plan_for` with an explicit armed supervision authorization.
+fn plan_for_armed(
+    state: &State,
+    submission_id: &str,
+    digest: &str,
+    items: Vec<(i64, &str, Option<&str>, SubmissionVerdict)>,
+    harness_lanes: Option<i64>,
+) -> QueueSubmissionPlan {
+    let mut plan = plan_for(state, submission_id, digest, items, harness_lanes);
+    plan.supervision = Some(armed_supervision());
+    plan
+}
+
+#[test]
+fn a_re_drive_arms_what_it_admits_with_the_submissions_own_authorization() {
+    let fixture = StateFixture::new("redrive-arm");
+    let state = fixture.open();
+    for (grant, issue) in [
+        ("gr_0000000000000021", 21),
+        ("gr_0000000000000022", 22),
+        ("gr_0000000000000023", 23),
+    ] {
+        state
+            .issue_grant(&grant_doc(grant, issue, REV_A, &GRANT_CAPS))
+            .expect("issue grant");
+    }
+    // ONE live holder occupies one of the two per-repository slots.
+    let holder = plan_for(
+        &state,
+        "qs_0000000000000021",
+        &"c".repeat(64),
+        vec![(
+            23,
+            REV_A,
+            Some("gr_0000000000000023"),
+            SubmissionVerdict::Approved,
+        )],
+        Some(0),
+    );
+    let (_, holder_items) = state.submit_queue_run(&holder).expect("holder commit");
+    let holder_run = holder_items[0].instance_id.clone().expect("holder run");
+
+    // The ARMED submission: its first item is admitted (one slot free) and
+    // armed by the submit path; its second parks on the now-full cap.
+    let armed = plan_for_armed(
+        &state,
+        "qs_0000000000000022",
+        &"d".repeat(64),
+        vec![
+            (
+                21,
+                REV_A,
+                Some("gr_0000000000000021"),
+                SubmissionVerdict::Approved,
+            ),
+            (
+                22,
+                REV_A,
+                Some("gr_0000000000000022"),
+                SubmissionVerdict::Approved,
+            ),
+        ],
+        Some(0),
+    );
+    let (_, armed_items) = state.submit_queue_run(&armed).expect("armed commit");
+    let submitted_run = armed_items[0]
+        .instance_id
+        .clone()
+        .expect("the first item is admitted at submit");
+    let submitted_row = state
+        .supervision_by_id(&submitted_run)
+        .expect("read")
+        .expect("the submit path armed it");
+    assert_eq!(submitted_row.desired, "armed");
+    assert_eq!(armed_items[1].status, "waiting", "{:?}", armed_items[1]);
+    assert!(armed_items[1].instance_id.is_none(), "no run yet");
+
+    // The transient hold is released and the bounded re-drive admits the
+    // parked item — ARMED with the submission's own authorization, bound to
+    // the same digest/boundary/epoch the submit path binds.
+    state
+        .release_run(
+            &holder_run,
+            "the transient holding run is freed",
+            "ik-release-261",
+            "2026-09-06T02:06:00Z",
+        )
+        .expect("release");
+    let outcome = state
+        .redrive_queue_submission(
+            "qs_0000000000000022",
+            "ik-redrive-261",
+            "2026-09-06T02:07:00Z",
+        )
+        .expect("the re-drive commits");
+    assert_eq!(outcome.admitted.len(), 1, "{outcome:?}");
+    let re_driven = outcome.admitted[0].2.clone();
+    let row = state
+        .supervision_by_id(&re_driven)
+        .expect("read")
+        .expect("the re-driven run is ARMED — never an inert admission");
+    assert_eq!(row.desired, "armed");
+    assert_eq!(
+        row.authorization_digest,
+        "d".repeat(64),
+        "the SAME approved digest the submit path binds"
+    );
+    assert_eq!(
+        (row.check_interval_secs, row.progress_timeout_secs),
+        (60, 900),
+        "the submission's OWN policy, never an invented one"
+    );
+    assert_eq!(row.approved_boundary, "merge", "the submission's boundary");
+    assert_eq!(
+        row.run_generation,
+        state.current_epoch().expect("epoch"),
+        "the submission's own state epoch"
+    );
+    // The driver's own reconciliation path (the daemon's real driver uses
+    // these two calls) reads the armed row and commits its check: nothing on
+    // the re-driven run needs an operator dispatch.
+    let evidence = state
+        .supervision_evidence(&re_driven)
+        .expect("evidence read")
+        .expect("evidence exists");
+    let check =
+        canter::supervision::check_plan(&row, &evidence, None, true, canter::time::unix_now());
+    state
+        .commit_supervision_check(&check)
+        .expect("the driver's own check commits for the re-driven run");
     // Audited: the re-drive is a hash-chained journal record, exactly once.
     let (_, lines) = state.journal_tail(0, 500).expect("journal");
-    let redrives = lines
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.contains("queue.redrive"))
+            .count(),
+        1,
+        "one audited re-drive record: {lines:?}"
+    );
+}
+
+#[test]
+fn the_operator_arm_control_recovers_an_inert_admitted_run_and_is_audited() {
+    let fixture = StateFixture::new("arm-control");
+    let state = fixture.open();
+    for (grant, issue) in [
+        ("gr_0000000000000031", 31),
+        ("gr_0000000000000032", 32),
+        ("gr_0000000000000033", 33),
+    ] {
+        state
+            .issue_grant(&grant_doc(grant, issue, REV_A, &GRANT_CAPS))
+            .expect("issue grant");
+    }
+    // One holder + an ARMED submission whose second item parks: the cap is
+    // full after the submit, so the parked item is admitted by the re-drive.
+    let holder = plan_for(
+        &state,
+        "qs_0000000000000031",
+        &"e".repeat(64),
+        vec![(
+            33,
+            REV_A,
+            Some("gr_0000000000000033"),
+            SubmissionVerdict::Approved,
+        )],
+        Some(0),
+    );
+    let (_, holder_items) = state.submit_queue_run(&holder).expect("holder commit");
+    let holder_run = holder_items[0].instance_id.clone().expect("holder run");
+    let armed = plan_for_armed(
+        &state,
+        "qs_0000000000000032",
+        &"f".repeat(64),
+        vec![
+            (
+                31,
+                REV_A,
+                Some("gr_0000000000000031"),
+                SubmissionVerdict::Approved,
+            ),
+            (
+                32,
+                REV_A,
+                Some("gr_0000000000000032"),
+                SubmissionVerdict::Approved,
+            ),
+        ],
+        Some(0),
+    );
+    let (_, armed_items) = state.submit_queue_run(&armed).expect("armed commit");
+    let sibling_run = armed_items[0].instance_id.clone().expect("armed sibling");
+    state
+        .release_run(
+            &holder_run,
+            "the transient holding run is freed",
+            "ik-release-arm-261",
+            "2026-09-06T02:06:00Z",
+        )
+        .expect("release");
+    let outcome = state
+        .redrive_queue_submission(
+            "qs_0000000000000032",
+            "ik-redrive-arm-261",
+            "2026-09-06T02:07:00Z",
+        )
+        .expect("the re-drive commits");
+    let inert_run = outcome.admitted[0].2.clone();
+    // The runaway case this control exists for: an admitted run that carries
+    // NO arming authorization (supervision disabled on the run itself).
+    state
+        .arm_supervision(
+            &inert_run,
+            &canter::state::SupervisionAuthorizationPlan {
+                desired: "disabled".to_string(),
+                check_interval_secs: 60,
+                progress_timeout_secs: 900,
+            },
+            &"f".repeat(64),
+            "merge",
+            state.current_epoch().expect("epoch"),
+            "2026-09-06T02:07:30Z",
+        )
+        .expect("the run is explicitly disabled: inert");
+    let disabled = state
+        .supervision_by_id(&inert_run)
+        .expect("read")
+        .expect("row");
+    assert_eq!(disabled.desired, "disabled", "the run is inert");
+    // The bounded, audited operator control arms it.
+    let armed_run = state
+        .arm_admitted_run(&inert_run, "ik-arm-261", "2026-09-06T02:08:00Z")
+        .expect("the arm commits");
+    assert_eq!(armed_run.row.desired, "armed");
+    assert_eq!(armed_run.row.instance_id, inert_run);
+    assert_eq!(
+        armed_run.submission_id, "qs_0000000000000032",
+        "the arm names the submission whose authorization it re-applied"
+    );
+    let reread = state
+        .supervision_by_id(&inert_run)
+        .expect("read")
+        .expect("armed");
+    assert_eq!(reread.desired, "armed");
+    assert_eq!(reread.authorization_digest, "f".repeat(64));
+    // Audited: exactly one hash-chained `supervision.arm` record names the run.
+    let (_, lines) = state.journal_tail(0, 900).expect("journal");
+    let arms = lines
         .iter()
-        .filter(|line| line.contains("queue.redrive"))
+        .filter(|line| line.contains("\"action\":\"supervision.arm\""))
         .count();
-    assert_eq!(redrives, 1, "one audited re-drive record: {lines:?}");
+    assert_eq!(arms, 1, "one audited arm record: {lines:?}");
+    // Typed refusals: an ALREADY armed run and a TERMINAL run are refused.
+    let err = state
+        .arm_admitted_run(&inert_run, "ik-arm-261-b", "2026-09-06T02:08:30Z")
+        .expect_err("an armed run is refused");
+    assert_eq!(
+        err.code,
+        canter::supervision::codes::ARM_ARMED,
+        "{}",
+        err.message
+    );
+    assert_eq!(
+        state
+            .supervision_by_id(&sibling_run)
+            .expect("read")
+            .expect("row")
+            .desired,
+        "armed"
+    );
+    let err = state
+        .arm_admitted_run(&sibling_run, "ik-arm-261-c", "2026-09-06T02:08:40Z")
+        .expect_err("already armed");
+    assert_eq!(
+        err.code,
+        canter::supervision::codes::ARM_ARMED,
+        "{}",
+        err.message
+    );
+}
+
+#[test]
+fn the_arm_control_names_each_run_it_refuses() {
+    let fixture = StateFixture::new("arm-refusals");
+    let state = fixture.open();
+    state
+        .issue_grant(&grant_doc("gr_0000000000000041", 41, REV_A, &GRANT_CAPS))
+        .expect("grant");
+    // An UNARMED submission: its admitted run has no arming authorization.
+    let unarmed = plan_for(
+        &state,
+        "qs_0000000000000041",
+        &"1".repeat(64),
+        vec![(
+            41,
+            REV_A,
+            Some("gr_0000000000000041"),
+            SubmissionVerdict::Approved,
+        )],
+        Some(0),
+    );
+    let (_, items) = state.submit_queue_run(&unarmed).expect("commit");
+    let run = items[0].instance_id.clone().expect("admitted");
+    assert!(
+        state.supervision_by_id(&run).expect("read").is_none(),
+        "an unarmed submission arms nothing"
+    );
+    let err = state
+        .arm_admitted_run(&run, "ik-arm-refuse", "2026-09-06T02:09:00Z")
+        .expect_err("no authorization is bound to this run");
+    assert_eq!(
+        err.code,
+        canter::supervision::codes::ARM_UNARMED,
+        "{}",
+        err.message
+    );
+    // A TERMINAL run is refused before any authorization is read.
+    state
+        .release_run(
+            &run,
+            "terminal",
+            "ik-release-arm-refuse",
+            "2026-09-06T02:09:30Z",
+        )
+        .expect("release");
+    let err = state
+        .arm_admitted_run(&run, "ik-arm-refuse-b", "2026-09-06T02:09:40Z")
+        .expect_err("a terminal run is never armed");
+    assert_eq!(
+        err.code,
+        canter::supervision::codes::ARM_TERMINAL,
+        "{}",
+        err.message
+    );
+    // A malformed target refuses typed.
+    let err = state
+        .arm_admitted_run("not-a-run", "ik-arm-refuse-c", "2026-09-06T02:09:50Z")
+        .expect_err("not a run identity");
+    assert_eq!(
+        err.code,
+        canter::supervision::codes::TARGET,
+        "{}",
+        err.message
+    );
 }
 
 // ---------------------------------------------------------------------------

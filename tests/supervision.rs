@@ -480,15 +480,41 @@ fn supervision_is_disabled_by_default_and_a_foreign_target_refuses() {
     );
     let result = rpc_ok(&fixture.socket, &fresh_id(1), "queue.submit", Some(params));
     let run = instance_of(&result, 5);
-    // AC1: absent authorization = disabled. There is no row to read, and the
-    // run is never evaluated.
-    let code = rpc_err(
+    // AC1: absent authorization = disabled. There is no row to read and the
+    // run is never evaluated. Issue #261 AC4: an ADMITTED run with no
+    // supervision row is a READABLE state — admitted, unarmed, nothing will
+    // drive it — not a bare not-found, and the read invents no row.
+    let unarmed = rpc_ok(
         &fixture.socket,
         &fresh_id(2),
         "supervision.status",
         Some(supervision::status_params(&run)),
     );
-    assert_eq!(code, "state.not_found");
+    assert_eq!(
+        unarmed
+            .get("supervision")
+            .and_then(|supervision| supervision.get("state"))
+            .and_then(Val::as_str),
+        Some("unarmed"),
+        "an admitted run with no authorization reads unarmed: {}",
+        canter::canonical::canonical_text(&unarmed)
+    );
+    assert_eq!(
+        unarmed
+            .get("evaluation")
+            .and_then(|evaluation| evaluation.get("reason"))
+            .and_then(Val::as_str),
+        Some(canter::supervision::codes::UNARMED_INERT),
+        "the read names WHY nothing drives it"
+    );
+    assert_eq!(
+        unarmed
+            .get("evaluation")
+            .and_then(|evaluation| evaluation.get("eligible"))
+            .and_then(Val::as_bool),
+        Some(false),
+        "an unarmed run is never eligible"
+    );
     // Force a semantic wake on the run (a control mutation notifies the
     // driver) and settle on its committed result: the un-authorized run is
     // still never evaluated, because the driver has no authority over it.
@@ -506,15 +532,27 @@ fn supervision_is_disabled_by_default_and_a_foreign_target_refuses() {
         Some("paused"),
         "the pause reached its safe boundary"
     );
-    let code = rpc_err(
+    let still_unarmed = rpc_ok(
         &fixture.socket,
         &fresh_id(4),
         "supervision.status",
         Some(supervision::status_params(&run)),
     );
     assert_eq!(
-        code, "state.not_found",
+        still_unarmed
+            .get("supervision")
+            .and_then(|supervision| supervision.get("state"))
+            .and_then(Val::as_str),
+        Some("unarmed"),
         "a wake never evaluates a run without an authorization"
+    );
+    assert_eq!(
+        still_unarmed
+            .get("supervision")
+            .and_then(|supervision| supervision.get("armed_at"))
+            .and_then(Val::as_str),
+        Some(""),
+        "the read invents no arming instant"
     );
     // The target is exactly one run identity.
     let code = rpc_err(
@@ -530,6 +568,72 @@ fn supervision_is_disabled_by_default_and_a_foreign_target_refuses() {
         state.supervision_rows().expect("rows").is_empty(),
         "no supervision row is ever written without an explicit authorization"
     );
+}
+
+#[test]
+fn the_arm_control_refuses_typed_on_every_run_that_must_not_be_armed() {
+    let fixture = DaemonFixture::new("arm-refusals");
+    let (bound, digest) = {
+        let state = fixture.seed();
+        seed_grant(&state, "gr_0000000000000098", 5);
+        render_bound(&state, &observation_request(vec![selected("#5", REV_A)]))
+    };
+    let daemon = fixture.spawn();
+    wait_ready(&fixture);
+    let socket = fixture.socket.display().to_string();
+    // The submission presents NO supervision authorization, so its admitted
+    // run has no arming authorization bound to it and nothing can be
+    // re-applied: the operator control refuses typed (issue #261 AC3) and
+    // writes nothing.
+    let key = idem_key("arm-refusals");
+    let params = params_doc(
+        &key,
+        &bound,
+        &digest,
+        &role_revision(),
+        "gr_0000000000000098",
+        None,
+    );
+    let result = rpc_ok(&fixture.socket, &fresh_id(1), "queue.submit", Some(params));
+    let run = instance_of(&result, 5);
+    assert!(
+        fixture
+            .seed()
+            .supervision_by_id(&run)
+            .expect("read")
+            .is_none(),
+        "an unarmed submission arms nothing"
+    );
+    let (exit, stdout, stderr) = cli(
+        &fixture,
+        &[
+            "supervision",
+            "arm",
+            "--run",
+            &run,
+            "--socket",
+            &socket,
+            "--json",
+        ],
+    );
+    assert_ne!(
+        exit, 0,
+        "a run with no arming authorization refuses: {stdout}{stderr}"
+    );
+    let text = format!("{stdout}{stderr}");
+    assert!(
+        text.contains(canter::supervision::codes::ARM_UNARMED),
+        "the typed code names the missing authorization: {text}"
+    );
+    assert!(
+        fixture
+            .seed()
+            .supervision_by_id(&run)
+            .expect("read")
+            .is_none(),
+        "the refused arm writes no row"
+    );
+    shutdown(daemon);
 }
 
 #[test]

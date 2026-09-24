@@ -100,6 +100,12 @@ pub mod codes {
     /// side effect. Supersession stays an explicit, recorded operator control
     /// (`run release`), after which a fresh submission admits a new run.
     pub const LIVE_RUN: &str = "submission.live_run";
+    /// The submission committed no `armed` supervision authorization (issue
+    /// #261): a re-drive refuses the whole control typed BEFORE any item is
+    /// admitted — it never creates a run nothing can drive — and names the
+    /// missing authorization. The parked items keep their hold; the remedy is
+    /// a fresh submission presented with `--supervise arm`.
+    pub const SUPERVISION_UNARMED: &str = "refusal.queue.supervision_unarmed";
 }
 
 /// A typed submission error/refusal (fail closed; stable codes).

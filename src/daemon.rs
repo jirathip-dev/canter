@@ -633,6 +633,7 @@ fn dispatch(shared: &Arc<Shared>, request: &Request) -> String {
         "run.dispatch" => method_run_dispatch(shared, request),
         "run.status" => method_run_status(shared, request),
         "supervision.status" => method_supervision_status(shared, request),
+        "supervision.arm" => method_supervision_arm(shared, request),
         "schedules.list" => method_schedules(shared, request),
         "schedules.create" => method_schedule_create(shared, request),
         "schedules.pause" => method_schedule_pause(shared, request),
@@ -6442,6 +6443,57 @@ fn method_run_status(shared: &Arc<Shared>, request: &Request) -> String {
 /// with its reason, the observed meaningful-progress marker and the folded
 /// pending wake. No claim, no journal write, and NO marker movement: a read
 /// (or a rendered status) is never progress (issue #95 AC2/AC7).
+/// `supervision.arm` (issue #261): arm exactly ONE already-admitted run that
+/// carries no arming authorization — the bounded operator control that
+/// recovers an inert run without release-and-resubmit. The authorization is
+/// the exact one the run's OWN committed submission presented; nothing else
+/// is invented, and the arm commits in ONE transaction with its
+/// hash-chained audit row. A terminal run, an already-armed run, a run no
+/// submission admitted and a submission that committed no `armed`
+/// authorization all refuse typed.
+fn method_supervision_arm(shared: &Arc<Shared>, request: &Request) -> String {
+    let Some(params) = request.params.as_ref() else {
+        return err_response(
+            &request.id,
+            "refusal.malformed",
+            "supervision.arm requires params: idempotency_key, instance_id",
+        );
+    };
+    let (instance_id, _) = match crate::supervision::parse_arm_params(params) {
+        Ok(parsed) => parsed,
+        Err(err) => return err_response(&request.id, err.code, err.message),
+    };
+    let target = format!("run:{instance_id}");
+    let key = match journal_mutation(shared, request, "mutate.supervision.arm", &target) {
+        Intent::Claimed { key } => key,
+        Intent::Replay { response } => return replay(shared, &response),
+        Intent::Refused { code, message } => return err_response(&request.id, code, &message),
+    };
+    crash_point("supervision.arm.after-intent");
+    let outcome = (|| -> Result<Val, (&'static str, String)> {
+        let state = shared
+            .lock_state()
+            .map_err(|message| ("state.unavailable", message))?;
+        let at = time::rfc3339_now();
+        let armed = state
+            .arm_admitted_run(&instance_id, &key, &at)
+            .map_err(|err| (err.code, err.message))?;
+        Ok(crate::supervision::arm_doc(&armed, &at, &key))
+    })();
+    match outcome {
+        Ok(doc) => finish_mutation(shared, request, &key, "supervision.arm", true, doc, None),
+        Err((code, message)) => finish_mutation(
+            shared,
+            request,
+            &key,
+            "supervision.arm",
+            false,
+            null(),
+            Some((code, message)),
+        ),
+    }
+}
+
 fn method_supervision_status(shared: &Arc<Shared>, request: &Request) -> String {
     let Some(params) = request.params.as_ref() else {
         return err_response(
@@ -6459,13 +6511,44 @@ fn method_supervision_status(shared: &Arc<Shared>, request: &Request) -> String 
             let row = match state.supervision_by_id(&instance_id) {
                 Ok(Some(row)) => row,
                 Ok(None) => {
-                    return err_response(
+                    // Issue #261 AC4: an ADMITTED run with no supervision row
+                    // at all is a readable state — "admitted, unarmed, nothing
+                    // will drive it" — and not a bare not-found: a cap refusal
+                    // must never be the only symptom. A run nobody admitted,
+                    // a terminal run and an unknown run keep `state.not_found`.
+                    let run = match state.instance_by_id(&instance_id) {
+                        Ok(run) => run,
+                        Err(err) => return err_response(&request.id, err.code, err.message),
+                    };
+                    let Some(run) = run else {
+                        return err_response(
+                            &request.id,
+                            "state.not_found",
+                            format!("no run {instance_id:?} exists"),
+                        );
+                    };
+                    let submission = match state.admitted_submission_of(&instance_id) {
+                        Ok(submission) => submission,
+                        Err(err) => return err_response(&request.id, err.code, err.message),
+                    };
+                    if submission.is_none() {
+                        return err_response(
+                            &request.id,
+                            "state.not_found",
+                            format!(
+                                "run {instance_id:?} was not admitted by a committed queue \
+                                 submission (supervision is disabled by default and is armed \
+                                 only by an explicit authorization committed with the run's \
+                                 submission)"
+                            ),
+                        );
+                    }
+                    return ok_response(
                         &request.id,
-                        "state.not_found",
-                        format!(
-                            "no supervision exists for run {instance_id:?} (supervision is \
-                             disabled by default and is armed only by an explicit authorization \
-                             committed with the run's submission)"
+                        crate::supervision::unarmed_doc(
+                            &run,
+                            submission.as_deref(),
+                            &time::rfc3339_now(),
                         ),
                     );
                 }
