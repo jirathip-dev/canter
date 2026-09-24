@@ -24,9 +24,8 @@ use canter::state::{
     SupervisionAuthorizationPlan, SupervisionRow,
 };
 use canter::supervision::{
-    PASS_DEADLINE_SECS,
-    DispatchIntent, SupervisedDispatch, SupervisorHandle, SupervisorOptions, SupervisorWake, codes,
-    start,
+    DispatchIntent, PASS_DEADLINE_SECS, SupervisedDispatch, SupervisorHandle, SupervisorOptions,
+    SupervisorWake, codes, start,
 };
 use canter::value::{Val, integer, object, string};
 
