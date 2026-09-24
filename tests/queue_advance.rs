@@ -2888,6 +2888,639 @@ fn the_supervisor_itself_drives_the_committed_merge_and_cleanup_to_the_last_step
 }
 
 // ---------------------------------------------------------------------------
+// Issue #272: a fix round's delivered head is re-bound by the run's OWN
+// machinery — the bounded re-collect of the repair leg's checkout and its own
+// review re-entry — with ZERO operator step-dispatches
+// ---------------------------------------------------------------------------
+
+/// The fake reviewer harness of the fix-rebind witness: it plays the run's
+/// reviewer leg and its verdict is HEAD-AWARE — it records `fail` at the head
+/// the run's evidence already stands at (the recorded pre-fix head, written
+/// into its own read-back file by the witness), and `pass` at any OTHER head
+/// the brief names.
+///
+/// That is what makes the witness discriminating: the run can only reach its
+/// tail if the review really re-entered at the head its own handoff delivered,
+/// because a re-review of the unchanged head records the SAME FAIL.
+fn write_fake_head_aware_reviewer(fixture: &DaemonFixture) -> PathBuf {
+    let bin = fixture.dir.join("fakebin");
+    std::fs::create_dir_all(&bin).expect("fake bin dir");
+    let path = bin.join("hermes");
+    std::fs::write(
+        &path,
+        r#"#!/bin/sh
+set -eu
+PATH=/usr/bin:/bin
+export PATH
+last=""
+for arg in "$@"; do last="$arg"; done
+flat=$(printf '%s' "$last" | tr -d '\n')
+verdict_path=$(printf '%s' "$flat" | sed -n 's/.*"\([^"]*\.json\)".*/\1/p')
+test -n "$verdict_path"
+head=$(printf '%s' "$flat" | sed -n 's/.*"feature_head":"\([0-9a-f]\{40\}\)".*/\1/p')
+base=$(printf '%s' "$flat" | sed -n 's/.*"integration_base":"\([0-9a-f]\{40\}\)".*/\1/p')
+test -n "$head"
+test -n "$base"
+test -f "$HOME/reviewed-head"
+printf '%s\n' "$head" >> "$HOME/review-heads.txt"
+mkdir -p "$(dirname "$verdict_path")"
+if [ "$head" = "$(cat "$HOME/reviewed-head")" ]; then
+  verdict=fail
+  checks='[{"name":"exact-head-review","status":"failed"}]'
+else
+  verdict=pass
+  checks='[{"name":"exact-head-review","status":"passed"}]'
+fi
+printf '%s' "{\"schema\":\"hf-evidence/v1\",\"feature_head\":\"$head\",\"integration_base\":\"$base\",\"verdict\":\"$verdict\",\"checks\":$checks}" > "$verdict_path"
+"#,
+    )
+    .expect("write fake reviewer");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("chmod");
+    }
+    bin
+}
+
+/// The repair leg's OWN lane checkout of the fix-rebind witness — the
+/// `(role, round)` derivation the engine creates it by, never a literal.
+fn fix_rebind_lane(fixture: &DaemonFixture) -> PathBuf {
+    fixture
+        .dir
+        .join("worktrees")
+        .join(canter::lane::lane_checkout(5, "implementer", 2))
+}
+
+/// The committed spine of the fix-rebind witness: the run's own read step, the
+/// harness step that binds its implementer session, its OWN collection, the
+/// self-dispatching review step, and the committed merge TAIL the run may only
+/// reach behind a verified delivery.
+fn fix_rebind_spine() -> Vec<qp::PlannedStep> {
+    let mut steps = self_dispatch_spine();
+    steps.push(qp::PlannedStep {
+        id: "m1".to_string(),
+        kind: "merge".to_string(),
+        params: Some(object(vec![
+            ("branch", string("issue-5")),
+            ("merge_policy", string("squash")),
+        ])),
+    });
+    steps
+}
+
+/// Record ONE `apply` claim of a run with the run's OWN dispatch material
+/// (topology + admission) and its recorded RESULT, through the same durable
+/// writers the apply path uses — the handoff facts `run_control`'s own
+/// witnesses read back (`seed_fix_round_response`).
+///
+/// This is the ONLY place the witness stands in for an effect: the fix round's
+/// own prompt cannot be delivered in a HEADLESS lane (the fix leg inherits the
+/// implementer leg's profile, which carries no provider/model pair outside its
+/// own `harness_start` dispatch), so the handoff it produces is recorded here
+/// and everything the run does with it is the real machinery.
+fn seed_fix_handoff_row(
+    fixture: &DaemonFixture,
+    state: &State,
+    run: &str,
+    step: &str,
+    kind: &str,
+    seed: u64,
+    result: Val,
+) -> String {
+    let key = idem_key(&format!("seeded-{step}-{seed}"));
+    let steps: Vec<Val> = fix_rebind_spine()
+        .iter()
+        .map(|step| object(vec![("id", string(&step.id)), ("kind", string(&step.kind))]))
+        .collect();
+    let line = canter::canonical::canonical_text(&object(vec![
+        ("schema", string("hf-rpc-request/v1")),
+        ("id", string(&format!("seeded-{seed}"))),
+        ("method", string("apply")),
+        (
+            "params",
+            object(vec![
+                ("idempotency_key", string(&key)),
+                ("instance_id", string(run)),
+                ("step", string(step)),
+                (
+                    "plan",
+                    object(vec![
+                        ("steps", Val::Arr(steps)),
+                        ("repository", string(REPO)),
+                    ]),
+                ),
+                (
+                    "topology",
+                    dispatch_bundle(fixture)
+                        .get("topology")
+                        .cloned()
+                        .unwrap_or(Val::Null),
+                ),
+                (
+                    "flags",
+                    object(vec![(
+                        "admission",
+                        dispatch_bundle(fixture)
+                            .get("admission")
+                            .cloned()
+                            .unwrap_or(Val::Null),
+                    )]),
+                ),
+            ]),
+        ),
+    ]));
+    let (claim, _) = state
+        .journal_intent(
+            &format!("mutate.{kind}"),
+            &format!("{REPO}:{run}:{step}"),
+            &key,
+            &format!("request-{seed:016x}"),
+            "apply",
+            None,
+            None,
+            &line,
+        )
+        .expect("step intent");
+    assert!(
+        matches!(claim, canter::state::ClaimAttempt::Claimed),
+        "the seeded claim must be fresh: {claim:?}"
+    );
+    let outcome = canter::canonical::canonical_text(&object(vec![("status", string("succeeded"))]));
+    let response = canter::canonical::canonical_text(&object(vec![
+        ("ok", canter::value::bool_(true)),
+        ("result", result),
+    ]));
+    state
+        .resolve_run_step_claim(
+            &key,
+            "apply",
+            &outcome,
+            &response,
+            run,
+            step,
+            &canter::time::rfc3339_now(),
+        )
+        .expect("step outcome");
+    key
+}
+
+/// Every durable `apply` claim of ONE run, `(key, request_line)`, in claim
+/// order — the ledger a dispatch witness reads read-only.
+fn apply_claims(db: &Path, run: &str) -> Vec<(String, String)> {
+    let conn =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("read-only connection");
+    let mut statement = conn
+        .prepare("SELECT key, request_line FROM idempotency WHERE method = 'apply' ORDER BY rowid")
+        .expect("prepare apply read");
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .expect("read apply rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("apply rows");
+    rows.into_iter()
+        .filter(|(_, line)| line.contains(run))
+        .collect()
+}
+
+/// Every hash-chained journal record of ONE run, `(action, target)`, oldest
+/// first — the audit rows a control witness cites.
+fn audit_rows(db: &Path, run: &str) -> Vec<(String, String)> {
+    let conn =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("read-only connection");
+    let mut statement = conn
+        .prepare("SELECT action, target FROM audit ORDER BY seq")
+        .expect("prepare audit read");
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .expect("read audit rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("audit rows");
+    rows.into_iter()
+        .filter(|(_, target)| target.contains(run))
+        .collect()
+}
+
+/// Issue #272 (AC1–AC4). A run whose own fix round delivered a moved head
+/// re-enters review AT THAT HEAD and advances to its committed tail through the
+/// run's OWN machinery: the driver re-collects the repair leg's own recorded
+/// checkout — the certificate binding is re-established by the run's own
+/// collection — the review re-entry runs on the run's own bounded
+/// re-evaluation, the head-aware reviewer's PASS is RECORDED, and the merge
+/// tail is dispatched. No operator step is dispatched anywhere: every `apply`
+/// claim of the run is the driver's own.
+///
+/// The reviewer is head-aware on purpose: it records the SAME `fail` at the
+/// head the run's evidence already stands at, so a re-review of an unchanged
+/// head can never complete the run.
+#[test]
+fn a_fix_rounds_delivered_head_is_re_bound_by_the_runs_own_machinery() {
+    let fixture = DaemonFixture::new("fix-rebind");
+    let base = repos_with_lane_branch(&fixture);
+    let repo = fixture.dir.join("repo");
+    let lane = fixture.dir.join("worktrees/issues-5");
+    std::fs::write(lane.join("delivered.txt"), "the reviewed delivery\n").expect("write");
+    git(&lane, &["add", "delivered.txt"]);
+    git(
+        &lane,
+        &["commit", "-q", "-m", "the lane delivery (synthetic)"],
+    );
+    let reviewed = git(&lane, &["rev-parse", "HEAD"]);
+    assert_ne!(reviewed, base, "the lane delivered content");
+    // The repair leg's OWN checkout (issue #256): the engine creates it as a
+    // DETACHED `worktree add` at the certified head, and the leg lands its
+    // repair there — the state the run's own collector re-observes.
+    let fix_lane = fix_rebind_lane(&fixture);
+    let repair_branch = canter::lane::lane_checkout(5, "implementer", 2);
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            &fix_lane.display().to_string(),
+            &reviewed,
+        ],
+    );
+    git(&fix_lane, &["checkout", "-q", "-b", &repair_branch]);
+    std::fs::write(fix_lane.join("repair.txt"), "the repair\n").expect("write repair");
+    git(&fix_lane, &["add", "repair.txt"]);
+    git(
+        &fix_lane,
+        &["commit", "-q", "-m", "the fix leg's repair (synthetic)"],
+    );
+    let delivered = git(&fix_lane, &["rev-parse", "HEAD"]);
+    assert_ne!(delivered, reviewed, "the repair leg delivered a moved head");
+    // The repair reached the run's OWN feature branch — the instruction asks
+    // the leg to push it there, and the push is a fast-forward: the run's lane
+    // checkout holds the delivered head, which is the head a review re-enters
+    // at (a reviewer is never started on a moved checkout).
+    git(&lane, &["merge", "--ff-only", &delivered]);
+    assert_eq!(
+        git(&lane, &["rev-parse", "HEAD"]),
+        delivered,
+        "the delivered head is on the run's own feature branch"
+    );
+    // The reviewer's own read-back file: the head its recorded FAIL stands at.
+    std::fs::write(fixture.dir.join("reviewed-head"), &reviewed).expect("reviewed head");
+    let fakebin = write_fake_head_aware_reviewer(&fixture);
+
+    // Admission and the recorded rows of the FAIL handoff — written through the
+    // production writers BEFORE the daemon serves the run, so the driver's own
+    // boot reconciliation starts from exactly this recorded evidence.
+    let run = {
+        let state = fixture.seed();
+        let caps_for_tail = tail_boundary_caps();
+        let tail_caps: Vec<&str> = caps_for_tail.iter().map(|cap| cap.as_str()).collect();
+        seed_grant_with_caps(&state, "gr_0000000000000005", 5, &tail_caps);
+        let mut request = request_with(vec![selected("#5", &[])]);
+        request.steps = fix_rebind_spine();
+        request.boundary.caps = tail_boundary_caps();
+        let (bound, digest) = render_bound(&state, &request);
+        let material = qx::parse_params(&submit_params_doc(
+            &idem_key("fix-rebind-submit"),
+            &bound,
+            &digest,
+            &[("#5", "gr_0000000000000005")],
+            ConcurrencyCaps {
+                global: 4,
+                per_repository: 2,
+                per_harness: 2,
+            },
+            5,
+            60,
+        ))
+        .expect("params parse");
+        let revalidated = qx::revalidate(&state, &material).expect("revalidate");
+        let submission_id = qx::submission_id(&material.digest, &material.idempotency_key);
+        let plan = QueueSubmissionPlan {
+            submission_id,
+            repository: revalidated.request.repository.clone(),
+            state_epoch: material.epoch,
+            digest: material.digest.clone(),
+            role_key: revalidated.request.harness_key.clone(),
+            role_revision: material.role_revision.clone(),
+            workflow_id: revalidated.request.workflow_id.clone(),
+            workflow_hash: revalidated.request.workflow_hash.clone(),
+            boundary_phase: revalidated.request.boundary.phase.clone(),
+            integration_branch: revalidated.request.boundary.integration_branch.clone(),
+            completion_branch: revalidated.request.boundary.completion_branch.clone(),
+            boundary_caps: revalidated.request.boundary.caps.clone(),
+            request_line: canter::canonical::canonical_text(
+                &revalidated
+                    .preview
+                    .doc
+                    .get("request")
+                    .cloned()
+                    .unwrap_or_else(|| material.preview.clone()),
+            ),
+            admission_caps: material.caps,
+            harness_lanes: material.harness_lanes,
+            supervision: material.supervision.as_ref().map(|authorization| {
+                canter::state::SupervisionAuthorizationPlan {
+                    desired: authorization.desired.clone(),
+                    check_interval_secs: authorization.policy.check_interval_secs,
+                    progress_timeout_secs: authorization.policy.progress_timeout_secs,
+                }
+            }),
+            items: revalidated
+                .items
+                .iter()
+                .enumerate()
+                .map(|(ordinal, item)| canter::state::QueueSubmissionItemPlan {
+                    ordinal: ordinal as i64,
+                    work_item: item.work_item.clone(),
+                    issue_number: item.issue_number,
+                    issue_revision: item.revision.clone(),
+                    grant_id: item.grant_id.clone(),
+                    resume_digest: item.resume_digest.clone(),
+                    verdict: item.verdict.clone(),
+                })
+                .collect(),
+            at: canter::time::rfc3339_now(),
+        };
+        let (_, items) = state.submit_queue_run(&plan).expect("submit");
+        let run = item_of(&items, 5)
+            .instance_id
+            .clone()
+            .expect("issue 5 admitted");
+        // The run's OWN collection certified the reviewed head.
+        seed_fix_handoff_row(
+            &fixture,
+            &state,
+            &run,
+            "p1",
+            "checkout",
+            1,
+            object(vec![("integration_base", string(&base))]),
+        );
+        seed_fix_handoff_row(
+            &fixture,
+            &state,
+            &run,
+            "s1",
+            "harness_start",
+            2,
+            object(vec![("session_id", string(&run))]),
+        );
+        seed_fix_handoff_row(
+            &fixture,
+            &state,
+            &run,
+            "o1",
+            "collect_outcome",
+            3,
+            object(vec![
+                ("head", string(&reviewed)),
+                ("base_head", string(&base)),
+                ("branch", string("issue-5")),
+                ("commits", Val::Arr(vec![string(&reviewed)])),
+                ("changed_files", Val::Arr(vec![string("delivered.txt")])),
+            ]),
+        );
+        // The recorded FAIL the review step handed to the run's own fix round
+        // (issue #238/#256): the round, its lane and the leg's OWN checkout.
+        seed_fix_handoff_row(
+            &fixture,
+            &state,
+            &run,
+            "r1",
+            "review_evidence",
+            4,
+            object(vec![
+                ("feature_head", string(&reviewed)),
+                ("integration_base", string(&base)),
+                ("verdict", string("fail")),
+                (
+                    "checks",
+                    Val::Arr(vec![object(vec![
+                        ("name", string("exact-head-review")),
+                        ("status", string("failed")),
+                    ])]),
+                ),
+                (
+                    "fix_round",
+                    object(vec![
+                        ("schema", string("hf-fix-round/v1")),
+                        ("round", integer(1)),
+                        ("bound", integer(canter::mutation::FIX_ROUNDS_MAX as i64)),
+                        ("feature_head", string(&reviewed)),
+                        ("lane", string("lane-0123456789abcdef")),
+                        ("agent", string("")),
+                        ("workspace", string("")),
+                        ("pane", string("")),
+                        ("worktree", string(&repair_branch)),
+                        ("delivery_attempts", integer(1)),
+                    ]),
+                ),
+            ]),
+        );
+        state
+            .record_evidence(
+                &run,
+                REPO,
+                &reviewed,
+                &base,
+                WORKFLOW_HASH,
+                POLICY_HASH,
+                "fail",
+                "lane-reviewer",
+                &Val::Arr(vec![object(vec![
+                    ("name", string("exact-head-review")),
+                    ("status", string("failed")),
+                ])]),
+            )
+            .expect("record the FAIL evidence");
+        run
+    };
+
+    // The BEFORE read: the run's own evidence stands at the reviewed head, its
+    // collection certified exactly that head, and the merge tail is unachieved.
+    let state = fixture.seed();
+    let before = state
+        .run_delivery_certificate(&run)
+        .expect("certificate read")
+        .expect("certified");
+    assert_eq!(before.head, reviewed, "{before:?}");
+
+    // From here on NO client dispatch of any step happens: the daemon's own
+    // boot reconciliation serves the armed run.
+    let daemon = fixture.spawn_with_path(&fakebin);
+    wait_ready(&fixture);
+    let mut timeline: Vec<String> = Vec::new();
+    let mut id = 700u64;
+    let started = Instant::now();
+    let mut last_progress = started;
+    let mut progress = String::new();
+    let mut settled;
+    loop {
+        id += 1;
+        let (status, step, kind, attempts) = cursor_sample(&fixture.socket, &run, id);
+        timeline.push(format!(
+            "t{} status={status} next={step}/{kind} attempts={attempts:?}",
+            id - 700
+        ));
+        // The driver's own acts, read from the run's live surfaces: the
+        // certificate moved to the DELIVERED head and the reviewer recorded its
+        // verdict there, so the run's own delivery is verified again.
+        let sample_state = fixture.seed();
+        let certificate = sample_state
+            .run_delivery_certificate(&run)
+            .expect("certificate read");
+        let evidence = sample_state
+            .evidence_for_instance(&run)
+            .expect("evidence read");
+        let recorded = evidence.first().cloned();
+        settled = attempts.clone();
+        if let (Some(certificate), Some(recorded)) = (&certificate, &recorded)
+            && certificate.head == delivered
+            && recorded.feature_head == delivered
+            && recorded.verdict == "pass"
+        {
+            break;
+        }
+        let observed = format!("{status}/{step}/{kind}/{attempts:?}");
+        if observed != progress {
+            progress = observed;
+            last_progress = Instant::now();
+        }
+        let stalled = last_progress.elapsed().as_secs();
+        assert!(
+            stalled < NO_PROGRESS_SECS,
+            "the run never re-bound its fix delivery: no progress for {stalled}s of {}s waited; \
+             observed: {timeline:?}",
+            started.elapsed().as_secs()
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    eprintln!("FIX_REBIND_TIMELINE={timeline:?}");
+    // The loop above only leaves once the run's own machinery re-bound the
+    // delivery: the certificate and the recorded verdict both name it.
+
+    // (2) AC2: the binding was re-established by the run's OWN collection — the
+    //     delivered head is what the run's own collector observed, at the LEG's
+    //     own checkout.
+    let certificate = state
+        .run_delivery_certificate(&run)
+        .expect("certificate read")
+        .expect("the run's own collection certified a delivery");
+    assert_eq!(
+        certificate.head, delivered,
+        "the run's own collection certified the head its handoff delivered: {certificate:?}"
+    );
+    assert_eq!(certificate.step_id, "o1", "the run's own collector step");
+
+    // (3) AC4: the reviewer's verdict IS recorded at the delivered head, so the
+    //     run's durable evidence no longer reads `FAIL at the pre-fix head`
+    //     while a later PASS sits on disk.
+    let evidence = state.evidence_for_instance(&run).expect("evidence read");
+    let newest = evidence.first().expect("the re-entry recorded evidence");
+    assert_eq!(
+        newest.feature_head, delivered,
+        "the recorded verdict names the delivered head: {newest:?}"
+    );
+    assert_eq!(newest.verdict, "pass", "{newest:?}");
+
+    // (4) AC1: the audit rows of the whole path, read from the run's own
+    //     durable ledger and hash-chained journal. The collector was dispatched
+    //     TWICE (the run's own collection, then the re-collect of the repair
+    //     leg's checkout, which is the row that moved the certificate), the
+    //     review re-entry is the run's own bounded, attributed re-evaluation,
+    //     and every `apply` claim is the DRIVER's own key — no operator
+    //     step-dispatch exists anywhere.
+    let claims = apply_claims(&fixture.db(), &run);
+    let collects: Vec<&(String, String)> = claims
+        .iter()
+        .filter(|(_, line)| line.contains(r#""step":"o1""#))
+        .collect();
+    assert_eq!(
+        collects.len(),
+        2,
+        "the seeded collection and the driver's own re-collect are the only ones: {collects:?}"
+    );
+    let recollect = collects.last().expect("the re-collect row").1.clone();
+    assert!(
+        recollect.contains(&repair_branch),
+        "the re-collect observed the repair leg's OWN checkout: {recollect}"
+    );
+    // The driver's own dispatch keys are `<run>-<step>-<second>`; the run's own
+    // re-evaluation re-dispatches on its fresh lane round under the same
+    // run identity. Nothing else dispatches a step of this run.
+    let run_tail = run.trim_start_matches("run-");
+    for (key, _) in claims.iter().skip(4) {
+        assert!(
+            key.starts_with(&format!("ik_{run}-")) || key.starts_with(&format!("ik_{run_tail}-")),
+            "every dispatch after the seeded handoff is the driver's own (no operator \
+             dispatch): {key:?}\n{claims:?}"
+        );
+    }
+    let reviews: Vec<&(String, String)> = claims
+        .iter()
+        .filter(|(_, line)| line.contains(r#""step":"r1""#))
+        .collect();
+    assert!(
+        reviews.len() >= 2,
+        "the review was re-dispatched for the delivered head: {reviews:?}"
+    );
+    let audit = audit_rows(&fixture.db(), &run);
+    let recollects = audit
+        .iter()
+        .filter(|(action, target)| action == "mutate.collect_outcome" && target.contains(":o1"))
+        .count();
+    assert_eq!(
+        recollects, 2,
+        "the re-collect is journaled like every other apply: {audit:?}"
+    );
+    let reevaluations = audit
+        .iter()
+        .filter(|(action, _)| action == "mutate.run.reevaluate")
+        .count();
+    assert_eq!(
+        reevaluations, 1,
+        "the review re-entry is the run's own bounded, recorded control: {audit:?}"
+    );
+
+    // (5) The run ADVANCED to its committed tail by the driver's own acts, and
+    //     the daemon's own log names them.
+    let log = std::fs::read_to_string(fixture.daemon_log()).unwrap_or_default();
+    assert!(
+        log.contains("dispatched step o1"),
+        "the driver dispatched the re-collect itself:\n{log}"
+    );
+    assert!(
+        log.contains("re-evaluated step r1"),
+        "the driver drove the review re-entry through the run's own control:\n{log}"
+    );
+    assert!(
+        !log.contains("step o1: refusal."),
+        "the re-collect was never refused:\n{log}"
+    );
+    assert!(
+        settled
+            .iter()
+            .any(|(step, status)| step == "r1" && status == "succeeded"),
+        "the review step is achieved at the delivered head: {settled:?}"
+    );
+    let socket = fixture.socket.clone();
+    shutdown(daemon);
+    assert!(
+        !matches!(
+            canter::lock::socket_presence(&socket),
+            canter::lock::SocketPresence::Active
+        ),
+        "the witness's own daemon is gone"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The supervised committed-tail dispatch capability (issue #152, supervisor
 // half): typed and closed, never a blanket allow-list entry
 // ---------------------------------------------------------------------------
@@ -2993,6 +3626,7 @@ fn the_supervisor_dispatch_capability_for_the_committed_tail_is_typed_and_closed
             fix_round: None,
             fix_leg: None,
             reevaluations: Vec::new(),
+            delivery: None,
         }
     }
 
@@ -3258,6 +3892,7 @@ fn only_a_reviewed_pass_with_green_checks_at_the_run_pins_is_a_delivery() {
             fix_round: None,
             fix_leg: None,
             reevaluations: Vec::new(),
+            delivery: None,
         }
     }
     let green = r#"[{"name":"hosted-ci","status":"passed"}]"#;

@@ -1650,11 +1650,49 @@ impl DaemonDispatch {
         if intent.reason == crate::supervision::codes::REEVALUATION {
             return self.apply_reevaluation(shared, intent, &key, now_unix);
         }
+        // Issue #272: the re-collect of the run's own fix delivery presents
+        // the collector's own committed inputs with the repair leg's recorded
+        // checkout as the worktree the collection observes. A handoff that
+        // cannot be read back names no head to collect: the refusal is
+        // recorded against the run and nothing is dispatched, never a guessed
+        // path.
+        let recollection = if intent.reason == crate::supervision::codes::RECOLLECT {
+            match recollect_step_params(shared, &intent.instance_id, &intent.step_id) {
+                Ok(params) => Some(params),
+                Err(message) => {
+                    record_unclaimed_dispatch_refusal(
+                        shared,
+                        &intent.instance_id,
+                        &intent.step_id,
+                        refusal_code_of(&message),
+                        &message,
+                        &key,
+                    );
+                    shared.log.write(
+                        "warn",
+                        "supervision.dispatch_refused",
+                        &format!(
+                            "run {} step {}: {message}",
+                            intent.instance_id, intent.step_id
+                        ),
+                    );
+                    self.note_refused(
+                        &intent.instance_id,
+                        &intent.step_id,
+                        supervision_interval_secs(shared, &intent.instance_id),
+                        now_unix,
+                    );
+                    return Err(message);
+                }
+            }
+        } else {
+            None
+        };
         let request = match build_dispatch_request(
             shared,
             &intent.instance_id,
             &intent.step_id,
-            None,
+            recollection.as_ref(),
             &key,
         ) {
             Ok(request) => request,
@@ -2189,6 +2227,65 @@ fn bind_delivered_review_head(shared: &Arc<Shared>, instance_id: &str, head: &mu
     {
         *head = Some(delivered);
     }
+}
+
+/// The step params of ONE re-collect (issue #272): the run's own committed
+/// collector step's params, with the worktree the collection OBSERVES replaced
+/// by the repair leg's own recorded lane checkout — the only recorded state
+/// that names the head the handoff delivered.
+///
+/// The committed `branch` binding is dropped: the repair leg's checkout is the
+/// engine's OWN `git worktree add --detach` checkout (a fresh branch cannot be
+/// attached while the run's feature branch is checked out in the implementer
+/// lane), so a branch pinned from the run's plan could never be the branch that
+/// checkout holds. The collection observes the branch the leg's work left it
+/// on, and a checkout left with no branch refuses typed — a branch is never
+/// fabricated for it. Everything else (the run's own collection base,
+/// `requires_delta`) stays the committed step's own binding: the re-collect is
+/// the same collection over the repair leg's checkout and nothing is invented.
+/// A handoff whose recorded checkout cannot be read back names no head to
+/// collect, and the dispatch refuses typed rather than collecting a guessed
+/// path.
+fn recollect_step_params(
+    shared: &Arc<Shared>,
+    instance_id: &str,
+    step_id: &str,
+) -> Result<Val, String> {
+    let (committed, worktree) = {
+        let state = shared.lock_state()?;
+        let material = read_dispatch_material(&state, instance_id, None)
+            .map_err(|(code, message)| format!("{code}: {message}"))?;
+        let committed = material
+            .steps
+            .iter()
+            .find(|step| step.get("id").and_then(Val::as_str) == Some(step_id))
+            .and_then(|step| step.get("params"))
+            .cloned();
+        let worktree = state
+            .supervision_evidence(instance_id)
+            .ok()
+            .flatten()
+            .and_then(|evidence| evidence.fix_round.map(|fix| fix.worktree))
+            .unwrap_or_default();
+        (committed, worktree)
+    };
+    if worktree.is_empty() {
+        return Err(format!(
+            "{}: the recorded fix-round handoff of run {instance_id} names no lane checkout, so \
+             the head it delivered cannot be collected",
+            crate::mutation::code::FIX_UNBOUND
+        ));
+    }
+    let Some(Val::Obj(mut params)) = merged_step_params(committed.as_ref(), None) else {
+        return Err(format!(
+            "{}: step {step_id:?} of run {instance_id} declares no params; a re-collect presents \
+             the collection's own inputs",
+            crate::mutation::code::FIX_UNBOUND
+        ));
+    };
+    params.remove("branch");
+    params.insert("worktree".to_string(), string(&worktree));
+    Ok(Val::Obj(params))
 }
 
 /// Build the `apply` request one committed-spine dispatch presents (issue #92
@@ -3033,6 +3130,15 @@ fn method_apply_from(shared: &Arc<Shared>, request: &Request, supervised: bool) 
                 let Some(evidence) = state.supervision_evidence(&parsed.instance_id)? else {
                     return Ok(false);
                 };
+                // Issue #272: the driver derives its one continuation from the
+                // repair leg's OWN observable checkout (the observed delivery
+                // of its fix round), so the SAME read is taken here before the
+                // intent is re-derived: a dispatch the driver derived is never
+                // refused for a fact the driver read.
+                let mut evidence = evidence;
+                let worktrees_root =
+                    crate::supervision::recorded_worktrees_root(&state, &parsed.instance_id);
+                crate::supervision::observe_fix_leg(&mut evidence, worktrees_root.as_deref());
                 // Issue #184: only a DIAGNOSED step attempt reserves and
                 // consumes supervision's own bounded retry. A recorded
                 // refusal of the run's OWN lapsed window is not a step
@@ -3042,14 +3148,26 @@ fn method_apply_from(shared: &Arc<Shared>, request: &Request, supervised: bool) 
                 // re-dispatch it authorized, instead of refusing it
                 // `refusal.run.retry_pending`; a consumed authorization is
                 // spent exactly once (the row is single use).
+                // Issue #272: the driver's re-collect of the run's own fix
+                // delivery is a re-dispatch of a step that already SUCCEEDED,
+                // so no attempt diagnoses it; it is counted against the same
+                // per-(run, step) budget, which is what bounds how many times
+                // the collector may be re-dispatched. It is the ONE
+                // non-diagnosed re-dispatch that spends a bounded
+                // authorization, and only while the driven intent is that
+                // re-collect.
+                let driven = crate::supervision::dispatch_intent(&row, &evidence);
                 automatic_retry = evidence.attempts.iter().any(|(step, status, code)| {
                     step == &parsed.step && crate::state::step_attempt_diagnosed(status, code)
                 }) || evidence
                     .retries
                     .iter()
-                    .any(|retry| retry.step_id == parsed.step && retry.consumed_at.is_empty());
-                Ok(crate::supervision::dispatch_intent(&row, &evidence)
-                    .is_some_and(|intent| intent.step_id == parsed.step))
+                    .any(|retry| retry.step_id == parsed.step && retry.consumed_at.is_empty())
+                    || driven.as_ref().is_some_and(|intent| {
+                        intent.reason == crate::supervision::codes::RECOLLECT
+                            && intent.step_id == parsed.step
+                    });
+                Ok(driven.is_some_and(|intent| intent.step_id == parsed.step))
             })();
             match eligible {
                 Ok(true) => {}

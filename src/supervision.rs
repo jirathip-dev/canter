@@ -439,6 +439,18 @@ pub mod codes {
     /// The tail behind the unverified delivery is still never driven and the
     /// run is still never reported eligible.
     pub const REEVALUATION: &str = "supervision.reevaluation.next_round";
+    /// The run's own fix round has delivered a MOVED head that its own
+    /// collection never observed (issue #272), so the ONE continuation is a
+    /// bounded RE-COLLECT of the repair leg's own lane checkout through the
+    /// run's own collector step. Nothing else may be derived while the run's
+    /// certified delivery does not name the head its own handoff delivered:
+    /// a review re-entry would consume a head no collection observed (the
+    /// engine refuses it typed), and the tail behind the delivery is never
+    /// driven on an uncertified head. The re-collect is journaled (the
+    /// ordinary `apply` record of the run's own collection step) and counted
+    /// against the run's shared per-(run, step) bounded-dispatch budget
+    /// ([`crate::state::RUN_RETRY_MAX`]).
+    pub const RECOLLECT: &str = "supervision.recollect.fix_delivery";
     /// The next unachieved step is the run's own verified-delivery consumer
     /// (a committed `merge` / `cleanup` tail step) and the driver may not
     /// dispatch it because the run's newest recorded review evidence is a
@@ -1000,6 +1012,14 @@ pub fn dispatch_intent(
     if evidence.in_flight.is_some() {
         return None;
     }
+    // Issue #272: the run's own fix round delivered a moved head its own
+    // collection never observed. The ONE continuation is the bounded
+    // re-collect of the repair leg's checkout — nothing else is derived while
+    // that holds (the review would consume an uncollected head and refuse it
+    // typed, and the tail is never driven behind an uncertified delivery).
+    if let Some(intent) = fix_recollect_intent(evidence) {
+        return Some(intent);
+    }
     let (step_id, kind) = next_unachieved_step(evidence)?;
     if !driver_dispatchable_kind(evidence, &step_id, &kind) {
         // Issue #243: the driver may not drive THIS frontier, but when the
@@ -1061,7 +1081,14 @@ pub fn dispatch_intent(
                 // the moved head: the frontier parks typed with the bounded
                 // retries UNSPENT, and the run is never presented as a step
                 // that could still be retried into consumption.
-                && newest_verdict(evidence) != "fail"
+                //
+                // Issue #272: that remedy is reachable now, so the fence ends
+                // where the remedy lands — once the run's OWN collection has
+                // certified the head its OWN handoff delivered, the head this
+                // step consumes is a collected fact again and a re-dispatch is
+                // the documented remedy, not a guarantee to refuse
+                // identically. Everything else about the park is unchanged.
+                && (newest_verdict(evidence) != "fail" || fix_delivery_recertified(evidence))
                 // Issue #241: a held authorization is spent by the ONE
                 // re-dispatch it authorizes, so it is dispatchable — for the
                 // steps the driver already re-dispatches on its own within
@@ -1083,7 +1110,15 @@ pub fn dispatch_intent(
                         && code != crate::mutation::code::LANE_TIMEOUT
                         && code != crate::mutation::code::VERDICT_STALE
                         && code != crate::mutation::code::DELIVERY_MOVED
-                        && code != crate::mutation::code::DELIVERY_UNBOUND
+                        // Issue #272: an unbound-delivery diagnosis is only
+                        // impossible while the head the step consumes is one
+                        // no collection observed. Once the run's own
+                        // collection certified the head its own handoff
+                        // delivered, the diagnosis is resolved and the step is
+                        // re-dispatched within its own bounded budget like
+                        // every other diagnosed step.
+                        && (code != crate::mutation::code::DELIVERY_UNBOUND
+                            || fix_delivery_recertified(evidence))
                         // Issue #263: a published ref that moved past the
                         // base the delivery certified and cannot carry the
                         // certified content byte-identically is a recorded
@@ -1193,6 +1228,99 @@ fn reevaluation_intent(
         step_id: producer.clone(),
         kind: producer_kind.clone(),
         reason: codes::REEVALUATION,
+    })
+}
+
+/// Whether the run's own recorded fix round has delivered a moved head its own
+/// collection has NOT observed yet (issue #272).
+///
+/// The recorded handoff names the certified head the FAIL was handed at; the
+/// repair leg advances the branch in its OWN lane checkout, so the head it
+/// carries is a fact about that checkout — observed read-only by
+/// [`observe_fix_leg`], never inferred, and only when the recorded handoff
+/// names that checkout at all (a row written before issue #256 names none, and
+/// a checkout is never guessed).
+///
+/// A delivery the run's own collection already certified is NOT this fact: the
+/// derivation stops the moment the certificate names the delivered head, so it
+/// converges by construction instead of looping.
+fn fix_delivery_uncertified(evidence: &SupervisionEvidence) -> bool {
+    // The run's durable evidence must still stand at the recorded FAIL: a
+    // delivery that has already been re-reviewed (the newest recorded verdict
+    // is a `pass`) must never be hijacked back into a collection — the run
+    // owns its tail from there.
+    if !matches!(evidence.verdicts.first(), Some((_, verdict, _)) if verdict == "fail") {
+        return false;
+    }
+    let Some(leg) = evidence.fix_leg.as_ref().filter(|leg| leg.delivered) else {
+        return false;
+    };
+    let Some(fix) = evidence.fix_round.as_ref() else {
+        return false;
+    };
+    if fix.worktree.is_empty() {
+        return false;
+    }
+    matches!(&evidence.delivery, Some(delivery) if delivery.head != leg.head)
+}
+
+/// Whether the run's own handoff has been RE-BOUND (issue #272): the head the
+/// recorded fix-round leg delivered IS the head this run's own collection
+/// certified, so the head the frontier would consume is a collected fact
+/// again. One fact, two readers: the re-collect derivation above, and the
+/// diagnosed-step fence below (an unbound-delivery park ends where it started
+/// — a collection that observed the moved head).
+fn fix_delivery_recertified(evidence: &SupervisionEvidence) -> bool {
+    let delivered = evidence.fix_leg.as_ref().filter(|leg| leg.delivered);
+    match (delivered, evidence.delivery.as_ref()) {
+        (Some(leg), Some(delivery)) => leg.head == delivery.head,
+        _ => false,
+    }
+}
+
+/// The driver's ONE continuation while the run's own fix round has delivered a
+/// moved head its own collection never observed (issue #272): a bounded
+/// RE-COLLECT of the repair leg's own lane checkout through the run's OWN
+/// collector step — the step the certified delivery was recorded by.
+///
+/// It re-establishes the certificate binding from recorded material only: the
+/// step is the certificate's own step of this run's committed spine (its own
+/// committed kind decides, never a name heuristic), the checkout is the one
+/// the recorded handoff names, and the branch + base are the collection's own
+/// recorded bindings, presented by the daemon's dispatch path. Nothing else is
+/// derived while this holds: the review cannot consume an uncollected head and
+/// the tail is never driven behind one.
+///
+/// Bounded twice over, both on recorded facts: the derivation stops as soon as
+/// the certificate names the delivered head, and a re-collect that cannot be
+/// taken is counted against the run's shared per-(run, step) bounded-dispatch
+/// budget ([`crate::state::RUN_RETRY_MAX`]) — the same budget a diagnosed
+/// step's bounded retry spends — so the collector is re-dispatched at most
+/// that many times and the frontier then parks typed.
+fn fix_recollect_intent(evidence: &SupervisionEvidence) -> Option<DispatchIntent> {
+    if !fix_delivery_uncertified(evidence) {
+        return None;
+    }
+    let collector = evidence.delivery.as_ref()?.step_id.clone();
+    if step_kind(evidence, &collector) != "collect_outcome" {
+        return None;
+    }
+    if !evidence.has_dispatch_context {
+        return None;
+    }
+    let recorded = evidence
+        .retries
+        .iter()
+        .filter(|retry| retry.step_id == collector)
+        .count();
+    if recorded >= crate::state::RUN_RETRY_MAX as usize {
+        return None;
+    }
+    Some(DispatchIntent {
+        instance_id: evidence.run.instance_id.clone(),
+        step_id: collector,
+        kind: "collect_outcome".to_string(),
+        reason: codes::RECOLLECT,
     })
 }
 
@@ -2962,6 +3090,7 @@ mod tests {
             fix_round: None,
             fix_leg: None,
             reevaluations: Vec::new(),
+            delivery: None,
         }
     }
 
@@ -4485,6 +4614,204 @@ mod tests {
         assert!(
             dispatched_human.contains("fix round dispatched to lane lane-0123456789abcdef"),
             "{dispatched_human}"
+        );
+    }
+
+    /// Issue #272: the run's own fix round delivered a MOVED head its own
+    /// collection never observed. The driver's ONE continuation is a bounded
+    /// re-collect of the repair leg's own lane checkout through the run's OWN
+    /// collector step — and the consumption fences end exactly where the
+    /// documented remedy lands.
+    ///
+    /// Three facts share one fixture: while the delivered head is unobserved
+    /// the review is never re-dispatched (the #202 AC2 fence stands, exactly
+    /// as `refusal.delivery.unbound` refuses it); the derivation converges the
+    /// moment the certificate names the delivered head; and the SAME bound
+    /// that fences a diagnosed step's retries fences the collector's
+    /// re-dispatches.
+    #[test]
+    fn a_fix_delivery_the_runs_own_collection_never_observed_is_re_collected() {
+        let state = temp_state("fix-recollect");
+        let digest = "d".repeat(64);
+        let run = "run-0123456789abcdef";
+        let policy = Policy {
+            check_interval_secs: 10,
+            progress_timeout_secs: 60,
+        };
+        let at = "2026-09-24T02:28:59Z";
+        let now_unix = time::unix_from_rfc3339(at).expect("instant");
+        state
+            .arm_supervision_for_test(run, "armed", &digest, "merge", policy, at)
+            .expect("arm");
+        let row = state.supervision_by_id(run).expect("read").expect("row");
+        let steps = [
+            ("p1", "checkout"),
+            ("p5", "collect_outcome"),
+            ("p6", "review_evidence"),
+            ("p7", "merge"),
+        ];
+        let certified = "e".repeat(40);
+        let delivered = "a".repeat(40);
+        let certificate = |head: &str| crate::state::DeliveryCertificate {
+            step_id: "p5".to_string(),
+            key: "ik_run-0123456789abcdef-p5-1790208650".to_string(),
+            branch: "issue-5".to_string(),
+            head: head.to_string(),
+            base_head: "b".repeat(40),
+        };
+        let retry_row = |step: &str, attempt: i64, consumed: bool| crate::state::RunRetryRow {
+            retry_id: format!("rt_0123456789abcde{attempt}"),
+            instance_id: run.to_string(),
+            step_id: step.to_string(),
+            attempt,
+            authorized_at: at.to_string(),
+            consumed_at: if consumed {
+                at.to_string()
+            } else {
+                String::new()
+            },
+            consumed_key: if consumed {
+                format!("ik_spent-{attempt}")
+            } else {
+                String::new()
+            },
+        };
+        // The recorded shape of the measured park: the review step's attempt
+        // was refused `refusal.delivery.unbound`, its FAIL stands, and the
+        // handoff's own repair leg holds a head past the certified one.
+        let scene = |code: &str| {
+            let mut evidence = evidence_with_failed_review(run_row(run), &steps, &certified);
+            evidence.attempts = vec![
+                ("p1".to_string(), "succeeded".to_string(), String::new()),
+                ("p5".to_string(), "succeeded".to_string(), String::new()),
+                ("p6".to_string(), "refused".to_string(), code.to_string()),
+            ];
+            evidence.run.caps = "[\"review\",\"merge\"]".to_string();
+            evidence.reviewer_leg_steps = vec!["p6".to_string()];
+            evidence.item = Some(crate::state::QueueItemRef {
+                submission_id: "qs_0123456789abcdef".to_string(),
+                ordinal: 0,
+                work_item: "wi_4aabf3ad5bea87b0".to_string(),
+                issue_number: 272,
+                status: "admitted".to_string(),
+            });
+            evidence.fix_round = Some(crate::state::SupervisionFixRound {
+                step: "p6".to_string(),
+                feature_head: certified.clone(),
+                round: 1,
+                bound: 3,
+                lane: "lane-0123456789abcdef".to_string(),
+                worktree: "issues-272-impl2".to_string(),
+            });
+            evidence.fix_leg = Some(crate::state::FixLegState {
+                head: delivered.clone(),
+                delivered: true,
+            });
+            evidence.delivery = Some(certificate(&certified));
+            evidence
+        };
+        let unbound = scene(crate::mutation::code::DELIVERY_UNBOUND);
+
+        // (1) The ONE derived continuation is the re-collect of the run's own
+        //     collector step: the frontier review is NOT re-dispatched while
+        //     the head it would consume is one no collection observed, and the
+        //     tail is never driven on it either.
+        let intent = dispatch_intent(&row, &unbound).expect("the re-collect is derived");
+        assert_eq!(intent.step_id, "p5", "{intent:?}");
+        assert_eq!(intent.kind, "collect_outcome");
+        assert_eq!(intent.reason, codes::RECOLLECT);
+        assert!(
+            !classify(&unbound, &digest, &policy, now_unix).eligible,
+            "the parked run is never reported eligible while it re-collects"
+        );
+
+        // (2) A held operator authorization does not buy the review's
+        //     re-dispatch while the delivery is uncertified: the fence the
+        //     measured runs parked on stands, and the authorization stays
+        //     SPENT-BY-NOTHING (the re-collect names its own step).
+        let mut held = unbound.clone();
+        held.retries = vec![retry_row("p6", 2, false)];
+        assert_eq!(
+            dispatch_intent(&row, &held).map(|intent| intent.step_id),
+            Some("p5".to_string()),
+            "an uncertified delivery re-collects; the review is never re-dispatched"
+        );
+
+        // (3) Once the run's OWN collection certifies the head its own handoff
+        //     delivered, the re-collect stops (it converges by construction)
+        //     and the diagnosed review is dispatchable again — with the held
+        //     authorization, and on the driver's own minted one when none is
+        //     held. The head it consumes is a collected fact again.
+        let mut recertified = held.clone();
+        recertified.delivery = Some(certificate(&delivered));
+        let intent = dispatch_intent(&row, &recertified).expect("the review re-enters");
+        assert_eq!(intent.step_id, "p6", "{intent:?}");
+        assert_eq!(intent.kind, "review_evidence");
+        assert_eq!(intent.reason, codes::DISPATCH);
+        let mut self_driving = recertified.clone();
+        self_driving.retries = Vec::new();
+        assert_eq!(
+            dispatch_intent(&row, &self_driving).map(|intent| intent.step_id),
+            Some("p6".to_string()),
+            "the driver mints its own bounded retry for the rebind consumer"
+        );
+        // And the bound is still a bound: a spent budget parks typed.
+        self_driving.retries = (1..=crate::state::RUN_RETRY_MAX)
+            .map(|attempt| retry_row("p6", attempt, true))
+            .collect();
+        assert!(
+            dispatch_intent(&row, &self_driving).is_none(),
+            "a spent budget parks the consumer exactly as before"
+        );
+        // A re-collect that cannot be taken is bounded the same way.
+        let mut spent_collector = recertified.clone();
+        spent_collector.delivery = Some(certificate(&certified));
+        spent_collector.retries = (1..=crate::state::RUN_RETRY_MAX)
+            .map(|attempt| retry_row("p5", attempt, true))
+            .collect();
+        assert!(
+            dispatch_intent(&row, &spent_collector).is_none(),
+            "the collector is re-dispatched at most the shared bounded budget"
+        );
+
+        // (4) The head the run re-collects is only ever the landed fact of a
+        //     recorded checkout: no observed leg, no recorded checkout, or a
+        //     leg that has not moved derives no re-collect at all — the park
+        //     stands exactly where it did before.
+        let mut unobserved = unbound.clone();
+        unobserved.fix_leg = None;
+        assert!(
+            dispatch_intent(&row, &unobserved).is_none(),
+            "an unobserved leg is never collected from a guessed path"
+        );
+        let mut unnamed_checkout = unbound.clone();
+        unnamed_checkout
+            .fix_round
+            .as_mut()
+            .expect("recorded")
+            .worktree = String::new();
+        unnamed_checkout.fix_leg = None;
+        assert!(
+            dispatch_intent(&row, &unnamed_checkout).is_none(),
+            "a handoff that names no checkout is never collected from a guessed path"
+        );
+        let mut swimming = unbound.clone();
+        swimming.fix_leg = Some(crate::state::FixLegState {
+            head: certified.clone(),
+            delivered: false,
+        });
+        assert!(
+            dispatch_intent(&row, &swimming).is_none(),
+            "a leg that has not moved is the wait it always was"
+        );
+
+        // (5) A delivery that was ALREADY re-reviewed is never hijacked back
+        //     into a collection: the newest recorded verdict owns the tail.
+        let mut passed = unbound.clone();
+        passed.verdicts[0].1 = "pass".to_string();
+        assert!(
+            dispatch_intent(&row, &passed).is_none_or(|intent| intent.reason != codes::RECOLLECT),
+            "a passed delivery is never re-collected"
         );
     }
 
