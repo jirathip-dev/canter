@@ -24,8 +24,8 @@ use canter::state::{
     SupervisionAuthorizationPlan, SupervisionRow,
 };
 use canter::supervision::{
-    DispatchIntent, SupervisedDispatch, SupervisorHandle, SupervisorOptions, SupervisorWake, codes,
-    start,
+    DispatchIntent, PASS_DEADLINE_SECS, SupervisedDispatch, SupervisorHandle, SupervisorOptions,
+    SupervisorWake, codes, start,
 };
 use canter::value::{Val, integer, object, string};
 
@@ -453,6 +453,7 @@ fn start_driver(
         Arc::clone(state),
         SupervisorOptions {
             max_wait_secs: 1,
+            pass_deadline_secs: PASS_DEADLINE_SECS,
             dispatch: Some(Arc::clone(dispatcher) as Arc<dyn SupervisedDispatch>),
         },
     );

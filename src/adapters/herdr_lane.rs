@@ -415,6 +415,15 @@ pub(super) fn start_with_env(
 /// own bounded wait decides when to come back (issue #224), and a
 /// generation/ownership MISMATCH still refuses
 /// [`CODE_STALE_GENERATION`], which is never waited on.
+///
+/// A lane whose REGISTERED worktree directory is already GONE (issue #270: the
+/// prunable specimen that wedged the supervision driver for 17 minutes) is
+/// refused typed WITHOUT a single Herdr call: there is no checkout left to
+/// address, so nothing about this lane's liveness, ownership or workspace can
+/// be read or verified — and a close whose target is gone must resolve, never
+/// sleep in a subprocess. The run's own retirement record is the remedy
+/// ([`crate::mutation::retire_run_lane`] treats an absent checkout as "no lane
+/// checkout residue").
 pub fn close_lane_workspace(
     session: &SessionHandle,
     worktree: &Path,
@@ -422,6 +431,20 @@ pub fn close_lane_workspace(
     timeout: Duration,
 ) -> Result<(), AdapterError> {
     let result = (|| {
+        // The registered checkout is the ONE address every verify below reads
+        // (a cwd for the Herdr rows, a path to prove the workspace belongs to
+        // this lane). No checkout, no verification — and no call.
+        if !worktree.is_dir() {
+            return Err(refusal(
+                CODE_INCOMPLETE_IDENTITY,
+                format!(
+                    "lane {} registers the worktree {:?}, which no longer exists: a lane whose \
+                     own checkout is gone has nothing to close and cannot be verified (its \
+                     workspace registration is retired, never guessed at)",
+                    session.session_id, worktree
+                ),
+            ));
+        }
         let list = herdr_call(&herdr_workspace_list_args(), timeout, env, Some(worktree))?;
         for workspace in herdr_items(&list, "workspaces") {
             if !workspace.get("worktree").is_some_and(|identity| {
@@ -483,12 +506,24 @@ pub fn close_lane_workspace(
 /// document instead of silently closing an agent. A live CURRENT generation
 /// is never passed here (its run is not terminal), so this never closes a
 /// live lane's workspace.
+///
+/// A generation whose REGISTERED worktree directory is already GONE (issue
+/// #270) is `None` — nothing to retire — WITHOUT a single Herdr call: an
+/// absent checkout has no registration left to address, exactly as
+/// `crate::mutation::retire_run_lane` already rules for the operator path.
+/// The call is therefore bounded by construction: a retire never sleeps on a
+/// subprocess for a checkout that no longer exists.
 pub fn retire_lane_workspace(
     session: &SessionHandle,
     worktree: &Path,
     env: &BTreeMap<String, String>,
     timeout: Duration,
 ) -> Result<Option<Val>, AdapterError> {
+    // An absent checkout has no registration left to retire (recorded, never
+    // forced): the caller's own record says so instead of a killed Herdr row.
+    if !worktree.is_dir() {
+        return Ok(None);
+    }
     let result = (|| {
         // The registration must be THIS run's own linked lane worktree: a
         // workspace of another checkout, another repository group or an

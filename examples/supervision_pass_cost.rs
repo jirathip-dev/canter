@@ -31,7 +31,7 @@ use canter::state::{
     QueueSubmissionItemPlan, QueueSubmissionItemRow, QueueSubmissionPlan, Retention, State,
     SubmissionVerdict, SupervisionAuthorizationPlan,
 };
-use canter::supervision::{SupervisorOptions, start};
+use canter::supervision::{PASS_DEADLINE_SECS, SupervisorOptions, start};
 use canter::value::{Val, integer, null, object, string};
 
 const REPO: &str = "example-org/widgets";
@@ -92,6 +92,7 @@ fn main() {
         Arc::clone(&state),
         SupervisorOptions {
             max_wait_secs: options.interval_secs.clamp(1, 30),
+            pass_deadline_secs: PASS_DEADLINE_SECS,
             dispatch: None,
         },
     );

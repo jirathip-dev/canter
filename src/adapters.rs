@@ -4920,6 +4920,93 @@ mod tests {
         new_session("sess-20260906-0001", sample_identity()).expect("session")
     }
 
+    /// A fake `herdr` that records every row it receives and answers the
+    /// workspace read-back with an empty set (nothing registered), so a
+    /// `close_lane_workspace` call at a REAL checkout resolves as a bounded
+    /// no-op. The recorded rows are the witness that a call did (or did not)
+    /// reach the substrate.
+    fn recording_fake_herdr(name: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("hf-lane-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create fake bin dir");
+        let rows = dir.join("rows.txt");
+        let path = dir.join(WORKSPACE_EXECUTABLE);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nPATH=/usr/bin:/bin\nprintf '%s\\n' \"$*\" >> \"{}\"\n\
+                 printf '{{\"id\":\"cli:workspace:list\",\"result\":{{\"workspaces\":[]}}}}\\n'\n",
+                rows.display()
+            ),
+        )
+        .expect("write fake executable");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).expect("chmod");
+        }
+        (dir, rows)
+    }
+
+    #[test]
+    fn a_gone_lane_worktree_resolves_typed_without_any_herdr_call() {
+        // Issue #270, the measured specimen: the lane worktrees the supervision
+        // pass was retiring were registered but PRUNABLE (their directories
+        // were gone) and the close slept in a subprocess instead of resolving.
+        // A CLI that records every row it receives is the witness that the
+        // gone checkout never reaches the substrate at all.
+        let (bin, rows) = recording_fake_herdr("gone-worktree");
+        let env = env_with_path(&[bin.to_str().expect("utf-8 path")]);
+        let gone = std::env::temp_dir().join(format!("hf-gone-lane-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&gone);
+
+        let closed = close_lane_workspace(&sample_session(), &gone, &env, ADAPTER_TIMEOUT);
+        let err = closed.expect_err("a gone lane checkout resolves typed, never as a close");
+        assert_eq!(err.code, CODE_INCOMPLETE_IDENTITY);
+        assert!(
+            err.message.contains("no longer exists"),
+            "the refusal names the missing checkout: {}",
+            err.message
+        );
+
+        // The retire of the same gone generation is the documented bounded
+        // NO-OP: an absent checkout has no registration left to retire.
+        let retired = retire_lane_workspace(&sample_session(), &gone, &env, ADAPTER_TIMEOUT)
+            .expect("a gone lane checkout is a bounded no-op, never an error");
+        assert!(retired.is_none(), "nothing was retired: {retired:?}");
+
+        assert!(
+            !rows.exists(),
+            "a gone lane checkout is never addressed: {}",
+            std::fs::read_to_string(&rows).unwrap_or_default()
+        );
+        let _ = std::fs::remove_dir_all(&bin);
+    }
+
+    #[test]
+    fn a_lane_worktree_that_exists_still_reaches_the_substrate() {
+        // The positive control of the check above: with the checkout PRESENT
+        // the very same call DOES read the workspace registration back, so the
+        // gone-checkout refusal cannot hide a lane that is really there.
+        let (bin, rows) = recording_fake_herdr("present-worktree");
+        let env = env_with_path(&[bin.to_str().expect("utf-8 path")]);
+        let worktree = std::env::temp_dir().join(format!("hf-live-lane-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&worktree);
+        std::fs::create_dir_all(&worktree).expect("lane dir");
+
+        close_lane_workspace(&sample_session(), &worktree, &env, ADAPTER_TIMEOUT)
+            .expect("an empty registration closes as a no-op");
+        let rows = std::fs::read_to_string(&rows).expect("the close reached the substrate");
+        assert!(
+            rows.lines().any(|row| row == "workspace list"),
+            "the lane's workspace read-back ran: {rows}"
+        );
+        let _ = std::fs::remove_dir_all(&bin);
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
     #[test]
     fn closed_kind_set_and_official_metadata_are_consistent() {
         assert_eq!(HarnessKind::OFFICIAL.len(), 5);
