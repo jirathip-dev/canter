@@ -2148,18 +2148,21 @@ fn parse_supervision(args: &[&String]) -> Result<Invocation, ParseError> {
         queue_action: None,
         run_action: None,
         supervision_action: Some(if command == "supervision arm" {
-            // A read is never claimed: the key is only meaningful for `arm`.
-            if idempotency_key.is_some() {
-                return Err(ParseError::Usage(format!(
-                    "{command}: --idempotency-key is not accepted (this subcommand is a read)"
-                )));
-            }
             SupervisionAction::Arm(SupervisionArmArgs {
                 run,
                 idempotency_key,
                 socket,
             })
         } else {
+            // A read is never claimed: `--idempotency-key` is meaningful only
+            // for the arm, so the STATUS branch rejects it (issue #261 fix
+            // round 1 — the rejection used to sit in the arm branch, where it
+            // refused the exact key the arm's usage line advertises).
+            if idempotency_key.is_some() {
+                return Err(ParseError::Usage(format!(
+                    "{command}: --idempotency-key is not accepted (this subcommand is a read)"
+                )));
+            }
             SupervisionAction::Status(SupervisionStatusArgs { run, socket })
         }),
         grant_action: None,
