@@ -1217,10 +1217,26 @@ fn reevaluation_intent(
     let recorded = evidence
         .reevaluations
         .iter()
-        .find(|(step, _)| step == producer)
-        .map(|(_, count)| *count)
-        .unwrap_or(0);
-    if recorded >= crate::run_control::RUN_REEVALUATION_MAX {
+        .find(|(step, _, _)| step == producer);
+    let count = recorded.map(|(_, count, _)| *count).unwrap_or(0);
+    if count >= crate::run_control::RUN_REEVALUATION_MAX {
+        return None;
+    }
+    // Issue #272: the re-entry is SINGLE per recorded verdict. Every record the
+    // control writes names the verdict row it re-evaluated; while the run's
+    // newest verdict is still that row, this run already holds its one re-entry
+    // for it — and recording another would re-dispatch the same round before the
+    // first round's own records have landed (the hosted race: two records naming
+    // one evidence row). A re-run that ANSWERS records a NEW verdict row, so the
+    // remedy stays reachable for the fresh FAIL inside the same bound, and a
+    // re-run that refuses is a recorded dispatch refusal the operator reads.
+    let newest_recorded = recorded.map(|(_, _, newest)| newest.as_str()).unwrap_or("");
+    let newest_verdict = evidence
+        .newest_evidence
+        .as_ref()
+        .map(|row| row.evidence_id.as_str())
+        .unwrap_or("");
+    if !newest_recorded.is_empty() && newest_recorded == newest_verdict {
         return None;
     }
     Some(DispatchIntent {
@@ -4813,6 +4829,50 @@ mod tests {
             dispatch_intent(&row, &passed).is_none_or(|intent| intent.reason != codes::RECOLLECT),
             "a passed delivery is never re-collected"
         );
+
+        // (6) Issue #272: the re-entry is SINGLE per recorded verdict. Every
+        //     record the control writes names the verdict row it re-evaluated;
+        //     while the run's newest verdict is still that row, the driver
+        //     records NO second re-entry — the hosted race was two records
+        //     naming one evidence row, taken before the first round's own
+        //     outcome had landed. A re-run that ANSWERS records a NEW verdict
+        //     row, so the remedy stays reachable inside the same bound.
+        let mut reviewed = recertified.clone();
+        reviewed.attempts = vec![
+            ("p1".to_string(), "succeeded".to_string(), String::new()),
+            ("p5".to_string(), "succeeded".to_string(), String::new()),
+            ("p6".to_string(), "succeeded".to_string(), String::new()),
+        ];
+        // The recorded row carries the RUN's own pins (the daemon writes them
+        // from the run), so the delivery is readable at all.
+        {
+            let row = reviewed.newest_evidence.as_mut().expect("recorded verdict");
+            row.workflow_hash = reviewed.run.workflow_hash.clone();
+            row.policy_hash = reviewed.run.policy_hash.clone();
+        }
+        // One re-entry is already recorded FOR the verdict that still stands.
+        let newest = reviewed
+            .newest_evidence
+            .as_ref()
+            .expect("recorded verdict")
+            .evidence_id
+            .clone();
+        reviewed.reevaluations = vec![("p6".to_string(), 1, newest.clone())];
+        assert!(
+            dispatch_intent(&row, &reviewed).is_none(),
+            "a verdict that already owns its one re-entry is never re-entered again"
+        );
+        // The control's own bound is untouched: a fresh verdict row (a re-run
+        // that answered) re-opens the remedy for the step.
+        let mut answered = reviewed.clone();
+        answered
+            .newest_evidence
+            .as_mut()
+            .expect("recorded verdict")
+            .evidence_id = "ev_fedcba9876543210".to_string();
+        let intent = dispatch_intent(&row, &answered).expect("the fresh FAIL re-enters");
+        assert_eq!(intent.step_id, "p6", "{intent:?}");
+        assert_eq!(intent.reason, codes::REEVALUATION);
     }
 
     #[test]
