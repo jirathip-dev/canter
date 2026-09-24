@@ -250,7 +250,8 @@ def _issue_shaped(value) -> tuple[str, str] | None:
 
 def validate_config(obj: dict) -> tuple[str, str]:
     err = _json_obj(obj, "hf-config", {"schema"}, {"schema", "daemon", "policy",
-                                                   "repository", "harness", "workflow", "role"})
+                                                   "repository", "harness", "workflow", "role",
+                                                   "skill"})
     if err:
         return err
     for key in ("daemon", "policy"):
@@ -286,7 +287,8 @@ def validate_config(obj: dict) -> tuple[str, str]:
             return _ref(REFUSE_MALFORMED, "config.harness must be a table")
         for name, entry in obj["harness"].items():
             shape = {"kind", "executable", "env_allow", "provider", "model",
-                     "fallback", "secret_env", "limits", "binding_introspection"}
+                     "fallback", "secret_env", "limits", "binding_introspection",
+                     "skills"}
             required = {"kind", "executable", "env_allow"}
             if (
                 not isinstance(entry, dict)
@@ -303,10 +305,11 @@ def validate_config(obj: dict) -> tuple[str, str]:
                 if key in entry and not isinstance(entry[key], str):
                     return _ref(REFUSE_MALFORMED,
                                 "config.harness.{}.{} must be a string".format(name, key))
-            # Optional issue #77 profile-planning keys: shape only here
-            # (bare-token pairs, allowlisted credential names and bounded
-            # limits are the decoder's rules).
-            for key in ("fallback", "secret_env"):
+            # Optional issue #77 profile-planning keys and the issue #267
+            # role skills: shape only here (bare-token pairs, allowlisted
+            # credential names, bounded limits and the skill-inventory
+            # resolution are the decoder's rules).
+            for key in ("fallback", "secret_env", "skills"):
                 if key in entry and (
                     not isinstance(entry[key], list)
                     or not all(isinstance(item, str) for item in entry[key])
@@ -327,7 +330,8 @@ def validate_config(obj: dict) -> tuple[str, str]:
                 isinstance(item, str) for item in env_allow
             ):
                 return _ref(REFUSE_MALFORMED, "config.harness.{}.env_allow must be [string]".format(name))
-    for table, allowed in (("workflow", {"id", "hash"}), ("role", {"hash"})):
+    for table, allowed in (("workflow", {"id", "hash"}), ("role", {"hash"}),
+                           ("skill", {"hash"})):
         if table in obj:
             if not isinstance(obj[table], dict):
                 return _ref(REFUSE_MALFORMED, "config.{} must be a table".format(table))

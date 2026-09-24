@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use crate::formats::{is_repository_identity, is_slug};
 use crate::schema::{Family, Refusal, Verdict, validate_bytes};
-use crate::value::{Val, bool_, object, string};
+use crate::value::{Val, bool_, null, object, string};
 
 /// An error that prevents a config/policy document from being loaded.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,6 +76,19 @@ pub struct WorkflowPin {
     pub hash: String,
 }
 
+/// One configured skill pin (issue #267): the declared content identity of
+/// one installed lane procedure, as the installation's own readback recorded
+/// it. A skill is *resolvable* when the configuration declares it here: the
+/// inventory is installation configuration (never a name inferred from the
+/// repository under work), and the pin is the content the plan binds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillPin {
+    /// Config table key (slug).
+    pub key: String,
+    /// Declared content identity (64-hex sha256 of the installed procedure).
+    pub hash: String,
+}
+
 /// One configured harness entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Harness {
@@ -87,6 +100,10 @@ pub struct Harness {
     pub executable: String,
     /// Explicit environment allowlist.
     pub env_allow: Vec<String>,
+    /// Declared role skills (issue #267): the procedure keys this role
+    /// binding gives its lane, resolved against the configuration's own
+    /// `skill.<key>` inventory. Empty when the binding declares none.
+    pub skills: Vec<String>,
     /// Explicit provider binding token for the official prompt rows that
     /// carry the provider/model pair on argv (Pi, Jcode; issue #80). `None`
     /// when the config declares no binding — there is no default and no
@@ -151,6 +168,9 @@ pub struct Config {
     pub harnesses: Vec<Harness>,
     /// Configured workflow pins in key order.
     pub workflows: Vec<WorkflowPin>,
+    /// Declared resolvable skills in key order (issue #267): the
+    /// installation's own inventory of installed lane procedures.
+    pub skills: Vec<SkillPin>,
 }
 
 impl Config {
@@ -485,6 +505,47 @@ fn extract_config(path: &Path, doc: &Val) -> Result<Config, LoadError> {
                     .collect(),
                 _ => Vec::new(),
             };
+            // Issue #267: the declared role skills — the procedure keys this
+            // role binding gives its lane. Each key must be a bare slug; the
+            // RESOLUTION against this configuration's own `skill.<key>`
+            // inventory is enforced where a plan binds the role
+            // (`refusal.skill.unresolved`), never silently dropped here.
+            let skills: Vec<String> = match entry.get("skills") {
+                None => Vec::new(),
+                Some(Val::Arr(items)) => {
+                    if items.len() > ROLE_SKILL_MAX {
+                        return Err(fail(format!(
+                            "config.harness.{key}.skills declares more than {ROLE_SKILL_MAX} skills"
+                        )));
+                    }
+                    let mut declared: Vec<String> = Vec::new();
+                    for item in items {
+                        let Some(text) = item.as_str() else {
+                            return Err(fail(format!(
+                                "config.harness.{key}.skills must be an array of skill keys"
+                            )));
+                        };
+                        if !crate::formats::is_slug(text) {
+                            return Err(fail(format!(
+                                "config.harness.{key}.skills entry {text:?} must be a lowercase \
+                                 slug (a-z, 0-9, '-')"
+                            )));
+                        }
+                        if declared.iter().any(|known| known == text) {
+                            return Err(fail(format!(
+                                "config.harness.{key}.skills declares {text:?} twice"
+                            )));
+                        }
+                        declared.push(text.to_string());
+                    }
+                    declared
+                }
+                Some(_) => {
+                    return Err(fail(format!(
+                        "config.harness.{key}.skills must be an array of skill keys"
+                    )));
+                }
+            };
             // Credentials arrive only through the explicit environment
             // allowlist (trust model T5): a secret name outside it would be a
             // value channel with no declared boundary, so it refuses.
@@ -547,6 +608,7 @@ fn extract_config(path: &Path, doc: &Val) -> Result<Config, LoadError> {
                     .to_string(),
                 executable,
                 env_allow,
+                skills,
                 provider,
                 model,
                 fallback,
@@ -575,6 +637,32 @@ fn extract_config(path: &Path, doc: &Val) -> Result<Config, LoadError> {
                     .and_then(Val::as_str)
                     .expect("validated")
                     .to_string(),
+            });
+        }
+    }
+
+    // Issue #267: the declared skill inventory — what the installation
+    // resolves against. Keys are slugs and each carries the recorded content
+    // identity (64-hex) of the installed procedure.
+    let mut skills: Vec<SkillPin> = Vec::new();
+    if let Some(entries) = doc.get("skill") {
+        let Val::Obj(map) = entries else {
+            return Err(fail("config.skill must be a table".to_string()));
+        };
+        for (key, entry) in map {
+            let Some(hash) = entry.get("hash").and_then(Val::as_str) else {
+                return Err(fail(format!(
+                    "config.skill.{key}.hash must be a 64-hex sha256"
+                )));
+            };
+            if !crate::formats::is_hex64(hash) {
+                return Err(fail(format!(
+                    "config.skill.{key}.hash must be a 64-hex sha256 (got {hash:?})"
+                )));
+            }
+            skills.push(SkillPin {
+                key: key.clone(),
+                hash: hash.to_string(),
             });
         }
     }
@@ -611,6 +699,7 @@ fn extract_config(path: &Path, doc: &Val) -> Result<Config, LoadError> {
         repositories,
         harnesses,
         workflows,
+        skills,
     })
 }
 
@@ -769,6 +858,12 @@ pub const CODE_PROFILE_BINDING: &str = "refusal.profile.binding";
 /// credential) changed after the preview.
 pub const CODE_PROFILE_REVISION: &str = "refusal.profile.revision";
 
+/// Typed refusal code (issue #267): a role binding declares a skill the
+/// configuration's own inventory does not resolve. A lane is never started
+/// short of the procedure its role binding declares, so the plan refuses
+/// typed here instead of quietly dispatching without it.
+pub const CODE_SKILL_UNRESOLVED: &str = "refusal.skill.unresolved";
+
 /// Recorded digest marker for a declared credential environment variable
 /// that is absent from the environment: the revision still covers the
 /// declared name and the fact that no value was present.
@@ -784,6 +879,8 @@ pub const PROFILE_FALLBACK_MAX: usize = 8;
 pub const PROFILE_SECRET_MAX: usize = 8;
 /// Maximum configured-limit entries bound into one plan.
 pub const PROFILE_LIMITS_MAX: usize = 16;
+/// Maximum role skills one binding may declare (issue #267).
+pub const ROLE_SKILL_MAX: usize = 16;
 
 /// A bounded printable string (never control characters, never empty).
 fn bounded_printable(text: &str, max: usize) -> bool {
@@ -869,6 +966,10 @@ pub struct ProfileBinding {
     pub introspection: bool,
     /// Declared credential names with their digest (or `unset`).
     pub secrets: Vec<(String, String)>,
+    /// The resolved role skills (issue #267): the declared procedure keys of
+    /// this role binding, each with the content identity it resolves to.
+    /// Empty when the binding declares none.
+    pub skills: Vec<SkillPin>,
     /// 64-hex sha256 over the canonical material.
     pub revision: String,
 }
@@ -881,6 +982,9 @@ pub enum ProfileBindingError {
     /// The presented revision does not match the recomputed fingerprint of
     /// the presented material.
     Revision(String),
+    /// One declared role skill does not resolve (issue #267): the
+    /// configuration declares no content identity for it.
+    SkillUnresolved(String),
 }
 
 impl ProfileBindingError {
@@ -889,21 +993,76 @@ impl ProfileBindingError {
         match self {
             ProfileBindingError::Binding(_) => CODE_PROFILE_BINDING,
             ProfileBindingError::Revision(_) => CODE_PROFILE_REVISION,
+            ProfileBindingError::SkillUnresolved(_) => CODE_SKILL_UNRESOLVED,
         }
     }
 
     /// The human message for this error.
     pub fn message(&self) -> &str {
         match self {
-            ProfileBindingError::Binding(message) | ProfileBindingError::Revision(message) => {
-                message
-            }
+            ProfileBindingError::Binding(message)
+            | ProfileBindingError::Revision(message)
+            | ProfileBindingError::SkillUnresolved(message) => message,
         }
     }
 }
 
 fn binding_error(message: impl Into<String>) -> ProfileBindingError {
     ProfileBindingError::Binding(message.into())
+}
+
+/// Resolve the declared role skills of one binding row (issue #267): each
+/// declared key must be declared in the configuration's own `skill.<key>`
+/// inventory, and the pin is the inventory's recorded content identity.
+///
+/// The resolution is total and fail-closed: one key that the inventory does
+/// not declare refuses the whole binding with `refusal.skill.unresolved`
+/// (never a partial set, never a silent skip) — the lane's role procedure is
+/// either the declared set, or there is no plan.
+pub fn resolve_role_skills(
+    config: &Config,
+    declared: &[String],
+    binding_key: &str,
+) -> Result<Vec<SkillPin>, ProfileBindingError> {
+    let mut resolved: Vec<SkillPin> = Vec::with_capacity(declared.len());
+    for key in declared {
+        let Some(pin) = config.skills.iter().find(|pin| &pin.key == key) else {
+            return Err(ProfileBindingError::SkillUnresolved(format!(
+                "role binding {binding_key:?} declares skill {key:?}, which the configuration's \
+                 skill inventory does not resolve (declare [skill.{key}] with the installed \
+                 procedure's content identity, or bind a skill the installation has)"
+            )));
+        };
+        resolved.push(pin.clone());
+    }
+    Ok(resolved)
+}
+
+/// The declared role skills of one binding row as a document (issue #267):
+/// one entry per declared key with the content identity it resolves to, or
+/// `null` when the inventory does not resolve it. Reporting only — the plan
+/// boundary refuses through [`resolve_role_skills`].
+pub fn role_skill_doc(config: &Config, harness: &Harness) -> Val {
+    Val::Arr(
+        harness
+            .skills
+            .iter()
+            .map(|key| {
+                object(vec![
+                    ("key", string(key)),
+                    (
+                        "hash",
+                        config
+                            .skills
+                            .iter()
+                            .find(|pin| &pin.key == key)
+                            .map(|pin| string(&pin.hash))
+                            .unwrap_or_else(null),
+                    ),
+                ])
+            })
+            .collect(),
+    )
 }
 
 impl ProfileBinding {
@@ -941,6 +1100,17 @@ impl ProfileBinding {
                         .collect(),
                 ),
             ),
+            (
+                "skills",
+                Val::Arr(
+                    self.skills
+                        .iter()
+                        .map(|pin| {
+                            object(vec![("key", string(&pin.key)), ("hash", string(&pin.hash))])
+                        })
+                        .collect(),
+                ),
+            ),
         ])
     }
 
@@ -968,17 +1138,29 @@ impl ProfileBinding {
     /// Build one binding from supported profile configuration (issue #77):
     /// the harness row keyed `key`, with the intended pair taken from the
     /// declared `provider`/`model` binding and the credential digests taken
-    /// from the supplied environment (digests only). `None` when the profile
-    /// is unknown or declares no binding pair (the prompt would refuse
-    /// `refusal.binding.missing`; there is no inferred plan).
+    /// from the supplied environment (digests only). `Ok(None)` when the
+    /// profile is unknown or declares no binding pair (the prompt would
+    /// refuse `refusal.binding.missing`; there is no inferred plan).
+    ///
+    /// Issue #267: the row's declared role skills RESOLVE here, against the
+    /// configuration's own `skill.<key>` inventory — one unresolvable skill
+    /// is the typed `refusal.skill.unresolved`, never a binding (and
+    /// therefore never a lane) started without its declared procedure.
     pub fn from_config(
         config: &Config,
         key: &str,
         env: &BTreeMap<String, String>,
-    ) -> Option<ProfileBinding> {
-        let harness = config.harnesses.iter().find(|harness| harness.key == key)?;
-        let provider = harness.provider.clone()?;
-        let model = harness.model.clone()?;
+    ) -> Result<Option<ProfileBinding>, ProfileBindingError> {
+        let Some(harness) = config.harnesses.iter().find(|harness| harness.key == key) else {
+            return Ok(None);
+        };
+        let Some(provider) = harness.provider.clone() else {
+            return Ok(None);
+        };
+        let Some(model) = harness.model.clone() else {
+            return Ok(None);
+        };
+        let skills = resolve_role_skills(config, &harness.skills, &harness.key)?;
         let secrets = harness
             .secret_env
             .iter()
@@ -993,10 +1175,11 @@ impl ProfileBinding {
             configured_limits: harness.limits.clone(),
             introspection: harness.binding_introspection,
             secrets,
+            skills,
             revision: String::new(),
         };
         binding.revision = binding.revision_of();
-        Some(binding)
+        Ok(Some(binding))
     }
 
     /// Validate one PRESENTED `hf-profile-binding/v1` document (the daemon
@@ -1008,7 +1191,7 @@ impl ProfileBinding {
         let Val::Obj(map) = doc else {
             return Err(binding_error("the profile binding must be an object"));
         };
-        const KEYS: [&str; 10] = [
+        const KEYS: [&str; 11] = [
             "schema",
             "key",
             "kind",
@@ -1018,6 +1201,7 @@ impl ProfileBinding {
             "configured_limits",
             "introspection",
             "secrets",
+            "skills",
             "revision",
         ];
         for key in map.keys() {
@@ -1172,6 +1356,52 @@ impl ProfileBinding {
                 ));
             }
         };
+        let skills = match doc.get("skills") {
+            Some(Val::Arr(items)) => {
+                if items.len() > ROLE_SKILL_MAX {
+                    return Err(binding_error(format!(
+                        "the profile binding carries more than {ROLE_SKILL_MAX} role skills"
+                    )));
+                }
+                let mut pins = Vec::new();
+                for item in items {
+                    let Some(item_key) = item.get("key").and_then(Val::as_str) else {
+                        return Err(binding_error(
+                            "every profile binding skill requires a slug key",
+                        ));
+                    };
+                    if !crate::formats::is_slug(item_key) {
+                        return Err(binding_error(format!(
+                            "profile binding skill key {item_key:?} must be a lowercase slug"
+                        )));
+                    }
+                    if pins.iter().any(|pin: &SkillPin| pin.key == item_key) {
+                        return Err(binding_error(format!(
+                            "the profile binding declares skill {item_key:?} twice"
+                        )));
+                    }
+                    let hash = match item.get("hash").and_then(Val::as_str) {
+                        Some(hash) if crate::formats::is_hex64(hash) => hash.to_string(),
+                        _ => {
+                            return Err(binding_error(format!(
+                                "profile binding skill {item_key:?} requires the 64-hex content \
+                                 identity it resolves to"
+                            )));
+                        }
+                    };
+                    pins.push(SkillPin {
+                        key: item_key.to_string(),
+                        hash,
+                    });
+                }
+                pins
+            }
+            _ => {
+                return Err(binding_error(
+                    "the profile binding requires skills (an array; may be empty)",
+                ));
+            }
+        };
         let revision = text("revision")?;
         if !crate::formats::is_hex64(&revision) {
             return Err(binding_error(
@@ -1187,6 +1417,7 @@ impl ProfileBinding {
             configured_limits,
             introspection,
             secrets,
+            skills,
             revision,
         };
         let expected = binding.revision_of();
@@ -1350,6 +1581,7 @@ request_timeout = "90s"
             "lane-orch-1",
             &profile_env(Some("example-secret-material")),
         )
+        .expect("the role skills resolve")
         .expect("bound profile preview");
         assert_eq!(binding.key, "lane-orch-1");
         assert_eq!(binding.kind, "pi");
@@ -1386,10 +1618,16 @@ request_timeout = "90s"
         ))
         .expect("load");
         assert!(
-            ProfileBinding::from_config(&unbound, "cli", &profile_env(None)).is_none(),
+            matches!(
+                ProfileBinding::from_config(&unbound, "cli", &profile_env(None)),
+                Ok(None)
+            ),
             "no declared binding means no plan"
         );
-        assert!(ProfileBinding::from_config(&unbound, "absent", &profile_env(None)).is_none());
+        assert!(matches!(
+            ProfileBinding::from_config(&unbound, "absent", &profile_env(None)),
+            Ok(None)
+        ));
     }
 
     #[test]
@@ -1398,6 +1636,7 @@ request_timeout = "90s"
         let config = profile_config("revision");
         let first =
             ProfileBinding::from_config(&config, "lane-orch-1", &profile_env(Some(SECRET_VALUE)))
+                .expect("the role skills resolve")
                 .expect("preview");
 
         // The credential VALUE never enters the plan, its canonical bytes,
@@ -1416,6 +1655,7 @@ request_timeout = "90s"
         // The same reviewed configuration is stable.
         let again =
             ProfileBinding::from_config(&config, "lane-orch-1", &profile_env(Some(SECRET_VALUE)))
+                .expect("the role skills resolve")
                 .expect("preview");
         assert_eq!(
             first.revision, again.revision,
@@ -1429,6 +1669,7 @@ request_timeout = "90s"
             "lane-orch-1",
             &profile_env(Some("example-secret-rotated")),
         )
+        .expect("the role skills resolve")
         .expect("preview");
         assert_ne!(
             first.revision, rotated.revision,
@@ -1438,6 +1679,7 @@ request_timeout = "90s"
         // A missing credential is bound as `unset` (the fact of the
         // declaration is covered) and disclosed as a NAME only.
         let missing = ProfileBinding::from_config(&config, "lane-orch-1", &profile_env(None))
+            .expect("the role skills resolve")
             .expect("preview");
         assert_eq!(missing.secrets[0].1, PROFILE_SECRET_UNSET);
         assert_ne!(first.revision, missing.revision);
@@ -1493,6 +1735,7 @@ request_timeout = "90s"
                 "lane-orch-1",
                 &profile_env(Some(SECRET_VALUE)),
             )
+            .expect("the role skills resolve")
             .expect("preview");
             assert_ne!(
                 first.revision, changed.revision,
@@ -1505,6 +1748,7 @@ request_timeout = "90s"
     fn profile_binding_documents_are_validated_and_revision_checked() {
         let config = profile_config("documents");
         let binding = ProfileBinding::from_config(&config, "lane-orch-1", &profile_env(None))
+            .expect("the role skills resolve")
             .expect("preview");
         let doc = binding.to_doc();
 

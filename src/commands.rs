@@ -4001,6 +4001,12 @@ fn execute_config(action: ConfigAction, invocation: &Invocation) -> CmdResult {
                         &harness.key,
                         &credential_env,
                     );
+                    // Issue #267: the declared role skills and the content
+                    // identity each resolves to (`null` when the inventory
+                    // does not resolve it) — legible here, refused at the
+                    // plan boundary.
+                    let skills = crate::config::role_skill_doc(&config, harness);
+                    let binding = binding.ok().flatten();
                     let (present, missing) =
                         crate::config::credential_presence(harness, &credential_env);
                     object(vec![
@@ -4034,6 +4040,7 @@ fn execute_config(action: ConfigAction, invocation: &Invocation) -> CmdResult {
                                 .map(|binding| binding.to_doc())
                                 .unwrap_or_else(null),
                         ),
+                        ("skills", skills),
                         (
                             "credentials",
                             object(vec![
@@ -4135,7 +4142,7 @@ fn execute_config(action: ConfigAction, invocation: &Invocation) -> CmdResult {
                     harness.env_allow.join(", ")
                 ));
                 let credential_env = crate::config::credential_environment(harness);
-                if let Some(binding) = crate::config::ProfileBinding::from_config(
+                if let Ok(Some(binding)) = crate::config::ProfileBinding::from_config(
                     &config,
                     &harness.key,
                     &credential_env,
@@ -4145,6 +4152,17 @@ fn execute_config(action: ConfigAction, invocation: &Invocation) -> CmdResult {
                          credential values never leave the environment)\n",
                         binding.revision, binding.provider, binding.model
                     ));
+                }
+                let skills = crate::config::role_skill_doc(&config, harness);
+                for skill in skills.as_array().into_iter().flatten() {
+                    let key = skill.get("key").and_then(Val::as_str).unwrap_or_default();
+                    match skill.get("hash").and_then(Val::as_str) {
+                        Some(hash) => human.push_str(&format!("    skill {key} resolved {hash}\n")),
+                        None => human.push_str(&format!(
+                            "    skill {key} UNRESOLVED (declare [skill.{key}.hash] with the \
+                             installed procedure's content identity; the plan refuses until then)\n"
+                        )),
+                    }
                 }
             }
             for pin in &config.workflows {
@@ -4322,8 +4340,8 @@ fn build_lane_plan(
             };
             let env = crate::config::credential_environment(harness);
             match crate::config::ProfileBinding::from_config(config, key, &env) {
-                Some(binding) => Some(binding),
-                None => {
+                Ok(Some(binding)) => Some(binding),
+                Ok(None) => {
                     return Err(Box::new(error_result(
                         5,
                         "config.harness",
@@ -4331,6 +4349,13 @@ fn build_lane_plan(
                             "harness {key:?} declares no provider/model binding; there is no \
                              inferred profile plan (declare `provider`/`model` or omit --profile)"
                         ),
+                        false,
+                    )));
+                }
+                Err(err) => {
+                    return Err(Box::new(lane_error(
+                        err.code(),
+                        err.message().to_string(),
                         false,
                     )));
                 }
@@ -4694,14 +4719,19 @@ fn fresh_role_binding(
     };
     let env = crate::config::credential_environment(harness);
     match crate::config::ProfileBinding::from_config(config, harness_key, &env) {
-        Some(binding) => Ok((binding.to_doc(), binding.revision)),
-        None => Err(Box::new(error_result(
+        Ok(Some(binding)) => Ok((binding.to_doc(), binding.revision)),
+        Ok(None) => Err(Box::new(error_result(
             5,
             "config.harness",
             format!(
                 "harness {harness_key:?} declares no provider/model binding; there is no \
                  re-observed role configuration to submit against"
             ),
+            false,
+        ))),
+        Err(err) => Err(Box::new(lane_error(
+            err.code(),
+            err.message().to_string(),
             false,
         ))),
     }
@@ -5214,23 +5244,34 @@ fn execute_queue_intake(args: &QueueIntakeArgs, invocation: &Invocation) -> CmdR
             false,
         );
     };
-    if crate::config::ProfileBinding::from_config(
+    // Issue #267: the re-observed role configuration resolves its declared
+    // role skills before any issue is read; an unresolvable skill refuses
+    // typed and submits nothing.
+    match crate::config::ProfileBinding::from_config(
         &config,
         &args.harness,
         &crate::config::credential_environment(harness),
-    )
-    .is_none()
-    {
-        return error_result(
-            5,
-            "config.harness",
-            format!(
-                "queue intake: harness {:?} declares no provider/model binding; there is no \
-                 re-observed role configuration to bind",
-                args.harness
-            ),
-            false,
-        );
+    ) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return error_result(
+                5,
+                "config.harness",
+                format!(
+                    "queue intake: harness {:?} declares no provider/model binding; there is no \
+                     re-observed role configuration to bind",
+                    args.harness
+                ),
+                false,
+            );
+        }
+        Err(err) => {
+            return lane_error(
+                err.code(),
+                format!("queue intake: {}", err.message()),
+                false,
+            );
+        }
     }
     // The ready issue set, read from the repository's own API surface (no
     // model, no agent, no third-party service).
@@ -5820,18 +5861,23 @@ fn execute_queue_preview(args: &QueuePreviewArgs, invocation: &Invocation) -> Cm
         );
     };
     let env = crate::config::credential_environment(harness);
-    let Some(binding) = crate::config::ProfileBinding::from_config(&config, &args.harness, &env)
-    else {
-        return error_result(
-            5,
-            "config.harness",
-            format!(
-                "harness {:?} declares no provider/model binding; there is no re-observed role \
-                 configuration to preview",
-                args.harness
-            ),
-            false,
-        );
+    let binding = match crate::config::ProfileBinding::from_config(&config, &args.harness, &env) {
+        Ok(Some(binding)) => binding,
+        Ok(None) => {
+            return error_result(
+                5,
+                "config.harness",
+                format!(
+                    "harness {:?} declares no provider/model binding; there is no re-observed \
+                     role configuration to preview",
+                    args.harness
+                ),
+                false,
+            );
+        }
+        Err(err) => {
+            return lane_error(err.code(), err.message().to_string(), false);
+        }
     };
     // The workflow binding: the same rule as `canter plan` (a configured pin
     // that names another workflow is refused; the workflow engine is a later
@@ -5915,17 +5961,22 @@ fn execute_queue_preview(args: &QueuePreviewArgs, invocation: &Invocation) -> Cm
                 );
             };
             let env = crate::config::credential_environment(row);
-            let Some(binding) = crate::config::ProfileBinding::from_config(&config, key, &env)
-            else {
-                return error_result(
-                    5,
-                    "config.harness",
-                    format!(
-                        "harness {key:?} declares no provider/model binding; the reviewer role \
-                         needs a reviewed binding the run's review step can declare"
-                    ),
-                    false,
-                );
+            let binding = match crate::config::ProfileBinding::from_config(&config, key, &env) {
+                Ok(Some(binding)) => binding,
+                Ok(None) => {
+                    return error_result(
+                        5,
+                        "config.harness",
+                        format!(
+                            "harness {key:?} declares no provider/model binding; the reviewer \
+                             role needs a reviewed binding the run's review step can declare"
+                        ),
+                        false,
+                    );
+                }
+                Err(err) => {
+                    return lane_error(err.code(), err.message().to_string(), false);
+                }
             };
             Some((
                 row.key.clone(),

@@ -790,12 +790,14 @@ mod tests {
                 secret_env: vec![],
                 limits: vec![],
                 binding_introspection: false,
+                skills: Vec::new(),
             }],
             workflows: vec![WorkflowPin {
                 key: "doctrine".to_string(),
                 id: "fleet-doctrine-1".to_string(),
                 hash: "a".repeat(64),
             }],
+            skills: Vec::new(),
         }
     }
 
@@ -819,7 +821,8 @@ mod tests {
         let env = BTreeMap::new();
         let plan = LanePlan::build(
             input(),
-            ProfileBinding::from_config(&config, "lane-orch-1", &env),
+            ProfileBinding::from_config(&config, "lane-orch-1", &env)
+                .expect("the role skills resolve"),
         );
         assert!(plan.profile.is_some());
         // A moved provider (a new revision) changes the digest: a previously
@@ -827,7 +830,8 @@ mod tests {
         config.harnesses[0].provider = Some("other".to_string());
         let moved = LanePlan::build(
             input(),
-            ProfileBinding::from_config(&config, "lane-orch-1", &env),
+            ProfileBinding::from_config(&config, "lane-orch-1", &env)
+                .expect("the role skills resolve"),
         );
         assert_ne!(plan.digest, moved.digest, "profile revision is bound");
     }

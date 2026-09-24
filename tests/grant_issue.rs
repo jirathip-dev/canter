@@ -326,6 +326,7 @@ fn config_binding(config_path: &Path) -> Val {
         .expect("harness");
     let env = credential_environment(harness);
     ProfileBinding::from_config(&config, HARNESS, &env)
+        .expect("the role skills resolve")
         .expect("binding")
         .to_doc()
 }

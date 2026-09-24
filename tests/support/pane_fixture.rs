@@ -133,6 +133,7 @@ pub fn binding_doc() -> Val {
         configured_limits: Vec::new(),
         introspection: false,
         secrets: vec![("PROVIDER_TOKEN".to_string(), SECRET_DIGEST.to_string())],
+        skills: Vec::new(),
         revision: String::new(),
     };
     binding.revision = binding.revision_of();
@@ -882,6 +883,7 @@ pub fn harness_binding_doc() -> Val {
         configured_limits: Vec::new(),
         introspection: false,
         secrets: Vec::new(),
+        skills: Vec::new(),
         revision: String::new(),
     };
     binding.revision = binding.revision_of();

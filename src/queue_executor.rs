@@ -543,7 +543,7 @@ pub fn bound_digest(bound: &Val) -> Result<String, SubmissionError> {
 /// refused, and the rebuild is what the digest is re-derived from.
 pub fn presented_request(material: &SubmissionMaterial) -> Result<QueueRequest, SubmissionError> {
     let bound = &material.preview;
-    const KEYS: [&str; 8] = [
+    const KEYS: [&str; 9] = [
         "schema",
         "repository",
         "host",
@@ -552,6 +552,11 @@ pub fn presented_request(material: &SubmissionMaterial) -> Result<QueueRequest, 
         "boundary",
         "steps",
         "selected",
+        // Issue #267: the declared legs and their role skills are a
+        // DETERMINISTIC derivation of the other facts (the role bindings and
+        // the step spine), re-derived by every render — a document whose
+        // legs disagree with its bindings moves the digest and refuses.
+        "legs",
     ];
     let Val::Obj(map) = bound else {
         return Err(SubmissionError::new(

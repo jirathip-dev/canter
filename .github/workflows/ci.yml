@@ -357,6 +357,7 @@ jobs:
           "--test restart_pause_continuity",
           "--test retirement",
           "--test review_dispatch",
+          "--test role_skills",
           "--test run_control",
           "--test run_control_cli",
           "--test service_plans",

@@ -1,7 +1,8 @@
 schema = "hf-config/v1"
 
 # One canonical XDG TOML config; no implicit profile/repository merge stack.
-# Optional tables only: daemon, policy, repository, harness, workflow, role.
+# Optional tables only: daemon, policy, repository, harness, workflow, role,
+# skill.
 
 [daemon]
 enabled = true
@@ -18,6 +19,7 @@ enabled = true
 kind = "argv"
 executable = "hf-cli-example"
 env_allow = ["PATH", "HOME"]
+skills = ["lane-impl"]
 
 # Optional profile-planning keys (issue #77): the explicit provider/model
 # binding, the authorized fallback pairs, the credential environment names
@@ -41,3 +43,9 @@ request_timeout = "90s"
 [workflow.bundle]
 id = "fleet-doctrine-1"
 hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+# The resolvable skill inventory (issue #267): each entry pins the content
+# identity of one installed lane procedure. A role binding whose declared
+# skill the inventory does not name refuses typed at the plan boundary.
+[skill.lane-impl]
+hash = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"

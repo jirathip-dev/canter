@@ -58,6 +58,18 @@ Normative rules:
   moved binding refuses with `refusal.evidence.stale`. The row is
   invalidated when the plan's workflow/policy hash set changes; latest
   per instance, append-only history is retained.
+- Reviewer procedure source (issue #267): the reviewer role contract is
+  committed as a portable, installable procedure,
+  [`skills/lane-reviewer/SKILL.md`](../../skills/lane-reviewer/SKILL.md). It
+  states the rule the engine already enforces — a verdict is written for the
+  exact **certified head** the lane was dispatched at, a head that moved under
+  the review (or a verdict naming another head) is refused with
+  `refusal.evidence.verdict_stale` rather than consumed, and the reviewer is
+  never the implementer that produced the head. The plan declares, per leg,
+  which role skill a lane is given (`docs/contracts/spec-plans.md`, "The
+  queue-run plan names, per leg, the role skills"), so the procedure is
+  configuration the plan digest binds — never an accident of profile
+  contents.
 
 ## Fixture map
 

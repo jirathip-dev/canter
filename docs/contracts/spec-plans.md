@@ -202,6 +202,32 @@ Normative rules:
 - The digest is what grants/audit records bind to, and what apply
   revalidation re-computes immediately before effects.
 
+### The queue-run plan names, per leg, the role skills (issue #267)
+
+- The queue-run producer (`canter queue preview`) renders the bound-input
+  document (`hf-queue-preview/v1`) whose closed key set carries a `legs`
+  array next to `steps` and `selected`: one entry per declared leg
+  (`{issue, role, round, agent, workspace, checkout, skills}`), where
+  `skills` is the procedure the lane is given. The implementer legs inherit
+  the run's reviewed role binding (`role_config.skills`, the resolved
+  `{key, hash}` pins the `hf-profile-binding/v1` revision fingerprints) and
+  each self-dispatching review step's reviewer leg inherits the
+  registry-resolved binding that step declares
+  (`steps[].params.reviewer_profile.skills`). `steps[].skills` repeats the
+  same per-leg names on the rendered step view.
+- The legs are a DETERMINISTIC derivation of the role bindings and the step
+  spine, so `queue.submit` re-derives them: a presented document whose legs
+  disagree with its bindings moves the digest and refuses
+  (`refusal.plan.stale`), and a change to the role→skill binding in
+  configuration moves the binding revision and therefore the plan digest —
+  the binding is certifiable rather than an accident of profile contents.
+- What a role binding may declare is configuration (`harness.<key>.skills`),
+  and every declared key must resolve against the installation's own
+  `skill.<key>` inventory. One unresolvable key refuses the plan typed
+  (`refusal.skill.unresolved`, exit 4) BEFORE any run, worktree or pane
+  exists — a lane never starts short of the procedure its role declares.
+  See [spec-config.md](spec-config.md), "Role skills".
+
 ## 2. Route grants: `hf-grant/v1` (AC3)
 
 A route grant is the only authorization to start durable work:

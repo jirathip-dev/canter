@@ -4990,6 +4990,7 @@ mod tests {
             secret_env: vec![],
             limits: vec![],
             binding_introspection: false,
+            skills: Vec::new(),
         };
         let profile = Profile::from_config(&harness).expect("profile");
         assert_eq!(profile.kind, HarnessKind::Codex);
@@ -5007,6 +5008,7 @@ mod tests {
             secret_env: vec![],
             limits: vec![],
             binding_introspection: false,
+            skills: Vec::new(),
         };
         let err = Profile::from_config(&unknown).expect_err("refused");
         assert_eq!(err.code, CODE_UNKNOWN_HARNESS);
@@ -5022,6 +5024,7 @@ mod tests {
             secret_env: vec![],
             limits: vec![],
             binding_introspection: false,
+            skills: Vec::new(),
         };
         let profile = Profile::from_config(&argv).expect("profile");
         assert_eq!(profile.kind, HarnessKind::Argv);
@@ -5191,6 +5194,7 @@ mod tests {
             secret_env: vec![],
             limits: vec![],
             binding_introspection: false,
+            skills: Vec::new(),
         };
         let profile = Profile::from_config(&harness).expect("profile");
         let session = sample_session();
@@ -5407,6 +5411,7 @@ mod tests {
             secret_env: vec![],
             limits: vec![],
             binding_introspection: false,
+            skills: Vec::new(),
         };
         let profile = Profile::from_config(&harness).expect("profile");
         assert_eq!(profile.provider.as_deref(), Some("example-provider"));
@@ -5423,6 +5428,7 @@ mod tests {
             secret_env: vec![],
             limits: vec![],
             binding_introspection: false,
+            skills: Vec::new(),
         };
         let err = Profile::from_config(&half).expect_err("half pair refused");
         assert_eq!(err.code, CODE_BAD_REQUEST);
