@@ -15037,13 +15037,13 @@ impl State {
         // Issue #243: every recorded check re-evaluation of this run, so the
         // driver reads the SAME durable bound the control itself enforces
         // before it derives a recovery intent.
-        let reevaluations = run_reevaluation_counts_locked(&conn, instance_id)?;
+        let reevaluations = run_reevaluation_counts_locked(conn, instance_id)?;
         // Issue #272: the run's own certified delivery binding, read from the
         // SAME recorded rows the consumption gate reads. The driver needs it to
         // tell a delivery its own collection observed from a head nothing ever
         // collected — a repair leg's delivered head is only consumable once
         // this names it.
-        let delivery = self.delivery_certificate_locked(&conn, instance_id)?;
+        let delivery = self.delivery_certificate_locked(conn, instance_id)?;
         Ok(Some(SupervisionEvidence {
             run,
             has_dispatch_context,
