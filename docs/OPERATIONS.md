@@ -551,6 +551,28 @@ $ ./target/release/canter daemon status --json    # exit 0 — live again
   interrupted work becomes `ambiguous` and needs external reconciliation.
 - Read-only commands never need the daemon — observing and planning stay
   available while the daemon is down.
+- **A terminal run's stale lane records** (issue #236): a run that reached
+  `done`/`invalidated` without its own `p8` cleanup keeps durable lane
+  records — the ownership row that still names it the owner of its issue,
+  its linked lane workspace, its registered lane checkout and its local lane
+  branch. Retire them with ONE bounded, audited control instead of editing
+  the state store:
+
+  ```console
+  $ ./target/release/canter run retire-lane --run run-<16hex> \
+      --reason 'the terminal generation is stale' --json
+  ```
+
+  The lane is derived from the run's own issue and the integration clone
+  from the run's OWN recorded topology (a first-time topology may be
+  presented with `--topology FILE`), so no lane path is spelled out by the
+  caller. A run that is NOT terminal refuses typed
+  (`refusal.lane.live_run`) and nothing is touched: a live lane still holds
+  its issue's unique ownership — release such a run first
+  (`run release`) if it can never progress. The retirement is one
+  hash-chained journal claim; a local-only lane branch is never destroyed
+  (the document records `branch_residue.removed: false` for it), and the
+  #190/#222 automatic reclaim at the next bind step is unchanged.
 
 ### 8.1 Integration branch deleted (staging)
 

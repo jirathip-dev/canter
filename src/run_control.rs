@@ -1,37 +1,43 @@
 //! Run-scoped controls (issue #86): safe-boundary pause, resume, bounded
 //! retry and supported step dispatch for ONE queue run, plus (issue #146)
-//! the explicit release of a run that can never progress.
+//! the explicit release of a run that can never progress and (issue #236)
+//! the retirement of ONE terminal run's stale lane records.
 //!
 //! A *run* is one durable `instances` row (`run-` + 16 hex) — the identity
 //! the merged queue executor (#85) commits for every admitted selected
 //! issue. This module is the typed control surface over those rows:
 //! parameter parsing, the closed refusal vocabulary, the deterministic
 //! projections (`hf-run-control/v1` / `hf-run-retry/v1` /
-//! `hf-run-release/v1`) and the pure diagnosis helpers. The daemon owns
+//! `hf-run-release/v1` / `hf-run-lane-retirement/v1`) and the pure diagnosis
+//! helpers. The daemon owns
 //! journaling and the state transactions (`State::request_run_pause`,
 //! `State::resume_run`, `State::record_run_retry`, `State::claim_run_retry`,
-//! `State::release_run`).
+//! `State::release_run`, `State::retire_run_lane_records`).
 //!
 //! ## Scope matrix (run vs fleet vs lane)
 //!
 //! | level | identity | control surface | effect of a run control |
 //! | --- | --- | --- | --- |
-//! | run | one `run-` instance id | `run.pause` / `run.resume` / `run.retry` / `run.release` / `run.dispatch` / `run.status` | exactly this run: stop admitting new steps (pause), lift this run's pause (resume), authorize one bounded re-dispatch of one diagnosed step (retry, authorization only), release ONE run that can never progress — its issue ownership and the occupancy it held are freed and the run goes terminal (release), dispatch ONE committed-spine step with the operator's own step inputs (dispatch, derived from the run's committed submission), read the control state back (status) |
+//! | run | one `run-` instance id | `run.pause` / `run.resume` / `run.retry` / `run.release` / `run.retire-lane` / `run.dispatch` / `run.status` | exactly this run: stop admitting new steps (pause), lift this run's pause (resume), authorize one bounded re-dispatch of one diagnosed step (retry, authorization only), release ONE run that can never progress — its issue ownership and the occupancy it held are freed and the run goes terminal (release), retire the stale LANE RECORDS of ONE run the ledger records as terminal — its leftover issue ownership rows and its own lane's residue, never a live lane (retire-lane, issue #236), dispatch ONE committed-spine step with the operator's own step inputs (dispatch, derived from the run's committed submission), read the control state back (status) |
 //! | fleet | the whole run population | NONE — no `fleet.*` method exists in the closed RPC set | a fleet-level hold is an operator policy expressed as the set of paused runs: every `run.resume` is fenced on the exact instance id, so it never lifts another run's pause and never re-enables anything fleet-wide |
-//! | lane | one handoff lane generation (replacement/checkpoint records) | `lane.*` only | run controls never touch lane records; a run control naming a non-run identity refuses typed |
+//! | lane | one handoff lane generation (replacement/checkpoint records) | `lane.*` only | a run control never ADDRESSES a lane identity (a lane id never resolves to a run: it refuses typed) and never advances a handoff record; `run.retire-lane` derives the lane of the run it addresses from that run's own issue and refuses every non-terminal run, so it can never reach a live lane |
 //!
-//! Nothing on this surface kills a process, cleans up work, mutates Git,
-//! clears a repository or fleet-level hold, or bypasses a gate: a pause
-//! stops admitting NEW work and preserves in-flight dirty work, a retry
-//! authorizes exactly ONE bounded step re-dispatch, and a release refuses
-//! while work is in flight or a bounded authorization is unconsumed — it
-//! frees durable BOOKKEEPING (ownership, occupancy) of a run that cannot
-//! make progress, never a running effect.
+//! Nothing on this surface kills a process, clears a repository or fleet-level
+//! hold, or bypasses a gate: a pause stops admitting NEW work and preserves
+//! in-flight dirty work, a retry authorizes exactly ONE bounded step
+//! re-dispatch, and a release refuses while work is in flight or a bounded
+//! authorization is unconsumed — it frees durable BOOKKEEPING (ownership,
+//! occupancy) of a run that cannot make progress, never a running effect. The
+//! one control that mutates Git is `run.retire-lane`, and only for a run the
+//! ledger already records as terminal: it retires that run's own lane under
+//! the same #190/#222 policy a bind step already applies, so the operator
+//! path and the automatic reclaim can never diverge.
 
 use crate::canonical::sha256_hex;
 use crate::formats;
 use crate::state::{
-    GrantRow, InstanceRow, RUN_RETRY_MAX, RunReleaseOutcome, RunRetryRow, StepFailure,
+    GrantRow, InstanceRow, RUN_RETRY_MAX, RunLaneRetirement, RunReleaseOutcome, RunRetryRow,
+    StepFailure,
 };
 use crate::value::{Val, bool_, integer, null, object, string};
 
@@ -55,6 +61,10 @@ pub const RUN_RESOLUTION_SCHEMA: &str = "hf-run-resolution/v1";
 /// The explicit release of a run that can never progress (issue #146;
 /// module-local).
 pub const RUN_RELEASE_SCHEMA: &str = "hf-run-release/v1";
+
+/// The retirement of ONE terminal run's stale lane records (issue #236;
+/// module-local).
+pub const RUN_LANE_RETIREMENT_SCHEMA: &str = "hf-run-lane-retirement/v1";
 
 /// Bound on the operator pause reason (same bound as the lane hold).
 pub const REASON_MAX: usize = 300;
@@ -138,6 +148,10 @@ pub mod codes {
     pub const RESOLUTION_KIND: &str = "refusal.run.resolution_kind";
     /// Artifact evidence or recorder identity is malformed/incomplete.
     pub const RESOLUTION_EVIDENCE: &str = "refusal.run.resolution_evidence";
+    /// The addressed run is LIVE: only a terminal run's lane records are
+    /// retired, because a live lane still holds its issue's unique ownership
+    /// and is never in the retired set (issue #236).
+    pub const LANE_LIVE: &str = "refusal.lane.live_run";
     /// The audited operator measurement of a `run dispatch` must carry BOTH
     /// the operator identity and the reason (issue #250): the daemon measures
     /// the host on the operator's audited behalf and records the act, so an
@@ -655,6 +669,92 @@ pub fn parse_release_params(params: &Val) -> Result<ReleaseParams, ControlError>
         instance_id,
         reason,
     })
+}
+
+/// `run.retire-lane` params (issue #236): ONE run the ledger records as
+/// terminal, the audited operator reason, and — only for a run whose own
+/// applies recorded no topology — the lane-path topology the retire presents
+/// (`integration_branch`, `integration_repo`, `worktrees_root`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LaneRetirementParams {
+    /// The presented idempotency key.
+    pub idempotency_key: String,
+    /// The exact run identity (`run-` + 16 hex).
+    pub instance_id: String,
+    /// The bounded operator reason, recorded with the retirement.
+    pub reason: String,
+    /// Initial lane paths, presented only when the run recorded none.
+    pub topology: Option<Val>,
+}
+
+/// Parse and shape-validate `run.retire-lane` params (issue #236): ONE run,
+/// the audited operator reason, and the lane-path topology only when the run
+/// recorded none. The identity is fully validated before any state is read —
+/// a lane id, a submission id or free text never addresses a run.
+pub fn parse_lane_retirement_params(params: &Val) -> Result<LaneRetirementParams, ControlError> {
+    only_keys(
+        params,
+        &["idempotency_key", "instance_id", "reason", "topology"],
+        "run.retire-lane",
+    )?;
+    let idempotency_key = required(params, "idempotency_key", "run.retire-lane")?;
+    if !formats::is_idempotency_key(&idempotency_key) {
+        return Err(ControlError::new(
+            "refusal.malformed",
+            "run.retire-lane params.idempotency_key must be `ik_` + 8-64 of [a-z0-9-]",
+        ));
+    }
+    let instance_id = required(params, "instance_id", "run.retire-lane")?;
+    if !formats::is_run_id(&instance_id) {
+        return Err(ControlError::new(
+            codes::TARGET,
+            format!(
+                "run.retire-lane addresses exactly ONE run (`run-` + 16 hex); {instance_id:?} is \
+                 not a run identity (a lane id, a submission id or free text never addresses a run)"
+            ),
+        ));
+    }
+    let reason = required(params, "reason", "run.retire-lane")?;
+    if reason.is_empty() || reason.len() > REASON_MAX || reason.chars().any(char::is_control) {
+        return Err(ControlError::new(
+            "refusal.malformed",
+            format!("run.retire-lane params.reason must be 1-{REASON_MAX} printable characters"),
+        ));
+    }
+    let topology = match params.get("topology") {
+        None | Some(Val::Null) => None,
+        Some(value @ Val::Obj(_)) => Some(value.clone()),
+        _ => {
+            return Err(ControlError::new(
+                "refusal.malformed",
+                "run.retire-lane params.topology must be an object when present",
+            ));
+        }
+    };
+    Ok(LaneRetirementParams {
+        idempotency_key,
+        instance_id,
+        reason,
+        topology,
+    })
+}
+
+/// The canonical `run.retire-lane` params document (issue #236).
+pub fn lane_retirement_params(
+    key: &str,
+    instance_id: &str,
+    reason: &str,
+    topology: Option<Val>,
+) -> Val {
+    let mut fields = vec![
+        ("idempotency_key", string(key)),
+        ("instance_id", string(instance_id)),
+        ("reason", string(reason)),
+    ];
+    if let Some(topology) = topology {
+        fields.push(("topology", topology));
+    }
+    object(fields)
 }
 
 /// Parse a recorder-attributed artifact resolution. Its closed evidence is
@@ -1414,6 +1514,65 @@ pub fn release_id(instance_id: &str, key: &str) -> String {
     format!("rl_{}", &sha256_hex(preimage.as_bytes())[..16])
 }
 
+/// Render the `hf-run-lane-retirement/v1` projection of ONE committed lane
+/// retirement (issue #236): the run, the operator reason, the durable lane
+/// records the operation removed (the leftover ownership rows that still
+/// named the terminal run the owner of its issue) and what the lane-residue
+/// retire recorded (`null` when the operator control stopped at the durable
+/// half).
+pub fn lane_retirement_doc(
+    retired: &RunLaneRetirement,
+    reason: &str,
+    retired_at: &str,
+    residue: Val,
+    key: &str,
+) -> Val {
+    let run = &retired.run;
+    object(vec![
+        ("schema", string(RUN_LANE_RETIREMENT_SCHEMA)),
+        (
+            "retirement_id",
+            string(&lane_retirement_id(&run.instance_id, key)),
+        ),
+        ("run", run_block(run)),
+        (
+            "retirement",
+            object(vec![
+                ("reason", string(reason)),
+                ("retired_at", string(retired_at)),
+                ("status", string(&run.status)),
+                (
+                    "ownership_rows_removed",
+                    integer(retired.ownership_rows_removed as i64),
+                ),
+                ("lane_residue", residue),
+            ]),
+        ),
+        (
+            "scope",
+            object(vec![
+                ("level", string("run")),
+                ("run", string(&run.instance_id)),
+                ("fleet_effect", string("none")),
+                ("lane_effect", string("ONE terminal run's lane")),
+            ]),
+        ),
+        ("statement", string(LANE_RETIREMENT_STATEMENT)),
+    ])
+}
+
+/// The deterministic retirement id of one lane retirement (`lr_` + 16 hex):
+/// derived from the document schema, the run and the idempotency key that
+/// claimed it.
+pub fn lane_retirement_id(instance_id: &str, key: &str) -> String {
+    let preimage = format!("{RUN_LANE_RETIREMENT_SCHEMA}|{instance_id}|{key}");
+    format!("lr_{}", &sha256_hex(preimage.as_bytes())[..16])
+}
+
+/// The statement every lane-retirement document carries: the bounds that make
+/// the control a retire and never a cleanup-by-other-means.
+pub const LANE_RETIREMENT_STATEMENT: &str = "run retire-lane only: exactly ONE TERMINAL run is addressed — the stale lane records it still holds are retired in one audited transaction (the ownership rows that still name it), and its lane residue is retired under the existing #190/#222 policy: the run's OWN linked lane workspace (a different lane's registration or an unverifiable read-back is refused and left untouched), its REGISTERED lane checkout in the integration clone, and its local lane branch only when the published branch carries the same tip — a local-only delivery is never deleted; a run that is not terminal refuses typed (`refusal.lane.live_run`) and nothing is touched, because a live lane still holds its issue's unique ownership; nothing is spawned, killed, resumed, retried, released or dispatched, no other run's lane, ownership or pause is touched, no other issue's lane is ever addressed, no gate is bypassed and no branch is force-updated";
+
 /// Render the `hf-run-release/v1` projection of one committed release
 /// (issue #146): the released run (now terminal), the operator reason, what
 /// the release freed, and the authorization window the run held when it was
@@ -1778,6 +1937,40 @@ pub fn render_human(document: &Val) -> String {
             text(&release, "released_at"),
             text(&release, "reason"),
             window,
+            text(&run, "instance_id"),
+        );
+    }
+    if schema == RUN_LANE_RETIREMENT_SCHEMA {
+        let retirement = document.get("retirement").cloned().unwrap_or_else(null);
+        let residue = retirement.get("lane_residue").cloned().unwrap_or_else(null);
+        let lane = if residue.is_null() {
+            "not attempted (the durable half was already retired)".to_string()
+        } else {
+            format!(
+                "branch {} at worktree {}; workspace {}; checkout/branch residue recorded",
+                text(&residue, "branch"),
+                text(&residue, "worktree"),
+                if residue
+                    .get("workspace")
+                    .and_then(|workspace| workspace.get("retired"))
+                    .and_then(Val::as_bool)
+                    == Some(true)
+                {
+                    "retired"
+                } else {
+                    "not retired"
+                }
+            )
+        };
+        return format!(
+            "run {} lane retired: status {}, {} at {}\nownership rows removed: {}\nlane: {}\nreason: {}\nscope: run {} only; nothing else is touched\n",
+            text(&run, "instance_id"),
+            text(&retirement, "status"),
+            text(document, "retirement_id"),
+            text(&retirement, "retired_at"),
+            number(&retirement, "ownership_rows_removed"),
+            lane,
+            text(&retirement, "reason"),
             text(&run, "instance_id"),
         );
     }

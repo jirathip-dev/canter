@@ -6,6 +6,27 @@ release process activates (docs/RELEASING.md), then semver applies.
 
 ## [Unreleased]
 
+### Added (issue #236 — `run retire-lane`, the bounded operator retirement of ONE terminal run's stale lane records)
+
+- `canter run retire-lane --run RUN_ID --reason TEXT [--topology FILE]`
+  retires the stale lane records of ONE run the ledger already records as
+  terminal, so a released run's residue is recoverable by one bounded,
+  audited operator control instead of hand-editing state or waiting for a
+  successor run's bind step: the leftover `queue_ownership` row that still
+  names the run the owner of its issue is removed in ONE transaction with a
+  `run.retire-lane` audit record, and its lane residue is retired under the
+  SAME #190/#222 policy a bind step applies — the run's OWN linked lane
+  workspace (a different pane, another lane's binding or an unverifiable
+  read-back is refused and left untouched), its REGISTERED lane checkout in
+  the integration clone, and its local lane branch only when the published
+  branch carries the same tip (a local-only delivery is never destroyed).
+  The lane is derived from the run's own issue (`issue-<N>` at
+  `issues-<N>`) and the integration clone from the run's own recorded
+  topology, never from a caller-named path. A run that is NOT terminal
+  refuses typed `refusal.lane.live_run` before any claim — a live lane still
+  holds its issue's unique ownership and is never in the retired set. The
+  same idempotency key replays the recorded response.
+
 ### Added (issue #245 — `queue intake`, the deterministic feeder)
 
 - `canter queue intake` turns the repository's own issue state into ONE

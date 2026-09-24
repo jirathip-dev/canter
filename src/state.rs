@@ -390,6 +390,17 @@ pub struct RunReleaseOutcome {
     pub grant_usable: bool,
 }
 
+/// The recorded outcome of ONE operator lane retirement (issue #236): the run
+/// row as it stands when its stale lane records were retired, and how many
+/// leftover ownership rows the retirement removed (`0` = the run held none).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunLaneRetirement {
+    /// The run whose lane records were retired (terminal in the ledger).
+    pub run: InstanceRow,
+    /// Ownership rows removed by this retirement.
+    pub ownership_rows_removed: usize,
+}
+
 /// The recorded outcome of ONE engine-owned renewal of a live run's own
 /// lapsed authorization window (issue #184): the successor grant row the run
 /// is bound to from here on, the lapsed grant row it supersedes, and the
@@ -3118,6 +3129,82 @@ impl State {
             out.push(row.map_err(|err| StateError::from_sqlite("retired_run_ids: row", err))?);
         }
         Ok(out)
+    }
+
+    /// Issue #236: retire the durable LANE RECORDS one run that can never
+    /// progress still holds — its leftover `queue_ownership` row(s), the
+    /// claim that still names this run as the owner of its repository issue.
+    ///
+    /// The admitting and completing paths free that row in the SAME
+    /// transaction that admits/completes the run, so a leftover row is
+    /// exactly the bookkeeping a run that went terminal by no other path
+    /// (a release that never reached `p8`, a rebound revision, an epoch
+    /// rotation) left behind: the durable half of "a released run keeps its
+    /// lane records". This retires it in ONE audited transaction, so a pinned
+    /// issue is recoverable without hand-editing the state store.
+    ///
+    /// A run that is NOT terminal refuses typed
+    /// ([`crate::run_control::codes::LANE_LIVE`]) and writes nothing: a live
+    /// lane still holds its issue's unique ownership, so it is never in the
+    /// retired set. An unknown run is `state.not_found`; a terminal run with
+    /// nothing left is an audited no-op that reports `0` rows removed.
+    pub fn retire_run_lane_records(
+        &self,
+        instance_id: &str,
+        reason: &str,
+        key: &str,
+    ) -> Result<RunLaneRetirement, StateError> {
+        self.ensure_writable()?;
+        let mut conn = self.lock("retire_run_lane_records")?;
+        let tx = conn
+            .transaction()
+            .map_err(|err| StateError::from_sqlite("retire_run_lane_records: begin", err))?;
+        let row = tx
+            .query_row(
+                format!("{} WHERE instance_id = ?1", instance_select_sql()).as_str(),
+                params![instance_id],
+                instance_row_from,
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("retire_run_lane_records: read", err))?;
+        let Some(run) = row else {
+            return Err(state_error(
+                "state.not_found",
+                format!("no instance {instance_id:?}"),
+            ));
+        };
+        if !matches!(run.status.as_str(), "done" | "invalidated") {
+            return Err(state_error(
+                crate::run_control::codes::LANE_LIVE,
+                format!(
+                    "run {instance_id} is live (status {:?}); only a terminal run's lane records \
+                     are retired — a live lane still holds its issue's unique ownership, and a run \
+                     that can never progress is retired with `run release` first",
+                    run.status
+                ),
+            ));
+        }
+        let removed = tx
+            .execute(
+                "DELETE FROM queue_ownership
+                  WHERE instance_id = ?1 AND repository = ?2 AND issue_number = ?3",
+                params![instance_id, run.repository, run.issue_number],
+            )
+            .map_err(|err| StateError::from_sqlite("retire_run_lane_records: ownership", err))?;
+        // The retirement record: the operator reason, the exact run identity
+        // and what was freed, in the same hash-chained audit as every other
+        // mutation, committed in the SAME transaction.
+        let target = format!(
+            "run:{instance_id}:repository:{}#{}@{}:ownership_rows:{removed}:reason:{reason}",
+            run.repository, run.issue_number, run.issue_revision
+        );
+        self.append_audit_locked(&tx, "run.retire-lane", &target, key, None, None)?;
+        tx.commit()
+            .map_err(|err| StateError::from_sqlite("retire_run_lane_records: commit", err))?;
+        Ok(RunLaneRetirement {
+            run,
+            ownership_rows_removed: removed,
+        })
     }
 
     /// The step id of a step-dispatch claim (`method:"apply"`) still in
@@ -16415,6 +16502,129 @@ mod tests {
                 .code,
             "state.approval_invalid"
         );
+    }
+
+    /// Issue #236: the bounded operator retirement of ONE terminal run's
+    /// stale lane records removes the leftover ownership row in one audited
+    /// transaction, is an idempotent no-op once nothing is left, and refuses
+    /// a LIVE run typed with nothing written — a live lane still holds its
+    /// issue's unique ownership.
+    #[test]
+    fn retire_run_lane_records_frees_a_terminal_runs_leftover_ownership_and_refuses_a_live_one() {
+        let path = temp_db("retire-run-lane-records.db");
+        let state = State::open(&path, Retention::default()).expect("open");
+        let at = "2026-09-06T00:00:00Z";
+        state.issue_grant(&sample_grant_doc()).expect("issue");
+        // A LIVE run and a second run of the same grant, both still holding
+        // their issue's ownership row: the durability of these rows is what a
+        // live-lane refusal must leave untouched.
+        state
+            .start_instance(
+                "run-236236236236beef",
+                "gr_0123456789abcdef",
+                "fleet-doctrine-1",
+                at,
+            )
+            .expect("start live");
+        state
+            .start_instance(
+                "run-236236236236abcd",
+                "gr_0123456789abcdef",
+                "fleet-doctrine-1",
+                at,
+            )
+            .expect("start");
+        {
+            let conn = Connection::open(&path).expect("open raw");
+            conn.execute(
+                "INSERT INTO queue_ownership (repository, issue_number, work_item,
+                                              submission_id, instance_id, created_at)
+                 VALUES ('example-org/widgets', 123, 'wi_0123456789abcdef',
+                         'qs_0123456789abcdef', 'run-236236236236abcd', ?1)",
+                params![at],
+            )
+            .expect("seed the leftover ownership row");
+            conn.execute(
+                "INSERT INTO queue_ownership (repository, issue_number, work_item,
+                                              submission_id, instance_id, created_at)
+                 VALUES ('example-org/widgets', 124, 'wi_0123456789abcdee',
+                         'qs_0123456789abcdef', 'run-236236236236beef', ?1)",
+                params![at],
+            )
+            .expect("seed the live ownership row");
+        }
+        // The LIVE run refuses typed and writes NOTHING: its ownership row is
+        // the live lane's claim and is never touched.
+        let err = state
+            .retire_run_lane_records(
+                "run-236236236236beef",
+                "a live lane is never retired",
+                "ik_run-236-live",
+            )
+            .expect_err("a live run refuses");
+        assert_eq!(err.code, crate::run_control::codes::LANE_LIVE);
+        assert!(
+            err.message.contains("run-236236236236beef"),
+            "the refusal names the live run: {}",
+            err.message
+        );
+        assert_eq!(
+            state.queue_ownership_rows().expect("ownership").len(),
+            2,
+            "a refused retirement writes nothing"
+        );
+
+        // The terminal shape: a run that went terminal (a revision edit, an
+        // epoch rotation, a `done` recorded outside the queue's own advance)
+        // still holding its issue's ownership row — the durable lane record
+        // the operator control exists to retire.
+        state
+            .invalidate_grant("gr_0123456789abcdef", at)
+            .expect("invalidate");
+        for run in ["run-236236236236abcd", "run-236236236236beef"] {
+            assert_eq!(
+                state
+                    .instance_by_id(run)
+                    .expect("read")
+                    .expect("row")
+                    .status,
+                "invalidated",
+                "the run is terminal in the ledger"
+            );
+        }
+        let retired = state
+            .retire_run_lane_records(
+                "run-236236236236abcd",
+                "the terminal run left a stale lane record",
+                "ik_run-236-retire",
+            )
+            .expect("retire");
+        assert_eq!(retired.ownership_rows_removed, 1);
+        let remaining = state.queue_ownership_rows().expect("ownership");
+        assert_eq!(
+            remaining.len(),
+            1,
+            "exactly the terminal run's own row was retired"
+        );
+        assert_eq!(
+            remaining[0].issue_number, 124,
+            "another issue's lane record is never touched"
+        );
+        // Idempotent: a fresh key over a run that holds nothing left is an
+        // audited no-op, never an error.
+        let again = state
+            .retire_run_lane_records(
+                "run-236236236236abcd",
+                "the terminal run left a stale lane record",
+                "ik_run-236-retire-2",
+            )
+            .expect("retire again");
+        assert_eq!(again.ownership_rows_removed, 0);
+        // An unknown run is `state.not_found`, never a fabrication.
+        let err = state
+            .retire_run_lane_records("run-0000000000000000", "unknown", "ik_run-236-unknown")
+            .expect_err("unknown run");
+        assert_eq!(err.code, "state.not_found");
     }
 
     #[test]
