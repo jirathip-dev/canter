@@ -2167,11 +2167,17 @@ fn bind_delivered_review_head(shared: &Arc<Shared>, instance_id: &str, head: &mu
             Ok(state) => state,
             Err(_) => return,
         };
-        let evidence = match state.supervision_evidence(instance_id) {
+        // Issue #268: the run's recorded rows are read once and both reads
+        // below are derived from them.
+        let records = match state.run_records(instance_id) {
+            Ok(records) => records,
+            Err(_) => return,
+        };
+        let evidence = match state.supervision_evidence_from(&records) {
             Ok(Some(evidence)) => evidence,
             _ => return,
         };
-        let worktrees_root = crate::supervision::recorded_worktrees_root(&state, instance_id);
+        let worktrees_root = crate::supervision::recorded_worktrees_root_of(&records);
         (evidence, worktrees_root)
     };
     crate::supervision::observe_fix_leg(&mut evidence, worktrees_root.as_deref());
@@ -6554,7 +6560,13 @@ fn method_supervision_status(shared: &Arc<Shared>, request: &Request) -> String 
                 }
                 Err(err) => return err_response(&request.id, err.code, err.message),
             };
-            let evidence = match state.supervision_evidence(&instance_id) {
+            // Issue #268: one read of the run's recorded rows serves both the
+            // evidence snapshot and the recorded worktrees root below.
+            let records = match state.run_records(&instance_id) {
+                Ok(records) => records,
+                Err(err) => return err_response(&request.id, err.code, err.message),
+            };
+            let evidence = match state.supervision_evidence_from(&records) {
                 Ok(Some(evidence)) => evidence,
                 Ok(None) => {
                     return err_response(
@@ -6578,7 +6590,7 @@ fn method_supervision_status(shared: &Arc<Shared>, request: &Request) -> String 
             // the repair leg's delivered head is read from. The read is taken
             // AFTER the state guard is released, so a status read never holds
             // the state across a host read.
-            let worktrees_root = crate::supervision::recorded_worktrees_root(&state, &instance_id);
+            let worktrees_root = crate::supervision::recorded_worktrees_root_of(&records);
             drop(state);
             let mut evidence = evidence;
             crate::supervision::observe_fix_leg(&mut evidence, worktrees_root.as_deref());
