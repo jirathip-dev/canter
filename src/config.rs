@@ -1011,6 +1011,18 @@ fn binding_error(message: impl Into<String>) -> ProfileBindingError {
     ProfileBindingError::Binding(message.into())
 }
 
+/// The fingerprint the pre-#269 product took over a binding material (issue
+/// #279): sha256 over the canonical document with the `skills` entry removed —
+/// the exact bytes a binding approved before that entry existed was hashed
+/// from. Only used to verify a document that carries no `skills` key at all.
+fn legacy_fingerprint_of(material: &Val) -> String {
+    let Val::Obj(mut material) = material.clone() else {
+        unreachable!("material is an object");
+    };
+    material.remove("skills");
+    crate::canonical::sha256_hex(&crate::canonical::canonical_bytes(&Val::Obj(material)))
+}
+
 /// Resolve the declared role skills of one binding row (issue #267): each
 /// declared key must be declared in the configuration's own `skill.<key>`
 /// inventory, and the pin is the inventory's recorded content identity.
@@ -1066,9 +1078,33 @@ pub fn role_skill_doc(config: &Config, harness: &Harness) -> Val {
 }
 
 impl ProfileBinding {
-    /// The canonical material document the revision fingerprints: exactly
-    /// the fields a plan binds. Credential entries carry digests only.
+    /// The canonical material document the binding's OWN revision
+    /// fingerprints: exactly the fields a plan binds, plus (since issue #267)
+    /// the resolved role-skill pins. Credential entries carry digests only.
+    ///
+    /// Issue #279: a binding approved BEFORE the `skills` axis existed has no
+    /// pins and the pre-#269 revision, which was taken over the document as it
+    /// stood then — with no `skills` entry. The material of such a binding is
+    /// that document, so a stored pre-#269 document round-trips unchanged
+    /// through validation and re-serialization (`to_doc`, `to_canonical_text`)
+    /// and `revision_of()` still reproduces exactly the revision the plan was
+    /// approved under. A binding that carries pins, or the current revision,
+    /// keeps the current material unchanged.
     pub fn material(&self) -> Val {
+        let mut material = self.material_with_skills();
+        if self.skills.is_empty()
+            && self.revision == legacy_fingerprint_of(&material)
+            && let Val::Obj(map) = &mut material
+        {
+            map.remove("skills");
+        }
+        material
+    }
+
+    /// [`ProfileBinding::material`] as the `skills` axis defined it (issue
+    /// #267): the material WITH the resolved pins, which is what the pre-#269
+    /// fingerprint is taken over minus that entry.
+    fn material_with_skills(&self) -> Val {
         object(vec![
             ("schema", string(PROFILE_BINDING_SCHEMA)),
             ("key", string(&self.key)),
@@ -1117,6 +1153,17 @@ impl ProfileBinding {
     /// The sha256 over the canonical material — the configuration revision.
     pub fn revision_of(&self) -> String {
         crate::canonical::sha256_hex(&crate::canonical::canonical_bytes(&self.material()))
+    }
+
+    /// The revision a binding approved BEFORE the `skills` axis existed
+    /// fingerprints (issue #279): the canonical material as the pre-#269
+    /// product hashed it — the same document without the `skills` entry,
+    /// which did not exist yet. It is only ever read to verify a document
+    /// that carries no `skills` key at all, so a stored pre-#269 binding is
+    /// checked against the material it actually bound instead of being
+    /// re-fingerprinted into a revision it never carried.
+    fn legacy_revision_of(&self) -> String {
+        legacy_fingerprint_of(&self.material_with_skills())
     }
 
     /// The full `hf-profile-binding/v1` document (material + revision).
@@ -1187,6 +1234,14 @@ impl ProfileBinding {
     /// presented revision must equal the fingerprint of the presented
     /// material, so a revision can never be claimed without the material it
     /// binds. Unknown keys refuse (closed surface).
+    ///
+    /// Issue #279: an ABSENT `skills` key is the shape a binding approved
+    /// before the `skills` axis existed has, and it resolves to the empty
+    /// array the schema allows (`refusal.profile.binding` is still the answer
+    /// for any PRESENT value that is not an array of well-formed pins). Such
+    /// a document's revision is verified against the pre-#269 material, so a
+    /// stored binding stays dispatchable without weakening what a present
+    /// value must satisfy.
     pub fn from_doc(doc: &Val) -> Result<ProfileBinding, ProfileBindingError> {
         let Val::Obj(map) = doc else {
             return Err(binding_error("the profile binding must be an object"));
@@ -1356,6 +1411,14 @@ impl ProfileBinding {
                 ));
             }
         };
+        // Issue #279: a stored binding approved BEFORE the `skills` axis
+        // existed carries no `skills` key at all, and an ABSENT key resolves
+        // to the empty array the schema allows — the stored document stays
+        // dispatchable instead of refusing forever. Only the absent key is
+        // tolerated: a PRESENT one is validated exactly as before, so a
+        // `skills` that is a string, an object, a bad key, a bad pin or a
+        // duplicate still refuses typed.
+        let mut skills_absent = false;
         let skills = match doc.get("skills") {
             Some(Val::Arr(items)) => {
                 if items.len() > ROLE_SKILL_MAX {
@@ -1396,7 +1459,11 @@ impl ProfileBinding {
                 }
                 pins
             }
-            _ => {
+            None => {
+                skills_absent = true;
+                Vec::new()
+            }
+            Some(_) => {
                 return Err(binding_error(
                     "the profile binding requires skills (an array; may be empty)",
                 ));
@@ -1420,7 +1487,14 @@ impl ProfileBinding {
             skills,
             revision,
         };
-        let expected = binding.revision_of();
+        // Issue #279: a document that carries no `skills` key is verified
+        // against the material its own fingerprint was taken over (the
+        // pre-#269 material); every other document keeps the current one.
+        let expected = if skills_absent {
+            binding.legacy_revision_of()
+        } else {
+            binding.revision_of()
+        };
         if expected != binding.revision {
             return Err(ProfileBindingError::Revision(format!(
                 "the presented profile revision {} does not match the fingerprint of the presented \
@@ -1815,6 +1889,128 @@ request_timeout = "90s"
                 mutate(map);
             }
             let err = ProfileBinding::from_doc(&mutated).expect_err(label);
+            assert_eq!(err.code(), CODE_PROFILE_BINDING, "{label}");
+        }
+    }
+
+    /// Issue #279: the `skills` key was added to the material by #269, so a
+    /// binding approved BEFORE it carries no `skills` key at all and its
+    /// revision fingerprints the material as it stood then. An ABSENT key
+    /// resolves to the empty array (the stored document stays dispatchable),
+    /// and its revision is verified against that pre-#269 material — the
+    /// shape the parked runs' durable rows carry — while every PRESENT value
+    /// keeps refusing typed.
+    #[test]
+    fn a_stored_pre_269_binding_is_dispatchable_and_present_values_stay_strict() {
+        let config = profile_config("legacy");
+        let binding = ProfileBinding::from_config(&config, "lane-orch-1", &profile_env(None))
+            .expect("the role skills resolve")
+            .expect("preview");
+        assert!(binding.skills.is_empty(), "the fixture declares no skills");
+
+        // The stored document as the pre-#269 product wrote it: the same
+        // material without the `skills` entry, fingerprinted over exactly
+        // those bytes. The test derives the pre-#269 fingerprint from the
+        // document it holds, never from the code under test.
+        let mut stored = binding.to_doc();
+        if let Val::Obj(map) = &mut stored {
+            map.remove("skills");
+            map.remove("revision");
+        }
+        let legacy_revision =
+            crate::canonical::sha256_hex(&crate::canonical::canonical_bytes(&stored));
+        assert_ne!(
+            legacy_revision, binding.revision,
+            "the pre-#269 fingerprint is taken over a different material"
+        );
+        if let Val::Obj(map) = &mut stored {
+            map.insert("revision".to_string(), string(&legacy_revision));
+        }
+
+        let restored = ProfileBinding::from_doc(&stored)
+            .expect("a stored pre-#269 binding stays dispatchable");
+        assert_eq!(restored.key, binding.key);
+        assert_eq!(restored.provider, binding.provider);
+        assert_eq!(
+            restored.revision, legacy_revision,
+            "the document keeps the revision it was approved under"
+        );
+        assert!(
+            restored.skills.is_empty(),
+            "an absent key resolves to the empty array"
+        );
+        assert_eq!(
+            restored.revision_of(),
+            legacy_revision,
+            "the fingerprint convention follows the document"
+        );
+        // The engine re-renders an accepted document (the review outcome, a
+        // stored lane plan): a pre-#269 document round-trips byte-identically,
+        // so no surface is ever asked to validate a re-serialization it can no
+        // longer accept.
+        assert_eq!(restored.to_doc(), stored);
+        assert_eq!(
+            ProfileBinding::from_doc(&restored.to_doc()).expect("the round trip re-validates"),
+            restored
+        );
+
+        // A pre-#269 document whose MATERIAL moved still refuses: the
+        // pre-#269 fingerprint is what must match, never a claimed revision.
+        let mut tampered = stored.clone();
+        if let Val::Obj(map) = &mut tampered {
+            map.insert("model".to_string(), string("example-model-2"));
+        }
+        assert_eq!(
+            ProfileBinding::from_doc(&tampered)
+                .expect_err("moved material")
+                .code(),
+            CODE_PROFILE_REVISION
+        );
+
+        // A VALID array still validates and yields the document it does today.
+        let current = binding.to_doc();
+        assert_eq!(
+            ProfileBinding::from_doc(&current).expect("valid document"),
+            binding
+        );
+
+        // Every PRESENT-but-malformed value refuses typed, exactly as before.
+        for (label, value) in [
+            ("string", string("lane-implementer")),
+            ("object", object(vec![("key", string("lane-implementer"))])),
+            (
+                "bad key",
+                Val::Arr(vec![object(vec![
+                    ("key", string("Lane-Implementer")),
+                    ("hash", string(&"a".repeat(64))),
+                ])]),
+            ),
+            (
+                "bad pin",
+                Val::Arr(vec![object(vec![
+                    ("key", string("lane-implementer")),
+                    ("hash", string("not-a-64-hex-digest")),
+                ])]),
+            ),
+            (
+                "duplicate",
+                Val::Arr(vec![
+                    object(vec![
+                        ("key", string("lane-implementer")),
+                        ("hash", string(&"a".repeat(64))),
+                    ]),
+                    object(vec![
+                        ("key", string("lane-implementer")),
+                        ("hash", string(&"b".repeat(64))),
+                    ]),
+                ]),
+            ),
+        ] {
+            let mut present = binding.to_doc();
+            if let Val::Obj(map) = &mut present {
+                map.insert("skills".to_string(), value);
+            }
+            let err = ProfileBinding::from_doc(&present).expect_err(label);
             assert_eq!(err.code(), CODE_PROFILE_BINDING, "{label}");
         }
     }

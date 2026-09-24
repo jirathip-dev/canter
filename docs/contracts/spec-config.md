@@ -98,6 +98,19 @@ refused at the boundary. A plan under an unchanged revision keeps binding.
   `queue submit`, `queue intake`, `grant issue` and the operator surface all
   derive their binding from the same configuration — and the refusal happens
   BEFORE any run, worktree or pane exists.
+- **Backward compatibility (issue #279):** the `skills` entry was added to the
+  material by #269, so a binding approved BEFORE it carries no `skills` key at
+  all, and such a document's revision fingerprints the material as it stood
+  then (the same document without that entry). An ABSENT key resolves to the
+  empty array the shape already allows and is verified against that pre-#269
+  material, so a stored pre-#269 binding stays dispatchable instead of
+  refusing `refusal.profile.binding` forever; such a binding's `revision_of()`
+  still reproduces the revision it was approved under and it re-serializes to
+  the same document, so a surface that re-renders it (the review outcome, a
+  stored lane plan) never writes a document the next read refuses. Only the
+  absent key is tolerated: a PRESENT `skills` value is validated exactly as
+  before (an array of well-formed `{key, hash}` pins, no duplicates), and a
+  malformed, mis-keyed or duplicated pin still refuses typed.
 - The canonical procedure sources for the three doctrine role contracts ship
   in this repository as installable skills (`skills/lane-implementer`,
   `skills/lane-reviewer`, `skills/lane-orchestrator`). They are sources, not

@@ -6,6 +6,23 @@ release process activates (docs/RELEASING.md), then semver applies.
 
 ## [Unreleased]
 
+### Fixed (issue #279 — a stored pre-#269 admission binding dispatches again)
+
+- A `hf-profile-binding/v1` document with NO `skills` key is accepted again:
+  the axis was added to the material by #269, so a binding approved BEFORE it
+  carries no such key at all and its revision fingerprints the material as it
+  stood then (the same document without that entry). An absent key resolves to
+  the empty array the shape already allows and is verified against that
+  pre-#269 material, so a run admitted before #269 — whose every dispatch
+  presents the STORED document — is dispatchable again instead of refusing
+  `refusal.profile.binding` forever, with its unconsumed bounded retry
+  unspendable and its per-repository slot pinned. Only the absent key is
+  tolerated: a PRESENT `skills` value is validated exactly as before (an array
+  of well-formed `{key, hash}` pins, no duplicates), and a malformed,
+  mis-keyed or duplicated one still refuses typed. Nothing is migrated,
+  re-bound or written back: the stored rows and the runs that hold them are
+  untouched.
+
 ### Fixed (issue #276 — a fix-round wait ends when the leg's own lane is gone, and the run re-dispatches itself)
 
 - A fix-round wait is no longer exempt from the policy's progress timeout: the
