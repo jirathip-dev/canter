@@ -3371,8 +3371,12 @@ fn the_driver_drives_the_runs_own_bounded_recovery_control_never_the_tail() {
         .expect("supervised run");
     assert_eq!(
         evidence.reevaluations,
-        vec![("p6".to_string(), canter::run_control::RUN_REEVALUATION_MAX)],
-        "the durable bound is read back per step"
+        vec![(
+            "p6".to_string(),
+            canter::run_control::RUN_REEVALUATION_MAX,
+            "ev_0123456789abcdef".to_string()
+        )],
+        "the durable bound is read back per step, with the verdict the newest re-entry was taken from"
     );
     assert!(
         canter::supervision::dispatch_intent(&row, &evidence).is_none(),
@@ -4546,7 +4550,13 @@ fn fix_leg_fixture(name: &str, submission: &str, advance: bool) -> FixLegFixture
         // the certified head, so the run is genuinely waiting on it.
         git(&lane, &["reset", "-q", "--hard", &certified]);
     }
-    let base = "bb".repeat(20);
+    // The run's own recorded COLLECTION base: the commit this checkout held
+    // when the run's collection certified it — a REAL commit, so the #272
+    // re-collect (which measures its delta over exactly this base) can land.
+    // The pre-#272 path read no base at all and this fixture carried a
+    // synthetic sha; a base no checkout holds parks the run on the collection's
+    // own typed refusal instead of proving the re-bind.
+    let base = certified.clone();
     let fix_lane = "lane-0123456789abcdef";
     seed_topology_with_admission(
         &state,
@@ -4716,13 +4726,41 @@ fn a_delivered_repair_leg_is_named_and_the_next_round_binds_the_delivered_head()
     );
     assert_eq!(observed.get("eligible").and_then(Val::as_bool), Some(false));
 
-    // (2) The next review round binds the DELIVERED head — driven with ZERO
-    //     operator control: the daemon's own armed driver re-evaluates the
-    //     recorded FAIL's check producer (the unchanged #243/#254 control), and
-    //     the run's own `run_dispatch` records the delivered head as the
-    //     observed head the reviewer leg's derived checkout materializes.
-    //     Nothing is asked of an operator here: the claim is polled for.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // (2) The delivered head is RE-BOUND by the run's OWN machinery before any
+    //     review consumes it (issue #272), and the next review round binds the
+    //     DELIVERED head — driven with ZERO operator control.
+    //
+    //     (2a) The armed driver first re-collects the repair leg's delivered
+    //     head into the run's own certificate: the run's own collection is the
+    //     only thing that may observe a head its own consumer then reads
+    //     (#202 AC2), so the re-bind is a collection over the leg's checkout —
+    //     never a consumption of a head no collection saw.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let certificate = loop {
+        let state = f.fixture.seed();
+        let certificate = state
+            .run_delivery_certificate(&f.run)
+            .expect("certificate read");
+        if let Some(certificate) = certificate
+            && certificate.head == f.delivered
+        {
+            break certificate;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the armed driver never re-collected the delivered head into the run's own certificate"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    println!(
+        "CERTIFIED => step={} head={}",
+        certificate.step_id, certificate.head
+    );
+    //     (2b) ... and THEN the driver re-evaluates the recorded FAIL's check
+    //     producer (the unchanged #243/#254 control), whose `run_dispatch`
+    //     records the delivered head as the observed head the reviewer leg's
+    //     derived checkout materializes. Nothing is asked of an operator here:
+    //     the claim is polled for.
     let claim = loop {
         let state = f.fixture.seed();
         if let Some(claim) = state.claim(&f.inner_key).expect("claim read") {

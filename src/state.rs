@@ -336,7 +336,7 @@ fn reevaluation_of(
 fn run_reevaluation_counts_locked(
     conn: &Connection,
     instance_id: &str,
-) -> Result<Vec<(String, i64)>, StateError> {
+) -> Result<Vec<(String, i64, String)>, StateError> {
     let prefix = format!("run:{instance_id}:step:");
     let mut statement = conn
         .prepare(
@@ -350,22 +350,41 @@ fn run_reevaluation_counts_locked(
             row.get::<_, String>(0)
         })
         .map_err(|err| StateError::from_sqlite("run_reevaluation_counts: query", err))?;
-    let mut counts: Vec<(String, i64)> = Vec::new();
+    let mut counts: Vec<(String, i64, String)> = Vec::new();
     for row in rows {
         let target =
             row.map_err(|err| StateError::from_sqlite("run_reevaluation_counts: row", err))?;
         let Some(rest) = target.strip_prefix(&prefix) else {
             continue;
         };
-        let Some((step, _)) = rest.split_once(":evidence:") else {
+        let Some((step, rest)) = rest.split_once(":evidence:") else {
             continue;
         };
         if !crate::formats::is_slug(step) {
             continue;
         }
-        match counts.iter_mut().find(|(candidate, _)| candidate == step) {
-            Some((_, count)) => *count += 1,
-            None => counts.push((step.to_string(), 1)),
+        // Issue #272: the verdict each recorded re-entry was taken FROM comes
+        // back with the count. The driver reads it to keep the re-entry SINGLE
+        // per recorded verdict — while the run's newest verdict is still this
+        // row, the re-entry for it is already recorded, and recording another
+        // would re-dispatch the same round (the hosted race: two records naming
+        // one evidence row). A re-run that answers records a NEW verdict row, so
+        // the remedy stays reachable for the fresh FAIL.
+        let Some((evidence_id, _)) = rest.split_once(":operator:") else {
+            continue;
+        };
+        if !crate::formats::is_evidence_id(evidence_id) {
+            continue;
+        }
+        match counts
+            .iter_mut()
+            .find(|(candidate, _, _)| candidate == step)
+        {
+            Some((_, count, newest)) => {
+                *count += 1;
+                *newest = evidence_id.to_string();
+            }
+            None => counts.push((step.to_string(), 1, evidence_id.to_string())),
         }
     }
     Ok(counts)
@@ -4318,15 +4337,17 @@ impl State {
         Ok(out)
     }
 
-    /// Every recorded check re-evaluation of one RUN as `(step, count)`, in
-    /// first-recorded step order (issue #243) — the durable bound the driver
-    /// reads before it drives the run's own bounded recovery control. Counted
-    /// from the same hash-chained journal records the control itself writes;
-    /// an unreadable target is skipped, never guessed.
+    /// Every recorded check re-evaluation of one RUN as
+    /// `(step, count, newest verdict row)`, in first-recorded step order
+    /// (issue #243) — the durable bound the driver reads before it drives the
+    /// run's own bounded recovery control, with the verdict the newest recorded
+    /// re-entry was taken from (issue #272). Counted from the same hash-chained
+    /// journal records the control itself writes; an unreadable target is
+    /// skipped, never guessed.
     pub fn run_reevaluation_counts(
         &self,
         instance_id: &str,
-    ) -> Result<Vec<(String, i64)>, StateError> {
+    ) -> Result<Vec<(String, i64, String)>, StateError> {
         let conn = self.lock("run_reevaluation_counts")?;
         run_reevaluation_counts_locked(&conn, instance_id)
     }
@@ -13308,8 +13329,17 @@ pub struct SupervisionEvidence {
     /// Every recorded check re-evaluation of this run as `(step, count)`
     /// (issue #243): the durable bound the driver reads before it drives the
     /// run's own bounded recovery control. Counted from the hash-chained
-    /// journal, never from a second bookkeeping row.
-    pub reevaluations: Vec<(String, i64)>,
+    /// journal, never from a second bookkeeping row. Each entry also carries
+    /// the NEWEST verdict row recorded re-entries were taken from (issue
+    /// #272), so the driver can keep the re-entry single per verdict.
+    pub reevaluations: Vec<(String, i64, String)>,
+    /// The run's own certified delivery binding (issue #202 AC2), when its own
+    /// collection observed one (issue #272): the branch + head + base the
+    /// run's own newest successful `collect_outcome` step certified. `None`
+    /// when no collection of this run ever certified a bindable head — the
+    /// classification then knows that no head is consumable at all, instead of
+    /// inferring one from a neighbouring effect.
+    pub delivery: Option<DeliveryCertificate>,
 }
 
 /// One recorded refusal of a supervised continuation dispatch (issue #141).
@@ -15031,6 +15061,12 @@ impl State {
         // driver reads the SAME durable bound the control itself enforces
         // before it derives a recovery intent.
         let reevaluations = run_reevaluation_counts_locked(conn, instance_id)?;
+        // Issue #272: the run's own certified delivery binding, read from the
+        // SAME recorded rows the consumption gate reads. The driver needs it to
+        // tell a delivery its own collection observed from a head nothing ever
+        // collected — a repair leg's delivered head is only consumable once
+        // this names it.
+        let delivery = self.delivery_certificate_locked(conn, instance_id)?;
         Ok(Some(SupervisionEvidence {
             run,
             has_dispatch_context,
@@ -15051,6 +15087,7 @@ impl State {
             fix_round,
             fix_leg: None,
             reevaluations,
+            delivery,
         }))
     }
 
