@@ -6,6 +6,41 @@ release process activates (docs/RELEASING.md), then semver applies.
 
 ## [Unreleased]
 
+### Fixed (issue #277 — a bump installs BOTH paths and proves the daemon runs the installed build)
+
+- `scripts/accept-bump.py` is the versioned bump driver (operator tooling, run
+  by hand, never from CI): it reconciles the integration checkout to the
+  requested sha (fetch, fast-forward check, `checkout -B <branch> <sha>`),
+  rebuilds with `cargo build --release --locked`, installs the SAME bytes to
+  BOTH the acceptance target and the path the service unit launches, ad-hoc
+  re-signs both (`codesign --force --sign -`, then `codesign -v`), refuses
+  unless the supervised job's `program` really is that service path, restarts
+  through the supervisor (`launchctl kickstart -k`) — no detached second copy —
+  and then proves the invariant: exactly ONE pid holds the socket, that pid's
+  executable sha256 IS the installed binary's sha256, and the daemon lease
+  names that pid with a recorded start that postdates the install. The measured
+  defect was a bump that installed one path while the KeepAlive unit kept
+  launching a separate copy: the supervisor resurrected the superseded build,
+  it won the socket, and the bump still reported success — silently
+  invalidating every measurement taken from that daemon.
+- `DONE` is printed only under that proof; every other outcome is a typed
+  `bump.refusal.<code>` with a non-zero exit status (build 4, non-fast-forward
+  5, reconcile 6, install 7, sign 8, install-divergence 9, supervisor-program
+  10, supervisor-not-loaded 11, restart 12, daemon-not-up 13, socket-holders 14,
+  stale-daemon 15, pid-exe-unresolved 16, lease 17). The bump log
+  (`<state>/accept/bump.log`) records the daemon pid, `started_at` and the
+  installed sha256 (post-sign, the identity of the executed bytes) with the
+  pre-sign candidate sha256 recorded alongside it.
+- `scripts/test-accept-bump.py` self-tests the driver in disposable roots with
+  an injected `launchctl` and no host activation: both-path identity and
+  signature, the single-holder/sha/lease proof, the read-only `--verify-only`
+  certification (same pid, no restart), idempotence, and every refusal
+  including the induced "a superseded build wins the socket" run, a lease whose
+  start predates the install, a supervisor that launches another path, a
+  refused restart and two socket holders. Runbook:
+  [docs/OPERATIONS.md](docs/OPERATIONS.md) section 10.1;
+  [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) carries the self-test row.
+
 ### Fixed (issue #224 — the publish route's post-merge bookkeeping, and a lane retire that removed a live run's lane)
 
 - The `pull_request` publish route FETCHES the landed head into the integration
