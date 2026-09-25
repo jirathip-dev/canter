@@ -1137,6 +1137,31 @@ impl LaneFixture {
         })
     }
 
+    /// The reviewer's own write for the #224 settle witness: held back until
+    /// the engine's own PROVEN-delivery record exists, so every read-back the
+    /// delivery proof takes is already behind us when the verdict lands and
+    /// the fixture's read-order clock (`settle_read`) starts exactly at the
+    /// verdict the consume path acts on — the lane is `working` then, as
+    /// measured, and never because the fixture guessed at a delay.
+    fn write_verdict_after_the_proven_delivery(
+        &self,
+        written: String,
+    ) -> std::thread::JoinHandle<()> {
+        let verdict_path = review_verdict_path(&self.review_root, &self.session, STEP);
+        let receipt = review_delivery_receipt_path(&self.review_root, &self.session, STEP);
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline {
+                if receipt.exists() {
+                    std::fs::write(&verdict_path, &written).expect("the reviewer writes");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("the review prompt was never proven delivered");
+        })
+    }
+
     /// The prompted workspace id and the lane checkout's HEAD at bind time,
     /// captured by the reviewer's own verdict writer.
     fn observed_prompt(&self) -> (String, String) {
@@ -1585,7 +1610,7 @@ fn a_reviewer_lane_still_working_at_its_verdict_settles_and_is_closed() {
     std::fs::write(fixture.state.join("settles-after-verdict"), "").expect("the settle control");
     let params = lane_review_params(&format!("issues-{ISSUE}-rev1"), 30);
     let plan = plan_with_review_step(params.clone());
-    let writer = fixture.write_verdict_when_prompted(passing_verdict(&fixture));
+    let writer = fixture.write_verdict_after_the_proven_delivery(passing_verdict(&fixture));
     let outcome = run_lane_review_step(&fixture, &plan, &params, &[]);
     writer.join().expect("the reviewer's write completes");
 

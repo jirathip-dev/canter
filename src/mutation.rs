@@ -4402,9 +4402,15 @@ fn collection_park(
 /// the next read-back.
 ///
 /// Returns `Ok(())` once the workspace is closed. `Err(outcome)` is terminal:
-/// [`code::LANE_TIMEOUT`] when the step's own effective deadline expires with
-/// the lane still unsettled (the workspace, checkout and branch untouched, the
-/// bounded retries unspent), or the close's own typed refusal.
+/// [`code::LANE_TIMEOUT`] when the caller's bound expires with the lane still
+/// unsettled (the workspace, checkout and branch untouched, the bounded
+/// retries unspent), or the close's own typed refusal.
+///
+/// `outlived` names what the timing condition MEANS for the waiting step — the
+/// clause its park states. Two callers share this wait: p8's cleanup (the
+/// worker outliving its own PUBLISH, the landing proof already holding) and
+/// p6's verdict consume (the reviewer outliving the VERDICT it wrote, already
+/// consumed) — see [`LANE_OUTLIVED_PUBLISH`] / [`LANE_OUTLIVED_REVIEW`].
 fn await_settled_lane(
     bound: Duration,
     // What the lane outliving its own work MEANS for the caller's step: the
