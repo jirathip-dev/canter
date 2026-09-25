@@ -43,9 +43,19 @@ impl ServiceFixture {
 
     /// Run a command, returning (exit_code, stdout, stderr).
     fn run(&self, args: &[&str]) -> (i32, String, String) {
-        let mut child = self
-            .command()
-            .args(args)
+        self.run_with_env(args, &[])
+    }
+
+    /// Run a command with explicit environment pairs on top of the fixture
+    /// environment — e.g. the invoking PATH a rendered unit's PATH derives
+    /// from (issue #266).
+    fn run_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
+        let mut command = self.command();
+        command.args(args);
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -87,6 +97,40 @@ fn write_config(fixture: &ServiceFixture, socket: &Path) {
         socket.display()
     )
     .expect("write config");
+}
+
+/// Write a config that also declares ONE harness entry whose executable the
+/// rendered unit's PATH must be able to resolve (issue #266).
+fn write_config_with_harness(fixture: &ServiceFixture, socket: &Path, key: &str, executable: &str) {
+    let config_dir = fixture.dir.join("config").join("canter");
+    std::fs::create_dir_all(&config_dir).expect("config dir");
+    let mut file = std::fs::File::create(config_dir.join("config.toml")).expect("config file");
+    write!(
+        file,
+        "schema = \"hf-config/v1\"\n[daemon]\nsocket = \"{}\"\n[harness.{}]\nkind = \"hermes\"\n\
+         executable = \"{}\"\nenv_allow = [\"PATH\", \"HOME\"]\n",
+        socket.display(),
+        key,
+        executable
+    )
+    .expect("write config");
+}
+
+/// Install a fake harness executable under the fixture's own bin dir (which
+/// is NOT any service-manager default PATH) and return that bin dir.
+fn install_fake_harness(fixture: &ServiceFixture, name: &str) -> PathBuf {
+    let bin_dir = fixture.dir.join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("bin dir");
+    let executable = bin_dir.join(name);
+    let mut file = std::fs::File::create(&executable).expect("harness file");
+    write!(file, "#!/bin/sh\nexit 0\n").expect("write harness");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod harness");
+    }
+    bin_dir
 }
 
 #[test]
@@ -184,5 +228,178 @@ fn service_status_and_uninstall_plans_are_consistent() {
     assert!(
         stdout_uninstall.contains(target_marker),
         "{stdout_uninstall}"
+    );
+}
+
+/// Issue #266 AC1 (render leg): on a host where the configured harness
+/// executable lives OUTSIDE the service-manager default PATH, the install
+/// plan renders a unit that declares the invoking PATH (and HOME), so the
+/// daemon the unit starts can resolve its harnesses — plus a log capture the
+/// operator can find from the plan output.
+#[test]
+fn install_plan_declares_the_unit_environment_and_log_capture() {
+    let fixture = ServiceFixture::new("install-env");
+    let socket = fixture.dir.join("runtime").join("daemon.sock");
+    write_config_with_harness(&fixture, &socket, "fixture-impl", "hf-fixture-harness");
+    // The executable exists only in the fixture's bin dir: the service
+    // manager's default PATH does not carry it.
+    let bin_dir = install_fake_harness(&fixture, "hf-fixture-harness");
+    let path = bin_dir.display().to_string();
+    let home = fixture.dir.display().to_string();
+    let state_dir = fixture.dir.join("state").join("canter");
+
+    let (exit, stdout, stderr) = fixture.run_with_env(
+        &["service", "install-plan", "--json"],
+        &[("PATH", path.as_str())],
+    );
+    assert_eq!(exit, 0, "install-plan exits 0: {stdout} {stderr}");
+
+    // The plan output names the environment the unit declares and the log
+    // capture, so the operator can read both without opening the plist.
+    assert!(
+        stdout.contains("\"environment\""),
+        "plan data carries the declared environment: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("\"PATH\":\"{path}\"")),
+        "the unit's PATH is the invoking PATH: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("\"HOME\":\"{home}\"")),
+        "the unit's HOME is the invoking HOME: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "\"stdout\":\"{}/daemon.out.log\"",
+            state_dir.display()
+        )),
+        "the plan names the captured stdout log: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "\"stderr\":\"{}/daemon.err.log\"",
+            state_dir.display()
+        )),
+        "the plan names the captured stderr log: {stdout}"
+    );
+
+    if cfg!(target_os = "macos") {
+        assert!(
+            stdout.contains("<key>EnvironmentVariables</key>"),
+            "the plist declares EnvironmentVariables: {stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("<string>{path}</string>")),
+            "the plist declares the invoking PATH: {stdout}"
+        );
+        assert!(
+            stdout.contains("<key>StandardOutPath</key>")
+                && stdout.contains("<key>StandardErrorPath</key>"),
+            "the plist captures stdout/stderr: {stdout}"
+        );
+    } else {
+        assert!(
+            stdout.contains(&format!("Environment=\"PATH={path}\"")),
+            "the unit declares the invoking PATH: {stdout}"
+        );
+        assert!(
+            stdout.contains("StandardOutput=append:") && stdout.contains("StandardError=append:"),
+            "the unit captures stdout/stderr: {stdout}"
+        );
+    }
+
+    // The install steps name the state dir and the log capture, so a failed
+    // start is diagnosable from the plan alone.
+    assert!(
+        stdout.contains(&format!("mkdir -p {}", state_dir.display())),
+        "the install steps prepare the state dir the logs live in: {stdout}"
+    );
+    assert!(
+        stdout.contains("daemon.out.log") && stdout.contains("daemon.err.log"),
+        "the install steps name the captured logs: {stdout}"
+    );
+}
+
+/// Issue #266 AC1 (refusal leg) + the gating scope: when a configured
+/// harness executable cannot be resolved under the environment the unit
+/// would declare, `install-plan` refuses typed NAMING the executable (no
+/// unit is rendered), while the inspection/removal plans keep rendering so a
+/// bad install stays inspectable and removable.
+#[test]
+fn install_plan_refuses_typed_when_a_configured_harness_executable_is_unresolvable() {
+    let fixture = ServiceFixture::new("install-unresolved");
+    let socket = fixture.dir.join("runtime").join("daemon.sock");
+    write_config_with_harness(&fixture, &socket, "fixture-impl", "hf-missing-harness");
+    // An empty bin dir stands in for a host PATH the executable is absent
+    // from (the service-manager default PATH never carries it either).
+    let bin_dir = fixture.dir.join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("bin dir");
+    let path = bin_dir.display().to_string();
+
+    let (exit, stdout, _stderr) = fixture.run_with_env(
+        &["service", "install-plan", "--json"],
+        &[("PATH", path.as_str())],
+    );
+    assert_eq!(
+        exit, 4,
+        "an unresolvable harness is a typed refusal: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"code\":\"refusal.service.harness_unresolved\""),
+        "the refusal is typed: {stdout}"
+    );
+    assert!(
+        stdout.contains("hf-missing-harness"),
+        "the refusal names the unresolvable executable: {stdout}"
+    );
+    assert!(
+        stdout.contains(&path),
+        "the refusal names the PATH it checked: {stdout}"
+    );
+    assert!(
+        !stdout.contains("\"unit\":"),
+        "no unit is rendered for a refused install: {stdout}"
+    );
+
+    // The check gates the INSTALL only.
+    let (exit_status, stdout_status, _) = fixture.run_with_env(
+        &["service", "status-plan", "--json"],
+        &[("PATH", path.as_str())],
+    );
+    assert_eq!(
+        exit_status, 0,
+        "status-plan keeps rendering: {stdout_status}"
+    );
+    assert!(
+        stdout_status.contains("\"unit\""),
+        "status-plan still shows the unit text: {stdout_status}"
+    );
+    let (exit_uninstall, stdout_uninstall, _) = fixture.run_with_env(
+        &["service", "uninstall-plan", "--json"],
+        &[("PATH", path.as_str())],
+    );
+    assert_eq!(
+        exit_uninstall, 0,
+        "uninstall-plan keeps rendering: {stdout_uninstall}"
+    );
+}
+
+/// Issue #266 AC1 (positive control): a resolvable harness keeps the install
+/// plan green — the refusal names an ABSENT executable, never a present one.
+#[test]
+fn install_plan_with_a_resolvable_harness_renders_instead_of_refusing() {
+    let fixture = ServiceFixture::new("install-resolvable");
+    let socket = fixture.dir.join("runtime").join("daemon.sock");
+    write_config_with_harness(&fixture, &socket, "fixture-impl", "hf-present-harness");
+    let bin_dir = install_fake_harness(&fixture, "hf-present-harness");
+    let (exit, stdout, _stderr) = fixture.run_with_env(
+        &["service", "install-plan", "--json"],
+        &[("PATH", bin_dir.display().to_string().as_str())],
+    );
+    assert_eq!(exit, 0, "a resolvable harness never refuses: {stdout}");
+    assert!(stdout.contains("\"unit\":"), "{stdout}");
+    assert!(
+        !stdout.contains("harness_unresolved"),
+        "no refusal is emitted: {stdout}"
     );
 }

@@ -6914,6 +6914,16 @@ doctor checks the daemon environment read-only (platform, config, socket
 state, per-user unit placement). The *-plan commands render the first-party
 launchd/systemd unit text and the exact command steps for a clean host —
 they never install, start, stop, or query the host service manager.
+
+The rendered unit declares the environment the daemon needs (issue #266):
+the invoking environment's PATH and HOME plus a stdout/stderr log capture
+under the state dir (daemon.out.log / daemon.err.log), so a failed start
+leaves a readable log. `install-plan` refuses typed
+(refusal.service.harness_unresolved, exit 4) when a configured harness
+executable cannot be resolved under the PATH the unit would declare —
+naming the executable — instead of rendering a unit that starts healthy
+and fails at the first harness spawn. status-plan/uninstall-plan keep
+rendering so a bad install stays inspectable and removable.
 ";
 
 const LANE_USAGE: &str = "\
@@ -7592,6 +7602,25 @@ fn execute_service_plan(invocation: &Invocation, kind: &str) -> CmdResult {
         .unwrap_or_else(|| std::path::PathBuf::from("canter"));
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let config_home = crate::dirs::config_home().ok();
+    // The rendered unit declares the environment the daemon will get (issue
+    // #266): the invoking environment's PATH/HOME plus the log capture under
+    // the state dir. `install-plan` refuses typed when a configured harness
+    // executable cannot resolve under it; `status-plan`/`uninstall-plan`
+    // keep rendering so a bad install stays inspectable and removable.
+    let invoking = adapter_environment();
+    let harnesses: &[crate::config::Harness] = config
+        .as_ref()
+        .map(|config| config.harnesses.as_slice())
+        .unwrap_or(&[]);
+    let environment = match kind {
+        "install" => {
+            match service::checked_unit_environment(&invoking, &paths.state_dir, harnesses) {
+                Ok(environment) => environment,
+                Err(refusal) => return error_result(4, refusal.code, refusal.message, false),
+            }
+        }
+        _ => service::unit_environment(&invoking, &paths.state_dir),
+    };
 
     let (unit, target) = match platform {
         "launchd" => {
@@ -7599,7 +7628,10 @@ fn execute_service_plan(invocation: &Invocation, kind: &str) -> CmdResult {
                 .as_ref()
                 .map(|home| service::launchd_plist_path(home))
                 .unwrap_or_else(|| std::path::PathBuf::from(format!("~/{LAUNCHD_LABEL}.plist")));
-            (service::launchd_unit(&bin, &paths.socket_path), target)
+            (
+                service::launchd_unit(&bin, &paths.socket_path, &environment),
+                target,
+            )
         }
         "systemd" => {
             let target = config_home
@@ -7608,7 +7640,10 @@ fn execute_service_plan(invocation: &Invocation, kind: &str) -> CmdResult {
                 .unwrap_or_else(|| {
                     std::path::PathBuf::from(format!("~/.config/systemd/user/{SYSTEMD_UNIT_NAME}"))
                 });
-            (service::systemd_unit(&bin, &paths.socket_path), target)
+            (
+                service::systemd_unit(&bin, &paths.socket_path, &environment),
+                target,
+            )
         }
         other => {
             return error_result(
@@ -7626,6 +7661,8 @@ fn execute_service_plan(invocation: &Invocation, kind: &str) -> CmdResult {
             &paths.socket_path,
             home.as_deref().unwrap_or(std::path::Path::new("~")),
             config_home.as_deref().unwrap_or(std::path::Path::new("~")),
+            &paths.state_dir,
+            &environment,
         ),
         "status" => service::status_plan_steps(platform),
         "uninstall" => service::uninstall_plan_steps(
@@ -7643,10 +7680,28 @@ fn execute_service_plan(invocation: &Invocation, kind: &str) -> CmdResult {
         }
     };
     let step_vals: Vec<Val> = steps.iter().map(|step| string(step)).collect();
+    let mut environment_pairs: Vec<(&str, Val)> = Vec::new();
+    for (name, value) in environment.vars() {
+        environment_pairs.push((name, string(value)));
+    }
     let data = object(vec![
         ("platform", string(platform)),
         ("target", string(&target.display().to_string())),
         ("unit", string(&unit)),
+        ("environment", object(environment_pairs)),
+        (
+            "logs",
+            object(vec![
+                (
+                    "stdout",
+                    string(&environment.stdout_log.display().to_string()),
+                ),
+                (
+                    "stderr",
+                    string(&environment.stderr_log.display().to_string()),
+                ),
+            ]),
+        ),
         ("steps", Val::Arr(step_vals)),
     ]);
     let mut human = String::new();
@@ -7655,6 +7710,15 @@ fn execute_service_plan(invocation: &Invocation, kind: &str) -> CmdResult {
     ));
     human.push_str(&format!("unit file: {}\n\n", target.display()));
     human.push_str(&unit);
+    human.push_str("\ndeclared unit environment (the daemon inherits exactly this):\n");
+    for (name, value) in environment.vars() {
+        human.push_str(&format!("  {name}={value}\n"));
+    }
+    human.push_str(&format!(
+        "captured daemon logs: {} (stdout), {} (stderr)\n",
+        environment.stdout_log.display(),
+        environment.stderr_log.display()
+    ));
     human.push_str("\nsteps:\n");
     for (index, step) in steps.iter().enumerate() {
         human.push_str(&format!("  {}. {step}\n", index + 1));

@@ -362,6 +362,49 @@ commands render the first-party per-user launchd/systemd unit text and the
 exact host steps. **They never install, start, stop, or query the host
 service manager** — a human executes the rendered steps on the target host.
 
+The rendered unit declares the environment the daemon needs (issue #266).
+A service manager gives the job only the unit's declared environment —
+launchd supplies `PATH=/usr/bin:/bin:/usr/sbin:/sbin` and no `HOME` — while
+every subprocess the daemon spawns resolves its executable through the
+daemon's own environment. A unit that declares no environment therefore
+starts healthy and then fails at the first harness spawn (the conductor's
+finding behind issue #266). So the unit carries, at minimum, the INVOKING
+environment's `PATH` and `HOME` — derived at render time, never a hardcoded
+host path list — as `EnvironmentVariables` (launchd) / `Environment=`
+(systemd). Because the daemon's PATH is exactly what the operator invoked
+the plan with, the operator's own tools (`PATH` entries holding the
+configured harness executables, `git`, `gh`, the workspace executable)
+resolve for the daemon as they did for the operator.
+
+`install-plan` refuses typed (`refusal.service.harness_unresolved`, exit 4)
+when a configured harness executable cannot be resolved on the PATH the unit
+would declare, naming the harness and the executable: an install from such a
+plan would start a daemon that cannot spawn that harness's lanes. Fix the
+invoking PATH (or the harness `executable`) and re-render. `status-plan` and
+`uninstall-plan` keep rendering, so a bad install stays inspectable and
+removable.
+
+The unit also captures the daemon's stdout/stderr (`StandardOutPath` /
+`StandardErrorPath`; `StandardOutput=append:` / `StandardError=append:` on
+systemd) at `<state>/daemon.out.log` and `<state>/daemon.err.log`
+(`<state>` is the daemon state dir, `canter` under the XDG state home), so a
+failed start leaves a readable log rather than nothing. The install steps
+name the state dir (created 0700 first, since the log files need it to
+exist) and the captured log paths, so both are findable from the plan output
+alone.
+
+No `GIT_TEMPLATE_DIR` is rendered, and that is deliberate: the scratch-`git
+init` class (issue #226) can only be triggered by `git init`/`git clone`,
+and the daemon's own git surface never runs either — it runs `rev-parse`,
+`worktree add`/`remove`, `merge-base`, `status`, `fetch`, `ls-remote`,
+`cat-file` and the certified push/rebase/merge steps. `git worktree add`,
+the daemon's only repository-creating operation, does not copy the host
+template directory (verified by probe: a template hook planted in
+`GIT_TEMPLATE_DIR` never appears in a worktree created from it), so the
+shared-Homebrew-template flake that #226 fixed cannot reach the daemon.
+An operator who wants defense in depth can add `GIT_TEMPLATE_DIR` pointing
+at an empty directory by hand.
+
 ```console
 $ ./target/release/canter service doctor --json      # exit 0
 {"command":"service doctor","data":{"checks":[
@@ -375,12 +418,17 @@ $ ./target/release/canter service doctor --json      # exit 0
 
 ```console
 $ ./target/release/canter service install-plan --json   # exit 0
-{"command":"service install-plan","data":{"platform":"systemd",
+{"command":"service install-plan","data":{
+ "environment":{"HOME":"...","PATH":"...:<dir holding the configured harness executables>:..."},
+ "logs":{"stderr":".../canter/daemon.err.log","stdout":".../canter/daemon.out.log"},
+ "platform":"systemd",
  "steps":[
+  "prepare the daemon state directory (private 0700): mkdir -p .../canter && chmod 700 .../canter",
   "write the rendered unit to .../.config/systemd/user/canter.service (content printed by the install command)",
   "run: systemctl --user daemon-reload",
   "run: systemctl --user enable --now canter.service",
-  "verify: systemctl --user --no-pager status canter.service"],
+  "verify: systemctl --user --no-pager status canter.service",
+  "if the service fails to start, read the captured daemon logs at .../canter/daemon.out.log (stdout) and .../canter/daemon.err.log (stderr)"],
  "target":".../.config/systemd/user/canter.service",
  "unit":"# canter per-user daemon unit (issue #5; rendered, not activated)
 [Unit]
@@ -392,7 +440,13 @@ ExecStart=<canter-binary> daemon run --socket .../canter/daemon.sock
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
-...
+Environment="PATH=...:<dir holding the configured harness executables>:..."
+Environment="HOME=..."
+StandardOutput=append:.../canter/daemon.out.log
+StandardError=append:.../canter/daemon.err.log
+
+[Install]
+WantedBy=default.target
 "}, "exit_code":0,"kind":"ok","schema":"hf-output/v1"}
 ```
 
@@ -406,6 +460,7 @@ Failure → remedy:
 | --- | --- | --- |
 | `service doctor` rows not ok | e.g. `daemon.enabled=false` in config, socket absent | Enable the daemon in config / start the daemon first; re-run `service doctor`. |
 | Wrong platform unit | `platform` row says `launchd`/`systemd` | The renderer targets the host it runs on; run `*-plan` on the target host (macOS → launchd, Linux → systemd). |
+| Install plan refuses (4) | `refusal.service.harness_unresolved` naming a configured harness executable and the PATH the unit would declare | Put the executable's directory on the invoking PATH (or fix `harness.<key>.executable`) and re-run; a unit whose daemon cannot resolve a configured harness would start healthy and fail at the first harness spawn. |
 
 ## 6. Grant-gated mutations (daemon `apply` — RPC only)
 
