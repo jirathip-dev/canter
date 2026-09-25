@@ -1328,9 +1328,19 @@ pub fn preview_queue(state: &State, request: &QueueRequest) -> Result<QueuePrevi
         .iter()
         .filter(|row| OWNED_RUN_STATES.contains(&row.status.as_str()))
         .collect();
+    // Issue #285: a run that is terminal by outcome (its diagnosed step's
+    // bounded-retry budget is spent and nothing is held) can never be
+    // dispatched again, so it occupies no slot here either — the SAME
+    // exclusion the fan-out gate applies to its own counted set.
+    let terminal: Vec<String> = state
+        .retry_exhausted_run_ids()
+        .map_err(|err| PreviewError::new(err.code, err.message))?;
     let counted: Vec<&InstanceRow> = instances
         .iter()
-        .filter(|row| COUNTED_RUN_STATES.contains(&row.status.as_str()))
+        .filter(|row| {
+            COUNTED_RUN_STATES.contains(&row.status.as_str())
+                && !terminal.contains(&row.instance_id)
+        })
         .collect();
     let running_total = counted.len();
     let same_repository: Vec<&InstanceRow> = counted

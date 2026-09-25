@@ -1442,12 +1442,22 @@ fn admission_gate(
         issue_number: instance.issue_number,
         identity: instance.instance_id.clone(),
     };
+    // Issue #285: a run that is terminal by outcome (a diagnosed step whose
+    // bounded-retry budget is spent, with nothing held) can never be
+    // dispatched again, so it is not an active lane here either — the SAME
+    // exclusion the queue admission derives its counted set with.
+    let terminal = state
+        .retry_exhausted_run_ids()
+        .map_err(|err| err_response(&request.id, err.code, err.message))?;
     let mut running = Vec::new();
     for row in state
         .list_instances()
         .map_err(|err| err_response(&request.id, err.code, err.message))?
     {
         if row.instance_id == parsed.instance_id {
+            continue;
+        }
+        if terminal.contains(&row.instance_id) {
             continue;
         }
         if matches!(
