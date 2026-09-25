@@ -643,3 +643,152 @@ fn a_moved_head_diagnosis_never_spends_a_bounded_retry() {
     );
     assert_eq!(fixture.attempts(), before, "and records no new attempt");
 }
+
+/// One git invocation inside `dir` (the fixture's own repositories).
+fn git_in(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        // #226: copy nothing from the host's shared git templates.
+        .env("GIT_TEMPLATE_DIR", "")
+        .output()
+        .expect("spawn git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Issue #282: the lane the step is about to materialize is still REGISTERED
+/// by the integration clone while its directory is GONE — the host state a
+/// re-dispatch died on, and each death was charged to the run's bounded retry
+/// budget (three of them wedged the run at `refusal.run.retry_bound`, so it
+/// could neither re-dispatch nor terminate while still holding its counted
+/// per-repository slot). The cause is stale host state with a mechanical
+/// remedy, so the run's own dispatch clears the registration for exactly that
+/// path and the step LANDS: the raw retry rows are empty BEFORE and AFTER, the
+/// run advances, and no operator key was used.
+#[test]
+fn a_missing_but_registered_lane_is_repaired_without_spending_a_bounded_retry() {
+    let fixture = Fixture::new("stale-registration");
+    let now = time::unix_now();
+    let lane = fixture.root.join("worktrees/lane");
+    let integration = fixture.root.join("integration");
+    // The measured host state: git still registers the lane checkout, its
+    // directory has been deleted from under the registration.
+    std::fs::remove_dir(&lane).expect("the obstruction is replaced by the measurement");
+    git_in(
+        &integration,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            lane.to_str().unwrap(),
+            "staging",
+        ],
+    );
+    std::fs::remove_dir_all(&lane).expect("deleted by hand, exactly as measured");
+    assert!(!lane.exists(), "the checkout is gone");
+    assert!(
+        git_in(&integration, &["worktree", "list"]).contains("worktrees/lane"),
+        "the registration is still there, and git calls it prunable"
+    );
+
+    // Raw retry rows BEFORE the dispatch: the run has spent nothing.
+    assert!(fixture.retries().is_empty(), "before: no retry row exists");
+
+    // The run's own supervision dispatches the step with zero operator keys.
+    fixture
+        .tick(now)
+        .expect("the run's own dispatch repairs the stale registration and lands p2");
+    assert_eq!(
+        fixture.attempts().last().unwrap(),
+        &("p2".into(), "succeeded".into())
+    );
+
+    // Raw retry rows AFTER: still none — a mechanical host-state repair is
+    // never charged to the run's bounded retry budget.
+    assert!(
+        fixture.retries().is_empty(),
+        "after: the repairable host condition spent no bounded retry"
+    );
+
+    // The run ADVANCED under its own machinery — the recorded attempt ledger
+    // is authoritative, so the frontier is the step AFTER the one the stale
+    // registration blocked — and the same supervision drives that next step to
+    // its own success: nothing here is wedged at a bound.
+    assert_eq!(
+        fixture.intent().unwrap().step_id,
+        "p3",
+        "the frontier moved past the step the stale registration blocked"
+    );
+    fixture
+        .tick(now + 6)
+        .expect("the run's own supervision drives the next step");
+    assert_eq!(
+        fixture.attempts().last().unwrap(),
+        &("p3".into(), "succeeded".into())
+    );
+    assert!(
+        fixture.retries().is_empty(),
+        "the whole advance spent no bounded retry"
+    );
+    let (_, journal) = fixture
+        .shared
+        .lock_state()
+        .unwrap()
+        .journal_tail(0, 1000)
+        .unwrap();
+    assert!(
+        !journal.iter().any(|line| line.contains("retry_bound")),
+        "nothing was charged to the bound: {journal:?}"
+    );
+
+    // The lane exists again at the recorded base, and its registration is
+    // coherent: it is the linked worktree of the integration clone.
+    assert!(lane.is_dir(), "the lane was created");
+    assert_eq!(
+        git_in(&lane, &["rev-parse", "--verify", "HEAD"]).trim(),
+        git_in(&integration, &["rev-parse", "--verify", "staging"]).trim(),
+        "the re-created lane is at the recorded base"
+    );
+    let listed = git_in(&integration, &["worktree", "list"]);
+    assert!(
+        !listed.contains("prunable"),
+        "no stale registration is left behind: {listed}"
+    );
+}
+
+/// Issue #282 (AC4 — no over-broadening): the repair addresses ONE host
+/// condition and nothing else. A lane whose checkout is PRESENT — the
+/// obstruction the retry witnesses above use — is never touched by it: the
+/// step still refuses `refusal.worktree.exists`, a genuine failure still
+/// consumes its bounded retry exactly as before, and the budget still fences
+/// the frontier when it is spent.
+#[test]
+fn a_present_lane_is_never_repaired_and_still_consumes_its_bounded_retries() {
+    let fixture = Fixture::new("present-control");
+    let now = time::unix_now();
+    let lane = fixture.root.join("worktrees/lane");
+    assert!(lane.is_dir(), "the fixture's obstructed lane is present");
+    for (offset, count) in [(0, 0), (5, 1), (15, 2), (35, 3)] {
+        assert!(
+            fixture
+                .tick(now + offset)
+                .unwrap_err()
+                .contains("refusal.worktree.exists"),
+            "a genuine obstruction is still refused typed"
+        );
+        assert_eq!(fixture.retries().len(), count, "charged exactly as today");
+        assert!(
+            lane.is_dir(),
+            "a present checkout is never addressed by the repair"
+        );
+    }
+    assert!(
+        fixture.intent().is_none(),
+        "the frontier is still fenced once the budget is spent on real failures"
+    );
+}

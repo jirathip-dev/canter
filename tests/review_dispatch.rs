@@ -1362,6 +1362,59 @@ fn a_moved_reviewer_lane_refuses_before_the_reviewer_starts() {
     );
 }
 
+/// Issue #282 (the measured p6 shape): the reviewer lane this step is about to
+/// create is still REGISTERED by the integration clone while its directory is
+/// GONE. A re-dispatch used to die on exactly that (`adapter.exit`), and each
+/// death was charged to the run's bounded retry budget — so the run could
+/// neither re-dispatch nor terminate while holding its counted slot. The
+/// registration is cleared for exactly this path and the review proceeds: the
+/// lane is materialized at the certified head, the repair rides the outcome,
+/// and no operator touched anything.
+#[test]
+fn a_missing_but_registered_reviewer_lane_is_repaired_and_the_review_proceeds() {
+    let fixture = LaneFixture::new("lane-stale-registration");
+    fixture.seed_run_lane();
+    fixture.register_reviewer_lane(&fixture.head);
+    // The checkout is deleted from under the registration — the measured host
+    // state ("missing but already registered worktree").
+    std::fs::remove_dir_all(&fixture.reviewer_lane).expect("the checkout is deleted by hand");
+    assert!(
+        !fixture.reviewer_lane.exists(),
+        "the checkout is gone, exactly as measured"
+    );
+    assert!(
+        git(&fixture.integration, &["worktree", "list"]).contains("issues-5-rev1"),
+        "the registration is stale, not gone"
+    );
+    let params = lane_review_params(&format!("issues-{ISSUE}-rev1"), 30);
+    let plan = plan_with_review_step(params.clone());
+    let writer = fixture.write_verdict_when_prompted(passing_verdict(&fixture));
+    let outcome = run_lane_review_step(&fixture, &plan, &params, &[]);
+    writer.join().expect("the reviewer's write completes");
+    assert_eq!(outcome.status, "succeeded", "{outcome:?}");
+    let registration = outcome
+        .result
+        .get("stale_registration")
+        .expect("the repair is recorded on the outcome");
+    assert_eq!(
+        registration.get("worktree").and_then(Val::as_str),
+        Some("issues-5-rev1"),
+        "the record names exactly the lane path this leg owns: {registration:?}"
+    );
+    assert!(
+        registration
+            .get("path")
+            .and_then(Val::as_str)
+            .is_some_and(|path| path.ends_with("issues-5-rev1")),
+        "the record names the cleared registration's path: {registration:?}"
+    );
+    let (_, head) = fixture.observed_prompt();
+    assert_eq!(
+        head, fixture.head,
+        "the reviewer bound the lane created at the certified head"
+    );
+}
+
 /// W3 (issue #210): a LEDGER-TERMINAL generation's reviewer lane is reclaimed
 /// — its registration closed and its stale checkout cleared, both recorded on
 /// the successor's outcome — while a LIVE holder is never adopted: its
@@ -2000,6 +2053,65 @@ fn a_recorded_fix_round_whose_lane_checkout_is_gone_is_superseded_by_the_next_ro
     // so the classification reads a handoff the run can wait on.
     let receipt = std::fs::read_to_string(fixture.fix_receipt()).expect("the round was recorded");
     assert!(receipt.contains("\"round\":2"), "{receipt}");
+}
+
+/// Issue #282 on the FIX leg's lane: the checkout the FAIL handoff is about to
+/// create is registered while its directory is gone. The run's own machinery
+/// (no operator — a recorded review FAIL dispatches the fix round itself)
+/// clears the registration for exactly that path and the handoff lands.
+#[test]
+fn a_missing_but_registered_fix_lane_is_repaired_and_the_fail_handoff_lands() {
+    let fixture = Fixture::new("fix-stale-registration");
+    let params = reviewer_leg_params(&reviewer_binding_doc(), 20);
+    let plan = plan_with_fix_leg(params.clone());
+    let next_lane =
+        fixture
+            .worktrees_root
+            .join(canter::lane::lane_checkout(ISSUE as u64, "implementer", 2));
+    std::fs::create_dir_all(&fixture.worktrees_root).expect("worktrees root");
+    git(
+        &fixture.lane,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            next_lane.to_str().expect("lane path"),
+            &fixture.head,
+        ],
+    );
+    std::fs::remove_dir_all(&next_lane).expect("the checkout is deleted by hand");
+    assert!(
+        !next_lane.exists(),
+        "the checkout is gone, exactly as measured"
+    );
+    assert!(
+        git(&fixture.lane, &["worktree", "list"]).contains("issues-5-impl2"),
+        "the registration is stale, not gone"
+    );
+
+    let outcome = review_with_written_verdict(
+        &fixture,
+        &plan,
+        &params,
+        failed_verdict(&fixture, "AC1-cursor", "AC2-brief"),
+    );
+    assert_eq!(outcome.status, "succeeded", "{outcome:?}");
+    let fix = outcome
+        .result
+        .get("fix_round")
+        .cloned()
+        .expect("the FAIL reached a fix round");
+    assert_eq!(fix.get("round").and_then(Val::as_int), Some(1), "{fix:?}");
+    assert!(
+        next_lane.is_dir(),
+        "the fix leg's lane was created despite the stale registration"
+    );
+    assert_eq!(
+        git(&next_lane, &["rev-parse", "--verify", "HEAD"]).trim(),
+        fixture.head,
+        "the fix leg starts at the certified reviewed head"
+    );
 }
 
 #[test]
