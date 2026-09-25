@@ -339,6 +339,7 @@ jobs:
           "--test herdr_compatibility",
           "--test herdr_pane_execution",
           "--test host_proof_renewal",
+          "--test lane_build_residue",
           "--test lane_cli",
           "--test lane_replacement",
           "--test live_run_guard",

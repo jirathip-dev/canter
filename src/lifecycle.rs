@@ -37,6 +37,49 @@ use crate::value::{Val, integer, object, string};
 /// are stale and refuse new fan-out (AC1: stale measurements refuse work).
 pub const HOST_PROOF_FRESHNESS_SECS: i64 = 120;
 
+/// The documented free-space floor (issue #231): the minimum number of free
+/// bytes a host must expose at the run's lane root — the filesystem the
+/// lane's worktree AND its build scratch live on — before canter fans a lane
+/// out, and the floor below which the daemon's state store reports its own
+/// typed disk condition instead of a raw SQLite I/O failure.
+///
+/// The measured trigger: native lanes dropped ~2.9 GB of Xcode DerivedData
+/// per lane into the home directory, the data volume reached 100% full, and
+/// every surface that needs to write (daemon state, CI suites, lanes) became
+/// unreliable at once. A host below this floor refuses the LANE START typed
+/// (`refusal.admission.resource_floor`, naming the floor and the observed
+/// free bytes) rather than starting a build that fails halfway and consumes
+/// host-wide disk. A proof that carries no free-byte observation cannot be
+/// checked against the floor and keeps the pre-#231 behaviour: freshness
+/// still decides it.
+pub const HOST_FREE_FLOOR_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// The nearest ANCESTOR of `path` that exists on disk, `path` itself
+/// included (issue #231): the path whose filesystem a measurement of an
+/// unborn lane root really reads. Pure path arithmetic plus one `exists`
+/// probe per component, so the walk is testable without a filesystem that
+/// changes under the test.
+pub fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut candidate = path;
+    loop {
+        if candidate.exists() {
+            return Some(candidate.to_path_buf());
+        }
+        candidate = candidate.parent()?;
+    }
+}
+
+/// The free bytes one path's filesystem exposes (issue #231): the ONE host
+/// measurement the admission floor, the submit-time proof and the state
+/// store's disk-exhaustion classification share. A path that does not exist
+/// yet is measured at its nearest existing ancestor (a lane root is often
+/// created by the step that follows); an unobservable path is `None` — no
+/// measurement is ever fabricated.
+pub fn available_bytes_at(path: &Path) -> Option<u64> {
+    let ancestor = nearest_existing_ancestor(path)?;
+    fs2::available_space(&ancestor).ok()
+}
+
 /// Default concurrency caps (bootstrap design commitment; configurable via
 /// policy overlay in a later slice — ponytail: defaults keep the AC
 /// machine-provable without widening the config contract).
@@ -92,6 +135,10 @@ pub mod code {
     pub const PROOF_MISSING: &str = "refusal.admission.proof_missing";
     /// The supplied host-resource proof is stale (older than the bound).
     pub const PROOF_STALE: &str = "refusal.admission.proof_stale";
+    /// The host's free space at the lane root is below the documented floor
+    /// (issue #231): a lane that would consume host-wide disk is refused
+    /// typed before any effect runs.
+    pub const RESOURCE_FLOOR: &str = "refusal.admission.resource_floor";
     /// The requested fan-out omits an applicable cap axis.
     pub const CAP_MISSING: &str = "refusal.admission.cap_missing";
 }
@@ -419,14 +466,38 @@ pub fn paths_overlap(a: &str, b: &str) -> bool {
 
 /// Host-resource proof: the daemon may refuse fan-out when the caller
 /// cannot present a FRESH measurement (unknown or stale measurements refuse
-/// new work — AC1).
+/// new work — AC1), and when the measurement shows the host below the
+/// documented free-space floor (issue #231).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostProof {
     /// Unix seconds when the resource measurement was taken.
     pub measured_at_unix: i64,
+    /// The free bytes the host exposed at the lane root when the proof was
+    /// measured (issue #231), when the presenter observed them. `None` is
+    /// the pre-#231 attestation shape — an instant without an observation —
+    /// and cannot be checked against the floor.
+    pub available_bytes: Option<u64>,
 }
 
 impl HostProof {
+    /// A proof that carries only its instant: the pre-#231 attestation shape
+    /// (no free-byte observation, so no floor check).
+    pub fn at(measured_at_unix: i64) -> HostProof {
+        HostProof {
+            measured_at_unix,
+            available_bytes: None,
+        }
+    }
+
+    /// A proof that carries the free bytes the presenter measured at the lane
+    /// root (issue #231).
+    pub fn measured(measured_at_unix: i64, available_bytes: u64) -> HostProof {
+        HostProof {
+            measured_at_unix,
+            available_bytes: Some(available_bytes),
+        }
+    }
+
     /// Whether the proof is fresh at `now_unix`.
     pub fn fresh_at(self, now_unix: i64) -> bool {
         now_unix - self.measured_at_unix <= HOST_PROOF_FRESHNESS_SECS
@@ -507,9 +578,11 @@ pub fn renew_lapsed_host_proof(
             available_bytes,
         } => Some(HostProofRenewal {
             superseded: presented,
-            replacement: HostProof {
-                measured_at_unix: *measured_at_unix,
-            },
+            // Issue #231: the replacement proof carries the free-byte
+            // observation of THIS dispatch, so the gate can decide the
+            // documented floor on the measurement (never on an attestation
+            // that observed nothing).
+            replacement: HostProof::measured(*measured_at_unix, *available_bytes),
             available_bytes: *available_bytes,
         }),
         HostMeasurement::Unmeasurable { .. } => None,
@@ -553,7 +626,21 @@ pub fn check_fanout_admission(
             ));
         }
     };
-    let _ = proof;
+    // Issue #231: a proof that carries the free bytes its presenter observed
+    // is checked against the documented floor BEFORE any other gate — a lane
+    // that would consume host-wide disk is refused typed (naming the floor
+    // and the observation), never started to fail halfway.
+    if let Some(available_bytes) = proof.available_bytes
+        && available_bytes < HOST_FREE_FLOOR_BYTES
+    {
+        return Err(LifecycleError::new(
+            code::RESOURCE_FLOOR,
+            format!(
+                "the host exposes {available_bytes} free bytes at the run's lane root, below the \
+                 documented floor of {HOST_FREE_FLOOR_BYTES} free bytes; refuse fan-out"
+            ),
+        ));
+    }
     if proposed.harness_key.is_empty() {
         return Err(LifecycleError::new(
             code::CAP_MISSING,
@@ -1195,6 +1282,117 @@ mod tests {
         ));
     }
 
+    /// #231 AC2: with the host's free space below the documented floor, the
+    /// lane start is refused typed and the refusal names the floor and the
+    /// observation; at the floor it proceeds, and a proof with no observation
+    /// keeps the pre-#231 decision while a missing proof still refuses.
+    #[test]
+    fn a_host_below_the_documented_floor_refuses_the_lane_start() {
+        let now = anchor_secs();
+        let proposed = lane("example-org/widgets", "lane", "worktrees/issues/231");
+        let below = HOST_FREE_FLOOR_BYTES - 1;
+        let refused = check_fanout_admission(
+            &proposed,
+            &[],
+            &ConcurrencyCaps::default(),
+            Some(HostProof::measured(now, below)),
+            now,
+        )
+        .unwrap_err();
+        assert_eq!(refused.code, code::RESOURCE_FLOOR);
+        assert!(
+            refused.message.contains(&below.to_string()),
+            "the refusal names the observation: {}",
+            refused.message
+        );
+        assert!(
+            refused.message.contains(&HOST_FREE_FLOOR_BYTES.to_string()),
+            "the refusal names the floor: {}",
+            refused.message
+        );
+        // At the floor the start proceeds: the floor is a minimum, never a
+        // reservation.
+        assert!(
+            check_fanout_admission(
+                &proposed,
+                &[],
+                &ConcurrencyCaps::default(),
+                Some(HostProof::measured(now, HOST_FREE_FLOOR_BYTES)),
+                now,
+            )
+            .is_ok()
+        );
+        // A proof that observed nothing cannot be checked against the floor.
+        assert!(
+            check_fanout_admission(
+                &proposed,
+                &[],
+                &ConcurrencyCaps::default(),
+                Some(HostProof::at(now)),
+                now,
+            )
+            .is_ok()
+        );
+        // The floor never replaces the freshness precondition.
+        assert_eq!(
+            check_fanout_admission(&proposed, &[], &ConcurrencyCaps::default(), None, now)
+                .unwrap_err()
+                .code,
+            code::PROOF_MISSING
+        );
+        assert_eq!(
+            check_fanout_admission(
+                &proposed,
+                &[],
+                &ConcurrencyCaps::default(),
+                Some(HostProof::measured(
+                    now - HOST_PROOF_FRESHNESS_SECS - 1,
+                    below
+                )),
+                now,
+            )
+            .unwrap_err()
+            .code,
+            code::PROOF_STALE
+        );
+    }
+
+    /// #231: the shared free-byte measurement measures an existing path, walks
+    /// to the nearest existing ancestor of a path that does not exist yet, and
+    /// reports `None` (never a fabricated number) when nothing on the chain
+    /// can be observed. The WALK is asserted exactly (the number itself moves
+    /// under a live host, so the measurement is asserted only to be real).
+    #[test]
+    fn the_shared_measurement_walks_to_a_path_that_exists() {
+        let dir = std::env::temp_dir().join(format!("hf-floor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        assert_eq!(
+            nearest_existing_ancestor(&dir).as_deref(),
+            Some(dir.as_path()),
+            "an existing path is its own measurement target"
+        );
+        let unborn = dir.join("lane-root-that-does-not-exist").join("deeper");
+        assert_eq!(
+            nearest_existing_ancestor(&unborn).as_deref(),
+            Some(dir.as_path()),
+            "an unborn path is measured at its nearest existing ancestor"
+        );
+        assert!(
+            available_bytes_at(&unborn).is_some_and(|bytes| bytes > 0),
+            "the walk yields a real measurement"
+        );
+        assert_eq!(
+            nearest_existing_ancestor(Path::new("no-such-relative-root-xyz/deeper")),
+            None,
+            "a path with no existing ancestor is unresolvable"
+        );
+        assert_eq!(
+            available_bytes_at(Path::new("no-such-relative-root-xyz/deeper")),
+            None,
+            "an unobservable path is never fabricated"
+        );
+    }
+
     #[test]
     fn fanout_refuses_without_fresh_proof_and_when_caps_exhausted() {
         let now = anchor_secs();
@@ -1212,9 +1410,7 @@ mod tests {
                 &proposed,
                 &[],
                 &ConcurrencyCaps::default(),
-                Some(HostProof {
-                    measured_at_unix: now - HOST_PROOF_FRESHNESS_SECS - 1,
-                }),
+                Some(HostProof::at(now - HOST_PROOF_FRESHNESS_SECS - 1)),
                 now
             )
             .unwrap_err()
@@ -1231,9 +1427,7 @@ mod tests {
                 &proposed,
                 &[lane("example-org/other", "lane", "worktrees/issues/1")],
                 &caps,
-                Some(HostProof {
-                    measured_at_unix: now
-                }),
+                Some(HostProof::at(now)),
                 now
             )
             .unwrap_err()
@@ -1254,9 +1448,7 @@ mod tests {
                     "worktrees/issues/1"
                 )],
                 &caps,
-                Some(HostProof {
-                    measured_at_unix: now
-                }),
+                Some(HostProof::at(now)),
                 now
             )
             .unwrap_err()
@@ -1273,9 +1465,7 @@ mod tests {
                 &proposed,
                 &[lane("example-org/widgets", "lane", "worktrees/issues/1")],
                 &caps,
-                Some(HostProof {
-                    measured_at_unix: now
-                }),
+                Some(HostProof::at(now)),
                 now
             )
             .unwrap_err()
@@ -1291,9 +1481,7 @@ mod tests {
     #[test]
     fn cap_refusals_name_the_count_the_cap_and_the_occupying_lanes() {
         let now = anchor_secs();
-        let proof = Some(HostProof {
-            measured_at_unix: now,
-        });
+        let proof = Some(HostProof::at(now));
         let proposed = lane("example-org/widgets", "lane-1", "worktrees/issues/9");
         let widgets = [
             named_lane(
@@ -1388,9 +1576,7 @@ mod tests {
     #[test]
     fn a_cap_refusal_is_unchanged_when_no_lane_occupies_the_repository() {
         let now = anchor_secs();
-        let proof = Some(HostProof {
-            measured_at_unix: now,
-        });
+        let proof = Some(HostProof::at(now));
         let proposed = lane("example-org/widgets", "lane-1", "worktrees/issues/9");
         let caps = ConcurrencyCaps {
             per_repository: 0,
@@ -1428,24 +1614,20 @@ mod tests {
     #[test]
     fn a_lapsed_proof_renews_only_from_a_dispatch_time_measurement_of_a_live_run() {
         let now = anchor_secs();
-        let lapsed = HostProof {
-            measured_at_unix: now - HOST_PROOF_FRESHNESS_SECS - 1,
-        };
+        let lapsed = HostProof::at(now - HOST_PROOF_FRESHNESS_SECS - 1);
         let measured = HostMeasurement::Measured {
             measured_at_unix: now,
             available_bytes: 4096,
         };
         // The lapsed proof of a live run renews from the measurement: the
-        // replacement is the MEASUREMENT's own instant, never `now` echoed.
+        // replacement is the MEASUREMENT's own instant, never `now` echoed —
+        // and (issue #231) it carries the free bytes the measurement OBSERVED,
+        // so the gate can decide the documented floor on the replacement.
         let renewal = renew_lapsed_host_proof(Some(lapsed), &measured, true, now)
             .expect("a lapsed proof of a live run renews");
         assert_eq!(renewal.superseded, lapsed);
-        assert_eq!(
-            renewal.replacement,
-            HostProof {
-                measured_at_unix: now
-            }
-        );
+        assert_eq!(renewal.replacement, HostProof::measured(now, 4096));
+        assert_eq!(renewal.replacement.available_bytes, Some(4096));
         assert_eq!(renewal.available_bytes, 4096);
         // The replacement is fresh under the SAME unchanged bound.
         assert!(renewal.replacement.fresh_at(now));
@@ -1456,14 +1638,7 @@ mod tests {
         );
         // A FRESH presented proof is never re-measured.
         assert_eq!(
-            renew_lapsed_host_proof(
-                Some(HostProof {
-                    measured_at_unix: now
-                }),
-                &measured,
-                true,
-                now
-            ),
+            renew_lapsed_host_proof(Some(HostProof::at(now)), &measured, true, now),
             None
         );
         // A missing proof is never invented (the gate's own proof_missing stands).
@@ -1499,9 +1674,7 @@ mod tests {
     #[test]
     fn overlapping_monorepo_scopes_refuse_and_disjoint_scope_passes() {
         let now = anchor_secs();
-        let proof = Some(HostProof {
-            measured_at_unix: now,
-        });
+        let proof = Some(HostProof::at(now));
         // Another lane of the same repository already claims issues/123 and
         // its subpaths; a fan-out into that subtree refuses.
         let overlapping = lane("example-org/widgets", "lane", "worktrees/issues/123");

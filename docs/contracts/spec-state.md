@@ -61,6 +61,30 @@ to journal fails closed — the mutation does not start.
 - The journal is append-only; consumers read it as JSONL
   (`journal.tail` RPC). Redaction applies before any record is written.
 
+## Write-failure classification: disk exhaustion is its own condition (issue #231)
+
+A write-class SQLite failure still fails closed exactly as before: the
+handle is poisoned and every later mutation refuses `state.poisoned` naming
+the FIRST failure. What changed with #231 is that the failure is CLASSIFIED
+before it is remembered and returned:
+
+- An I/O-class failure (`SQLITE_IOERR`, `SQLITE_FULL`) observed while the
+  state database's own filesystem holds fewer free bytes than the
+  documented floor (`HOST_FREE_FLOOR_BYTES`, the same commitment the
+  fan-out admission enforces) is reported as **`state.disk_exhausted`** —
+  naming the observation, the floor and the raw SQLite detail — so an
+  operator can tell "the host's disk is full" from "the database is
+  broken". The measured trigger: a 100% full data volume surfaced as
+  `state.poisoned: state.write_io: … SQLITE_IOERR unable to open database
+  file`, indistinguishable from corruption.
+- A corrupt, future-schema, read-only or busy database keeps its own typed
+  code however little space the host has; an unobservable state root (a
+  host that does not expose its free bytes) proves nothing and the failure
+  is reported unchanged. No measurement is ever fabricated.
+- The classification is decided by one pure predicate over (error class,
+  observed free bytes) with the probe at its call boundary, so the decision
+  is witnessable without a genuinely full volume.
+
 ## Backup/restore boundaries and retention
 
 | Boundary | Content | Owner | Retention (default; configurable via policy overlay) |
@@ -277,8 +301,9 @@ to journal fails closed — the mutation does not start.
   `refusal.successor.attempts` when exhausted; a delivered successor
   re-verifies instead of spawning again). Admission failures are the
   lifecycle codes (`refusal.admission.proof_missing` / `proof_stale` /
-  `cap_missing` / `cap_global` / `cap_repository` / `cap_harness` /
-  `monorepo_overlap`) and hold with no child and no state change.
+  `resource_floor` / `cap_missing` / `cap_global` / `cap_repository` /
+  `cap_harness` / `monorepo_overlap`) and hold with no child and no state
+  change.
 - **Adoption**: `commit_lane_adoption` requires the fresh `observation` and
   `reobservation` of the lane to be canonically identical
   (`refusal.successor.binding` otherwise), compares the fresh observation

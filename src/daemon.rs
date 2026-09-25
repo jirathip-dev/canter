@@ -924,6 +924,10 @@ struct AdmissionParams {
     harness_lanes: Option<i64>,
     /// Unix seconds when the host-resource measurement was taken.
     host_proof_at: Option<i64>,
+    /// Free bytes the host exposed at the run's lane root when the proof was
+    /// measured (issue #231), when the presenter observed them: the fan-out
+    /// gate refuses below the documented floor.
+    host_proof_bytes: Option<u64>,
 }
 
 fn apply_params(request: &Request) -> Result<ApplyParams, (String, String)> {
@@ -1140,12 +1144,21 @@ fn apply_params(request: &Request) -> Result<ApplyParams, (String, String)> {
                 .and_then(|proof| proof.get("measured_at"))
                 .and_then(Val::as_str)
                 .and_then(crate::time::unix_from_rfc3339);
+            // Issue #231: the free-byte observation the presenter recorded
+            // with the proof, when it measured one (the fan-out gate refuses
+            // below the documented floor).
+            let host_proof_bytes = admission
+                .get("host_proof")
+                .and_then(|proof| proof.get("available_bytes"))
+                .and_then(Val::as_int)
+                .and_then(|bytes| u64::try_from(bytes).ok());
             Some(AdmissionParams {
                 global_cap: int_field("global"),
                 repository_cap: int_field("repository"),
                 harness_cap: int_field("harness"),
                 harness_lanes: non_negative(admission.get("harness_lanes")),
                 host_proof_at,
+                host_proof_bytes,
             })
         }
         Some(_) => {
@@ -1476,9 +1489,17 @@ fn admission_gate(
         }
     }
     drop(state);
-    let host_proof = admission
-        .host_proof_at
-        .map(|measured_at_unix| crate::lifecycle::HostProof { measured_at_unix });
+    // Issue #231: the proof the gate decides carries the free-byte
+    // observation the presenter recorded with it (when it measured one).
+    let host_proof =
+        admission
+            .host_proof_at
+            .map(|measured_at_unix| match admission.host_proof_bytes {
+                Some(available_bytes) => {
+                    crate::lifecycle::HostProof::measured(measured_at_unix, available_bytes)
+                }
+                None => crate::lifecycle::HostProof::at(measured_at_unix),
+            });
     crate::lifecycle::check_fanout_admission(
         &proposed,
         &running,
@@ -2459,8 +2480,13 @@ fn measure_host(lane_root: &Path) -> crate::lifecycle::HostMeasurement {
 /// One admission document with its host proof replaced by the measurement
 /// taken at this dispatch (issue #198). Every other key — caps, occupancy —
 /// is preserved verbatim, and the proof object keeps any extra keys: only
-/// its `measured_at` is superseded.
-fn admission_with_renewed_proof(admission: &Val, measured_at: &str) -> Option<Val> {
+/// its `measured_at` and its free-byte observation (issue #231) are
+/// superseded.
+fn admission_with_renewed_proof(
+    admission: &Val,
+    measured_at: &str,
+    available_bytes: u64,
+) -> Option<Val> {
     let Val::Obj(mut admission) = admission.clone() else {
         return None;
     };
@@ -2469,6 +2495,10 @@ fn admission_with_renewed_proof(admission: &Val, measured_at: &str) -> Option<Va
         _ => std::collections::BTreeMap::new(),
     };
     proof.insert("measured_at".to_string(), string(measured_at));
+    proof.insert(
+        "available_bytes".to_string(),
+        integer(available_bytes as i64),
+    );
     admission.insert("host_proof".to_string(), Val::Obj(proof));
     Some(Val::Obj(admission))
 }
@@ -2531,7 +2561,7 @@ fn renew_host_proof_for_dispatch(
         .and_then(|proof| proof.get("measured_at"))
         .and_then(Val::as_str)
         .and_then(time::unix_from_rfc3339)
-        .map(|measured_at_unix| crate::lifecycle::HostProof { measured_at_unix })?;
+        .map(crate::lifecycle::HostProof::at)?;
     let now = time::unix_now();
     if presented.fresh_at(now) {
         // The run's own proof is still fresh: it is presented as recorded.
@@ -2608,11 +2638,9 @@ fn renew_host_proof_for_dispatch(
     }
     // Present the measurement: the run's recorded caps and occupancy ride
     // along verbatim; only the lapsed proof is superseded.
-    let Some(admission) = material
-        .admission
-        .as_ref()
-        .and_then(|admission| admission_with_renewed_proof(admission, &measured_at))
-    else {
+    let Some(admission) = material.admission.as_ref().and_then(|admission| {
+        admission_with_renewed_proof(admission, &measured_at, renewal.available_bytes)
+    }) else {
         shared.log.write(
             "error",
             "run.host_proof.renewal_failed",
@@ -2734,7 +2762,7 @@ fn operator_measured_proof(
         .and_then(time::unix_from_rfc3339);
     let now = time::unix_now();
     if presented.is_some_and(|measured_at_unix| {
-        crate::lifecycle::HostProof { measured_at_unix }.fresh_at(now)
+        crate::lifecycle::HostProof::at(measured_at_unix).fresh_at(now)
     }) {
         // The recorded proof is still fresh: it is presented as recorded and
         // no measurement is taken.
@@ -2744,7 +2772,8 @@ fn operator_measured_proof(
     let superseded_at = presented
         .map(time::rfc3339_from_unix)
         .unwrap_or_else(|| "none".to_string());
-    let Some(bound) = admission_with_renewed_proof(&admission, &measured_at) else {
+    let Some(bound) = admission_with_renewed_proof(&admission, &measured_at, available_bytes)
+    else {
         return false;
     };
     // The audit record comes first: an act that cannot be recorded is never
@@ -6469,7 +6498,7 @@ fn recorded_proof_park(
         .and_then(Val::as_str)
         .and_then(crate::time::unix_from_rfc3339);
     let fresh = measured_at.is_some_and(|measured_at_unix| {
-        crate::lifecycle::HostProof { measured_at_unix }.fresh_at(crate::time::unix_now())
+        crate::lifecycle::HostProof::at(measured_at_unix).fresh_at(crate::time::unix_now())
     });
     if fresh {
         return None;
@@ -9244,6 +9273,14 @@ fn successor_admission(
         .and_then(|proof| proof.get("measured_at"))
         .and_then(Val::as_str)
         .and_then(crate::time::unix_from_rfc3339);
+    // Issue #231: the free-byte observation the lane's start attestation
+    // carries, when its caller measured one (the gate refuses below the
+    // documented floor).
+    let available_bytes = admission
+        .get("host_proof")
+        .and_then(|proof| proof.get("available_bytes"))
+        .and_then(Val::as_int)
+        .and_then(|bytes| u64::try_from(bytes).ok());
     let Some(measured_at_unix) = host_proof else {
         return Err((
             crate::lifecycle::code::PROOF_MISSING,
@@ -9307,7 +9344,10 @@ fn successor_admission(
         &proposed,
         &running,
         &caps,
-        Some(HostProof { measured_at_unix }),
+        Some(match available_bytes {
+            Some(available_bytes) => HostProof::measured(measured_at_unix, available_bytes),
+            None => HostProof::at(measured_at_unix),
+        }),
         time::unix_now(),
     )
     .map_err(|err| {
@@ -11534,8 +11574,8 @@ mod tests {
                 ]),
             ),
         ]);
-        let renewed =
-            admission_with_renewed_proof(&admission, "2026-09-18T08:59:55Z").expect("an object");
+        let renewed = admission_with_renewed_proof(&admission, "2026-09-18T08:59:55Z", 987654321)
+            .expect("an object");
         assert_eq!(
             renewed.get("caps"),
             admission.get("caps"),
@@ -11549,6 +11589,16 @@ mod tests {
                 .and_then(Val::as_str),
             Some("2026-09-18T08:59:55Z")
         );
+        // Issue #231: the dispatch-time measurement supersedes the free-byte
+        // observation too, so the gate decides the documented floor on THIS
+        // dispatch's measurement (never on a stale attestation).
+        assert_eq!(
+            renewed
+                .get("host_proof")
+                .and_then(|proof| proof.get("available_bytes"))
+                .and_then(Val::as_int),
+            Some(987654321)
+        );
         assert_eq!(
             renewed
                 .get("host_proof")
@@ -11558,7 +11608,7 @@ mod tests {
             "unknown proof keys are preserved"
         );
         assert_eq!(
-            admission_with_renewed_proof(&null(), "2026-09-18T08:59:55Z"),
+            admission_with_renewed_proof(&null(), "2026-09-18T08:59:55Z", 1),
             None,
             "a non-object admission is never rewritten"
         );

@@ -6,6 +6,39 @@ release process activates (docs/RELEASING.md), then semver applies.
 
 ## [Unreleased]
 
+### Fixed (issue #231 — native lanes' build scratch belongs to the lane, and disk pressure is typed)
+
+- A lane's build scratch is derived from its own leg
+  (`crate::lane::lane_build_residue_roots`: `<agent>-derived` and
+  `<agent>-DD`) and named in the worker payload the plan produces
+  (`-derivedDataPath ../<agent>-derived`, with the home directory explicitly
+  forbidden): the measured defect was native lanes dropping a full Xcode
+  DerivedData tree per lane into the host home directory, filling the data
+  volume. `tests/lane_build_residue.rs` witnesses the payload's path, a
+  native build that follows it leaving the home directory untouched (with the
+  leaked shape as the discriminating control), and the reaper below.
+- The lane-residue reclaim gained a THIRD half (`build_residue`): for a
+  ledger-terminal generation the reaper reclaims both derived roots (any
+  `DerivedData` tree inside them included) under the run's own
+  `worktrees_root`, and touches nothing else — a sibling lane's root
+  survives, and a symlinked root is refused (`refusal.cleanup.symlink`) and
+  left exactly where it is.
+- The fan-out admission gate enforces a documented free-space floor
+  (`HOST_FREE_FLOOR_BYTES`): a lane start whose host proof carries a free-byte
+  observation below the floor is refused typed
+  (`refusal.admission.resource_floor`, naming the floor and the observation)
+  before any effect runs. The proof carries the observation the presenter
+  measured (`host_proof.available_bytes`): `queue submit --topology` records
+  one from the host it runs on, and the dispatch-time renewal supersedes it
+  with the daemon's own measurement.
+- Disk exhaustion is its own typed state condition: a write-class SQLite
+  failure observed while the state root holds fewer free bytes than the same
+  documented floor is reported as `state.disk_exhausted` (naming the
+  observation, the floor and the raw SQLite detail) instead of the
+  indistinguishable `state.write_io`; a database fault keeps its own code
+  however little space the host has, and an unobservable host is never
+  guessed.
+
 ### Fixed (issue #277 — a bump installs BOTH paths and proves the daemon runs the installed build)
 
 - `scripts/accept-bump.py` is the versioned bump driver (operator tooling, run

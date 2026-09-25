@@ -260,6 +260,11 @@ pub fn queue_run_steps(
     for number in issues {
         let branch = format!("issue-{number}");
         let worktree = crate::lane::lane_checkout(*number, "implementer", 1);
+        // Issue #231: the worker payload names the lane's OWN build-scratch
+        // root (the checkout's sibling, derived from the lane leg) and forbids
+        // the host home directory — the one instruction channel the plan has
+        // to the lane, and the path the reaper reclaims as lane residue.
+        let scratch = crate::lane::lane_build_root_relative(*number, "implementer", 1);
         steps.push(PlanStep {
             id: format!("p4-{number}"),
             kind: "prompt".to_string(),
@@ -268,7 +273,7 @@ pub fn queue_run_steps(
                 (
                     "payload",
                     string(&format!(
-                        "Implement {repository}#{number} from its latest issue text. Follow the repository instructions, run its required gates, commit the bounded change, push the feature branch, open or update its pull request to {integration_branch}, and report the exact delivery evidence."
+                        "Implement {repository}#{number} from its latest issue text. Follow the repository instructions, run its required gates, commit the bounded change, push the feature branch, open or update its pull request to {integration_branch}, and report the exact delivery evidence. Keep every build's scratch (for example Xcode DerivedData) inside this lane: pass -derivedDataPath {scratch} explicitly and never write build scratch into the home directory."
                     )),
                 ),
                 ("worktree", string(&worktree)),

@@ -3264,7 +3264,10 @@ fn clear_stale_lane_registration(
 
 /// Issue #222: reclaim the lane residue a ledger-TERMINAL generation of this
 /// repository issue left in the integration clone, and return one record of
-/// the attempt (removed, or refused with its reason).
+/// the attempt (removed, or refused with its reason). The residue set is
+/// three halves: the registered checkout, the local lane branch, and — issue
+/// #231 — the lane's build residue (its DerivedData scratch roots) under the
+/// run's own worktrees root.
 ///
 /// Policy, stated because the issue asks which one is implemented: the retired
 /// generation's REGISTERED lane checkout at this leg's own relative path is
@@ -3284,9 +3287,83 @@ fn reclaim_retired_lane_residue(
     worktree: &Path,
 ) -> Vec<Val> {
     match residue_host(ctx) {
-        Ok(host) => reclaim_lane_residue(&host, ctx.retired_run_ids, branch, relative, worktree),
+        Ok(host) => reclaim_lane_residue(
+            &host,
+            ctx.retired_run_ids,
+            branch,
+            relative,
+            worktree,
+            ctx.worktrees_root,
+            ctx.plan.issue_number as u64,
+        ),
         Err(_) => Vec::new(),
     }
+}
+
+/// The lane's BUILD residue (issue #231, the third residue half): the
+/// per-lane build-scratch roots the host measured — `<agent>-derived` and
+/// `<agent>-DD` — directly under the run's own `worktrees_root`.
+///
+/// The roots are DERIVED from the issue's own implementer leg
+/// ([`crate::lane::lane_build_residue_roots`]), so the set is exactly this
+/// lane's residue: a sibling lane of another issue is never a candidate, and
+/// a path that is not one of the two derived names is never touched. The
+/// caller has already proven the generation is ledger-TERMINAL, so a live
+/// lane's scratch root is unreachable here — and a symlinked root is refused
+/// and left in place (a symlink is never followed, exactly like a cleanup
+/// target). One record per root is returned either way (removed or refused).
+fn reclaim_build_residue(worktrees_root: &Path, issue: u64) -> Vec<Val> {
+    let mut records = Vec::new();
+    for name in crate::lane::lane_build_residue_roots(issue, "implementer", 1) {
+        let path = worktrees_root.join(&name);
+        let record = if !path.exists() {
+            object(vec![
+                ("root", string(&name)),
+                ("removed", bool_(true)),
+                ("message", string("no build residue")),
+            ])
+        } else if std::fs::symlink_metadata(&path)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            object(vec![
+                ("root", string(&name)),
+                ("removed", bool_(false)),
+                ("code", string(code::CLEANUP_SYMLINK)),
+                (
+                    "message",
+                    string(
+                        "the build-residue root is a symlink; a symlinked root is never followed \
+                         and nothing is removed",
+                    ),
+                ),
+            ])
+        } else {
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => object(vec![
+                    ("root", string(&name)),
+                    ("removed", bool_(true)),
+                    (
+                        "message",
+                        string("regenerable lane build residue (DerivedData) reclaimed"),
+                    ),
+                ]),
+                Err(err) => object(vec![
+                    ("root", string(&name)),
+                    ("removed", bool_(false)),
+                    ("code", string(code::CLEANUP_UNKNOWN)),
+                    (
+                        "message",
+                        string(&format!(
+                            "the build-residue root could not be removed: {err}"
+                        )),
+                    ),
+                ]),
+            }
+        };
+        records.push(record);
+    }
+    records
 }
 
 fn reclaim_lane_residue(
@@ -3295,6 +3372,8 @@ fn reclaim_lane_residue(
     branch: &str,
     relative: &str,
     worktree: &Path,
+    worktrees_root: &Path,
+    issue: u64,
 ) -> Vec<Val> {
     let registered = registered_worktree_paths_on(host);
     let checkout = if !worktree.exists() {
@@ -3369,6 +3448,10 @@ fn reclaim_lane_residue(
         ),
         ("checkout_residue", checkout),
         ("branch_residue", lane_branch),
+        (
+            "build_residue",
+            Val::Arr(reclaim_build_residue(worktrees_root, issue)),
+        ),
     ])]
 }
 
@@ -3497,7 +3580,15 @@ pub fn retire_run_lane(
             result: null(),
         };
     }
-    let residue = reclaim_lane_residue(&host, &generations, &branch, &relative, &lane);
+    let residue = reclaim_lane_residue(
+        &host,
+        &generations,
+        &branch,
+        &relative,
+        &lane,
+        worktrees_root,
+        issue,
+    );
     ok(object(vec![
         ("run", string(run)),
         ("branch", string(&branch)),

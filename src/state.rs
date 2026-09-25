@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -54,8 +54,9 @@ impl Default for Retention {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StateError {
     /// Stable error code (`state.open`, `state.corrupt`, `state.schema_future`,
-    /// `state.write_full`, `state.write_io`, `state.busy`, `state.audit_tampered`,
-    /// `state.poisoned`, `state.conflict`, `state.not_found`).
+    /// `state.write_full`, `state.write_io`, `state.disk_exhausted`,
+    /// `state.busy`, `state.audit_tampered`, `state.poisoned`,
+    /// `state.conflict`, `state.not_found`).
     pub code: &'static str,
     /// Human message (never contains credentials).
     pub message: String,
@@ -2065,6 +2066,10 @@ struct AdoptionBinding {
 pub struct State {
     conn: Mutex<Connection>,
     retention: Retention,
+    /// The directory the state database lives in (issue #231): the filesystem
+    /// whose free space classifies a write failure as disk exhaustion rather
+    /// than a generic I/O fault. Recorded at open; never re-derived.
+    root: PathBuf,
     poisoned: AtomicBool,
     /// The FIRST write that failed and poisoned this handle (item 4b of issue
     /// #144): the cause every later `state.poisoned` refusal names.
@@ -2238,6 +2243,10 @@ impl State {
         let state = State {
             conn: Mutex::new(conn),
             retention,
+            root: path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from(".")),
             poisoned: AtomicBool::new(false),
             poison_cause: Mutex::new(None),
         };
@@ -2401,10 +2410,7 @@ impl State {
             grant_id,
             request_line,
         );
-        if let Err(err) = &outcome {
-            self.poison_on(err);
-        }
-        outcome
+        outcome.map_err(|err| self.poison_on(err))
     }
 
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -2509,10 +2515,7 @@ impl State {
         response_line: Option<&str>,
     ) -> Result<AuditRow, StateError> {
         let outcome = self.resolve_claim_inner(key, method, status, outcome_line, response_line);
-        if let Err(err) = &outcome {
-            self.poison_on(err);
-        }
-        outcome
+        outcome.map_err(|err| self.poison_on(err))
     }
 
     fn resolve_claim_inner(
@@ -2677,10 +2680,7 @@ impl State {
         outcome_line: &str,
     ) -> Result<AuditRow, StateError> {
         let outcome = self.journal_reconcile_inner(key, method, status, outcome_line);
-        if let Err(err) = &outcome {
-            self.poison_on(err);
-        }
-        outcome
+        outcome.map_err(|err| self.poison_on(err))
     }
 
     fn journal_reconcile_inner(
@@ -4885,10 +4885,7 @@ impl State {
         plan: &QueueSubmissionPlan,
     ) -> Result<(QueueSubmissionRow, Vec<QueueSubmissionItemRow>), StateError> {
         let outcome = self.submit_queue_run_inner(plan);
-        if let Err(err) = &outcome {
-            self.poison_on(err);
-        }
-        outcome
+        outcome.map_err(|err| self.poison_on(err))
     }
 
     fn submit_queue_run_inner(
@@ -5857,10 +5854,7 @@ impl State {
     /// the audit pair).
     pub fn journal_salvage(&self, target: &str, instance_id: &str) -> Result<AuditRow, StateError> {
         let outcome = self.journal_salvage_inner(target, instance_id);
-        if let Err(err) = &outcome {
-            self.poison_on(err);
-        }
-        outcome
+        outcome.map_err(|err| self.poison_on(err))
     }
 
     fn journal_salvage_inner(
@@ -6069,10 +6063,7 @@ impl State {
         at: &str,
     ) -> Result<AuditRow, StateError> {
         let result = self.complete_schedule_run_inner(schedule_id, next_run_at, at);
-        if let Err(err) = &result {
-            self.poison_on(err);
-        }
-        result
+        result.map_err(|err| self.poison_on(err))
     }
 
     fn complete_schedule_run_inner(
@@ -6131,10 +6122,7 @@ impl State {
         at: &str,
     ) -> Result<AuditRow, StateError> {
         let result = self.pause_schedule_with_reason_inner(schedule_id, reason, at);
-        if let Err(err) = &result {
-            self.poison_on(err);
-        }
-        result
+        result.map_err(|err| self.poison_on(err))
     }
 
     fn pause_schedule_with_reason_inner(
@@ -6212,10 +6200,7 @@ impl State {
             profile,
             at,
         );
-        if let Err(err) = &outcome {
-            self.poison_on(err);
-        }
-        outcome
+        outcome.map_err(|err| self.poison_on(err))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6388,10 +6373,7 @@ impl State {
     ) -> Result<LaneReplacementRow, StateError> {
         let outcome =
             self.advance_lane_replacement_inner(replacement_id, expected_phase, generation, at);
-        if let Err(err) = &outcome {
-            self.poison_on(err);
-        }
-        outcome
+        outcome.map_err(|err| self.poison_on(err))
     }
 
     fn advance_lane_replacement_inner(
@@ -6474,10 +6456,7 @@ impl State {
         at: &str,
     ) -> Result<LaneReplacementRow, StateError> {
         let outcome = self.hold_lane_replacement_inner(replacement_id, reason, at);
-        if let Err(err) = &outcome {
-            self.poison_on(err);
-        }
-        outcome
+        outcome.map_err(|err| self.poison_on(err))
     }
 
     fn hold_lane_replacement_inner(
@@ -6552,10 +6531,7 @@ impl State {
         at: &str,
     ) -> Result<LaneReplacementRow, StateError> {
         let outcome = self.cancel_lane_replacement_inner(replacement_id, reason, at);
-        if let Err(err) = &outcome {
-            self.poison_on(err);
-        }
-        outcome
+        outcome.map_err(|err| self.poison_on(err))
     }
 
     fn cancel_lane_replacement_inner(
@@ -6728,10 +6704,7 @@ impl State {
             exclude_key,
             at,
         );
-        if let Err(err) = &outcome {
-            self.poison_on(err);
-        }
-        outcome
+        outcome.map_err(|err| self.poison_on(err))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7207,10 +7180,7 @@ impl State {
             reason,
             at,
         );
-        if let Err(err) = &outcome {
-            self.poison_on(err);
-        }
-        outcome
+        outcome.map_err(|err| self.poison_on(err))
     }
 
     fn commit_lane_retirement_inner(
@@ -7349,10 +7319,7 @@ impl State {
         at: &str,
     ) -> Result<bool, StateError> {
         let outcome = self.mark_replacement_ambiguous_inner(params, reason, at);
-        if let Err(err) = &outcome {
-            self.poison_on(err);
-        }
-        outcome
+        outcome.map_err(|err| self.poison_on(err))
     }
 
     fn mark_replacement_ambiguous_inner(
@@ -7766,10 +7733,7 @@ impl State {
             profile_kind,
             at,
         );
-        if let Err(err) = &outcome {
-            self.poison_on(err);
-        }
-        outcome
+        outcome.map_err(|err| self.poison_on(err))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7969,10 +7933,7 @@ impl State {
         at: &str,
     ) -> Result<LaneSuccessorRow, StateError> {
         let outcome = self.note_lane_successor_attempt_inner(replacement_id, nonce, at);
-        if let Err(err) = &outcome {
-            self.poison_on(err);
-        }
-        outcome
+        outcome.map_err(|err| self.poison_on(err))
     }
 
     fn note_lane_successor_attempt_inner(
@@ -8063,10 +8024,7 @@ impl State {
         at: &str,
     ) -> Result<LaneSuccessorRow, StateError> {
         let outcome = self.mark_lane_successor_delivered_inner(replacement_id, nonce, at);
-        if let Err(err) = &outcome {
-            self.poison_on(err);
-        }
-        outcome
+        outcome.map_err(|err| self.poison_on(err))
     }
 
     fn mark_lane_successor_delivered_inner(
@@ -8155,10 +8113,7 @@ impl State {
             reason,
             at,
         );
-        if let Err(err) = &outcome {
-            self.poison_on(err);
-        }
-        outcome
+        outcome.map_err(|err| self.poison_on(err))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8606,10 +8561,7 @@ impl State {
             reason,
             at,
         );
-        if let Err(err) = &outcome {
-            self.poison_on(err);
-        }
-        outcome
+        outcome.map_err(|err| self.poison_on(err))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8887,10 +8839,7 @@ impl State {
             completions,
             at,
         );
-        if let Err(err) = &outcome {
-            self.poison_on(err);
-        }
-        outcome
+        outcome.map_err(|err| self.poison_on(err))
     }
 
     fn consume_lane_successor_completions_inner(
@@ -9429,11 +9378,21 @@ impl State {
     /// mutation, remembering WHICH write failed first (item 4b of issue
     /// #144). Read-only queries keep working; every later mutation is refused
     /// until the process restarts.
-    fn poison_on(&self, err: &StateError) {
+    ///
+    /// Issue #231: the failure is CLASSIFIED before it is remembered and
+    /// returned. A write-class SQLite failure while the state root's free
+    /// space sits below the documented floor is the host's disk exhaustion —
+    /// `state.disk_exhausted`, naming the observation and the floor — never
+    /// the generic `state.write_io` an operator cannot tell from a database
+    /// fault.
+    fn poison_on(&self, err: StateError) -> StateError {
+        let err =
+            self.classify_write_failure(err, crate::lifecycle::available_bytes_at(&self.root));
         let write_class = matches!(
             err.code,
             "state.write_full"
                 | "state.write_io"
+                | "state.disk_exhausted"
                 | "state.corrupt"
                 | "state.readonly"
                 | "state.busy"
@@ -9446,6 +9405,36 @@ impl State {
                 *cause = Some(format!("{}: {}", err.code, err.message));
             }
         }
+        err
+    }
+
+    /// Classify one write-class failure against the state root's free space
+    /// (`None` when the host could not be observed).
+    ///
+    /// Pure over its inputs — the probe is the caller's — so the decision is
+    /// witnessable without a genuinely full volume: an I/O-class SQLite
+    /// failure below the documented floor IS disk exhaustion; at or above it
+    /// (and for every non-I/O class) the failure keeps its own typed code.
+    fn classify_write_failure(&self, err: StateError, free_bytes: Option<u64>) -> StateError {
+        if !matches!(err.code, "state.write_full" | "state.write_io") {
+            return err;
+        }
+        let Some(free_bytes) = free_bytes else {
+            return err;
+        };
+        if free_bytes >= crate::lifecycle::HOST_FREE_FLOOR_BYTES {
+            return err;
+        }
+        state_error(
+            "state.disk_exhausted",
+            format!(
+                "{}; the state root holds {free_bytes} free bytes, below the documented floor of \
+                 {} free bytes — the host's disk is exhausted, not the database ({})",
+                err.message,
+                crate::lifecycle::HOST_FREE_FLOOR_BYTES,
+                free_bytes
+            ),
+        )
     }
 
     /// Append an audit record inside an existing transaction. The caller
@@ -14550,10 +14539,7 @@ impl State {
             run_generation,
             at,
         );
-        if let Err(err) = &outcome {
-            self.poison_on(err);
-        }
-        outcome
+        outcome.map_err(|err| self.poison_on(err))
     }
 
     fn arm_supervision_inner(
@@ -14807,10 +14793,7 @@ impl State {
         at: &str,
     ) -> Result<bool, StateError> {
         let outcome = self.record_supervision_trigger_inner(instance_id, trigger, seq, at);
-        if let Err(err) = &outcome {
-            self.poison_on(err);
-        }
-        outcome
+        outcome.map_err(|err| self.poison_on(err))
     }
 
     fn record_supervision_trigger_inner(
@@ -15330,10 +15313,7 @@ impl State {
     ) -> Result<AuditRow, StateError> {
         let outcome =
             self.record_supervision_dispatch_refusal_inner(instance_id, step, code, reason);
-        if let Err(err) = &outcome {
-            self.poison_on(err);
-        }
-        outcome
+        outcome.map_err(|err| self.poison_on(err))
     }
 
     fn record_supervision_dispatch_refusal_inner(
@@ -15382,10 +15362,7 @@ impl State {
         plan: &SupervisionCheckPlan,
     ) -> Result<SupervisionRow, StateError> {
         let outcome = self.commit_supervision_check_inner(plan);
-        if let Err(err) = &outcome {
-            self.poison_on(err);
-        }
-        outcome
+        outcome.map_err(|err| self.poison_on(err))
     }
 
     fn commit_supervision_check_inner(
@@ -15554,10 +15531,7 @@ impl State {
     /// Persist the driver cursor.
     pub fn set_supervision_runtime(&self, event_cursor: i64, at: &str) -> Result<(), StateError> {
         let outcome = self.set_supervision_runtime_inner(event_cursor, at);
-        if let Err(err) = &outcome {
-            self.poison_on(err);
-        }
-        outcome
+        outcome.map_err(|err| self.poison_on(err))
     }
 
     fn set_supervision_runtime_inner(&self, event_cursor: i64, at: &str) -> Result<(), StateError> {
@@ -15585,10 +15559,7 @@ impl State {
         at: &str,
     ) -> Result<SupervisionFold, StateError> {
         let outcome = self.fold_supervision_events_inner(cursor, at);
-        if let Err(err) = &outcome {
-            self.poison_on(err);
-        }
-        outcome
+        outcome.map_err(|err| self.poison_on(err))
     }
 
     fn fold_supervision_events_inner(
@@ -15916,6 +15887,105 @@ mod tests {
             audit_rows: 4,
             event_rows: 4,
         }
+    }
+
+    /// #231 AC4: a write-class SQLite I/O failure on a host whose free space
+    /// sits below the documented floor is reported as its OWN typed state
+    /// condition — `state.disk_exhausted`, naming the observation and the
+    /// floor — never the generic `state.write_io` an operator cannot tell
+    /// from a database fault. At or above the floor (and for every non-I/O
+    /// class) the failure keeps its own code, and an unobservable host never
+    /// invents a disk verdict.
+    #[test]
+    fn disk_exhaustion_is_its_own_typed_state_condition() {
+        let path = temp_db("disk-exhausted/state.db");
+        let state = State::open(&path, retention_tiny()).expect("open the state store");
+        let io_failure = || {
+            state_error(
+                "state.write_io",
+                "commit_supervision_check: update: SQLite I/O failure (SQLITE_IOERR) unable to \
+                 open database file",
+            )
+        };
+        let floor = crate::lifecycle::HOST_FREE_FLOOR_BYTES;
+
+        // Below the floor: the host's disk exhaustion, named with both
+        // numbers and distinguishable from a database fault.
+        let exhausted = state.classify_write_failure(io_failure(), Some(floor - 1));
+        assert_eq!(exhausted.code, "state.disk_exhausted");
+        assert!(
+            exhausted.message.contains(&format!("{floor}")),
+            "the refusal names the documented floor: {}",
+            exhausted.message
+        );
+        assert!(
+            exhausted.message.contains(&format!("{}", floor - 1)),
+            "the refusal names the observation: {}",
+            exhausted.message
+        );
+        assert!(
+            exhausted.message.contains("SQLITE_IOERR"),
+            "the raw failure detail stays readable: {}",
+            exhausted.message
+        );
+
+        // At and above the floor: the failure keeps its own typed code.
+        assert_eq!(
+            state.classify_write_failure(io_failure(), Some(floor)).code,
+            "state.write_io"
+        );
+        assert_eq!(
+            state
+                .classify_write_failure(io_failure(), Some(floor * 2))
+                .code,
+            "state.write_io"
+        );
+        // A SQLITE_FULL failure is the same disk class.
+        let full = state_error("state.write_full", "update: SQLite disk full (SQLITE_FULL)");
+        assert_eq!(
+            state.classify_write_failure(full, Some(0)).code,
+            "state.disk_exhausted"
+        );
+        // An unobservable host proves nothing: the failure is unchanged.
+        assert_eq!(
+            state.classify_write_failure(io_failure(), None).code,
+            "state.write_io"
+        );
+        // A database fault is NEVER reported as disk exhaustion, however
+        // little space the host has.
+        let corrupt = state_error("state.corrupt", "quick_check: the database is malformed");
+        let classified = state.classify_write_failure(corrupt, Some(0));
+        assert_eq!(classified.code, "state.corrupt");
+        assert!(classified.message.contains("malformed"));
+    }
+
+    /// #231: a classified disk exhaustion POISONS the handle exactly like any
+    /// other write-class failure, and every later mutation's refusal names the
+    /// typed condition (the measured evidence was a poisoned handle whose
+    /// cause read as a raw SQLite I/O error).
+    #[test]
+    fn a_poisoned_handle_names_a_disk_exhaustion_cause() {
+        let path = temp_db("disk-poison/state.db");
+        let state = State::open(&path, retention_tiny()).expect("open the state store");
+        let io_failure = state_error(
+            "state.write_io",
+            "journal: begin: SQLite I/O failure (SQLITE_IOERR) unable to open database file",
+        );
+        let classified = state.classify_write_failure(io_failure, Some(0));
+        assert_eq!(classified.code, "state.disk_exhausted");
+        state.poisoned.store(true, Ordering::SeqCst);
+        if let Ok(mut cause) = state.poison_cause.lock() {
+            *cause = Some(format!("{}: {}", classified.code, classified.message));
+        }
+        let refused = state
+            .ensure_writable()
+            .expect_err("a poisoned handle refuses mutations");
+        assert_eq!(refused.code, "state.poisoned");
+        assert!(
+            refused.message.contains("state.disk_exhausted"),
+            "the refusal names the typed cause: {}",
+            refused.message
+        );
     }
 
     /// #236: the per-repository cap refusal names what occupies the slot — the
