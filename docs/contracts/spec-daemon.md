@@ -941,8 +941,16 @@ clears a repository/fleet-level hold or bypasses a gate.
   condition, not an ownership problem. The step then WAITS, bounded by its own
   effective deadline (the cleanup row of the per-kind table, or the plan's
   declared `deadline_secs`), for the settled turn the worker produces on its
-  own (`refusal.lane.busy` names the live lane on every read-back), and closes
-  the workspace once the lane settles; the recorded outcome carries the wait
+  own, and closes the workspace once that turn is CONFIRMED — the collection's
+  own discipline (issue #170 N7): `COLLECT_STOP_SAMPLES` consecutive
+  corroborated read-backs, BOTH views non-working and the lane's own lifecycle
+  counter unmoved, sampled across the documented `COLLECT_STOP_INTERVAL_SECS`
+  interval; a sample that reports the lane still working never reaches a
+  close. A state that flaps to a stop MID-TURN is therefore never a settle.
+  The close keeps its own whole-lane verification (lane token, generation,
+  worktree, settled agent state): a close that finds the lane running again
+  reports `refusal.lane.busy`, the confirmation is void and the wait
+  re-confirms. The recorded outcome carries the wait
   (`lane_wait`: `bound_secs`, `waited_ms`) alongside the step's own
   `deadline_secs`. A wait that exhausts the bound records `effect.lane_timeout`
   as `ambiguous` with the live lane's own message and the bound named, and the

@@ -123,8 +123,10 @@ can run with **no harness credentials** (AC7).
   documented pane row — issue #139),
   `refusal.lane.busy` (the addressed lane is THIS generation's own and its
   agent is still running, so its workspace is preserved; a caller that has
-  already certified the delivery waits, bounded, for the settled turn instead
-  of spending a retry on the timing — issue #224, `effect.lane_timeout`),
+  already certified the delivery waits, bounded, for the CONFIRMED settled turn
+  — the collection's consecutive corroborated read-backs, issue #170 N7 —
+  instead of spending a retry on the timing — issue #224,
+  `effect.lane_timeout`),
   `refusal.request.malformed`, `refusal.session.unbound` (a harness step
   addressed the run's bound session but the run bound none; issue #92 F2),
   `refusal.prompt.undelivered` (the pane substrate's prompt did not reach the

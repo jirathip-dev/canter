@@ -123,9 +123,34 @@ log() { printf '%s\n' "$*" >> "$LOG"; }
 read_state() { [ -f "$STATE/$1" ] && sed -n 1p "$STATE/$1" || printf '%s' "$2"; }
 report_lane() { printf '%s' "${HF_FAKE_HERDR_REPORT_LANE:-$(read_state lane '')}"; }
 report_generation() { printf '%s' "${HF_FAKE_HERDR_REPORT_GENERATION:-$(read_state generation '')}"; }
+# The lane's own reported state for ONE read-back: the seeded state plus the
+# opt-in controls. HF_FAKE_HERDR_SETTLE_AFTER_LIST_READS settles the lane to
+# `idle` after N agent-list read-backs; HF_FAKE_HERDR_FLAP_UNTIL_LIST_READS
+# makes it FLAP to a stop state MID-TURN until N read-backs (the measured #170
+# N7 shape) and settle after. BOTH views of the lane — its own row and the
+# status row — report this same state: the flap is ONE lane flapping, so no
+# witness may confirm a settle from one view alone.
+lane_state() {
+  reads=0
+  [ -f "$STATE/agent_list_reads" ] && reads=$(sed -n 1p "$STATE/agent_list_reads")
+  if [ -n "${HF_FAKE_HERDR_FLAP_UNTIL_LIST_READS:-}" ]; then
+    if [ "$reads" -le "$HF_FAKE_HERDR_FLAP_UNTIL_LIST_READS" ]; then
+      if [ $((reads % 2)) -eq 0 ]; then printf '%s' "idle"; else printf '%s' "working"; fi
+    else
+      printf '%s' "idle"
+    fi
+    return
+  fi
+  if [ -n "${HF_FAKE_HERDR_SETTLE_AFTER_LIST_READS:-}" ] \
+    && [ "$reads" -gt "$HF_FAKE_HERDR_SETTLE_AFTER_LIST_READS" ]; then
+    printf '%s' "idle"
+    return
+  fi
+  read_state state 'idle'
+}
 agent_doc() {
   printf '{"name":"%s","pane_id":"%s","cwd":"%s","agent_status":"%s","state_change_seq":%s,"tokens":{"canter_lane":"%s","canter_generation":"%s"}%s}' \
-    "$(read_state name '')" "$(read_state pane 'w1:p1')" "$(read_state cwd '')" "${2:-$(read_state state 'idle')}" \
+    "$(read_state name '')" "$(read_state pane 'w1:p1')" "$(read_state cwd '')" "${2:-$(lane_state)}" \
     "$(read_state seq '0')" \
     "$(report_lane)" "$(report_generation)" "${1:-}"
 }
@@ -216,17 +241,11 @@ case "$1 $2" in
     [ -f "$STATE/agent_list_reads" ] && list_reads=$(sed -n 1p "$STATE/agent_list_reads")
     list_reads=$((list_reads + 1))
     printf '%s' "$list_reads" > "$STATE/agent_list_reads"
-    list_state="$(read_state state 'idle')"
-    # Issue #224 control: a lane whose agent is still iterating SETTLES on its
-    # own after N read-backs — the worker outliving its own publish. Off
-    # unless the fixture asks for it; the read count is recorded so a witness
-    # can prove the bounded wait actually polled.
-    if [ -n "${HF_FAKE_HERDR_SETTLE_AFTER_LIST_READS:-}" ] \
-      && [ "$list_reads" -gt "$HF_FAKE_HERDR_SETTLE_AFTER_LIST_READS" ]; then
-      list_state="idle"
-    fi
+    # The read-back count is recorded so a witness can prove the bounded wait
+    # actually polled; the reported state (settle/flap controls included) comes
+    # from lane_state(), the SAME source the lane's own row reads (issue #224).
     if [ -f "$STATE/name" ] && [ ! -f "$STATE/no_agent" ]; then
-      printf '{"id":"cli:agent:list","result":{"agents":[%s],"type":"agent_list"}}\n' "$(agent_doc '' "$list_state")"
+      printf '{"id":"cli:agent:list","result":{"agents":[%s],"type":"agent_list"}}\n' "$(agent_doc '')"
     else
       printf '{"id":"cli:agent:list","result":{"agents":[],"type":"agent_list"}}\n'
     fi
@@ -910,7 +929,7 @@ fn p8_preserves_dirty_live_and_stale_lanes_then_closes_the_owned_workspace() {
         ("kind", string("hermes")),
     ]);
     let plan = bound_plan(vec![
-        plan_step("p3", "harness_start", start_params),
+        plan_step("p3", "harness_start", start_params.clone()),
         plan_step("p8-5", "cleanup", params.clone()),
     ]);
     let root = fixture.dir.path("worktrees");
@@ -1001,7 +1020,24 @@ fn p8_preserves_dirty_live_and_stale_lanes_then_closes_the_owned_workspace() {
             .any(|row| row.starts_with("workspace close"))
     );
     fixture.seed("generation", "1");
-    let cleaned = execute_step(&ctx);
+    // The settled lane: with both views reporting a stop, only the CONFIRMED
+    // settled turn closes its workspace (issue #224), and a confirmation needs
+    // a bound that can host its own intervals — the leg above keeps the step's
+    // declared one-second bound for the park it witnesses.
+    let settled_params = object(vec![
+        ("worktree", string("issues-5")),
+        ("branch", string("issue-5")),
+        ("deadline_secs", integer(60)),
+    ]);
+    let settled_plan = bound_plan(vec![
+        plan_step("p3", "harness_start", start_params),
+        plan_step("p8-5", "cleanup", settled_params.clone()),
+    ]);
+    let cleaned = execute_step(&EffectContext {
+        plan: &settled_plan,
+        params: Some(&settled_params),
+        ..ctx
+    });
     assert_eq!(cleaned.status, "succeeded", "{:?}", cleaned.message);
     assert!(!fixture.worktree.exists());
     assert!(!fixture.state.join("pane").exists());
@@ -1104,10 +1140,14 @@ fn p8_waits_bounded_for_a_published_live_lane_and_still_refuses_an_unpublished_o
         "succeeded"
     );
     let head = lane_delivery_commit(&fixture);
+    // The settle leg below now costs the collection's confirmed-settle
+    // intervals (issue #224: N corroborated read-backs across two real
+    // intervals), so the step's declared bound is sized for a loaded host —
+    // the behaviour under witness is the confirmation, not the bound.
     let params = object(vec![
         ("worktree", string("issues-5")),
         ("branch", string("issue-5")),
-        ("deadline_secs", integer(30)),
+        ("deadline_secs", integer(180)),
     ]);
     let start_params = object(vec![
         ("harness_key", string("lane-role")),
@@ -1198,12 +1238,12 @@ fn p8_waits_bounded_for_a_published_live_lane_and_still_refuses_an_unpublished_o
         });
     assert_eq!(
         wait.get("bound_secs").and_then(Val::as_int),
-        Some(30),
+        Some(180),
         "the recorded outcome states the wait's own bound: {wait:?}"
     );
     assert_eq!(
         cleaned.result.get("deadline_secs").and_then(Val::as_int),
-        Some(30),
+        Some(180),
         "the recorded outcome states the step's effective bound"
     );
     assert!(
@@ -1220,6 +1260,167 @@ fn p8_waits_bounded_for_a_published_live_lane_and_still_refuses_an_unpublished_o
         "the settled lane's checkout is reclaimed"
     );
     assert!(!fixture.state.join("pane").exists());
+    assert_eq!(
+        fixture
+            .rows()
+            .iter()
+            .filter(|row| row.starts_with("workspace close"))
+            .count(),
+        1,
+        "the settled lane's workspace is closed exactly once: {:?}",
+        fixture.rows()
+    );
+    assert_eq!(
+        cleaned
+            .result
+            .get("salvage")
+            .and_then(|salvage| salvage.get("head"))
+            .and_then(Val::as_str),
+        Some(head.as_str()),
+        "the certified delivery is the lane's own published head"
+    );
+}
+
+/// Issue #224: the settled turn the cleanup wait closes on is CONFIRMED — the
+/// collection's own discipline (three corroborated non-working read-backs
+/// across two real intervals, with the lane's own counter unmoved) — so a live
+/// lane whose state FLAPS to a stop state mid-turn is never closed on a flap,
+/// and its workspace is retired only once it genuinely settles.
+#[test]
+fn p8_never_closes_a_flapping_live_lane_and_closes_it_after_the_settle() {
+    let fixture = Fixture::new("p8-live-flap");
+    fixture.install(FAKE_HERDR);
+    let env = fixture.env(&[]);
+    let session = lane_session(1);
+    let profile = lane_profile(ExecutionMode::HerdrPane);
+    assert_eq!(
+        execute_op_in_worktree(&profile, &start_request(&session), &env, &fixture.worktree).status,
+        "succeeded"
+    );
+    let head = lane_delivery_commit(&fixture);
+    publish_lane_delivery(&fixture);
+    let start_params = object(vec![
+        ("harness_key", string("lane-role")),
+        ("kind", string("hermes")),
+    ]);
+    let root = fixture.dir.path("worktrees");
+    let integration = fixture.dir.path("integration");
+
+    // (a) The lane's state flaps to a stop state MID-TURN for longer than the
+    // step's own bound: ONE stop read-back is not a settled turn, so the
+    // workspace is never closed and the wait parks typed on its own bound with
+    // the live state it last read named.
+    let bound = 8;
+    let params = object(vec![
+        ("worktree", string("issues-5")),
+        ("branch", string("issue-5")),
+        ("deadline_secs", integer(bound)),
+    ]);
+    let plan = bound_plan(vec![
+        plan_step("p3", "harness_start", start_params.clone()),
+        plan_step("p8-5", "cleanup", params.clone()),
+    ]);
+    let flapping = fixture.env(&[("HF_FAKE_HERDR_FLAP_UNTIL_LIST_READS", "1000".to_string())]);
+    let ctx = EffectContext {
+        plan: &plan,
+        step_id: "p8-5",
+        kind: "cleanup",
+        params: Some(&params),
+        repository: "example-org/widgets",
+        integration_branch: "staging",
+        production_branches: &[],
+        publish_route: "push",
+        worktrees_root: &root,
+        integration_repo: &integration,
+        observed_feature_head: None,
+        observed_integration_base: None,
+        env: &flapping,
+        role: None,
+        session: Some(&session),
+        archive_root: None,
+        review_root: None,
+        retired_run_ids: &[],
+    };
+    fixture.seed("state", "working");
+    let rows_before = fixture.rows().len();
+    let parked = execute_step(&ctx);
+    assert_eq!(parked.status, "ambiguous", "{:?}", parked.message);
+    assert_eq!(
+        parked.code.as_deref(),
+        Some("effect.lane_timeout"),
+        "a flap is not a settled turn: {:?}",
+        parked.message
+    );
+    assert_eq!(
+        parked.result.get("deadline_secs").and_then(Val::as_int),
+        Some(bound),
+        "the park states the step's own bound"
+    );
+    assert!(
+        fixture.worktree.exists(),
+        "the flapping lane's checkout is preserved"
+    );
+    assert!(
+        fixture.state.join("pane").exists(),
+        "the flapping lane's workspace is PRESERVED (a live lane is never closed on a flap)"
+    );
+    assert!(
+        !fixture
+            .rows()
+            .iter()
+            .skip(rows_before)
+            .any(|row| row.starts_with("workspace list")),
+        "no close is ever attempted on a flap — the workspace is never even probed: {:?}",
+        fixture.rows().iter().skip(rows_before).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        fixture
+            .rows()
+            .iter()
+            .filter(|row| row.starts_with("workspace close"))
+            .count(),
+        0,
+        "no close is attempted on a flap: {:?}",
+        fixture.rows()
+    );
+
+    // (b) The flap ends and the lane settles: the CONFIRMED settle closes the
+    // workspace — three corroborated non-working read-backs across two real
+    // intervals — and the recorded outcome carries the wait it cost.
+    let settles_after = fixture.agent_list_reads() + 1;
+    let settling = fixture.env(&[(
+        "HF_FAKE_HERDR_FLAP_UNTIL_LIST_READS",
+        settles_after.to_string(),
+    )]);
+    let params = object(vec![
+        ("worktree", string("issues-5")),
+        ("branch", string("issue-5")),
+        ("deadline_secs", integer(120)),
+    ]);
+    let plan = bound_plan(vec![
+        plan_step("p3", "harness_start", start_params),
+        plan_step("p8-5", "cleanup", params.clone()),
+    ]);
+    fixture.seed("state", "working");
+    let cleaned = execute_step(&EffectContext {
+        plan: &plan,
+        params: Some(&params),
+        env: &settling,
+        ..ctx
+    });
+    assert_eq!(cleaned.status, "succeeded", "{:?}", cleaned.message);
+    let wait =
+        cleaned.result.get("lane_wait").cloned().unwrap_or_else(|| {
+            panic!("the bounded wait is part of the recorded outcome: {cleaned:?}")
+        });
+    assert!(
+        wait.get("waited_ms").and_then(Val::as_int).unwrap_or(0) >= 10_000,
+        "the confirmed settle costs its real intervals: {wait:?}"
+    );
+    assert!(
+        !fixture.worktree.exists(),
+        "the settled lane's checkout is reclaimed"
+    );
     assert_eq!(
         fixture
             .rows()

@@ -213,7 +213,13 @@ keeps the gate's own message verbatim.
   an ownership problem. The step re-reads the lane (each read-back verifying
   the lane token, the generation and the worktree as always) and waits up to
   its own effective deadline for the settled turn the worker produces on its
-  own; the still-running read-back is `refusal.lane.busy`, the recorded
+  own — a settled turn CONFIRMED the way the collection confirms a stop (issue
+  #170 N7: consecutive corroborated non-working read-backs across the
+  documented interval, the lane's counter unmoved, so a state that flaps to a
+  stop mid-turn is never a settle, and a lane still working is never closed).
+  The close keeps its own whole-lane verification, reporting
+  `refusal.lane.busy` for a lane that started running again (the confirmation
+  is void and the wait re-confirms); the recorded
   outcome carries the wait (`lane_wait`, with `bound_secs`), and the retry
   budget is never spent on it — a wait that exhausts the bound records
   `effect.lane_timeout` (`ambiguous`, bound and live state named) and leaves
