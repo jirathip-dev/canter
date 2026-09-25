@@ -29,7 +29,9 @@ use canter::lifecycle::ConcurrencyCaps;
 use canter::plan::DOCTRINE_WORKFLOW_ID;
 use canter::queue_executor as qx;
 use canter::queue_preview as qp;
-use canter::state::{Retention, State};
+use canter::state::{
+    QueueSubmissionItemPlan, QueueSubmissionPlan, Retention, State, SubmissionVerdict,
+};
 use canter::supervision;
 use canter::value::{Val, integer, null, object, string};
 use process_group::{GroupChild, assert_no_process_for_socket};
@@ -1365,6 +1367,294 @@ fn a_repeatedly_refused_continuation_is_not_redispatched_every_tick() {
         attempts_for(&fixture, &run, "p3"),
         0,
         "no attempt of the step itself ever ran: the refusal is before the claim"
+    );
+
+    let socket = fixture.socket.clone();
+    shutdown(daemon);
+    assert_no_process_for_socket(&socket);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #279: a stored pre-#269 admission binding dispatches again
+// ---------------------------------------------------------------------------
+
+/// One `hf-profile-binding/v1` document as an admission stored it BEFORE
+/// #269: the `skills` key did not exist yet, so the document carries no such
+/// entry and its revision fingerprints the material as it stood then (the
+/// same document without that entry — the fingerprint the pre-#269 product
+/// computed). The post-#269 writer always emits the key, so this shape is
+/// reachable only by writing the durable row the pre-#269 product wrote;
+/// that is exactly what the two parked runs' rows carry.
+fn legacy_binding_doc() -> Val {
+    let mut doc = binding_doc();
+    // The fingerprint covers the MATERIAL only: the `skills` entry the
+    // pre-#269 axis never had, and the revision field it never hashes.
+    if let Val::Obj(map) = &mut doc {
+        map.remove("skills");
+        map.remove("revision");
+    }
+    let revision = canter::canonical::sha256_hex(&canter::canonical::canonical_bytes(&doc));
+    if let Val::Obj(map) = &mut doc {
+        map.insert("revision".to_string(), string(&revision));
+    }
+    doc
+}
+
+fn legacy_binding_revision() -> String {
+    legacy_binding_doc()
+        .get("revision")
+        .and_then(Val::as_str)
+        .expect("the pre-#269 revision")
+        .to_string()
+}
+
+/// Issue #279's measured shape: an armed run whose durable admission carries
+/// the skills-less binding and whose topology the submission itself recorded
+/// (`params.dispatch`), so NOTHING but the run's own supervision ever
+/// dispatches a step of it. The fixture drives no `run.*` control at all.
+fn legacy_admission_scenario(name: &str) -> (DaemonFixture, GroupChild, String) {
+    let fixture = DaemonFixture::new(name);
+    let integration = fixture.dir.join("integration");
+    init_repo(&integration);
+    let fakebin = write_fake_gh(&fixture.dir);
+    let run = {
+        let state = fixture.seed();
+        seed_grant(&state, "gr_0000000000000095", 5);
+        let epoch = state.current_epoch().expect("epoch");
+        // The bound-input document of a pre-#269 approval: the same request,
+        // bound to the skills-less reviewed document, with the digest
+        // re-derived over exactly those bytes.
+        let (rendered, _) = render_bound(&state, &request_with(vec![selected("#5", REV_A)]));
+        let legacy = legacy_binding_doc();
+        let mut bound = rendered;
+        let Val::Obj(map) = &mut bound else {
+            unreachable!("the bound-input document is an object")
+        };
+        map.insert("role_config".to_string(), legacy.clone());
+        let digest = qx::bound_digest(&bound).expect("bound digest");
+        let key = idem_key(name);
+        let grant_id = "gr_0000000000000095";
+        let caps = ConcurrencyCaps {
+            global: 4,
+            per_repository: 2,
+            per_harness: 2,
+        };
+        // The durable `queue.submit` claim the pre-#269 product recorded: the
+        // params document the submit surface presents, carrying the
+        // skills-less binding and the topology the run's own dispatches bind
+        // (an armed submission sources it from `--topology FILE`).
+        let mut params = qx::submit_params(
+            &key,
+            &digest,
+            epoch,
+            &bound,
+            &legacy,
+            &legacy_binding_revision(),
+            caps,
+            Some(true),
+            Some(0),
+            &[qx::ItemGrant {
+                id: "#5".to_string(),
+                grant_id: grant_id.to_string(),
+            }],
+            &[],
+            Some(&armed(5, 60)),
+        );
+        if let Val::Obj(map) = &mut params {
+            map.insert(
+                "dispatch".to_string(),
+                object(vec![
+                    (
+                        "topology",
+                        object(vec![
+                            ("integration_branch", string("staging")),
+                            ("production_branches", Val::Arr(Vec::new())),
+                            (
+                                "worktrees_root",
+                                string(&fixture.dir.join("worktrees").to_string_lossy()),
+                            ),
+                            (
+                                "archive_root",
+                                string(&fixture.dir.join("archive").to_string_lossy()),
+                            ),
+                            ("integration_repo", string(&integration.to_string_lossy())),
+                        ]),
+                    ),
+                    (
+                        "admission",
+                        object(vec![
+                            (
+                                "caps",
+                                object(vec![
+                                    ("global", integer(4)),
+                                    ("repository", integer(2)),
+                                    ("harness", integer(2)),
+                                ]),
+                            ),
+                            ("harness_lanes", integer(0)),
+                            (
+                                "host_proof",
+                                object(vec![("measured_at", string(&canter::time::rfc3339_now()))]),
+                            ),
+                        ]),
+                    ),
+                ]),
+            );
+        }
+        let submission_id = qx::submission_id(&digest, &key);
+        let (_, items) = state
+            .submit_queue_run(&QueueSubmissionPlan {
+                submission_id: submission_id.clone(),
+                repository: REPO.to_string(),
+                state_epoch: epoch,
+                digest: digest.clone(),
+                role_key: HARNESS.to_string(),
+                role_revision: legacy_binding_revision(),
+                workflow_id: DOCTRINE_WORKFLOW_ID.to_string(),
+                workflow_hash: WORKFLOW_HASH.to_string(),
+                boundary_phase: "merge".to_string(),
+                integration_branch: "staging".to_string(),
+                completion_branch: "staging".to_string(),
+                boundary_caps: vec![
+                    "read".to_string(),
+                    "worktree".to_string(),
+                    "spawn".to_string(),
+                    "prompt".to_string(),
+                    "merge".to_string(),
+                ],
+                request_line: canter::canonical::canonical_text(&bound),
+                admission_caps: caps,
+                harness_lanes: Some(0),
+                items: vec![QueueSubmissionItemPlan {
+                    ordinal: 0,
+                    work_item: canter::board::work_item_id(REPO, 5),
+                    issue_number: 5,
+                    issue_revision: REV_A.to_string(),
+                    grant_id: Some(grant_id.to_string()),
+                    resume_digest: None,
+                    verdict: SubmissionVerdict::Approved,
+                }],
+                supervision: Some(canter::state::SupervisionAuthorizationPlan {
+                    desired: "armed".to_string(),
+                    check_interval_secs: 5,
+                    progress_timeout_secs: 60,
+                }),
+                at: canter::time::rfc3339_now(),
+            })
+            .expect("submit");
+        let run = items[0].instance_id.clone().expect("issue 5 admitted");
+        state
+            .journal_intent(
+                "queue.submit",
+                &format!("submission {submission_id}"),
+                &key,
+                "req-279-legacy",
+                "queue.submit",
+                Some(&digest),
+                Some(grant_id),
+                &canter::canonical::canonical_text(&object(vec![
+                    ("schema", string("hf-rpc-request/v1")),
+                    ("id", string("req-279-legacy")),
+                    ("method", string("queue.submit")),
+                    ("params", params),
+                ])),
+            )
+            .expect("the durable submission claim");
+        run
+    };
+    let host_path = std::env::var("PATH").unwrap_or_default();
+    let daemon = fixture.spawn_with_path(&format!("{}:{host_path}", fakebin.display()));
+    wait_ready(&fixture);
+    (fixture, daemon, run)
+}
+
+/// Issue #279: a run admitted BEFORE #269 stores a `hf-profile-binding/v1`
+/// document with no `skills` key, and every dispatch of it presents that
+/// STORED document — so before the fix the run's own supervision refuses
+/// `refusal.profile.binding` forever, the unconsumed bounded retry it holds
+/// can never be spent, and the per-repository cap stays pinned with no
+/// operator-free way out.
+///
+/// With an ABSENT key resolving to the empty array the schema allows (and the
+/// fingerprint verified against the pre-#269 material), the run's OWN
+/// supervision dispatches its frontier with no operator control at all: the
+/// attempt ledger shows `p1` succeeded, the frontier advances past it, and no
+/// dispatch of the run is refused.
+#[test]
+fn a_stored_pre_269_binding_is_dispatched_by_the_run_s_own_supervision() {
+    let (fixture, daemon, run) = legacy_admission_scenario("legacy-binding");
+
+    // Nothing but the run's own supervision dispatches its frontier. The wait
+    // names a REFUSED dispatch as soon as one is recorded instead of timing
+    // out: the defect is the refusal (the parked runs loop on exactly this
+    // row), not a missing attempt.
+    let started = Instant::now();
+    let ceiling = first_event_ceiling_secs();
+    let attempts = loop {
+        let refusals = dispatch_refusals(&fixture, &run);
+        assert!(
+            refusals.is_empty(),
+            "the run's own supervised dispatch was refused: {refusals:?}\n{}",
+            std::fs::read_to_string(fixture.daemon_log()).unwrap_or_default()
+        );
+        let attempts = fixture.seed().run_step_attempts(&run).expect("attempts");
+        if attempts.iter().any(|(id, _)| id == "p1") {
+            break attempts;
+        }
+        let stalled = started.elapsed().as_secs();
+        assert!(
+            stalled < ceiling,
+            "the driver never dispatched p1: no progress for {stalled}s of {ceiling}s waited \
+             ({attempts:?}): {}",
+            std::fs::read_to_string(fixture.daemon_log()).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let p1 = attempts
+        .iter()
+        .find(|(step, _)| step == "p1")
+        .unwrap_or_else(|| panic!("the driver never dispatched p1: {attempts:?}"));
+    assert_eq!(
+        p1.1, "succeeded",
+        "the stored skills-less binding dispatched: {attempts:?}"
+    );
+
+    // The raw audit rows carry no refused dispatch of this run at all, and no
+    // dispatch of it is refused for its binding.
+    assert!(dispatch_refusals(&fixture, &run).is_empty());
+    let log = std::fs::read_to_string(fixture.daemon_log()).unwrap_or_default();
+    assert!(
+        !log.contains("refusal.profile.binding"),
+        "no dispatch of the run is refused for its binding: {log}"
+    );
+
+    // The durable admission really is the pre-#269 shape (the product's own
+    // read of the stored row the run's dispatches present).
+    let stored = fixture
+        .seed()
+        .run_role_binding(&run)
+        .expect("durable binding read")
+        .expect("the submission carried the reviewed binding");
+    assert!(
+        stored.get("skills").is_none(),
+        "the stored binding is the pre-#269 document: {}",
+        canter::canonical::canonical_text(&stored)
+    );
+
+    // The frontier advanced past the step by the driver alone.
+    let checks_before = checks_of(&fixture, &run);
+    let settled = wait_for_status(&fixture, &run, "the frontier advances past p1", |doc| {
+        picked(doc, &["cursor", "next_step"]).is_empty()
+            && path_of(doc, &["evaluation", "checks"])
+                .as_int()
+                .unwrap_or(0)
+                > checks_before
+    });
+    assert_eq!(picked(&settled, &["cursor", "next_step"]), "");
+    assert_eq!(
+        path_of(&settled, &["evaluation", "eligible"]).as_bool(),
+        Some(false),
+        "an exhausted spine is not an eligible continuation"
     );
 
     let socket = fixture.socket.clone();

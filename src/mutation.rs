@@ -9575,6 +9575,76 @@ mod tests {
         }
     }
 
+    /// Issue #279: a plan admitted BEFORE #269 stores a `reviewer_profile` with
+    /// no `skills` entry, and the review step's own param contract — the same
+    /// pure pre-screen the daemon evaluates before anything is journaled —
+    /// accepts it, so a run parked at its review step is never refused for a
+    /// document the product itself wrote. Both fingerprints the engine reads
+    /// (the preset material and the round-trip document) are derived here, from
+    /// the material WITHOUT that entry, never by the code under test.
+    #[test]
+    fn a_stored_pre_269_reviewer_binding_passes_the_review_contract() {
+        let material = object(vec![
+            ("schema", string(crate::config::PROFILE_BINDING_SCHEMA)),
+            ("key", string("lane-role")),
+            ("kind", string("argv")),
+            ("provider", string("provider-a")),
+            ("model", string("model-a")),
+            ("fallbacks", Val::Arr(Vec::new())),
+            ("configured_limits", object(vec![])),
+            ("introspection", bool_(false)),
+            ("secrets", Val::Arr(Vec::new())),
+        ]);
+        let revision = crate::canonical::sha256_hex(&crate::canonical::canonical_bytes(&material));
+        let mut reviewer = material;
+        if let Val::Obj(map) = &mut reviewer {
+            map.insert("revision".to_string(), string(&revision));
+        }
+        let contract = ParamContract {
+            observed_feature_head: Some("1111111111111111111111111111111111111111"),
+            observed_integration_base: Some("2222222222222222222222222222222222222222"),
+            ..ParamContract::default()
+        };
+        let params = object(vec![
+            ("harness_key", string("lane-role")),
+            ("executable", string("hf-reviewer-example")),
+            ("kind", string("argv")),
+            ("execution", string("headless")),
+            ("worktree", string("lane-7")),
+            ("reviewer_profile", reviewer.clone()),
+        ]);
+        let inputs = review_evidence_inputs(Some(&params), &contract)
+            .expect("a stored pre-#269 reviewer binding is accepted");
+        match inputs.shape {
+            ReviewEvidenceShape::SelfDispatch(leg) => {
+                assert_eq!(leg.profile.key, "lane-role");
+                assert_eq!(
+                    leg.profile.revision, revision,
+                    "the binding keeps the revision it was approved under"
+                );
+                assert!(
+                    leg.profile.skills.is_empty(),
+                    "an absent key resolves to the empty array"
+                );
+                // The engine re-renders the accepted document into its own
+                // outcome: it round-trips unchanged.
+                assert_eq!(leg.profile.to_doc(), reviewer);
+            }
+            ReviewEvidenceShape::Presented(_) => panic!("the step declares the reviewer leg"),
+        }
+        // The malformed directions are unchanged at this same contract: a
+        // present-but-wrong `skills` value still refuses typed.
+        let mut malformed = params.clone();
+        if let Val::Obj(map) = &mut malformed
+            && let Some(Val::Obj(profile)) = map.get_mut("reviewer_profile")
+        {
+            profile.insert("skills".to_string(), string("lane-implementer"));
+        }
+        let refused = check_step_params("review_evidence", Some(&malformed), &contract)
+            .expect_err("a present string skills refuses");
+        assert_eq!(refused.0, crate::config::CODE_PROFILE_BINDING);
+    }
+
     /// Issue #92 F7: the containment screen and the official-executable
     /// screen are part of the same pre-fence contract — an escaping worktree
     /// path and a foreign official executable are refused BEFORE the fence,
