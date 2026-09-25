@@ -151,6 +151,22 @@ All three require the release binary (`cargo build --release --locked`);
 the archive-builder self-test additionally requires a clean tracked
 worktree (the builder enforces the same).
 
+## Operator bump driver (issue #277)
+
+`scripts/accept-bump.py` bumps an installed candidate: it installs the build
+to BOTH the acceptance target and the path the service unit launches, ad-hoc
+re-signs both, restarts through the supervisor, and proves that exactly one
+pid holds the socket and that pid is running the installed build (typed
+refusals — never a success on a stale daemon; `docs/OPERATIONS.md` section
+10.1 is the runbook). It is operator tooling — run it by hand, never from CI —
+and it is self-tested in disposable roots with a fake `launchctl`:
+
+```console
+$ python3 scripts/test-accept-bump.py
+```
+
+The self-test needs a built release binary (`cargo build --release --locked`).
+
 ## Coverage — Phase 1 decision
 
 **Phase 1: no coverage gate.** The scaffold's test surface was a CLI metadata

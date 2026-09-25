@@ -661,6 +661,94 @@ single normative list is the
 [compatibility contract](contracts/compatibility.md#product-rename-issue-106)
 (also: the archive/executable name is now `canter-<version>-<platform>`).
 
+### 10.1 Bumping an installed candidate (operator tooling, issue #277)
+
+A bump installs a freshly built candidate and restarts the daemon. Done by
+hand it can leave the host running the *previous* build: the service unit
+(`com.canter.daemon`; inspect it with
+`launchctl print gui/$(id -u)/com.canter.daemon`) launches one fixed program
+path, so a bump that installs a **different** path races that supervisor —
+which resurrects the superseded binary, can win the socket, and leaves every
+measurement taken from that daemon invalid while the bump still reported
+success.
+
+`scripts/accept-bump.py` is the versioned driver for that flow. It is operator
+tooling: run it by hand, never from CI (step 2 activates the host service
+manager).
+
+```console
+$ python3 scripts/accept-bump.py --sha <40-hex-sha>           # reconcile + build + install
+$ python3 scripts/accept-bump.py --candidate /path/to/canter   # install a prebuilt candidate
+$ python3 scripts/accept-bump.py --verify-only                # read-only certification
+```
+
+`--verify-only` runs steps 3 and 5 alone against what is already installed
+(it installs, builds, restarts and re-signs nothing): it answers "is the daemon
+this host is running the build installed at both paths, and is the supervisor
+launching that path?" — the diagnosis half of the same proof.
+
+1. **reconcile** — fetch the integration ref, fast-forward-check the target
+   sha, move the integration checkout (branch included) onto it, then rebuild
+   with `cargo build --release --locked` from that exact tree.
+2. **install** — install the same bytes to BOTH paths: the acceptance target
+   (`<state>/accept/target/release/canter`, default
+   `.../.local/state/canter/accept/target/release/canter`) and the path the
+   service unit launches (`<bin-dir>/canter`, default
+   `.../.local/bin/canter`), ad-hoc re-signing both (`codesign --force --sign -`
+   then `codesign -v`). The two paths cannot diverge in bytes or signature.
+3. **supervisor** — refuse unless the supervised job's `program` really is the
+   service path: the supervisor's program is the path the bump writes.
+4. **restart** — `launchctl kickstart -k gui/<uid>/<label>`. The supervisor
+   owns the daemon; no detached second copy is started beside it.
+5. **verify** — prove that exactly ONE pid holds the socket
+   (`<state>/canter.sock`), resolve that pid's executable, require its sha256
+   to equal the installed build's sha256, and require the daemon lease
+   (`<state>/daemon.lock`) to name that same pid *and* to record a start that
+   postdates the install — so a superseded daemon that still holds the socket
+   cannot pass even though the file at its executable path was just replaced.
+   The bump log (`<state>/accept/bump.log`) records the daemon pid,
+   `started_at` and the installed sha256.
+
+Success prints `DONE` plus one machine-readable line. Every other outcome is a
+typed refusal with a non-zero exit status, and `DONE` is **never** printed for
+a daemon that is not the installed build:
+
+| Refusal code | Exit | Meaning |
+| --- | --- | --- |
+| `bump.refusal.usage` | 2 | invalid invocation |
+| `bump.refusal.build` | 4 | the candidate failed to build |
+| `bump.refusal.non_ff` | 5 | the integration checkout is not an ancestor of the target sha |
+| `bump.refusal.reconcile` | 6 | the checkout did not land on the target sha/branch |
+| `bump.refusal.install` | 7 | installing to a destination path failed |
+| `bump.refusal.sign` | 8 | re-signing or the signature check failed |
+| `bump.refusal.install_divergence` | 9 | the two installed paths are not byte-identical |
+| `bump.refusal.supervisor_program` | 10 | the job launches a path other than the service path |
+| `bump.refusal.supervisor_not_loaded` | 11 | the job is not loaded (section 5.1) |
+| `bump.refusal.restart` | 12 | the supervisor refused the restart |
+| `bump.refusal.daemon_not_up` | 13 | no pid held the socket before the deadline |
+| `bump.refusal.socket_holders` | 14 | more than one pid holds the socket |
+| `bump.refusal.stale_daemon` | 15 | the holder's executable is not the installed build |
+| `bump.refusal.pid_exe_unresolved` | 16 | the holder's executable could not be resolved |
+| `bump.refusal.lease` | 17 | the lease does not name the socket holder |
+
+Witness the result directly (the bump log's sha256 is the identity of the
+bytes the daemon actually executes, i.e. post-sign):
+
+```console
+$ lsof -U | grep canter.sock                  # exactly one pid
+$ ps -p <pid> -o comm=                        # the executable that pid runs
+$ shasum -a 256 ~/.local/bin/canter           # must equal the bump log's sha256
+$ codesign -v ~/.local/bin/canter \
+    ~/.local/state/canter/accept/target/release/canter
+```
+
+The driver is self-tested (disposable roots, fake `launchctl`, no host
+activation):
+
+```console
+$ python3 scripts/test-accept-bump.py          # needs target/release/canter
+```
+
 ---
 
 ## 11. Lane handoff for ONE explicit lane: preview / request / status
