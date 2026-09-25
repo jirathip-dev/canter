@@ -84,7 +84,12 @@ when any applicable admission input is missing, stale, or exceeded:
   `refusal.admission.cap_missing` (unknown measurements refuse new work).
 - Global and per-repository caps are enforced against the daemon's own
   durable state (active lanes per repository; the proposed lane itself is
-  excluded). The per-harness axis uses the caller-attested
+  excluded). A run that is TERMINAL BY OUTCOME — its newest recorded attempt
+  is a diagnosed step whose bounded-retry budget is spent with no
+  authorization left, so every further dispatch of it refuses
+  `refusal.run.retry_bound` — is not an active lane: its slot is recovered
+  without an operator release, while the run and all of its rows stay
+  untouched (issue #285). The per-harness axis uses the caller-attested
   `harness_lanes` count (harness occupancy is client-side state; same
   attestation boundary as apply observed params). Refusals:
   `refusal.admission.cap_global` / `cap_repository` / `cap_harness`.

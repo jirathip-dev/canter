@@ -862,11 +862,71 @@ struct GrantBinding {
     status: String,
 }
 
+/// Whether ONE run is TERMINAL BY OUTCOME (issue #285) and therefore holds no
+/// concurrency slot: its NEWEST recorded attempt is a step DIAGNOSIS
+/// ([`step_attempt_diagnosed`] — the SAME predicate the bounded-retry fence
+/// reads) of a step whose bounded-retry budget is spent with nothing left to
+/// spend.
+///
+/// Such a run can never be dispatched again: every further re-dispatch of that
+/// step needs an authorization the budget refuses (`refusal.run.retry_bound`,
+/// `State::record_run_retry`) and no authorization is held, so the driver and
+/// every operator control are equally closed to it. Its slot is then free for
+/// work that can still progress — recovered without a `run release`, and
+/// without touching the run: nothing is released, moved, burned or deleted,
+/// and the run's own rows stay readable exactly as they were.
+///
+/// A run that is still dispatchable is NEVER excluded: a park that is the
+/// run's own lapsed window (the fan-out admission's proof codes, an expired
+/// grant) is not a diagnosis, an unconsumed authorization is not spent budget,
+/// an unspent budget is not the bound, and a step whose newest attempt
+/// succeeded is not parked at all.
+fn run_retry_exhausted_locked(conn: &Connection, instance_id: &str) -> Result<bool, StateError> {
+    // Cheapest first: the run must have a step whose whole bounded-retry
+    // budget is consumed and which holds no unconsumed authorization.
+    let mut statement = conn
+        .prepare(
+            "SELECT r.step_id FROM run_retries r
+              WHERE r.instance_id = ?1 AND r.consumed_at != ''
+              GROUP BY r.step_id
+             HAVING COUNT(*) >= ?2
+                AND NOT EXISTS (SELECT 1 FROM run_retries pending
+                                 WHERE pending.instance_id = r.instance_id
+                                   AND pending.step_id = r.step_id
+                                   AND pending.consumed_at = '')",
+        )
+        .map_err(|err| StateError::from_sqlite("run_retry_exhausted: prepare", err))?;
+    let rows = statement
+        .query_map(params![instance_id, RUN_RETRY_MAX], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|err| StateError::from_sqlite("run_retry_exhausted: query", err))?;
+    let mut spent: Vec<String> = Vec::new();
+    for row in rows {
+        spent.push(row.map_err(|err| StateError::from_sqlite("run_retry_exhausted: row", err))?);
+    }
+    if spent.is_empty() {
+        return Ok(false);
+    }
+    // The park itself: the run's newest recorded attempt — the row the
+    // bounded-retry fence and the remedy decision both key on, so the exclusion
+    // names the step that really cannot be dispatched.
+    let attempts = run_step_attempts_of(&RunRecords::read(conn, instance_id)?);
+    Ok(attempts.last().is_some_and(|(step, status, code, _)| {
+        spent.iter().any(|exhausted| exhausted == step) && step_attempt_diagnosed(status, code)
+    }))
+}
+
 /// Every counted lane — the fan-out gate's own run-state set, across all
 /// repositories — as the admission gate's footprints (#236). The SAME rows
 /// the counted axes derive from, so a cap refusal names exactly the lanes it
 /// counted; the per-repository subset is derived from this one set. Ordered
 /// by run id, so one durable state renders one message.
+///
+/// Issue #285: a run that is TERMINAL BY OUTCOME
+/// ([`run_retry_exhausted_locked`]) can no longer progress, so it is not a
+/// counted lane — its slot returns to work that can still be dispatched
+/// without any operator `run release`.
 fn counted_lane_footprints(
     tx: &rusqlite::Transaction<'_>,
     label: &str,
@@ -891,7 +951,12 @@ fn counted_lane_footprints(
         .map_err(|err| StateError::from_sqlite(label, err))?;
     let mut lanes = Vec::new();
     for row in rows {
-        lanes.push(row.map_err(|err| StateError::from_sqlite(label, err))?);
+        let lane = row.map_err(|err| StateError::from_sqlite(label, err))?;
+        // Issue #285: a run that is terminal by outcome holds no slot.
+        if run_retry_exhausted_locked(tx, &lane.identity)? {
+            continue;
+        }
+        lanes.push(lane);
     }
     Ok(lanes)
 }
@@ -15161,6 +15226,41 @@ impl State {
         let attempts = self.run_step_attempts_with_codes(&conn, instance_id)?;
         Ok(latest_step_attempt(&attempts, step_id)
             .is_some_and(|(_, status, code)| step_attempt_diagnosed(status, code)))
+    }
+
+    /// The counted runs that are TERMINAL BY OUTCOME (issue #285): the ids of
+    /// the runs in the fan-out gate's own status set whose standing park is a
+    /// diagnosed step with its bounded-retry budget spent
+    /// ([`run_retry_exhausted_locked`]). They can never be dispatched again, so
+    /// the counted axes — and every consumer that renders or re-derives them —
+    /// must not count them as active lanes. Read-only: nothing is released,
+    /// moved, retried or deleted, and every row of those runs stays readable.
+    pub fn retry_exhausted_run_ids(&self) -> Result<Vec<String>, StateError> {
+        let conn = self.lock("retry_exhausted_run_ids")?;
+        let mut statement = conn
+            .prepare(
+                "SELECT instance_id FROM instances
+                  WHERE status IN ('new', 'running', 'human_queue', 'blocked')
+                  ORDER BY instance_id",
+            )
+            .map_err(|err| StateError::from_sqlite("retry_exhausted_run_ids: prepare", err))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|err| StateError::from_sqlite("retry_exhausted_run_ids: query", err))?;
+        let mut candidates: Vec<String> = Vec::new();
+        for row in rows {
+            candidates.push(
+                row.map_err(|err| StateError::from_sqlite("retry_exhausted_run_ids: row", err))?,
+            );
+        }
+        drop(statement);
+        let mut exhausted = Vec::new();
+        for instance_id in candidates {
+            if run_retry_exhausted_locked(&conn, &instance_id)? {
+                exhausted.push(instance_id);
+            }
+        }
+        Ok(exhausted)
     }
 
     /// Record ONE refused continuation dispatch of a supervised run (issue

@@ -1982,6 +1982,193 @@ fn state_release_frees_the_occupancy_the_run_held() {
 }
 
 #[test]
+fn state_retry_exhausted_run_frees_the_capacity_it_held() {
+    let fixture = StateFixture::new("retry-exhausted-capacity");
+    let state = fixture.open();
+    // The per-repository cap (2) is spent on two live runs; the victim is the
+    // run whose bounded-retry budget runs out.
+    let runs = seed_submission(&state, &[(5, GRANT_5), (6, GRANT_6)]);
+    let victim = runs[0].clone();
+    // The victim's own evidence, recorded while it still HOLDS its slot: the
+    // capacity fix must leave it readable (AC2).
+    let evidence = state
+        .record_evidence(
+            &victim,
+            REPO,
+            &"b".repeat(40),
+            &"c".repeat(40),
+            WORKFLOW_HASH,
+            POLICY_HASH,
+            "pass",
+            "rev-5-r1",
+            &checks(&[("hosted-ci", "passed")]),
+        )
+        .expect("the run's evidence records");
+    // Its frontier step fails, so the bounded-retry fence is on (a diagnosis),
+    // and each authorization it is granted is spent by exactly one
+    // re-dispatch that fails again.
+    let mut spent = Vec::new();
+    for attempt in 1..=2 {
+        seed_attempt(
+            &state,
+            &victim,
+            "p1",
+            &idem_key(&format!("exhaust-attempt-000{attempt}")),
+            Some("failed"),
+        );
+        let retry = state
+            .record_run_retry(&victim, "p1", AT)
+            .unwrap_or_else(|err| panic!("attempt {attempt}: {}", err.message));
+        assert!(matches!(
+            state
+                .claim_run_retry(
+                    &victim,
+                    "p1",
+                    &idem_key(&format!("exhaust-dispatch-000{attempt}")),
+                    AT
+                )
+                .expect("the authorization is consumed by the re-dispatch"),
+            RunRetryClaim::Consumed(_)
+        ));
+        spent.push(retry.retry_id);
+    }
+
+    // (1) A park with budget LEFT is still a lane: nothing about it is terminal,
+    //     so the cap it holds is untouched and a fresh run still waits for it.
+    assert_eq!(
+        state.retry_exhausted_run_ids().expect("exhausted read"),
+        Vec::<String>::new(),
+        "two of three retries spent is not the bound"
+    );
+    let held = submit_with_id(&state, "qs_0000000000000301", &[(7, GRANT_7)]);
+    assert_eq!(
+        item_outcome(&held[0]),
+        ("waiting", "refusal.admission.cap_repository")
+    );
+
+    // (2) The last authorization is spent too: the step is diagnosed, no
+    //     authorization is held and the budget answers every further attempt
+    //     `refusal.run.retry_bound` — the run is terminal by outcome.
+    seed_attempt(
+        &state,
+        &victim,
+        "p1",
+        &idem_key("exhaust-attempt-0003"),
+        Some("failed"),
+    );
+    let third = state
+        .record_run_retry(&victim, "p1", AT)
+        .expect("the third authorization");
+    assert!(matches!(
+        state
+            .claim_run_retry(&victim, "p1", &idem_key("exhaust-dispatch-0003"), AT)
+            .expect("the third authorization is consumed"),
+        RunRetryClaim::Consumed(_)
+    ));
+    spent.push(third.retry_id.clone());
+    let err = state
+        .record_run_retry(&victim, "p1", AT)
+        .expect_err("the budget is spent");
+    assert_eq!(err.code, "refusal.run.retry_bound");
+    assert_eq!(
+        state.retry_exhausted_run_ids().expect("exhausted read"),
+        vec![victim.clone()],
+        "the retry-exhausted run is the one the counted axes must not count"
+    );
+
+    // (3) AC1: the capacity comes back with NO operator `run.*` control — the
+    //     preview admits a fresh run...
+    let request = request_with_default_steps(vec![selected("#7", REV_A)]);
+    let preview = qp::preview_queue(&state, &request).expect("preview renders");
+    let holds: Vec<String> = preview
+        .doc
+        .get("holds")
+        .and_then(Val::as_array)
+        .expect("holds")
+        .iter()
+        .filter_map(|hold| hold.get("code").and_then(Val::as_str))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        !holds.contains(&"refusal.admission.cap_repository".to_string()),
+        "the excluded run holds no slot: {holds:?}"
+    );
+    assert_eq!(
+        preview
+            .doc
+            .get("concurrency")
+            .and_then(|concurrency| concurrency.get("running"))
+            .and_then(|running| running.get("repository"))
+            .and_then(Val::as_int),
+        Some(1),
+        "one lane is counted, not two"
+    );
+    // ...and the submission gate agrees: the issue waiting for capacity is
+    // admitted, while the slot left is exactly one.
+    let admitted = submit_with_id(&state, "qs_0000000000000302", &[(7, GRANT_7)]);
+    assert_eq!(item_outcome(&admitted[0]), ("admitted", ""));
+    let still_held = submit_with_id(&state, "qs_0000000000000303", &[(8, GRANT_8)]);
+    assert_eq!(
+        item_outcome(&still_held[0]),
+        ("waiting", "refusal.admission.cap_repository"),
+        "the fix frees one slot, not the cap"
+    );
+
+    // (4) AC2/B3: nothing of the excluded run was released, moved or deleted —
+    //     its evidence (recorded while it still held the slot), its attempts
+    //     and its retry authorizations are readable exactly as they were, and
+    //     no `run.release` was ever recorded (AC3).
+    let reread = state
+        .evidence_for_instance(&victim)
+        .expect("evidence read")
+        .into_iter()
+        .find(|row| row.evidence_id == evidence.evidence_id)
+        .expect("the evidence row of the excluded run is still readable");
+    assert_eq!(reread.verdict, "pass");
+    let retries = state.run_retries(&victim).expect("retries");
+    assert_eq!(
+        retries
+            .iter()
+            .map(|row| row.retry_id.clone())
+            .collect::<Vec<_>>(),
+        spent,
+        "every authorization is still recorded, consumed as it was"
+    );
+    let attempts = state.run_step_attempts(&victim).expect("attempts");
+    assert_eq!(attempts.len(), 3, "the three failed attempts are intact");
+    assert!(
+        attempts
+            .iter()
+            .all(|(step, status)| step == "p1" && status == "failed"),
+        "the attempts still read back as the run's own park: {attempts:?}"
+    );
+    let failure = state
+        .run_step_failure(&victim)
+        .expect("failure read")
+        .expect("the excluded run still reports its park");
+    assert_eq!(failure.step, "p1");
+    assert_eq!(failure.status, "failed");
+    assert_eq!(
+        state
+            .instance_by_id(&victim)
+            .expect("run read")
+            .expect("row")
+            .status,
+        "new",
+        "the excluded run keeps its own status: it is neither released nor moved"
+    );
+    assert!(
+        state
+            .queue_ownership_rows()
+            .expect("ownership")
+            .iter()
+            .any(|owner| owner.issue_number == 5 && owner.instance_id == victim),
+        "the excluded run still owns its issue"
+    );
+    assert!(release_records(&state).is_empty(), "no operator release");
+}
+
+#[test]
 fn state_release_of_a_paused_predecessor_clears_the_pause_and_admits_a_fresh_submission() {
     let fixture = StateFixture::new("release-paused");
     let state = fixture.open();

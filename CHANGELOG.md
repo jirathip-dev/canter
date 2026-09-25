@@ -24,6 +24,25 @@ release process activates (docs/RELEASING.md), then semver applies.
   unchanged, as is the one-read policy for a lane whose own read-back cannot
   be taken at all (the close's own verification decides it, at once).
 
+### Fixed (issue #285 — a retry-exhausted run no longer pins a concurrency slot)
+
+- A run that is TERMINAL BY OUTCOME stops being counted as an active lane. When
+  the run's newest recorded attempt is a step DIAGNOSIS (the same predicate the
+  bounded-retry fence reads) and that step's whole bounded-retry budget is spent
+  with no unconsumed authorization left, every further dispatch of it refuses
+  `refusal.run.retry_bound` and no exposed control can move it — so the global,
+  per-repository and per-harness slots it held are free again for work that can
+  still progress. One derivation (`State::retry_exhausted_run_ids`) feeds the
+  queue admission's counted-lane set, the preview's capacity holds and the
+  daemon's dispatch-time fan-out gate, so a preview or a fresh submission
+  admits the issue that was waiting on the cap WITHOUT an operator
+  `run release`, and exactly one slot is freed. Nothing is released, retried,
+  moved or deleted: the run keeps its status, its issue ownership, its attempt
+  rows, its retry authorizations and its evidence rows, all still readable. A
+  park that is the run's own lapsed window (the admission proof codes, a lapsed
+  grant), a park whose budget is NOT spent, and a run holding an unconsumed
+  authorization are never excluded.
+
 ### Fixed (issue #279 — a stored pre-#269 admission binding dispatches again)
 
 - A `hf-profile-binding/v1` document with NO `skills` key is accepted again:
