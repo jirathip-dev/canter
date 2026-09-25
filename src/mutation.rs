@@ -2997,6 +2997,14 @@ fn lane_integration_base(ctx: &EffectContext<'_>) -> Result<String, EffectOutcom
 /// this repository issue (a live run is never in that set, and a sibling
 /// issue's run resolves to a different set), and only the branch and checkout
 /// THIS step is about to create are touched.
+///
+/// Issue #282 adds the OTHER stale-host-state shape at the same scope: the
+/// path this step is about to create is still REGISTERED by the integration
+/// clone while its directory is gone, so the create would die on the stale
+/// entry (git's `is a missing but already registered worktree`) and the death
+/// would be charged to the run's bounded retry budget. The registration is
+/// cleared for exactly that path first (see
+/// [`clear_stale_lane_registration`]) and the repair rides the outcome.
 fn effect_worktree_create(ctx: &EffectContext<'_>) -> EffectOutcome {
     let (branch, relative) = match worktree_create_inputs(ctx.params, &ctx.param_contract()) {
         Ok(inputs) => inputs,
@@ -3047,6 +3055,14 @@ fn effect_worktree_create(ctx: &EffectContext<'_>) -> EffectOutcome {
     if let Some(parent) = worktree.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    // Issue #282: a registration git still holds for exactly this lane path
+    // while its directory is gone is stale host state with a mechanical remedy
+    // — it is cleared for this path before the create, never charged to the
+    // run's bounded retry budget as a step failure.
+    let stale_registration = match clear_stale_lane_registration(ctx, &relative, &worktree) {
+        Ok(record) => record,
+        Err(outcome) => return outcome,
+    };
     match run_git(
         ctx,
         ctx.integration_repo,
@@ -3083,6 +3099,9 @@ fn effect_worktree_create(ctx: &EffectContext<'_>) -> EffectOutcome {
             ];
             if !reclaimed.is_empty() {
                 fields.push(("reclaimed", Val::Arr(reclaimed)));
+            }
+            if let Some(record) = stale_registration {
+                fields.push(("stale_registration", record));
             }
             ok(object(fields))
         }
@@ -3143,10 +3162,86 @@ fn registered_worktree_paths_on(host: &ResidueHost<'_>) -> Vec<PathBuf> {
     }
 }
 
+/// The comparable form of a lane checkout path even when the checkout itself
+/// is GONE (issue #282): the deepest EXISTING ancestor is canonicalized and
+/// the missing tail re-appended. Git reports resolved paths (on macOS
+/// `/private/var/...` for a `/var/...` root), so a byte comparison against a
+/// raw path would miss the very registration this read exists for — while a
+/// checkout whose directory was deleted can never be canonicalized whole.
+fn resolved_lane_path(path: &Path) -> PathBuf {
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return resolved;
+    }
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path.to_path_buf();
+    while let Some(name) = cursor.file_name() {
+        tail.push(name.to_os_string());
+        let parent = cursor.parent().map(Path::to_path_buf).unwrap_or_default();
+        if let Ok(resolved) = std::fs::canonicalize(&parent) {
+            let mut out = resolved;
+            out.extend(tail.iter().rev());
+            return out;
+        }
+        if parent.as_os_str().is_empty() {
+            break;
+        }
+        cursor = parent;
+    }
+    path.to_path_buf()
+}
+
 /// Whether `path` is one of the integration clone's registered worktrees.
 fn is_registered_worktree(path: &Path, registered: &[PathBuf]) -> bool {
-    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    registered.iter().any(|candidate| candidate == &resolved)
+    let resolved = resolved_lane_path(path);
+    registered
+        .iter()
+        .any(|candidate| candidate == &resolved || candidate == path)
+}
+
+/// Issue #282: clear the integration clone's STALE registration of exactly the
+/// lane checkout this step is about to materialize.
+///
+/// A checkout git still registers whose directory is GONE is the host state
+/// `git worktree add` refuses with `fatal: '<path>' is a missing but already
+/// registered worktree; use 'add -f' to override, or 'prune' or 'remove' to
+/// clear`. It is not a step failure: the cause is stale host state and git's
+/// own `worktree remove` is the mechanical remedy, scoped to the ONE path this
+/// step is about to create — the path the run owns by its own recorded
+/// topology. The registration is therefore cleared here, before the create, so
+/// the dispatch never dies on it (a dispatch that died on it charged the run's
+/// bounded retry budget and could neither re-dispatch nor terminate).
+///
+/// Scoped by construction: a checkout that is PRESENT is never addressed (the
+/// duplicate-lane refusals stay the answer), a path this clone does not
+/// register is left alone, another leg's lane is a different path, and no
+/// branch is ever deleted. Returns the record for the step outcome, `None`
+/// when there was nothing stale to clear.
+fn clear_stale_lane_registration(
+    ctx: &EffectContext<'_>,
+    relative: &str,
+    worktree: &Path,
+) -> Result<Option<Val>, EffectOutcome> {
+    if worktree.exists() {
+        return Ok(None);
+    }
+    let host = residue_host(ctx)?;
+    if !is_registered_worktree(worktree, &registered_worktree_paths_on(&host)) {
+        return Ok(None);
+    }
+    let path = worktree.to_string_lossy().into_owned();
+    run_git_on(&host, host.integration_repo, &["worktree", "remove", &path])?;
+    Ok(Some(object(vec![
+        ("worktree", string(relative)),
+        ("path", string(&path)),
+        (
+            "message",
+            string(
+                "the integration clone still registered this lane checkout while its directory \
+                 was gone; the registration was cleared for exactly this path, so the lane is \
+                 created instead of the dispatch dying on the stale entry",
+            ),
+        ),
+    ])))
 }
 
 /// Issue #222: reclaim the lane residue a ledger-TERMINAL generation of this
@@ -4751,12 +4846,20 @@ fn reviewer_checkout_round(issue: u64, checkout: &str) -> Option<u64> {
 /// the step outcome), then THIS generation's lane is created at the certified
 /// head. A live or foreign holder is never adopted: its retire is refused and
 /// the lane is left untouched (#157), and the substrate refusal stands.
+///
+/// Issue #282: a registration the integration clone still holds for THIS
+/// leg's own lane path while its directory is gone is stale host state, not a
+/// step failure — it is cleared for exactly that path before the create (see
+/// [`clear_stale_lane_registration`]) and the repair rides the outcome, so a
+/// re-dispatch materializes the lane instead of dying on the stale entry.
+///
+/// Returns the lane and, when one was cleared, the stale-registration record.
 fn ensure_reviewer_lane(
     ctx: &EffectContext<'_>,
     leg: &ReviewerLeg,
     feature_head: &str,
     retired: &mut Vec<Val>,
-) -> Result<PathBuf, EffectOutcome> {
+) -> Result<(PathBuf, Option<Val>), EffectOutcome> {
     let issue = ctx.plan.issue_number as u64;
     let relative = crate::lane::lane_checkout(issue, "reviewer", leg.round);
     if relative != leg.worktree {
@@ -4808,11 +4911,17 @@ fn ensure_reviewer_lane(
     }
     if lane.is_dir() {
         verify_reviewer_lane(ctx, &relative, &lane, feature_head)?;
-        return Ok(lane);
+        return Ok((lane, None));
     }
     if let Some(parent) = lane.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    // Issue #282: the lane this leg is about to create is the run's own path
+    // (derived from the issue and the leg's round), so a registration git still
+    // holds for it while its directory is gone is stale host state with a
+    // mechanical remedy: it is cleared for exactly this path before the create
+    // below, and the repair is recorded on the step outcome.
+    let stale_registration = clear_stale_lane_registration(ctx, &relative, &lane)?;
     let lane_text = lane.to_string_lossy().into_owned();
     match run_git(
         ctx,
@@ -4823,7 +4932,7 @@ fn ensure_reviewer_lane(
         Err(outcome) => return Err(outcome),
     }
     verify_reviewer_lane(ctx, &relative, &lane, feature_head)?;
-    Ok(lane)
+    Ok((lane, stale_registration))
 }
 
 /// Remove the reviewer leg's own lane once its verdict is consumed (issue
@@ -5297,6 +5406,11 @@ fn ensure_fix_lane(
     if let Some(parent) = lane.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    // Issue #282: the fix leg's lane is a lane path this run owns by its own
+    // recorded topology, so a registration git still holds for it while its
+    // directory is gone is cleared for exactly this path first (the fix round
+    // is dispatched by the run's own machinery, with no operator involved).
+    let _ = clear_stale_lane_registration(ctx, relative, &lane)?;
     let lane_text = lane.to_string_lossy().into_owned();
     match run_git(
         ctx,
@@ -5702,12 +5816,16 @@ fn review_self_dispatch(
         profile.lane_names = Some(names.clone());
     }
     let mut retired_reviewer_lanes: Vec<Val> = Vec::new();
+    let mut lane_registration: Option<Val> = None;
     let worktree = match headless_lane {
         Some(worktree) => worktree,
         None => {
             match ensure_reviewer_lane(ctx, leg, &inputs.feature_head, &mut retired_reviewer_lanes)
             {
-                Ok(lane) => lane,
+                Ok((lane, registration)) => {
+                    lane_registration = registration;
+                    lane
+                }
                 Err(mut outcome) => {
                     // A reclaim that already happened is recorded on the failed
                     // outcome too, exactly as the pane bind records its own
@@ -5975,6 +6093,7 @@ fn review_self_dispatch(
         ("reviewer_worktree", string(&worktree.to_string_lossy())),
         ("verdict_path", string(&verdict_path.to_string_lossy())),
         ("retired_reviewer_lanes", Val::Arr(retired_reviewer_lanes)),
+        ("stale_registration", lane_registration.unwrap_or_else(null)),
         (
             "reviewer_lane_cleanup",
             reviewer_lane_cleanup.unwrap_or_else(null),
