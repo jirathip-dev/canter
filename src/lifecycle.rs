@@ -54,6 +54,21 @@ pub const HOST_PROOF_FRESHNESS_SECS: i64 = 120;
 /// still decides it.
 pub const HOST_FREE_FLOOR_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
+/// The nearest ANCESTOR of `path` that exists on disk, `path` itself
+/// included (issue #231): the path whose filesystem a measurement of an
+/// unborn lane root really reads. Pure path arithmetic plus one `exists`
+/// probe per component, so the walk is testable without a filesystem that
+/// changes under the test.
+pub fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut candidate = path;
+    loop {
+        if candidate.exists() {
+            return Some(candidate.to_path_buf());
+        }
+        candidate = candidate.parent()?;
+    }
+}
+
 /// The free bytes one path's filesystem exposes (issue #231): the ONE host
 /// measurement the admission floor, the submit-time proof and the state
 /// store's disk-exhaustion classification share. A path that does not exist
@@ -61,15 +76,8 @@ pub const HOST_FREE_FLOOR_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// created by the step that follows); an unobservable path is `None` — no
 /// measurement is ever fabricated.
 pub fn available_bytes_at(path: &Path) -> Option<u64> {
-    let mut candidate = path;
-    loop {
-        if candidate.exists()
-            && let Ok(bytes) = fs2::available_space(candidate)
-        {
-            return Some(bytes);
-        }
-        candidate = candidate.parent()?;
-    }
+    let ancestor = nearest_existing_ancestor(path)?;
+    fs2::available_space(&ancestor).ok()
 }
 
 /// Default concurrency caps (bootstrap design commitment; configurable via
@@ -1350,20 +1358,33 @@ mod tests {
     }
 
     /// #231: the shared free-byte measurement measures an existing path, walks
-    /// to the nearest existing ancestor of a path that does not exist yet,
-    /// and reports `None` (never a fabricated number) when nothing on the
-    /// chain can be observed.
+    /// to the nearest existing ancestor of a path that does not exist yet, and
+    /// reports `None` (never a fabricated number) when nothing on the chain
+    /// can be observed. The WALK is asserted exactly (the number itself moves
+    /// under a live host, so the measurement is asserted only to be real).
     #[test]
     fn the_shared_measurement_walks_to_a_path_that_exists() {
         let dir = std::env::temp_dir().join(format!("hf-floor-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
-        let measured = available_bytes_at(&dir).expect("an existing directory is measurable");
-        assert!(measured > 0);
+        assert_eq!(
+            nearest_existing_ancestor(&dir).as_deref(),
+            Some(dir.as_path()),
+            "an existing path is its own measurement target"
+        );
         let unborn = dir.join("lane-root-that-does-not-exist").join("deeper");
         assert_eq!(
-            available_bytes_at(&unborn),
-            Some(measured),
+            nearest_existing_ancestor(&unborn).as_deref(),
+            Some(dir.as_path()),
             "an unborn path is measured at its nearest existing ancestor"
+        );
+        assert!(
+            available_bytes_at(&unborn).is_some_and(|bytes| bytes > 0),
+            "the walk yields a real measurement"
+        );
+        assert_eq!(
+            nearest_existing_ancestor(Path::new("no-such-relative-root-xyz/deeper")),
+            None,
+            "a path with no existing ancestor is unresolvable"
         );
         assert_eq!(
             available_bytes_at(Path::new("no-such-relative-root-xyz/deeper")),
