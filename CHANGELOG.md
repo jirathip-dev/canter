@@ -6,6 +6,24 @@ release process activates (docs/RELEASING.md), then semver applies.
 
 ## [Unreleased]
 
+### Fixed (issue #224 — the cleanup lane wait closes only on a CONFIRMED settled turn)
+
+- The `p8` lane wait's settled turn is the COLLECTION's confirmed stop (issue
+  #170 N7), not one read-back: the cleanup step closes the live lane's
+  workspace only after `COLLECT_STOP_SAMPLES` consecutive corroborated
+  read-backs — BOTH views non-working, the lane's own lifecycle counter
+  unmoved — sampled across the documented `COLLECT_STOP_INTERVAL_SECS`
+  interval, and keeps calling the same whole-lane close (lane token,
+  generation, worktree, settled agent state) afterwards. A status that FLAPS
+  to `idle`/`done` MID-TURN — the measured shape the collection's confirmed
+  stop exists for — is therefore never read as a settle, so a live lane's
+  workspace cannot be retired on a flap; a lane that starts working again
+  between the confirmation and the close voids it and the wait re-confirms.
+  The bound, the `effect.lane_timeout` park (workspace preserved, bounded
+  retries unspent) and every refusal that is not the timing condition are
+  unchanged, as is the one-read policy for a lane whose own read-back cannot
+  be taken at all (the close's own verification decides it, at once).
+
 ### Fixed (issue #279 — a stored pre-#269 admission binding dispatches again)
 
 - A `hf-profile-binding/v1` document with NO `skills` key is accepted again:

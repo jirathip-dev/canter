@@ -76,11 +76,16 @@ pub const HARNESS_START_DEADLINE_DEFAULT_SECS: u64 = 300;
 /// agent is genuinely alive and only then costs wall clock.
 pub const CLEANUP_DEADLINE_DEFAULT_SECS: u64 = PROMPT_DEADLINE_DEFAULT_SECS;
 
-/// Cadence of ONE poll of the cleanup step's bounded lane-settle wait (issue
-/// #224): the same 100 ms the collection's worker wait polls at, so a lane
-/// that settles between two polls is closed promptly and a still-working one
-/// costs one bounded subprocess round trip per poll.
-const LANE_SETTLE_POLL: Duration = Duration::from_millis(100);
+/// The cleanup step's bounded lane-settle wait (issue #224) samples the lane,
+/// and closes its workspace, under the COLLECTION's own discipline
+/// ([`COLLECT_STOP_SAMPLES`] corroborated read-backs across
+/// [`COLLECT_STOP_INTERVAL_SECS`]): the wait IS "the same discipline `p5`
+/// already uses before certifying a delta", so a one-read settle is never a
+/// settled turn here either. The one-read shape was exactly the measured flap
+/// class the collection's confirmed stop exists for (#170 N7) — a status that
+/// reports `idle`/`done` MID-TURN — and a close judged from it would retire
+/// the workspace of a lane that is still alive.
+const LANE_SETTLE_SAMPLE_INTERVAL_SECS: u64 = COLLECT_STOP_INTERVAL_SECS;
 
 /// Documented default deadline (seconds) for one review step's verdict wait
 /// (`review_evidence`): the reviewer's own round trip — read the certified
@@ -4229,6 +4234,122 @@ fn collection_park(
             ("waited_secs", integer(waited.as_secs() as i64)),
             ("progress_secs", integer(progress_age.as_secs() as i64)),
             ("progress", string(progress)),
+        ]),
+    }
+}
+
+/// Wait, bounded, for the lane to produce a CONFIRMED settled turn and then
+/// close its workspace (issue #224).
+///
+/// The confirmation is the collection's own (issue #170 N7) — this is "the
+/// same discipline `p5` already uses before certifying a delta": a settled
+/// turn is [`COLLECT_STOP_SAMPLES`] consecutive read-backs whose BOTH views
+/// report a non-working state, with the lane's own lifecycle counter unmoved,
+/// spanning at least the documented [`LANE_SETTLE_SAMPLE_INTERVAL_SECS`]
+/// interval. ONE read-back is not a settle: the measured flap reports a stop
+/// state MID-TURN, and closing on it would retire the workspace of a lane
+/// that is still alive — the protection issue #224 fences off.
+///
+/// `close` is the whole-lane verification the step always ran (lane token,
+/// generation, worktree, settled agent state); it stays the authority for
+/// every outcome that is not the timing condition. A lane whose own read-back
+/// cannot be taken at all carries no settle evidence and falls straight
+/// through to it (nothing observable is not waited on); a superseded
+/// generation's or another lane's workspace still refuses at once, never
+/// waited on; and a busy close — the lane started working again between the
+/// confirmation and the close — voids the confirmation and re-confirms from
+/// the next read-back.
+///
+/// Returns `Ok(())` once the workspace is closed. `Err(outcome)` is terminal:
+/// [`code::LANE_TIMEOUT`] when the step's own effective deadline expires with
+/// the lane still unsettled (the workspace, checkout and branch untouched, the
+/// bounded retries unspent), or the close's own typed refusal.
+fn await_settled_lane(
+    bound: Duration,
+    mut observe: impl FnMut(
+        Duration,
+    ) -> Result<crate::adapters::PaneSample, crate::adapters::ProcessFailure>,
+    mut close: impl FnMut() -> Result<(), crate::adapters::AdapterError>,
+    elapsed: impl Fn() -> Duration,
+    mut sleep: impl FnMut(Duration),
+) -> Result<(), EffectOutcome> {
+    let bound_secs = bound.as_secs();
+    let interval = Duration::from_secs(LANE_SETTLE_SAMPLE_INTERVAL_SECS);
+    let span =
+        Duration::from_secs(LANE_SETTLE_SAMPLE_INTERVAL_SECS * (COLLECT_STOP_SAMPLES as u64 - 1));
+    let mut previous: Option<crate::adapters::PaneSample> = None;
+    let mut stop_run: Option<(usize, Duration)> = None;
+    let mut last_state: Option<String> = None;
+    loop {
+        let now = elapsed();
+        if now >= bound {
+            return Err(lane_settle_park(bound_secs, now, last_state.as_deref()));
+        }
+        // The read-back is evidence for the settle, so it may never outlive
+        // the bound: its budget is what the bound has left, floored at one
+        // second so a read is always given a real chance.
+        let budget = bound.saturating_sub(now).max(Duration::from_secs(1));
+        let settled = match observe(budget) {
+            Ok(sample) => {
+                let counter_moved = previous
+                    .as_ref()
+                    .map(|previous| previous.seq != sample.seq)
+                    .unwrap_or(false);
+                last_state = Some(sample.lane_state.clone());
+                previous = Some(sample.clone());
+                let stop = pane_stop_state(&sample.lane_state)
+                    && status_corroborates_stop(&sample.status_state)
+                    && !counter_moved;
+                if stop {
+                    let (samples, since) = match stop_run {
+                        Some((samples, since)) => (samples + 1, since),
+                        None => (1, now),
+                    };
+                    stop_run = Some((samples, since));
+                    samples >= COLLECT_STOP_SAMPLES && now.saturating_sub(since) >= span
+                } else {
+                    stop_run = None;
+                    false
+                }
+            }
+            Err(_) => true,
+        };
+        if settled {
+            match close() {
+                Ok(()) => return Ok(()),
+                Err(err) if err.code == crate::adapters::CODE_LANE_BUSY => stop_run = None,
+                Err(err) => return Err(refusal(err.code, err.message)),
+            }
+        }
+        let remaining = bound.saturating_sub(elapsed());
+        if remaining.is_zero() {
+            continue;
+        }
+        sleep(interval.min(remaining));
+    }
+}
+
+/// The bounded lane-settle wait's park (issue #224): `effect.lane_timeout` as
+/// `ambiguous`, its bound and the live state it last read named, the workspace
+/// preserved and the bounded retries unspent.
+fn lane_settle_park(bound_secs: u64, waited: Duration, last_state: Option<&str>) -> EffectOutcome {
+    let observed = match last_state {
+        Some(state) => format!("lane is still {state}; preserve its workspace"),
+        None => "the lane's own read-back could not be taken; preserve its workspace".to_string(),
+    };
+    EffectOutcome {
+        status: "ambiguous",
+        code: Some(code::LANE_TIMEOUT.to_string()),
+        message: Some(format!(
+            "{observed}; the delivery is already verified landed, so the lane outliving \
+             its own publish is a timing condition: the bounded wait of {bound_secs}s \
+             for a CONFIRMED settled turn expired (waited {}ms); the workspace is preserved \
+             and cleanup parked without redispatch",
+            waited.as_millis()
+        )),
+        result: object(vec![
+            ("deadline_secs", integer(bound_secs as i64)),
+            ("waited_ms", integer(waited.as_millis() as i64)),
         ]),
     }
 }
@@ -8577,51 +8698,30 @@ fn effect_cleanup(ctx: &EffectContext<'_>) -> EffectOutcome {
             Err(outcome) => return outcome,
         };
         let started = std::time::Instant::now();
-        loop {
-            match crate::adapters::close_lane_workspace(
-                &session,
-                &worktree,
-                ctx.env,
-                crate::adapters::ADAPTER_TIMEOUT,
-            ) {
-                Ok(()) => {
-                    lane_wait = Some(object(vec![
-                        ("bound_secs", integer(bound as i64)),
-                        ("waited_ms", integer(started.elapsed().as_millis() as i64)),
-                    ]));
-                    break;
-                }
-                // The lane is ALIVE (issue #224): the landing proof above
-                // already holds, so this is the worker outliving its own
-                // publish — a timing condition, not a refusal. Wait, bounded
-                // by the step's EFFECTIVE deadline, for the settled turn the
-                // worker produces on its own. Every other refusal — above all
-                // the generation/ownership mismatch — is never waited on.
-                Err(err) if err.code == crate::adapters::CODE_LANE_BUSY => {
-                    let waited = started.elapsed();
-                    let bound_duration = Duration::from_secs(bound);
-                    if waited >= bound_duration {
-                        return EffectOutcome {
-                            status: "ambiguous",
-                            code: Some(code::LANE_TIMEOUT.to_string()),
-                            message: Some(format!(
-                                "{}; the delivery is already verified landed, so the lane outliving \
-                                 its own publish is a timing condition: the bounded wait of {bound}s \
-                                 for a settled lane expired (waited {}ms); the workspace is preserved \
-                                 and cleanup parked without redispatch",
-                                err.message,
-                                waited.as_millis()
-                            )),
-                            result: object(vec![
-                                ("deadline_secs", integer(bound as i64)),
-                                ("waited_ms", integer(waited.as_millis() as i64)),
-                            ]),
-                        };
-                    }
-                    std::thread::sleep(LANE_SETTLE_POLL.min(bound_duration - waited));
-                }
-                Err(err) => return refusal(err.code, err.message),
+        let waited = await_settled_lane(
+            Duration::from_secs(bound),
+            |remaining| {
+                crate::adapters::observe_pane_worker(&session, &worktree, remaining, ctx.env)
+            },
+            || {
+                crate::adapters::close_lane_workspace(
+                    &session,
+                    &worktree,
+                    ctx.env,
+                    crate::adapters::ADAPTER_TIMEOUT,
+                )
+            },
+            || started.elapsed(),
+            std::thread::sleep,
+        );
+        match waited {
+            Ok(()) => {
+                lane_wait = Some(object(vec![
+                    ("bound_secs", integer(bound as i64)),
+                    ("waited_ms", integer(started.elapsed().as_millis() as i64)),
+                ]));
             }
+            Err(outcome) => return outcome,
         }
     }
     // Remove the worktree (clean, so no --force) then the local branch.
@@ -8900,6 +9000,236 @@ mod tests {
     /// A read-back whose two views agree, the measured shape of one Herdr row.
     fn pane(state: &str) -> crate::adapters::PaneSample {
         pane_sample(state, state, None)
+    }
+
+    // -------------------------------------------------------------------
+    // Issue #224: the cleanup step's lane-settle wait. It closes the lane's
+    // workspace only on a CONFIRMED settled turn — the collection's own
+    // discipline (issue #170 N7) — driven here at a local clock.
+    // -------------------------------------------------------------------
+
+    /// A lane whose read-backs flap between working and a stop state is never
+    /// a settled turn: no close is ever attempted, and the wait parks on its
+    /// own bound with the live state it last read named.
+    #[test]
+    fn cleanup_lane_wait_never_closes_on_a_flapping_lane() {
+        use std::cell::Cell;
+        let elapsed = Cell::new(Duration::ZERO);
+        let reads = Cell::new(0usize);
+        let closes = Cell::new(0usize);
+        let flap = ["working", "idle", "working", "done", "working"];
+        let outcome = await_settled_lane(
+            Duration::from_secs(30),
+            |_| {
+                reads.set(reads.get() + 1);
+                let state = match flap.get(reads.get() - 1) {
+                    Some(state) => pane(state),
+                    None => pane("working"),
+                };
+                Ok(state)
+            },
+            || {
+                closes.set(closes.get() + 1);
+                Ok(())
+            },
+            || elapsed.get(),
+            |wait| elapsed.set(elapsed.get() + wait),
+        )
+        .expect_err("a transient stop report is not a settled turn");
+        assert_eq!(outcome.status, "ambiguous");
+        assert_eq!(outcome.code.as_deref(), Some(code::LANE_TIMEOUT));
+        assert_eq!(
+            closes.get(),
+            0,
+            "the workspace of a flapping lane is never closed"
+        );
+        assert_eq!(
+            outcome.result.get("deadline_secs"),
+            Some(&integer(30)),
+            "the park states the step's own bound: {:?}",
+            outcome.result
+        );
+        let message = outcome.message.unwrap_or_default();
+        assert!(
+            message.contains("still working") && message.contains("bounded wait of 30s"),
+            "the park names the live state it last read and the bound: {message}"
+        );
+    }
+
+    /// The settled turn is confirmed exactly like the collection's stop: three
+    /// corroborated non-working read-backs spanning two real intervals. The
+    /// close may not happen before that confirmation.
+    #[test]
+    fn cleanup_lane_wait_closes_only_on_the_confirmed_settle() {
+        use std::cell::Cell;
+        let elapsed = Cell::new(Duration::ZERO);
+        let reads = Cell::new(0usize);
+        let closes = Cell::new(0usize);
+        let outcome = await_settled_lane(
+            Duration::from_secs(60),
+            |_| {
+                reads.set(reads.get() + 1);
+                if reads.get() == 1 {
+                    Ok(pane("working"))
+                } else {
+                    Ok(pane("idle"))
+                }
+            },
+            || {
+                closes.set(closes.get() + 1);
+                Ok(())
+            },
+            || elapsed.get(),
+            |wait| elapsed.set(elapsed.get() + wait),
+        );
+        assert!(outcome.is_ok(), "the confirmed settle closes: {outcome:?}");
+        assert_eq!(closes.get(), 1, "the workspace is closed exactly once");
+        assert_eq!(
+            reads.get(),
+            4,
+            "one working read-back, then COLLECT_STOP_SAMPLES corroborated stop read-backs"
+        );
+        assert_eq!(
+            elapsed.get(),
+            Duration::from_secs(15),
+            "the confirmation spans (N-1) real intervals"
+        );
+    }
+
+    /// A lane whose own lifecycle counter moves between non-working read-backs
+    /// is still moving through its lifecycle: it is never a settled turn.
+    #[test]
+    fn cleanup_lane_wait_never_settles_a_lane_whose_counter_moved() {
+        use std::cell::Cell;
+        let elapsed = Cell::new(Duration::ZERO);
+        let reads = Cell::new(0i64);
+        let closes = Cell::new(0usize);
+        let outcome = await_settled_lane(
+            Duration::from_secs(12),
+            |_| {
+                reads.set(reads.get() + 1);
+                Ok(pane_sample("idle", "idle", Some(reads.get())))
+            },
+            || {
+                closes.set(closes.get() + 1);
+                Ok(())
+            },
+            || elapsed.get(),
+            |wait| elapsed.set(elapsed.get() + wait),
+        )
+        .expect_err("a moving lane is not a settled one");
+        assert_eq!(outcome.code.as_deref(), Some(code::LANE_TIMEOUT));
+        assert_eq!(closes.get(), 0);
+    }
+
+    /// The confirmed settle is void the moment the close finds the lane busy
+    /// again (it took another turn): the wait re-confirms from the next
+    /// read-back instead of closing under a live worker.
+    #[test]
+    fn cleanup_lane_wait_reconfirms_when_the_lane_started_working_again() {
+        use std::cell::Cell;
+        let elapsed = Cell::new(Duration::ZERO);
+        let reads = Cell::new(0usize);
+        let closes = Cell::new(0usize);
+        let outcome = await_settled_lane(
+            Duration::from_secs(120),
+            |_| {
+                reads.set(reads.get() + 1);
+                if reads.get() == 1 || reads.get() == 5 {
+                    Ok(pane("working"))
+                } else {
+                    Ok(pane("idle"))
+                }
+            },
+            || {
+                closes.set(closes.get() + 1);
+                if closes.get() == 1 {
+                    Err(crate::adapters::AdapterError::refusal(
+                        crate::adapters::CODE_LANE_BUSY,
+                        "lane impl-5 is still working; preserve its workspace",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+            || elapsed.get(),
+            |wait| elapsed.set(elapsed.get() + wait),
+        );
+        assert!(
+            outcome.is_ok(),
+            "the re-confirmed settle closes the workspace: {outcome:?}"
+        );
+        assert_eq!(
+            closes.get(),
+            2,
+            "the busy close voids the first confirmation and the wait re-confirms"
+        );
+    }
+
+    /// Every outcome that is not the timing condition is never waited on: the
+    /// close's own typed refusal returns at the confirmation, not after a wait.
+    #[test]
+    fn cleanup_lane_wait_never_waits_on_a_typed_refusal() {
+        use std::cell::Cell;
+        let elapsed = Cell::new(Duration::ZERO);
+        let outcome = await_settled_lane(
+            Duration::from_secs(600),
+            |_| Ok(pane("idle")),
+            || {
+                Err(crate::adapters::AdapterError::refusal(
+                    crate::adapters::CODE_STALE_GENERATION,
+                    "a superseded generation's workspace is never waited on",
+                ))
+            },
+            || elapsed.get(),
+            |wait| elapsed.set(elapsed.get() + wait),
+        )
+        .expect_err("a generation mismatch is never waited on");
+        assert_eq!(
+            outcome.code.as_deref(),
+            Some(crate::adapters::CODE_STALE_GENERATION)
+        );
+        assert_eq!(
+            elapsed.get(),
+            Duration::from_secs(10),
+            "the refusal returns at the confirmation, never after a wait"
+        );
+    }
+
+    /// A lane whose own read-back cannot be taken at all carries no settle
+    /// evidence: the close's own verification decides, at once — nothing
+    /// observable is not waited on.
+    #[test]
+    fn cleanup_lane_wait_closes_when_the_lane_cannot_be_observed() {
+        use std::cell::Cell;
+        let elapsed = Cell::new(Duration::ZERO);
+        let closes = Cell::new(0usize);
+        let outcome = await_settled_lane(
+            Duration::from_secs(30),
+            |_| {
+                Err(crate::adapters::ProcessFailure {
+                    code: crate::adapters::CODE_INCOMPLETE_IDENTITY,
+                    message: "the lane's own read-back could not be taken".to_string(),
+                    detail: String::new(),
+                })
+            },
+            || {
+                closes.set(closes.get() + 1);
+                Ok(())
+            },
+            || elapsed.get(),
+            |wait| elapsed.set(elapsed.get() + wait),
+        );
+        assert!(
+            outcome.is_ok(),
+            "the close decides when there is nothing to observe: {outcome:?}"
+        );
+        assert_eq!(closes.get(), 1, "the close runs once");
+        assert_eq!(
+            elapsed.get(),
+            Duration::ZERO,
+            "an unobservable lane is not waited on"
+        );
     }
 
     /// Issue #170 N7/N8: the documented numbers are pinned contract values —
