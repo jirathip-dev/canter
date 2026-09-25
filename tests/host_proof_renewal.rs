@@ -477,6 +477,130 @@ fn renewals(audit: &str) -> Vec<Val> {
         .collect()
 }
 
+/// Issue #231 AC2 through the daemon: a fan-out dispatch whose admission
+/// carries a free-byte observation BELOW the documented floor is refused
+/// typed — naming the floor and the observation — before any effect runs,
+/// and the same dispatch with an at-the-floor observation proceeds. The floor
+/// number the refusal names is read from the same constant the gate decides
+/// on (one fact, never two).
+#[test]
+fn a_fanout_below_the_documented_floor_is_refused_typed() {
+    let fixture = Fixture::new();
+    let (digest, _preview) = fixture.preview(REV_A);
+    let grant = fixture.grant("3600");
+    let submitted = fixture.ok(&[
+        "queue",
+        "submit",
+        "--request",
+        fixture.path("request.json").to_str().unwrap(),
+        "--confirm-digest",
+        &digest,
+        "--grant",
+        &format!("5={}", text(&grant, &["grant_id"])),
+        "--caps",
+        "4/2/2",
+        "--host-available",
+        "yes",
+        "--harness-lanes",
+        "0",
+        "--supervise",
+        "off",
+        "--topology",
+        fixture.path("topology.json").to_str().unwrap(),
+    ]);
+    let run = text(item_of(&submitted, "acme/widgets#5"), &["instance_id"]).to_string();
+
+    // The operator drives the spine: p1 (checkout) and the lane worktree are
+    // not fan-out steps, so their proof carries no observation at all —
+    // exactly the pre-#231 shape.
+    fixture.first(&run, &canter::time::rfc3339_now());
+    fixture.ok(&[
+        "run",
+        "dispatch",
+        "--run",
+        &run,
+        "--step",
+        "p2-5",
+        "--topology",
+        fixture.path("topology.json").to_str().unwrap(),
+        "--admission",
+        fixture.path("admission.json").to_str().unwrap(),
+    ]);
+
+    // The attestation under test: a REAL observation (one byte less than the
+    // documented floor, and exactly the floor in the control leg).
+    let admission = |available_bytes: i64| {
+        canonical_text(&object(vec![
+            (
+                "caps",
+                object(vec![
+                    ("global", integer(4)),
+                    ("repository", integer(2)),
+                    ("harness", integer(2)),
+                ]),
+            ),
+            ("harness_lanes", integer(0)),
+            (
+                "host_proof",
+                object(vec![
+                    ("measured_at", string(&canter::time::rfc3339_now())),
+                    ("available_bytes", integer(available_bytes)),
+                ]),
+            ),
+        ]))
+    };
+    let floor = canter::lifecycle::HOST_FREE_FLOOR_BYTES as i64;
+    fixture.write("admission-floor.json", &admission(floor - 1));
+    let (exit, refused) = fixture.cli(&[
+        "run",
+        "dispatch",
+        "--run",
+        &run,
+        "--step",
+        "p3",
+        "--topology",
+        fixture.path("topology.json").to_str().unwrap(),
+        "--admission",
+        fixture.path("admission-floor.json").to_str().unwrap(),
+    ]);
+    println!("FLOOR-REFUSAL exit={exit} {}", canonical_text(&refused));
+    assert_ne!(exit, 0, "the below-floor start is refused: {refused:?}");
+    assert_eq!(
+        text(&refused, &["error", "code"]),
+        "refusal.admission.resource_floor"
+    );
+    let message = text(&refused, &["error", "message"]);
+    assert!(
+        message.contains(&floor.to_string()) && message.contains(&(floor - 1).to_string()),
+        "the refusal names the floor and the observation: {message}"
+    );
+
+    // The control: the SAME dispatch at the floor is admitted — the refusal
+    // above is the floor's decision, not a broken submission.
+    fixture.write("admission-floor.json", &admission(floor));
+    let accepted = fixture.ok(&[
+        "run",
+        "dispatch",
+        "--run",
+        &run,
+        "--step",
+        "p3",
+        "--topology",
+        fixture.path("topology.json").to_str().unwrap(),
+        "--admission",
+        fixture.path("admission-floor.json").to_str().unwrap(),
+    ]);
+    println!("FLOOR-ACCEPTED {}", canonical_text(&accepted));
+    // The SAME step, the SAME run, the SAME instant's attestation shape — only
+    // the observed free bytes differ, and the gate admits this one: the
+    // refusal above is the floor's decision, not a broken submission.
+    assert_eq!(
+        text(&accepted, &["step", "kind"]),
+        "harness_start",
+        "the at-the-floor dispatch was admitted: {accepted:?}"
+    );
+}
+
 /// The fixture's own containment witness: every daemon owns one process
 /// group and is reaped, so a lane never leaks a daemon behind a socket.
 #[test]

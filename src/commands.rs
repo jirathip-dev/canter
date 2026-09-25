@@ -5746,6 +5746,15 @@ fn execute_queue_submit(args: &QueueSubmitArgs, invocation: &Invocation) -> CmdR
             }
         };
         if let Val::Obj(map) = &mut params {
+            // Issue #231: the submit-time proof carries the free bytes this
+            // host exposes at the run's lane root — the operator CLI is
+            // already running on that host, so the attestation names a real
+            // observation (never a placeholder), and the fan-out gate can
+            // refuse a lane start below the documented floor.
+            let available_bytes = topology
+                .get("worktrees_root")
+                .and_then(Val::as_str)
+                .and_then(|root| crate::lifecycle::available_bytes_at(std::path::Path::new(root)));
             map.insert(
                 "dispatch".to_string(),
                 object(vec![
@@ -5767,7 +5776,15 @@ fn execute_queue_submit(args: &QueueSubmitArgs, invocation: &Invocation) -> CmdR
                             ),
                             (
                                 "host_proof",
-                                object(vec![("measured_at", string(&crate::time::rfc3339_now()))]),
+                                object(vec![
+                                    ("measured_at", string(&crate::time::rfc3339_now())),
+                                    (
+                                        "available_bytes",
+                                        available_bytes
+                                            .map(|bytes| integer(bytes as i64))
+                                            .unwrap_or_else(null),
+                                    ),
+                                ]),
                             ),
                         ]),
                     ),

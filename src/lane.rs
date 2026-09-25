@@ -46,6 +46,33 @@ pub fn lane_branch(issue: u64) -> String {
     format!("issue-{issue}")
 }
 
+/// The lane leg's BUILD-RESIDUE root names (issue #231): the per-lane
+/// directories a native lane's build scratch (Xcode DerivedData) may live in,
+/// derived from the same leg identity as every other lane name.
+///
+/// The host measured both spellings on disk — `<agent>-derived` and
+/// `<agent>-DD` — and both are *regenerable lane residue*: a native lane is
+/// told to use the first, and the reaper reclaims whichever exists for a
+/// ledger-terminal generation of the issue. Deriving the names from the leg
+/// (never from a run, a surface or the host home) is what makes that residue
+/// attributable to exactly one lane and reclaimable under the same rules as
+/// the checkout.
+pub fn lane_build_residue_roots(issue: u64, role: &str, round: u64) -> [String; 2] {
+    let (agent, _, _) = lane_identity(issue, role, round);
+    [format!("{agent}-derived"), format!("{agent}-DD")]
+}
+
+/// The canonical build-scratch root name one lane leg is TOLD to use, as a
+/// path relative to the lane checkout (`../<agent>-derived` from inside the
+/// checkout — the sibling of `issues-<N>` under the run's worktrees root).
+///
+/// This is the ONE spelling the plan producer names in the worker payload:
+/// build scratch belongs to the lane, never to the host home directory, and
+/// the reaper reclaims exactly this derived root.
+pub fn lane_build_root_relative(issue: u64, role: &str, round: u64) -> String {
+    format!("../{}", lane_build_residue_roots(issue, role, round)[0])
+}
+
 /// The three public identity strings of one leg, in one place.
 fn lane_identity(issue: u64, role: &str, round: u64) -> (String, String, String) {
     match (role, round) {
@@ -118,6 +145,47 @@ mod tests {
         {
             assert_eq!(lane_branch(issue), branch);
             assert_eq!(lane_checkout(issue, "implementer", 1), checkout);
+        }
+    }
+
+    #[test]
+    fn build_residue_roots_derive_from_the_leg_and_stay_outside_the_checkout() {
+        // Issue #231: the residue a native lane's build leaves is attributable
+        // to ONE leg — the two measured spellings derive from that leg alone,
+        // and the scratch root a lane is told to use is the checkout's sibling
+        // (never the host home directory).
+        assert_eq!(
+            lane_build_residue_roots(231, "implementer", 1),
+            ["impl-231-derived".to_string(), "impl-231-DD".to_string()]
+        );
+        assert_eq!(
+            lane_build_residue_roots(231, "implementer", 2),
+            [
+                "impl-231-r2-derived".to_string(),
+                "impl-231-r2-DD".to_string()
+            ]
+        );
+        assert_eq!(
+            lane_build_residue_roots(158, "reviewer", 1),
+            [
+                "rev-158-r1-derived".to_string(),
+                "rev-158-r1-DD".to_string()
+            ]
+        );
+        assert_eq!(
+            lane_build_root_relative(231, "implementer", 1),
+            "../impl-231-derived"
+        );
+        // The relative scratch root never escapes the checkout's parent: it is
+        // exactly one level up, beside the lane's own `issues-<N>` checkout.
+        for (issue, role, round) in [(7, "implementer", 1), (210, "reviewer", 3)] {
+            let relative = lane_build_root_relative(issue, role, round);
+            assert_eq!(relative.matches('/').count(), 1, "{relative}");
+            assert!(relative.starts_with("../"));
+            assert_eq!(
+                relative,
+                format!("../{}", lane_build_residue_roots(issue, role, round)[0])
+            );
         }
     }
 

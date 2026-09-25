@@ -1280,9 +1280,10 @@ recorded outcome and never repeats the spawn).
   executable refuses `refusal.unavailable.harness`) and verifies the
   successor from a fresh observation — a booted process alone is never a
   usable successor. Admission failures are the lifecycle codes
-  (`refusal.admission.proof_missing` / `proof_stale` / `cap_missing` /
-  `cap_global` / `cap_repository` / `cap_harness` / `monorepo_overlap`);
-  every refusal before the spawn holds with no child and no state change.
+  (`refusal.admission.proof_missing` / `proof_stale` / `resource_floor` /
+  `cap_missing` / `cap_global` / `cap_repository` / `cap_harness` /
+  `monorepo_overlap`); every refusal before the spawn holds with no child and
+  no state change.
   `params.successor.kickoff_receipt` is the closed kickoff binding: a
   64-hex digest of the kickoff receipt that the adapter read-back must
   echo, or the start refuses.

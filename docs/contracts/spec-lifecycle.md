@@ -98,6 +98,20 @@ when any applicable admission input is missing, stale, or exceeded:
   (`refusal.admission.monorepo_overlap`; component-aware — `issues/1`
   never overlaps `issues/12`). Pure predicate probes in
   `src/lifecycle.rs`.
+- Free space below the documented floor refuses the start (issue #231). A
+  proof MAY carry the free bytes its presenter observed at the run's lane
+  root (`host_proof.available_bytes`); when it does and the observation is
+  below `HOST_FREE_FLOOR_BYTES` (`src/lifecycle.rs`, a design commitment),
+  the fan-out refuses `refusal.admission.resource_floor` naming the
+  observation and the floor. The measured trigger: native lanes dropped
+  Xcode DerivedData into the host home directory, the data volume reached
+  100% full and every writer (daemon state, CI suites, lanes) became
+  unreliable at once — a lane that would consume host-wide disk is refused
+  before any effect runs instead of being started to fail halfway. A proof
+  that carries no observation (the pre-#231 attestation shape) cannot be
+  checked against the floor and keeps the freshness decision above; the
+  `queue submit --topology` attestation and the §4.1 dispatch-time renewal
+  both record one.
 - Caps are per-request declared bounds (like plan/observed attests); the
   durable, state-owned half is the running-lane count. Default caps and
   freshness windows are design commitments (`src/lifecycle.rs` consts).
@@ -122,7 +136,11 @@ submit-time attestation echoed back, and never a fabricated instant:
   `host.proof.renewal` journal record naming the superseded instant, the
   replacement (the measurement) and the observed free bytes, plus one
   `run.host_proof.renewed` daemon-log line. A renewal that cannot be
-  recorded is not presented (fail closed).
+  recorded is not presented (fail closed). The admission the run presents
+  from then on carries the observation too (`host_proof.available_bytes`,
+  issue #231), so the fan-out gate can decide the documented free-space
+  floor on a measurement instead of on an attestation that observed
+  nothing.
 - An UNMEASURABLE host renews nothing: the recorded proof is presented
   unchanged and the gate still refuses `refusal.admission.proof_stale`
   (`run.host_proof.unmeasurable` names why on the daemon log). Nothing here
