@@ -5163,7 +5163,7 @@ fn method_run_retire_lane(shared: &Arc<Shared>, request: &Request) -> String {
     };
     // The gate reads durable state only, before any claim exists: a live run
     // is refused here and the refusal is journaled by nobody.
-    let (instance, recorded) = {
+    let (instance, recorded, siblings) = {
         let state = match shared.lock_state() {
             Ok(state) => state,
             Err(message) => return err_response(&request.id, "state.unavailable", message),
@@ -5183,7 +5183,20 @@ fn method_run_retire_lane(shared: &Arc<Shared>, request: &Request) -> String {
             Ok(recorded) => recorded,
             Err(err) => return err_response(&request.id, err.code, err.message),
         };
-        (instance, recorded)
+        // Issue #224 (AC5): the LIVE siblings of this run's issue. One issue
+        // has ONE lane (the branch and the checkout are derived from the issue
+        // number), so a non-terminal run of the same issue may hold — or still
+        // need — exactly the refs this retirement would remove. Read with the
+        // gate, before any claim exists, and refused on below.
+        let siblings = match state.live_lane_siblings(
+            &instance.repository,
+            instance.issue_number,
+            &parsed.instance_id,
+        ) {
+            Ok(siblings) => siblings,
+            Err(err) => return err_response(&request.id, err.code, err.message),
+        };
+        (instance, recorded, siblings)
     };
     if !matches!(instance.status.as_str(), "done" | "invalidated") {
         return err_response(
@@ -5194,6 +5207,34 @@ fn method_run_retire_lane(shared: &Arc<Shared>, request: &Request) -> String {
                  live lane still holds its issue's unique ownership, so it is never in the retired \
                  set (a run that can never progress is retired with `run release` first)",
                 parsed.instance_id, instance.status
+            ),
+        );
+    }
+    // Issue #224 (AC5): a retirement is scoped to the ADDRESSED run's own
+    // residue. One issue has ONE lane — the branch and the checkout are
+    // derived from the issue number (`crate::lane::lane_branch` /
+    // `lane_checkout`) — so another run of the same issue that is still
+    // NON-TERMINAL holds, or still needs, exactly the refs this retirement
+    // would remove. The measured drive retired a DONE run's lane while a live
+    // run of the same issue was mid-flight; the live run's own publish then
+    // had no branch and no worktree to refresh. The refusal is typed, names
+    // every live sibling, and touches nothing: no claim, no journal row, no
+    // git call and no workspace close.
+    if !siblings.is_empty() {
+        let issue = instance.issue_number.max(0) as u64;
+        return err_response(
+            &request.id,
+            crate::run_control::codes::LANE_LIVE,
+            format!(
+                "the lane of terminal run {} (branch {:?}, checkout {:?}) is referenced by {} \
+                 NON-TERMINAL run(s) of the same issue — {} — whose own published delivery \
+                 depends on it: a terminal run's retirement never removes a branch or checkout a \
+                 live run still needs, so nothing was read, claimed or touched",
+                parsed.instance_id,
+                crate::lane::lane_branch(issue),
+                crate::lane::lane_checkout(issue, "implementer", 1),
+                siblings.len(),
+                siblings.join(", ")
             ),
         );
     }

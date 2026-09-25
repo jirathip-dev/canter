@@ -34,16 +34,27 @@ struct Sandbox {
     root: PathBuf,
 }
 
+/// One process-wide sequence, so two sandboxes for the SAME scenario name can
+/// never share a root. The clock alone is not enough: this host's clock
+/// resolves in whole microseconds (six consecutive `SystemTime::now()` reads
+/// return one instant), so parallel test threads legitimately read the same
+/// tick and collided on one root — a `git init` in a root another test was
+/// initializing failed the whole target on `.git/config.lock` (`File exists`)
+/// instead of testing anything. The name is kept deliberately SHORT: the
+/// daemon's Unix socket lives under this root and macOS's `sun_path` is ~104
+/// bytes (the previous pid+nanos name sat within a few bytes of it).
+static SANDBOX_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl Sandbox {
     fn new(name: &str) -> Sandbox {
         let root = std::env::temp_dir().join(format!(
             "hf-mut8-{name}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+            SANDBOX_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
+        // A root a PREVIOUS run left behind under a recycled pid is never
+        // reused: this fixture always starts from a clean tree.
+        let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("sandbox root");
         Sandbox { root }
     }
@@ -1863,6 +1874,233 @@ fn a_declared_pull_request_route_publishes_and_post_merge_verify_proves_it() {
     );
 }
 
+/// Witness (AC1, issue #224): the forge lands the merge on the REMOTE and the
+/// landed commit object never enters the integration checkout's object store
+/// before the step reads it — the measured p7 shape, where the step merged
+/// remotely and then read the commit it had just landed and died on a bare
+/// `adapter.exit`/128 (`fatal: bad object <landed-sha>`). The step FETCHES the
+/// landed head into the checkout FIRST, so the read-back is verified, the
+/// landed content is proven on the published ref and the integration checkout
+/// follows it. The fixture's forge never writes the commit into the checkout
+/// (it lands it in the bare remote through `--git-dir`), so the read can only
+/// succeed because the fetch precedes it.
+#[test]
+fn p7_fetches_the_landed_published_head_before_reading_it() {
+    let (scenario, feature, base) = cycle2_reviewed_merge_routed("squash", false, "pull_request");
+    let origin = scenario.origin();
+    let origin_git = Git::new(&origin);
+    let published_before = origin_git.head("staging");
+    assert_eq!(published_before, base, "the fixture starts unpublished");
+    let checkout = Git::new(&scenario.repos.checkout);
+    // The delivery is published as a pull request (the run's own delivery step
+    // does this): its branch is on the remote and an OPEN pull request names
+    // the certified head.
+    checkout.run(&["push", "origin", "issue-123:refs/heads/issue-123"]);
+    std::fs::write(
+        scenario.sandbox.path("forge-pr-head.txt"),
+        format!("{feature}\n"),
+    )
+    .expect("pr head file");
+    write_remote_only_forge(&scenario, false);
+
+    let landed = scenario.apply_ok(15, "m1", Some(&feature), Some(&base));
+    assert_eq!(landed.get("mode").and_then(Val::as_str), Some("landed"));
+    assert_eq!(landed.get("landed").and_then(Val::as_bool), Some(true));
+    let published_after = origin_git.head("staging");
+    assert_ne!(
+        published_after, published_before,
+        "the fixture's forge landed the merge on the remote"
+    );
+    assert_eq!(
+        landed.get("published_after").and_then(Val::as_str),
+        Some(published_after.as_str()),
+        "the recorded read-back names the ref the forge actually published"
+    );
+    // The landed head is READABLE from the integration checkout, and the
+    // published ref was fetched into the checkout's remote-tracking ref: the
+    // object is in the checkout's object store only because the step fetched
+    // it (the forge wrote it into the bare remote alone).
+    assert_eq!(
+        checkout.head(&format!("{published_after}^{{commit}}")),
+        published_after,
+        "the landed commit is readable from the integration checkout"
+    );
+    assert_eq!(
+        checkout.head("refs/remotes/origin/staging"),
+        published_after,
+        "the step fetched the landed published head into the checkout"
+    );
+    // The landed content is on the PUBLISHED ref, by content, and the checkout
+    // followed the published head — the tail never reads a stale local view.
+    assert_eq!(
+        origin_git.run(&["show", &format!("{published_after}:lane.txt")]),
+        "lane change\n",
+        "the reviewed content is on the published integration ref"
+    );
+    assert_eq!(scenario.integration_base(), published_after);
+    // The forge merged the delivery's own pull request at the EXACT certified
+    // head (the same exact-head discipline the push route lands under).
+    let recorded = forge_argv(&scenario);
+    let merge = recorded
+        .lines()
+        .find(|line| line.starts_with("pr merge"))
+        .unwrap_or_default();
+    assert!(
+        merge.contains("--squash") && merge.contains(&format!("--match-head-commit {feature}")),
+        "the forge merge is bound to the certified head: {recorded}"
+    );
+}
+
+/// Witness (AC1/AC4, issue #224): a landed head the integration checkout
+/// cannot READ even after the fetch that precedes every read — the fixture's
+/// forge lands the merge on the remote and then drops the landing's own object
+/// there, so `origin/staging` names a commit neither side can serve — is this
+/// step's OWN typed static condition (`effect.merge.static`), never the bare
+/// `adapter.exit` a first read of the missing object produces. The typed
+/// message names the landed head, and the cause is static: no re-dispatch
+/// fetches it any harder, so supervision parks the frontier on it with the
+/// bounded retries UNSPENT instead of spending them on a cause identical
+/// between attempts (the measured #224 drive spent two attempts on each).
+#[test]
+fn an_unreadable_landed_head_is_the_steps_own_typed_static_condition() {
+    let (scenario, feature, base) = cycle2_reviewed_merge_routed("squash", false, "pull_request");
+    let origin = scenario.origin();
+    let origin_git = Git::new(&origin);
+    let published_before = origin_git.head("staging");
+    assert_eq!(published_before, base, "the fixture starts unpublished");
+    let checkout = Git::new(&scenario.repos.checkout);
+    checkout.run(&["push", "origin", "issue-123:refs/heads/issue-123"]);
+    std::fs::write(
+        scenario.sandbox.path("forge-pr-head.txt"),
+        format!("{feature}\n"),
+    )
+    .expect("pr head file");
+    write_remote_only_forge(&scenario, true);
+
+    let (code, message) = scenario.apply_err(15, "m1", Some(&feature), Some(&base));
+    let landed = origin_git.head("staging");
+    assert_ne!(
+        landed, published_before,
+        "the fixture's forge did move the published ref (a real landing)"
+    );
+    assert_eq!(
+        code, "effect.merge.static",
+        "the unreadable landed head is typed, never a bare adapter exit: {message}"
+    );
+    assert!(
+        message.contains(&landed),
+        "the typed condition names the landed head {landed}: {message}"
+    );
+    assert!(
+        message.contains("not readable from the integration checkout"),
+        "the typed condition names the read it could not make: {message}"
+    );
+    // Fail closed: nothing moved locally and the delivery branch was never
+    // rewritten.
+    assert_eq!(
+        scenario.integration_base(),
+        published_before,
+        "an unreadable landing moves no integration ref locally"
+    );
+    assert_eq!(
+        checkout.head("issue-123"),
+        feature,
+        "the delivery branch is never rewritten"
+    );
+}
+
+/// Witness (AC2/AC3, issue #224): the merge ALREADY landed on the published
+/// ref (the run's own p7 landed it, and the published ref moved past the base
+/// the verdict was recorded against) while the delivery branch has NO worktree
+/// in the integration clone — exactly the measured shape, where a lane
+/// retirement had removed the checkout. Re-entry detects the landing from the
+/// published ref and the commit object alone (the delivered file is readable
+/// from the landed commit; nothing needs the delivery branch's worktree) and
+/// records success instead of attempting a reconciliation that would rewrite
+/// the branch. Nothing is rewritten and nothing is published a second time.
+#[test]
+fn p7_reentry_certifies_an_already_landed_delivery_without_a_feature_branch_worktree() {
+    let (scenario, feature, base) = cycle2_reviewed_merge_routed("squash", false, "pull_request");
+    let origin = scenario.origin();
+    let origin_git = Git::new(&origin);
+    let published_before = origin_git.head("staging");
+    assert_eq!(published_before, base, "the fixture starts unpublished");
+    let checkout = Git::new(&scenario.repos.checkout);
+    checkout.run(&["push", "origin", "issue-123:refs/heads/issue-123"]);
+    std::fs::write(
+        scenario.sandbox.path("forge-pr-head.txt"),
+        format!("{feature}\n"),
+    )
+    .expect("pr head file");
+    write_fixture_forge(&scenario);
+
+    // The run's p7 lands and publishes the certified delivery.
+    let first = scenario.apply_ok(15, "m1", Some(&feature), Some(&base));
+    assert_eq!(first.get("mode").and_then(Val::as_str), Some("landed"));
+    let landed_head = origin_git.head("staging");
+    assert_ne!(landed_head, published_before);
+    assert_eq!(
+        checkout.head("issue-123"),
+        feature,
+        "the delivery branch is intact"
+    );
+
+    // The lane's checkout is retired (a lane retirement removes it): the
+    // delivery branch keeps its ref, its WORKTREE is gone.
+    let lane = scenario.repos.worktrees_root.join("issues-123");
+    assert!(
+        lane.is_dir(),
+        "the lane worktree exists after the first drive"
+    );
+    Git::new(&scenario.repos.checkout).run(&["worktree", "remove", lane.to_str().unwrap()]);
+    assert!(!lane.exists(), "the lane worktree was removed");
+    assert!(
+        !checkout
+            .run(&["worktree", "list", "--porcelain"])
+            .contains("issues-123"),
+        "no worktree of the delivery branch is registered any more"
+    );
+
+    // Re-entry: the SAME step re-runs against the moved published ref. The
+    // landing is proven from the published ref and the commit object, so no
+    // feature-branch worktree is needed and nothing is rewritten.
+    let again = scenario.apply_ok(16, "m1", Some(&feature), Some(&base));
+    assert_eq!(
+        again.get("mode").and_then(Val::as_str),
+        Some("already-landed"),
+        "re-entry records the landing instead of reconciling: {}",
+        canter::canonical::canonical_text(&again)
+    );
+    assert_eq!(again.get("landed").and_then(Val::as_bool), Some(true));
+    assert_eq!(
+        again.get("landed_head").and_then(Val::as_str),
+        Some(landed_head.as_str())
+    );
+    // The delivered files are readable from the landed commit on the PUBLISHED
+    // ref — the fact the check uses — and the published ref did not move.
+    assert_eq!(
+        origin_git.run(&["show", &format!("{landed_head}:lane.txt")]),
+        "lane change\n"
+    );
+    assert_eq!(
+        origin_git.head("staging"),
+        landed_head,
+        "nothing was published again"
+    );
+    assert_eq!(
+        checkout.head("issue-123"),
+        feature,
+        "the delivery branch was never rewritten"
+    );
+    assert_eq!(checkout.head("staging"), landed_head);
+    assert!(
+        !checkout
+            .run(&["worktree", "list", "--porcelain"])
+            .contains("issues-123"),
+        "no worktree was invented for the delivery branch"
+    );
+}
+
 /// Fixture hook (issue #219): the bare "remote" applies a repository rule to
 /// its integration ref, so a direct push is REJECTED exactly as a
 /// pull-request-only ruleset rejects it. Reads (`ls-remote`) still work, so
@@ -1953,6 +2191,80 @@ fn write_forge_without_pull_request(scenario: &Scenario) {
         "fakebin/gh",
         "#!/bin/sh\ncase \"$1\" in\n  run)\n    case \"$2\" in\n      list) printf '[{\"databaseId\":4242,\"workflowName\":\"ci\",\"status\":\"completed\",\"conclusion\":\"success\"}]'; exit 0 ;;\n    esac ;;\n  pr)\n    case \"$2\" in\n      list) printf '[]'; exit 0 ;;\n    esac ;;\nesac\nexit 1\n",
     );
+    scenario.sandbox.chmod_x("fakebin/gh");
+}
+
+/// Fixture forge (issue #224) whose squash landing happens ON THE REMOTE
+/// ALONE: the landing commit is created in the bare remote's own object store
+/// (`--git-dir`) and the remote ref is moved there, so the integration
+/// checkout has never seen the landed head — exactly the forge-side merge the
+/// measured #224 drive read too early (`fatal: bad object <landed-sha>`). The
+/// step can read it only after fetching it. Everything else is the same as
+/// [`write_fixture_forge`]: the merge is refused unless
+/// `--match-head-commit` names the head recorded in
+/// `<sandbox>/forge-pr-head.txt`, and every call's argv is appended to
+/// `<sandbox>/forge-argv.txt`.
+///
+/// With `drop_object` the forge then deletes the landing's own loose object
+/// from the remote as well: the published ref names a commit neither the
+/// remote nor the checkout can serve, so no fetch can bring it in.
+fn write_remote_only_forge(scenario: &Scenario, drop_object: bool) {
+    let origin = scenario.origin().display().to_string();
+    let head_file = scenario
+        .sandbox
+        .path("forge-pr-head.txt")
+        .display()
+        .to_string();
+    let record = scenario
+        .sandbox
+        .path("forge-argv.txt")
+        .display()
+        .to_string();
+    let drop = if drop_object {
+        format!(
+            "rm -f '{origin}/objects/'\"$(printf '%s' \"$landing\" | cut -c1-2)\"/\"$(printf '%s' \"$landing\" | cut -c3-)\"\n\\\n         "
+        )
+    } else {
+        String::new()
+    };
+    let script = format!(
+        "#!/bin/sh\n\
+         printf '%s\\n' \"$*\" >> '{record}'\n\
+         case \"$1\" in\n\
+         run)\n\
+         case \"$2\" in\n\
+         list)\n\
+         printf '%s' '[{{\"databaseId\":4242,\"workflowName\":\"ci\",\"status\":\"completed\",\"conclusion\":\"success\"}}]'\n\
+         exit 0 ;;\n\
+         esac ;;\n\
+         pr)\n\
+         case \"$2\" in\n\
+         list)\n\
+         printf '[{{\"number\": 224, \"headRefOid\": \"%s\"}}]' \"$(cat '{head_file}')\"\n\
+         exit 0 ;;\n\
+         merge)\n\
+         previous=''\n\
+         match=''\n\
+         for arg in \"$@\"; do\n\
+         if [ \"$previous\" = '--match-head-commit' ]; then match=\"$arg\"; fi\n\
+         previous=\"$arg\"\n\
+         done\n\
+         expected=$(cat '{head_file}')\n\
+         if [ \"$match\" != \"$expected\" ]; then\n\
+         printf 'the forge refuses a merge that does not match the reviewed head\\n' >&2\n\
+         exit 1\n\
+         fi\n\
+         published=$(git --git-dir='{origin}' rev-parse --verify refs/heads/staging)\n\
+         tree=$(git --git-dir='{origin}' rev-parse --verify 'issue-123^{{tree}}')\n\
+         landing=$(git --git-dir='{origin}' -c user.name=forge -c user.email=forge@example.invalid commit-tree \"$tree\" -p \"$published\" -m 'squash merge the reviewed delivery (fixture forge, remote only)')\n\
+         git --git-dir='{origin}' update-ref refs/heads/staging \"$landing\" || exit 1\n\
+         {drop}printf 'Merged pull request #224 (squash)\\n'\n\
+         exit 0 ;;\n\
+         esac ;;\n\
+         esac\n\
+         exit 1\n"
+    );
+    scenario.sandbox.write("fakebin/gh", &script);
     scenario.sandbox.chmod_x("fakebin/gh");
 }
 

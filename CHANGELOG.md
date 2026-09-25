@@ -6,6 +6,32 @@ release process activates (docs/RELEASING.md), then semver applies.
 
 ## [Unreleased]
 
+### Fixed (issue #224 — the publish route's post-merge bookkeeping, and a lane retire that removed a live run's lane)
+
+- The `pull_request` publish route FETCHES the landed head into the integration
+  checkout — verified against the published read — BEFORE anything reads it:
+  the forge's landing exists on the remote alone, and reading the commit it
+  had just landed first is the measured bare `adapter.exit`/128 (`fatal: bad
+  object <landed-sha>`). A landed head the checkout still cannot read after
+  that fetch is the step's OWN typed static condition `effect.merge.static`,
+  which parks its frontier with the bounded retries UNSPENT — the measured
+  drive spent two attempts of `p7`, and two of `p6`, on causes identical
+  between attempts.
+- A delivery whose reviewed content ALREADY IS on the published ref is
+  certified as landed from the published ref and the commit objects alone
+  (`mode:"already-landed"` on re-entry), WITHOUT requiring the delivery
+  branch's worktree — a lane retirement may legitimately have removed it, and
+  the old reconciliation refused `effect.merge.failed` for a delivery that had
+  already landed.
+- `run retire-lane` refuses typed BEFORE any claim when another NON-TERMINAL
+  run of the same repository issue exists: one issue has ONE lane, so a live
+  sibling still needs exactly the refs the retire would remove (the measured
+  drive removed a DONE run's checkout and branch while a live same-issue run
+  was mid-flight). A Herdr-side lane-retire refusal
+  (`refusal.stale.generation`) is recorded as the residue half's OWN typed
+  outcome and the registered checkout and the local lane branch are left in
+  place — a reported removal never coexists with a failed workspace retire.
+
 ### Fixed (issue #224 — the cleanup lane wait closes only on a CONFIRMED settled turn)
 
 - The `p8` lane wait's settled turn is the COLLECTION's confirmed stop (issue

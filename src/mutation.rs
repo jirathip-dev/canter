@@ -345,6 +345,19 @@ pub mod code {
     /// resolve — never a terminal `effect.merge.failed` and never a silent
     /// consumption of unreviewed content.
     pub const MERGE_BASE_MOVED: &str = "effect.merge.base_moved";
+    /// The merge step's post-merge bookkeeping hit a STATIC MECHANICAL
+    /// condition (issue #224): the landed integration head is not readable
+    /// from the integration checkout even after the fetch that brings it in
+    /// (a missing object), or the delivery branch has no worktree in that
+    /// checkout, so its certified content cannot be refreshed there (a missing
+    /// checkout). Neither cause changes by re-running the SAME step — nothing
+    /// fetches the object by itself and no checkout reappears — so it is this
+    /// step's OWN typed condition and supervision parks the frontier on it
+    /// with the bounded retries UNSPENT, exactly like the #263 base move: the
+    /// measured #224 drive spent two attempts of p7 (and two of p6) on causes
+    /// that were identical between attempts. The run escalates or is repaired
+    /// instead of burning the budget on a static mechanical cause.
+    pub const MERGE_STATIC: &str = "effect.merge.static";
     /// The remote REJECTED the publish (issue #219): the ref is protected by
     /// repository rules, so the update can never be accepted by a direct push
     /// however the local checkout is shaped. Its own code, so an operator
@@ -3458,6 +3471,32 @@ pub fn retire_run_lane(
         }
     };
     let generations = vec![run.to_string()];
+    // Issue #224 (AC6): a Herdr-side retire that REFUSED typed is never a
+    // success this control builds a deletion on. The lane's own workspace
+    // could not be retired (the measured drive: `refusal.stale.generation`,
+    // the pane substrate refusing a reused identity), so the registered
+    // checkout and the local lane branch are left exactly where they are and
+    // the refusal is surfaced as the residue half's OWN typed outcome. It
+    // never coexists with a reported-successful removal of the refs a live
+    // lane may depend on — the measured drive removed both while its workspace
+    // retire refused, and the live run's next step had no branch to read.
+    if let Some(code_text) = workspace.get("code").and_then(Val::as_str) {
+        let detail = workspace
+            .get("message")
+            .and_then(Val::as_str)
+            .unwrap_or("the lane workspace retire refused without a message");
+        return EffectOutcome {
+            status: "refused",
+            code: Some(code_text.to_string()),
+            message: Some(format!(
+                "the lane workspace of run {run} was not retired ({code_text}: {detail}); the \
+                 registered checkout {relative:?} and the local lane branch {branch:?} were NOT \
+                 removed — a lane whose own workspace could not be retired is not residue this \
+                 control may delete, and nothing is forced"
+            )),
+            result: null(),
+        };
+    }
     let residue = reclaim_lane_residue(&host, &generations, &branch, &relative, &lane);
     ok(object(vec![
         ("run", string(run)),
@@ -6554,6 +6593,66 @@ fn fetched_published_head(
     Ok(fetched)
 }
 
+/// The landed integration head FETCHED into the integration checkout and
+/// proven READABLE there before anything reads it (issue #224).
+///
+/// A forge landing happens on the REMOTE, so the commit object of the head the
+/// read-back names is not in the integration checkout's object store until it
+/// is fetched: the measured drive read it first and died on a bare
+/// `adapter.exit`/128 (`fatal: bad object <landed-sha>`) — the merge action
+/// and the verification of the merge action were not ordered against each
+/// other, and the retry spent its budget on the same missing object. The fetch
+/// is the same verified one the #178 reconciliation uses (the fetched head
+/// must agree with the published read); the landed COMMIT is then proven
+/// readable. A landed head the checkout still cannot read afterwards is this
+/// step's own typed static condition — no re-dispatch fetches it any harder —
+/// never the bare adapter exit the first read would produce.
+fn fetched_landed_head(ctx: &EffectContext<'_>, landed: &str) -> Result<(), EffectOutcome> {
+    // The fetch that brings the landed head in. It is the same verified fetch
+    // the #178 reconciliation uses; a failure of ANY class that leaves the
+    // landed head unreadable is re-stated as this step's own static condition
+    // (naming the head) instead of a ref-shaped message an operator has to map
+    // back to the landing.
+    if let Err(outcome) = fetched_published_head(ctx, landed) {
+        if outcome.code.as_deref() != Some(code::MERGE_FAILED) {
+            return Err(outcome);
+        }
+        let detail = outcome
+            .message
+            .as_deref()
+            .unwrap_or("the fetch failed without a message");
+        return Err(failed(
+            code::MERGE_STATIC,
+            format!(
+                "the landed integration head {landed} is not readable from the integration checkout {:?}: the fetch that brings it in from origin did not deliver it ({detail})",
+                ctx.integration_repo.display()
+            ),
+        ));
+    }
+    let object = run_git(
+        ctx,
+        ctx.integration_repo,
+        &["rev-parse", "--verify", &format!("{landed}^{{commit}}")],
+    );
+    match object {
+        Ok(_) => Ok(()),
+        Err(outcome) if outcome.code.as_deref() != Some(code::EXIT) => Err(outcome),
+        Err(outcome) => {
+            let detail = outcome
+                .message
+                .as_deref()
+                .unwrap_or("the read failed without a message");
+            Err(failed(
+                code::MERGE_STATIC,
+                format!(
+                    "the landed integration head {landed} is not readable from the integration checkout {:?} after fetching it from origin: {detail}",
+                    ctx.integration_repo.display()
+                ),
+            ))
+        }
+    }
+}
+
 /// The NUL-delimited paths that differ between two tree-ish in the
 /// integration repo. The cleanup content proof's lossless-adapter rules
 /// (issue #132) apply verbatim: a replacement character, a truncated NUL
@@ -6724,9 +6823,9 @@ fn branch_worktree(ctx: &EffectContext<'_>, branch: &str) -> Result<PathBuf, Eff
     }
     let Some(path) = found else {
         return Err(failed(
-            code::MERGE_FAILED,
+            code::MERGE_STATIC,
             format!(
-                "feature branch {branch:?} has no worktree in the integration checkout; a reconciliation refuses to rewrite a branch it cannot check out"
+                "feature branch {branch:?} has no worktree in the integration checkout; a reconciliation refuses to rewrite a branch it cannot check out (a delivery whose reviewed content already landed on the published ref is certified without a worktree — this one is not there yet, so no re-dispatch can refresh it)"
             ),
         ));
     };
@@ -6874,6 +6973,23 @@ fn reconcile_moved_published(
                 "the certified head {certified} does not descend from the reviewed base {reviewed_base}; refusing to reconcile content that was never reviewed against it"
             ),
         ));
+    }
+    // Issue #224 (AC2/AC3): a delivery whose reviewed content ALREADY IS on
+    // the published ref has landed. A squash landing rewrites the delivered
+    // commits, so ancestry can never prove it, and the reconciliation below
+    // would want to REWRITE a branch whose worktree a lane retirement may
+    // legitimately have removed. The landing is therefore proven from the
+    // published ref and the commit objects alone — every path the review
+    // covered (`reviewed_base..certified`) carries the certified head's exact
+    // content on `target` — which needs neither the delivery branch's ref nor
+    // its worktree, and re-entry records success instead of attempting a
+    // reconciliation. A delivery whose content is NOT (fully) on the target
+    // still takes the reconciliation below, unchanged.
+    if certified_content_differences(ctx, reviewed_base, certified, target)?
+        .1
+        .is_empty()
+    {
+        return Ok(());
     }
     let branch_head = run_git(
         ctx,
@@ -7613,6 +7729,15 @@ fn publish_via_pull_request(
     }
     // The landed content, proven by content — the same fail-closed fact the
     // push landing, `post_merge_verify` and the cleanup proof use.
+    //
+    // Issue #224 (AC1): the landed head is FETCHED into the integration
+    // checkout before any read of it. The forge landed it on the remote, so
+    // the commit object is not in this checkout's object store yet; reading it
+    // first is guaranteed to fail (`fatal: bad object`, a bare adapter exit)
+    // and no re-dispatch repairs that by itself.
+    if let Err(outcome) = fetched_landed_head(ctx, &published_after) {
+        return outcome;
+    }
     let (landed_paths, landed_differing) =
         match certified_content_differences(ctx, reviewed_base, certified_head, &published_after) {
             Ok(pair) => pair,
