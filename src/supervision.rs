@@ -1190,6 +1190,17 @@ pub fn dispatch_intent(
                         // whole budget on a base move the run cannot resolve
                         // by itself.
                         && code != crate::mutation::code::MERGE_BASE_MOVED
+                        // Issue #224: a post-merge bookkeeping read that hit a
+                        // STATIC MECHANICAL condition (the landed head is not
+                        // readable from the integration checkout after its
+                        // fetch, or the delivery branch has no worktree there
+                        // to refresh) is the same park: no re-dispatch fetches
+                        // the object harder and no checkout reappears, so the
+                        // driver parks the frontier typed with the bounded
+                        // retries UNSPENT instead of burning the budget on a
+                        // cause that is identical between attempts (the
+                        // measured #224 drive spent two attempts on each).
+                        && code != crate::mutation::code::MERGE_STATIC
                         && step_retries.len() < crate::state::RUN_RETRY_MAX as usize)) => {}
         Some(_) => return None,
     }
@@ -4258,6 +4269,106 @@ mod tests {
             dispatch_intent(&row, &retryable).map(|intent| intent.step_id),
             Some("p8".to_string()),
             "a retryable diagnosis of the same cleanup frontier still retries"
+        );
+    }
+
+    /// Issue #224 (AC4): a MERGE frontier whose recorded attempt is the step's
+    /// own STATIC MECHANICAL condition — the landed integration head is not
+    /// readable from the integration checkout after the fetch that brings it
+    /// in, or the delivery branch has no worktree there so its certified
+    /// content cannot be refreshed (`effect.merge.static`) — is not retryable.
+    /// Nothing the driver does fetches the object harder or brings a checkout
+    /// back, so a re-dispatch refuses identically: the frontier parks typed
+    /// (needs-attention, the recorded code as the detail) with the bounded
+    /// retries UNSPENT, exactly like the #263 base move — never a silent park
+    /// and never a burn of the budget on a cause identical between attempts
+    /// (the measured #224 drive spent two attempts of p7, and two of p6, on
+    /// exactly this shape). The same frontier with a retryable diagnosis still
+    /// takes its bounded retry.
+    #[test]
+    fn a_static_mechanical_merge_cause_parks_the_frontier_without_burning_a_bounded_retry() {
+        use crate::state::{EvidenceRow, QueueItemRef};
+        let state = temp_state("merge-static-park");
+        let digest = "c".repeat(64);
+        let run = "run-22468ac1de7b21aa";
+        let policy = Policy {
+            check_interval_secs: 10,
+            progress_timeout_secs: 60,
+        };
+        let at = "2026-09-25T09:57:57Z";
+        let now_unix = time::unix_from_rfc3339(at).expect("instant");
+        state
+            .arm_supervision_for_test(run, "armed", &digest, "merge", policy, at)
+            .expect("arm");
+        let row = state.supervision_by_id(run).expect("read").expect("row");
+        let steps = [
+            ("p5", "collect_outcome"),
+            ("p6", "review_evidence"),
+            ("p7", "merge"),
+            ("p8", "cleanup"),
+        ];
+        let scene = |code: &str| {
+            let pins = run_row(run);
+            let mut evidence = evidence_for(
+                pins.clone(),
+                Some(&digest),
+                &steps,
+                &[
+                    ("p5", "succeeded", ""),
+                    ("p6", "succeeded", ""),
+                    ("p7", "failed", code),
+                ],
+                at,
+            );
+            // The frontier is the run's OWN committed tail step of a run whose
+            // reviewed delivery is verified: the `merge` cap, an admitted
+            // membership item and the newest recorded passing evidence.
+            evidence.run.caps = "[\"merge\",\"cleanup\"]".to_string();
+            evidence.item = Some(QueueItemRef {
+                submission_id: "qs_0123456789abcdef".to_string(),
+                ordinal: 0,
+                work_item: "wi_4aabf3ad5bea87b0".to_string(),
+                issue_number: 224,
+                status: "admitted".to_string(),
+            });
+            evidence.newest_evidence = Some(EvidenceRow {
+                evidence_id: "ev_22468ac1de7b21aa".to_string(),
+                instance_id: run.to_string(),
+                repository: "example-org/widgets".to_string(),
+                feature_head: "1".repeat(40),
+                integration_base: "2".repeat(40),
+                workflow_hash: pins.workflow_hash.clone(),
+                policy_hash: pins.policy_hash.clone(),
+                verdict: "pass".to_string(),
+                reviewer: "reviewer-1".to_string(),
+                checks: "[{\"name\":\"hosted-ci\",\"status\":\"passed\"}]".to_string(),
+                created_at: at.to_string(),
+            });
+            evidence
+        };
+        let stat = scene(crate::mutation::code::MERGE_STATIC);
+        assert!(
+            driver_dispatchable_kind(&stat, "p7", "merge"),
+            "the fixture frontier is a genuinely dispatchable committed tail step"
+        );
+        assert!(
+            dispatch_intent(&row, &stat).is_none(),
+            "a static mechanical cause is never re-dispatched into the retry budget"
+        );
+        let verdict = classify(&stat, &digest, &policy, now_unix);
+        assert_eq!(verdict.class, "needs-attention");
+        assert_eq!(verdict.reason, codes::STEP_DIAGNOSED);
+        assert_eq!(verdict.detail, crate::mutation::code::MERGE_STATIC);
+        assert!(!verdict.eligible, "the parked frontier is never eligible");
+        assert!(
+            stat.retries.is_empty(),
+            "the bounded retries stay unspent on a static mechanical cause"
+        );
+        let retryable = scene("refusal.worktree.exists");
+        assert_eq!(
+            dispatch_intent(&row, &retryable).map(|intent| intent.step_id),
+            Some("p7".to_string()),
+            "a retryable diagnosis of the same merge frontier still retries"
         );
     }
 

@@ -3321,6 +3321,49 @@ impl State {
         })
     }
 
+    /// Issue #224: every OTHER run of the same (repository, issue) that is
+    /// still NON-TERMINAL — the live siblings a lane retirement must respect.
+    ///
+    /// One issue has ONE physical lane: the branch and the checkout are
+    /// derived from the issue number (`crate::lane::lane_branch` /
+    /// `lane_checkout`), so a run that is still live for this issue may hold —
+    /// or still need — exactly the refs a terminal sibling's residue covers.
+    /// The measured #224 drive retired a DONE run's lane while a live run of
+    /// the same issue was mid-flight, and the live run's own publish then had
+    /// no branch and no worktree to refresh.
+    ///
+    /// The non-terminal set is the SAME closed set the ownership snapshot
+    /// admission reads (`new`/`running`/`paused`/`human_queue`/`blocked`): a
+    /// paused or blocked run is still live, and only `done`/`invalidated` are
+    /// terminal. Ordered by run id, so one durable state renders one message.
+    pub fn live_lane_siblings(
+        &self,
+        repository: &str,
+        issue_number: i64,
+        except: &str,
+    ) -> Result<Vec<String>, StateError> {
+        let conn = self.lock("live_lane_siblings")?;
+        let mut statement = conn
+            .prepare(
+                "SELECT instance_id FROM instances
+                  WHERE repository = ?1 AND issue_number = ?2 AND instance_id != ?3
+                    AND status IN ('new', 'running', 'paused', 'human_queue', 'blocked')
+                  ORDER BY instance_id",
+            )
+            .map_err(|err| StateError::from_sqlite("live_lane_siblings: prepare", err))?;
+        let rows = statement
+            .query_map(params![repository, issue_number, except], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|err| StateError::from_sqlite("live_lane_siblings: query", err))?;
+        let mut siblings = Vec::new();
+        for row in rows {
+            siblings
+                .push(row.map_err(|err| StateError::from_sqlite("live_lane_siblings: row", err))?);
+        }
+        Ok(siblings)
+    }
+
     /// The step id of a step-dispatch claim (`method:"apply"`) still in
     /// flight for one run, or `None` when nothing is in flight. An
     /// unreadable claimed line is treated as unknown in-flight work

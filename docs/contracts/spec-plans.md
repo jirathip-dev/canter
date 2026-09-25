@@ -93,9 +93,19 @@ Normative rules:
   a recorded fact about the PUBLISHED ref, so the run parks on it with the
   bounded retries UNSPENT instead of spending the whole budget on a condition
   it can never resolve by itself, and the delivery must be refreshed under a
-  fresh review whose new verdict names the refreshed head. A missing or
-  uncontained lane worktree still refuses with diagnostics and never leaves a
-  partial rewrite.
+  fresh review whose new verdict names the refreshed head. A delivery whose
+  reviewed content ALREADY IS on the published ref has landed, and that is
+  proven from the published ref and the commit objects alone — every path the
+  review covered carries the certified head's exact content there — so
+  re-entry records the landing (`mode:"already-landed"`) WITHOUT requiring the
+  delivery branch's worktree, which a lane retirement may legitimately have
+  removed (issue #224). A lane worktree that is missing, or a landed head the
+  integration checkout cannot read even after the fetch that brings it in, is
+  this step's OWN typed static condition `effect.merge.static`: no re-dispatch
+  changes either cause, so the frontier parks on it with the bounded retries
+  UNSPENT instead of spending the budget on a cause identical between
+  attempts. An uncontained lane worktree still refuses with diagnostics and
+  never leaves a partial rewrite.
   The LANDING honours the declared policy: `squash` writes ONE new integration
   commit whose tree is the delivered tree and whose parent is the published
   head (the delivered commits are rewritten, so a squash landing is never an
@@ -142,8 +152,14 @@ Normative rules:
   the integration ref, and whose head names the certified head — squash-merged
   by the authenticated forge CLI with the certified head matched at merge time
   (`gh pr merge --squash --match-head-commit <certified head>`). The published
-  ref is then read back and the landed content is proven by the SAME
-  fail-closed content fact the landing and `post_merge_verify` use; the
+  ref is then read back, and the landed head is FETCHED into the integration
+  checkout — verified against that read — BEFORE anything reads it: the
+  forge's landing exists on the remote alone, so reading the commit it had
+  just landed first is the measured `adapter.exit`/128 (`fatal: bad object
+  <landed-sha>`, issue #224), and a landed head that is still unreadable
+  afterwards is the typed static condition above. The landed content is then
+  proven by the SAME fail-closed content fact the landing and
+  `post_merge_verify` use; the
   integration checkout is fast-forwarded onto the published head (fetch, verify
   the fetched head against the published read, `merge --ff-only`), so no later
   step of the run reads a stale local view. Nothing local moves before the

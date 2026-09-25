@@ -3587,6 +3587,378 @@ fn the_operators_lane_retirement_retires_a_terminal_runs_lane_and_refuses_a_live
     );
 }
 
+/// Issue #224 (AC5): a terminal run's lane retirement is scoped to that run's
+/// OWN residue. One issue has ONE lane — the branch and the checkout are
+/// derived from the issue number — so a NON-TERMINAL run of the same issue
+/// still holds, or still needs, exactly the refs this retire would remove: the
+/// measured drive removed a DONE run's `issues-<n>` checkout and its
+/// `issue-<n>` branch while a live run of the same issue was mid-flight, and
+/// that run's own publish then had no branch and no worktree to refresh. The
+/// control refuses TYPED, names the live sibling and touches nothing — and
+/// once the sibling is terminal too, the SAME retire reclaims the residue, so
+/// the guard is a scope and never a blanket refusal.
+#[test]
+fn a_terminal_runs_lane_retirement_never_removes_the_lane_a_live_sibling_needs() {
+    const GRANT: &str = "gr_00000000000000b5";
+    let fixture = DaemonFixture::new("retire-sibling");
+    let integration = fixture.dir.join("integration");
+    init_repo(&integration);
+    let fakebin_hermes = write_fake_hermes(&fixture.dir);
+    let fakebin_herdr = write_fake_herdr(&fixture.dir);
+    let host_path = std::env::var("PATH").unwrap_or_default();
+    let daemon = fixture.spawn_with_path(&format!(
+        "{}:{}:{host_path}",
+        fakebin_herdr.display(),
+        fakebin_hermes.display()
+    ));
+    wait_ready(&fixture);
+
+    // The FIRST generation of this issue: grant, submission, lane worktree,
+    // lane bind. The spine stops at p2 (this witness never prompts).
+    let (bound, digest) = {
+        let state = fixture.seed();
+        seed_grant(&state, GRANT, 5);
+        let mut steps = harness_pane_steps(HARNESS);
+        steps.truncate(2);
+        let request = qp::QueueRequest {
+            steps,
+            role_config: harness_binding_doc(),
+            ..observation_request(vec![selected("#5", REV_A)])
+        };
+        render_bound(&state, &request)
+    };
+    let submitted = rpc_ok(
+        &fixture.socket,
+        &fresh_id(1),
+        "queue.submit",
+        Some(harness_submit_params(
+            &idem_key("sibling-1"),
+            &bound,
+            &digest,
+            GRANT,
+        )),
+    );
+    let run = instance_of(&submitted, 5);
+    let lane = fixture.dir.join("worktrees/issues-5");
+    apply_step(
+        &fixture,
+        &integration,
+        &bound,
+        &run,
+        GRANT,
+        2,
+        "p1",
+        "sibling-lane-0001",
+    );
+    apply_step(
+        &fixture,
+        &integration,
+        &bound,
+        &run,
+        GRANT,
+        3,
+        "p2",
+        "sibling-bind-0001",
+    );
+    assert!(lane.is_dir(), "the first generation's lane checkout exists");
+    assert!(fixture.dir.join("herdr-state/pane").exists());
+    let lane_tip = git_output(&integration, &["rev-parse", "issue-5"])
+        .trim()
+        .to_string();
+
+    // The first generation ends and a SECOND generation of the SAME issue is
+    // admitted: it is live, and its own lane IS this issue's lane.
+    rpc_ok(
+        &fixture.socket,
+        &fresh_id(4),
+        "run.release",
+        Some(canter::run_control::release_params(
+            &idem_key("sibling-release-1"),
+            &run,
+            "the first generation can never progress",
+        )),
+    );
+    let sibling = {
+        let admitted = rpc_ok(
+            &fixture.socket,
+            &fresh_id(5),
+            "queue.submit",
+            Some(harness_submit_params(
+                &idem_key("sibling-2"),
+                &bound,
+                &digest,
+                GRANT,
+            )),
+        );
+        instance_of(&admitted, 5)
+    };
+    assert_ne!(sibling, run, "a fresh same-issue run was admitted");
+    let sibling_status = fixture
+        .seed()
+        .instance_by_id(&sibling)
+        .expect("read the sibling")
+        .expect("the sibling exists")
+        .status;
+    assert_eq!(
+        sibling_status, "new",
+        "the sibling run is non-terminal before it is driven"
+    );
+
+    // The retire of the TERMINAL run refuses TYPED, names the live sibling and
+    // touches nothing at all — no claim, no git call, no workspace close.
+    let refused = rpc(
+        &fixture.socket,
+        &fresh_id(6),
+        "run.retire-lane",
+        Some(canter::run_control::lane_retirement_params(
+            &idem_key("sibling-retire-1"),
+            &run,
+            "the terminal generation's lane looks stale",
+            None,
+        )),
+    );
+    assert_eq!(
+        refused.get("ok").and_then(Val::as_bool),
+        Some(false),
+        "the retirement is refused: {}",
+        canter::canonical::canonical_text(&refused)
+    );
+    let error = refused.get("error").cloned().unwrap_or_else(null);
+    let code = error
+        .get("code")
+        .and_then(Val::as_str)
+        .unwrap_or("missing.code");
+    let message = error
+        .get("message")
+        .and_then(Val::as_str)
+        .unwrap_or("no message");
+    assert_eq!(code, "refusal.lane.live_run", "{message}");
+    assert!(
+        message.contains(&sibling),
+        "the refusal names the live sibling: {message}"
+    );
+    assert!(
+        message.contains("issue-5") && message.contains("issues-5"),
+        "the refusal names the lane it refuses to remove: {message}"
+    );
+    assert!(lane.is_dir(), "the live sibling's checkout is untouched");
+    assert!(
+        git_output(&integration, &["worktree", "list", "--porcelain"]).contains("issues-5"),
+        "the live sibling's registration is untouched"
+    );
+    assert_eq!(
+        git_output(&integration, &["rev-parse", "issue-5"]).trim(),
+        lane_tip,
+        "the live sibling's branch keeps its tip"
+    );
+    assert!(
+        fixture.dir.join("herdr-state/pane").exists(),
+        "the live sibling's workspace is untouched"
+    );
+
+    // Control: with the sibling terminal too, the SAME retire reclaims the
+    // residue — the guard is a scope, never a blanket refusal.
+    rpc_ok(
+        &fixture.socket,
+        &fresh_id(7),
+        "run.release",
+        Some(canter::run_control::release_params(
+            &idem_key("sibling-release-2"),
+            &sibling,
+            "the sibling generation is terminal too",
+        )),
+    );
+    let retired = rpc_ok(
+        &fixture.socket,
+        &fresh_id(8),
+        "run.retire-lane",
+        Some(canter::run_control::lane_retirement_params(
+            &idem_key("sibling-retire-2"),
+            &run,
+            "the terminal run's lane is stale",
+            None,
+        )),
+    );
+    println!(
+        "LANE-RETIREMENT-AFTER-SIBLING {}",
+        canter::canonical::canonical_text(&retired)
+    );
+    let residue = retired
+        .get("retirement")
+        .and_then(|retirement| retirement.get("lane_residue"))
+        .cloned()
+        .unwrap_or_else(null);
+    assert_eq!(
+        residue.get("branch").and_then(Val::as_str),
+        Some("issue-5"),
+        "the retired lane is the run's own: {}",
+        canter::canonical::canonical_text(&retired)
+    );
+    assert!(
+        !lane.exists(),
+        "the residue is reclaimed once no live run needs it: {}",
+        canter::canonical::canonical_text(&retired)
+    );
+    assert!(
+        git_output(&integration, &["branch", "--list", "issue-5"])
+            .trim()
+            .is_empty(),
+        "the recoverable lane branch is gone"
+    );
+
+    shutdown(daemon);
+}
+
+/// Issue #224 (AC6): a Herdr-side lane-retire failure is a TYPED outcome of
+/// the retirement and never coexists with a reported-successful removal of the
+/// lane's branch and checkout. The measured drive reported
+/// `refusal.stale.generation` for the workspace half WHILE reporting
+/// `checkout_residue: {"removed": true}` and `branch_residue: {...,
+/// "removed": true}` — and the live run that needed them was left with no
+/// branch and no worktree. Here the pane's own lane binding reports a
+/// SUPERSEDED generation (the substrate's reused-identity refusal), so the
+/// retirement records that refusal as the residue half's own typed outcome and
+/// removes nothing.
+#[test]
+fn a_herdr_side_retire_refusal_never_coexists_with_a_removed_lane_residue() {
+    const GRANT: &str = "gr_00000000000000c5";
+    let fixture = DaemonFixture::new("retire-gen224");
+    let integration = fixture.dir.join("integration");
+    init_repo(&integration);
+    let fakebin_hermes = write_fake_hermes(&fixture.dir);
+    let fakebin_herdr = write_fake_herdr(&fixture.dir);
+    let host_path = std::env::var("PATH").unwrap_or_default();
+    let daemon = fixture.spawn_with_path(&format!(
+        "{}:{}:{host_path}",
+        fakebin_herdr.display(),
+        fakebin_hermes.display()
+    ));
+    wait_ready(&fixture);
+
+    let (bound, digest) = {
+        let state = fixture.seed();
+        seed_grant(&state, GRANT, 5);
+        let mut steps = harness_pane_steps(HARNESS);
+        steps.truncate(2);
+        let request = qp::QueueRequest {
+            steps,
+            role_config: harness_binding_doc(),
+            ..observation_request(vec![selected("#5", REV_A)])
+        };
+        render_bound(&state, &request)
+    };
+    let submitted = rpc_ok(
+        &fixture.socket,
+        &fresh_id(1),
+        "queue.submit",
+        Some(harness_submit_params(
+            &idem_key("stale-gen-1"),
+            &bound,
+            &digest,
+            GRANT,
+        )),
+    );
+    let run = instance_of(&submitted, 5);
+    let lane = fixture.dir.join("worktrees/issues-5");
+    apply_step(
+        &fixture,
+        &integration,
+        &bound,
+        &run,
+        GRANT,
+        2,
+        "p1",
+        "stale-gen-lane-0001",
+    );
+    apply_step(
+        &fixture,
+        &integration,
+        &bound,
+        &run,
+        GRANT,
+        3,
+        "p2",
+        "stale-gen-bind-0001",
+    );
+    assert!(lane.is_dir(), "the lane checkout exists");
+    let lane_tip = git_output(&integration, &["rev-parse", "issue-5"])
+        .trim()
+        .to_string();
+
+    // The pane's own lane binding is a SUPERSEDED generation (the substrate's
+    // reused-identity shape the measured drive hit): the workspace retire
+    // refuses typed and the residue must be left exactly where it is.
+    std::fs::write(fixture.dir.join("herdr-state/generation"), "2").expect("generation token");
+    rpc_ok(
+        &fixture.socket,
+        &fresh_id(4),
+        "run.release",
+        Some(canter::run_control::release_params(
+            &idem_key("stale-gen-release"),
+            &run,
+            "the generation is terminal",
+        )),
+    );
+
+    let retired = rpc_ok(
+        &fixture.socket,
+        &fresh_id(5),
+        "run.retire-lane",
+        Some(canter::run_control::lane_retirement_params(
+            &idem_key("stale-gen-retire"),
+            &run,
+            "the terminal generation's lane is stale",
+            None,
+        )),
+    );
+    println!(
+        "LANE-RETIREMENT-STALE-GENERATION {}",
+        canter::canonical::canonical_text(&retired)
+    );
+    let residue = retired
+        .get("retirement")
+        .and_then(|retirement| retirement.get("lane_residue"))
+        .cloned()
+        .unwrap_or_else(null);
+    assert_eq!(
+        residue.get("status").and_then(Val::as_str),
+        Some("refused"),
+        "the Herdr-side refusal is the residue half's own typed outcome: {}",
+        canter::canonical::canonical_text(&retired)
+    );
+    assert_eq!(
+        residue.get("code").and_then(Val::as_str),
+        Some("refusal.stale.generation"),
+        "the substrate's own code is surfaced: {}",
+        canter::canonical::canonical_text(&retired)
+    );
+    let message = residue.get("message").and_then(Val::as_str).unwrap_or("");
+    assert!(
+        message.contains("were NOT removed")
+            && message.contains("issue-5")
+            && message.contains("issues-5"),
+        "the typed outcome says what was left alone: {message}"
+    );
+    // Nothing was removed and nothing was closed: the checkout, its
+    // registration, the branch and the workspace are exactly where they were.
+    assert!(lane.is_dir(), "the registered checkout was not removed");
+    assert!(
+        git_output(&integration, &["worktree", "list", "--porcelain"]).contains("issues-5"),
+        "the registration was not removed"
+    );
+    assert_eq!(
+        git_output(&integration, &["rev-parse", "issue-5"]).trim(),
+        lane_tip,
+        "the lane branch was not deleted"
+    );
+    assert!(
+        fixture.dir.join("herdr-state/pane").exists(),
+        "the workspace was not closed"
+    );
+
+    shutdown(daemon);
+}
+
 // ---------------------------------------------------------------------------
 // Issue #92 F2: the role-bound session lifecycle on the run's own path
 // ---------------------------------------------------------------------------

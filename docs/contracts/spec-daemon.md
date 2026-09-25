@@ -581,7 +581,21 @@ clears a repository/fleet-level hold or bypasses a gate.
   The control refuses typed BEFORE any claim or effect when the run is NOT
   terminal (`refusal.lane.live_run`, naming the run and its status): a live
   lane still holds its issue's unique ownership and is never in the retired
-  set. An unknown run is `state.not_found`; a terminal run that holds nothing
+  set. The SAME typed refusal comes BEFORE any claim or effect when ANOTHER
+  non-terminal run of the same repository issue exists (issue #224): one issue
+  has ONE lane — `issue-<N>` at `issues-<N>` is derived from the issue number —
+  so a live sibling run holds, or still needs, exactly the refs this retire
+  would remove, and the refusal names every such run (the measured #224 drive
+  removed a DONE run's lane while a live same-issue run was mid-flight, and
+  that run's own publish then had no branch and no worktree to refresh). When
+  the run's own lane WORKSPACE could not be retired because the substrate
+  refused typed (e.g. `refusal.stale.generation` for a superseded
+  generation), the git residue is NOT touched either: the residue half records
+  that refusal as its own typed outcome (`status:"refused"` plus the
+  substrate's code and message) and the registered checkout and the local lane
+  branch are left exactly where they are — a reported removal never coexists
+  with a failed workspace retire (issue #224). An unknown run is
+  `state.not_found`; a terminal run that holds nothing
   left is an audited no-op that reports `ownership_rows_removed: 0`. The same
   idempotency key replays the recorded response. Nothing is spawned, killed,
   resumed, retried, released or dispatched, no other run's lane, ownership or
@@ -765,11 +779,16 @@ clears a repository/fleet-level hold or bypasses a gate.
   presents the committed step's OWN params; the retry it spends is minted and
   consumed atomically through the apply path. The diagnoses a re-dispatch can
   never repair — `effect.worker_timeout`, `refusal.evidence.verdict_stale`,
-  `refusal.delivery.moved` / `refusal.delivery.unbound`, and the merge's own
+  `refusal.delivery.moved` / `refusal.delivery.unbound`, the merge's own
   base move `effect.merge.base_moved` (issue #263: the published ref moved
   past the base the delivery certified and cannot carry the certified content
   byte-identically — the refresh is withdrawn, so a re-dispatch refuses
-  identically) — stay parked with their bounded retries UNSPENT. An
+  identically), and the merge's static mechanical conditions
+  `effect.merge.static` (issue #224: the landed integration head is not
+  readable from the integration checkout even after the fetch that brings it
+  in, or the delivery branch has no worktree there to refresh — no
+  re-dispatch changes either) — stay parked with their bounded retries
+  UNSPENT. An
   authorization the run already HOLDS (a
   `run.retry` row, issue #241) is consumed by that very re-dispatch, exactly
   once, recorded under the dispatch's own journaled idempotency key: the
