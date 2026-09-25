@@ -34,16 +34,27 @@ struct Sandbox {
     root: PathBuf,
 }
 
+/// One process-wide sequence, so two sandboxes for the SAME scenario name can
+/// never share a root. The clock alone is not enough: this host's clock
+/// resolves in whole microseconds (six consecutive `SystemTime::now()` reads
+/// return one instant), so parallel test threads legitimately read the same
+/// tick and collided on one root — a `git init` in a root another test was
+/// initializing failed the whole target on `.git/config.lock` (`File exists`)
+/// instead of testing anything. The name is kept deliberately SHORT: the
+/// daemon's Unix socket lives under this root and macOS's `sun_path` is ~104
+/// bytes (the previous pid+nanos name sat within a few bytes of it).
+static SANDBOX_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl Sandbox {
     fn new(name: &str) -> Sandbox {
         let root = std::env::temp_dir().join(format!(
             "hf-mut8-{name}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+            SANDBOX_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
+        // A root a PREVIOUS run left behind under a recycled pid is never
+        // reused: this fixture always starts from a clean tree.
+        let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("sandbox root");
         Sandbox { root }
     }
