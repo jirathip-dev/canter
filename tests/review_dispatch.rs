@@ -752,7 +752,25 @@ row_of_id() {
   root=$(sed -n "s/^$1|[^|]*|[^|]*|\(.*\)$/\1/p" "$STATE/workspaces")
   printf '{"workspace_id":"%s","label":"%s","cwd":"%s","worktree":{"repo_root":"%s","checkout_path":"%s","is_linked_worktree":true,"repo_name":"widgets"}}' "$1" "$label" "$cwd" "$root" "$cwd"
 }
+# Issue #224 fixture control: a reviewer whose own turn ends AFTER it wrote the
+# verdict — the measured shape (the lane is still `working` when the verdict is
+# consumed). With the control marker present the lane reports `working` at that
+# instant, and the THIRD read of its own row after the verdict landed reports
+# the settled turn the worker produced on its own: the substrate's own read
+# order is the clock, so no witness here has to sleep or guess at one. Every
+# other fixture is untouched (no marker, no behaviour change).
+settle_read() {
+  [ -f "$STATE/settles-after-verdict" ] || return 0
+  [ -f "$STATE/$1.prompted" ] || return 0
+  [ -f "$HF_FAKE_HERDR_VERDICT" ] || return 0
+  n=$(cat "$STATE/$1.settle-reads" 2>/dev/null || printf 0)
+  n=$((n + 1))
+  printf '%s' "$n" > "$STATE/$1.settle-reads"
+  if [ "$n" -ge 3 ]; then printf 'done' > "$STATE/$1.state"; fi
+  return 0
+}
 agent_row() {
+  settle_read "$1"
   printf '{"name":"%s","pane_id":"%s","cwd":"%s","agent_status":"%s","state_change_seq":%s,"tokens":{"canter_lane":"%s","canter_generation":"%s"}}' \
     "$(cat "$STATE/$1.agent")" "$(cat "$STATE/$1.pane")" "$(cat "$STATE/$1.cwd")" \
     "$(cat "$STATE/$1.state")" "$(cat "$STATE/$1.seq")" \
@@ -868,8 +886,10 @@ case "$1 $2" in
     fi
     printf '%s' "$4" > "$STATE/$id.content"
     # A long-turn fixture (`long-turns` marker) keeps the agent working, so
-    # the reviewer's turn outlives one attempt's verdict wait.
-    if [ -f "$STATE/long-turns" ]; then
+    # the reviewer's turn outlives one attempt's verdict wait — and the #224
+    # control (`settles-after-verdict`) starts the same way, but settles on the
+    # substrate's own read order (see settle_read above).
+    if [ -f "$STATE/long-turns" ] || [ -f "$STATE/settles-after-verdict" ]; then
       printf 'working' > "$STATE/$id.state"
     else
       printf 'done' > "$STATE/$id.state"
@@ -893,7 +913,7 @@ case "$1 $2" in
     mv "$STATE/workspaces.tmp" "$STATE/workspaces" 2>/dev/null || true
     rm -f "$STATE/$id.pane" "$STATE/$id.cwd" "$STATE/$id.root" "$STATE/$id.state" \
       "$STATE/$id.seq" "$STATE/$id.agent" "$STATE/$id.lane" "$STATE/$id.generation" \
-      "$STATE/$id.content" "$STATE/$id.prompted" "$STATE/$id.head"
+      "$STATE/$id.content" "$STATE/$id.prompted" "$STATE/$id.head" "$STATE/$id.settle-reads"
     printf '{"result":{}}\n'
     ;;
   *)
@@ -972,6 +992,12 @@ impl LaneFixture {
         let head = git(&lane, &["rev-parse", "HEAD"]).trim().to_string();
         let state = root.join("herdr-state");
         let review_root = root.join("reviews");
+        let session = run_session_handle(RUN).expect("the run session derives");
+        // Issue #224: the fake substrate's settle control reads the verdict's
+        // own path — the reviewer's write is the instant the lane was measured
+        // still `working` at, so the fixture's clock is keyed on that file and
+        // never on a wall-clock the test guessed at.
+        let verdict = review_verdict_path(&review_root, &session, STEP);
         let env = BTreeMap::from([
             (
                 "PATH".to_string(),
@@ -990,6 +1016,10 @@ impl LaneFixture {
                 "HF_FAKE_HERDR_STATE".to_string(),
                 state.to_string_lossy().to_string(),
             ),
+            (
+                "HF_FAKE_HERDR_VERDICT".to_string(),
+                verdict.to_string_lossy().to_string(),
+            ),
         ]);
         LaneFixture {
             root: root.clone(),
@@ -1003,7 +1033,7 @@ impl LaneFixture {
             log: root.join("herdr.log"),
             seed_head,
             head,
-            session: run_session_handle(RUN).expect("the run session derives"),
+            session,
         }
     }
 
@@ -1104,6 +1134,31 @@ impl LaneFixture {
                 std::thread::sleep(Duration::from_millis(10));
             }
             panic!("the reviewer was never prompted");
+        })
+    }
+
+    /// The reviewer's own write for the #224 settle witness: held back until
+    /// the engine's own PROVEN-delivery record exists, so every read-back the
+    /// delivery proof takes is already behind us when the verdict lands and
+    /// the fixture's read-order clock (`settle_read`) starts exactly at the
+    /// verdict the consume path acts on — the lane is `working` then, as
+    /// measured, and never because the fixture guessed at a delay.
+    fn write_verdict_after_the_proven_delivery(
+        &self,
+        written: String,
+    ) -> std::thread::JoinHandle<()> {
+        let verdict_path = review_verdict_path(&self.review_root, &self.session, STEP);
+        let receipt = review_delivery_receipt_path(&self.review_root, &self.session, STEP);
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline {
+                if receipt.exists() {
+                    std::fs::write(&verdict_path, &written).expect("the reviewer writes");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("the review prompt was never proven delivered");
         })
     }
 
@@ -1527,6 +1582,241 @@ fn a_retired_generations_reviewer_lane_is_reclaimed_while_a_live_one_is_never_ad
     assert!(
         live.reviewer_lane.is_dir(),
         "the live checkout is preserved"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #224: a completed run leaves no reviewer lane behind. The verdict is
+// consumed the instant the reviewer has written it — while its own turn is
+// still `working` — so the single close that retired nothing refused
+// `refusal.lane.busy` on 30 of 30 recorded p6 receipts, the registration, the
+// pane and the checkout outlived the run, and the NEXT run of the same issue
+// collided with the deterministic lane name until an operator closed the
+// workspace by hand. The close is now WAITED for (bounded, on the cleanup
+// step's confirmed-settle discipline), and the successor reclaims what a lane
+// that never settled still left behind.
+// ---------------------------------------------------------------------------
+
+/// AC1 (the fix — RED at the base commit): the reviewer's own turn outlives the
+/// verdict it just wrote, exactly as measured. The step waits for the CONFIRMED
+/// settled turn (the substrate's own read order is the clock in this fixture),
+/// closes the workspace, removes the checkout and records the wait on the
+/// receipt — while the step still SUCCEEDS, so no bounded retry is spent (AC4)
+/// and the next run of this issue finds no residue to collide with.
+#[test]
+fn a_reviewer_lane_still_working_at_its_verdict_settles_and_is_closed() {
+    let fixture = LaneFixture::new("lane-settle");
+    fixture.seed_run_lane();
+    std::fs::write(fixture.state.join("settles-after-verdict"), "").expect("the settle control");
+    let params = lane_review_params(&format!("issues-{ISSUE}-rev1"), 30);
+    let plan = plan_with_review_step(params.clone());
+    let writer = fixture.write_verdict_after_the_proven_delivery(passing_verdict(&fixture));
+    let outcome = run_lane_review_step(&fixture, &plan, &params, &[]);
+    writer.join().expect("the reviewer's write completes");
+
+    assert_eq!(outcome.status, "succeeded", "{outcome:?}");
+    let cleanup = outcome
+        .result
+        .get("reviewer_lane_cleanup")
+        .expect("the lane cleanup receipt");
+    let workspace = cleanup
+        .get("workspace")
+        .expect("the workspace receipt is recorded");
+    assert_eq!(
+        workspace.get("closed").and_then(Val::as_bool),
+        Some(true),
+        "the settled reviewer lane's workspace is closed: {cleanup:?}"
+    );
+    let waited = workspace
+        .get("waited_ms")
+        .and_then(Val::as_int)
+        .unwrap_or(-1);
+    assert!(
+        waited > 0,
+        "the close WAITED for the settled turn instead of refusing: {cleanup:?}"
+    );
+    assert_eq!(
+        cleanup
+            .get("checkout")
+            .and_then(|checkout| checkout.get("removed"))
+            .and_then(Val::as_bool),
+        Some(true),
+        "the settled reviewer lane's checkout is removed: {cleanup:?}"
+    );
+    // No orphan residue at all: the next run of this issue binds the same
+    // deterministic lane identity without an operator touching anything.
+    assert_eq!(
+        fixture.workspace_ids(),
+        vec!["E1".to_string()],
+        "only the run's own lane stays registered"
+    );
+    assert!(
+        !fixture.reviewer_lane.exists(),
+        "the consumed review leaves no orphan checkout"
+    );
+}
+
+/// AC1 (bounded, and never forced): a reviewer lane that does NOT settle inside
+/// the step's own bound is parked typed — `effect.lane_timeout` with the bound
+/// and the live state it last read — and the receipt keeps the close's OWN
+/// refusal verbatim (`refusal.lane.busy`, the #260 NB-2 pin) beside the wait's
+/// record. The workspace, the checkout and the branch are preserved and the
+/// step still succeeds: no bounded retry is spent on a timing condition (AC4),
+/// and the residue stays reclaimable by the successor (AC2).
+#[test]
+fn a_reviewer_lane_that_never_settles_parks_the_wait_and_preserves_its_lane() {
+    let fixture = LaneFixture::new("lane-settle-park");
+    fixture.seed_run_lane();
+    std::fs::write(fixture.state.join("long-turns"), "").expect("the reviewer is mid-turn");
+    let params = lane_review_params(&format!("issues-{ISSUE}-rev1"), WITNESS_DEADLINE_SECS);
+    let plan = plan_with_review_step(params.clone());
+    let writer = fixture.write_verdict_when_prompted(passing_verdict(&fixture));
+    let outcome = run_lane_review_step(&fixture, &plan, &params, &[]);
+    writer.join().expect("the reviewer's write completes");
+
+    assert_eq!(
+        outcome.status, "succeeded",
+        "the consumed verdict is recorded; the lane cleanup never fails the step: {outcome:?}"
+    );
+    let cleanup = outcome
+        .result
+        .get("reviewer_lane_cleanup")
+        .expect("the lane cleanup receipt");
+    let workspace = cleanup
+        .get("workspace")
+        .expect("the workspace receipt is recorded");
+    assert_eq!(
+        workspace.get("closed").and_then(Val::as_bool),
+        Some(false),
+        "a lane that never settled is never closed: {cleanup:?}"
+    );
+    assert_eq!(
+        workspace.get("code").and_then(Val::as_str),
+        Some("refusal.lane.busy"),
+        "the close's own refusal is recorded verbatim: {cleanup:?}"
+    );
+    assert_eq!(
+        workspace
+            .get("wait")
+            .and_then(|wait| wait.get("code"))
+            .and_then(Val::as_str),
+        Some("effect.lane_timeout"),
+        "the bounded wait's own park is recorded beside it: {cleanup:?}"
+    );
+    assert_eq!(
+        workspace
+            .get("wait")
+            .and_then(|wait| wait.get("bound_secs"))
+            .and_then(Val::as_int),
+        Some(WITNESS_DEADLINE_SECS),
+        "the park names the step's own bound: {cleanup:?}"
+    );
+    let waited = workspace
+        .get("waited_ms")
+        .and_then(Val::as_int)
+        .unwrap_or(-1);
+    assert!(
+        waited >= WITNESS_DEADLINE_SECS * 1000,
+        "the wait ran its full bound before parking: {cleanup:?}"
+    );
+    assert!(
+        fixture.reviewer_lane.is_dir(),
+        "the unsettled lane's checkout is preserved, never forced"
+    );
+    assert_eq!(
+        fixture.workspace_ids(),
+        vec!["E1".to_string(), "w1".to_string()],
+        "the run's lane and the preserved reviewer lane are the only registrations"
+    );
+}
+
+/// AC2 (the cure for the residue already on disk): a registration survives —
+/// the run that left it is LEDGER-TERMINAL and its reviewer never settled (the
+/// measured shape: the p6 receipt refused `refusal.lane.busy` 30 of 30 times) —
+/// so the NEXT run's reviewer-leg bind reclaims it instead of returning
+/// `refusal.lane.name_collision`, and the review proceeds with no operator
+/// involved. The reclaim is ownership-verified: exactly that generation's own
+/// registration at this leg's own checkout, closed and cleared, while the new
+/// generation binds there at the certified head.
+#[test]
+fn a_terminal_generations_unsettled_reviewer_lane_is_reclaimed_by_the_next_run() {
+    let fixture = LaneFixture::new("lane-reclaim-unsettled");
+    fixture.seed_run_lane();
+    fixture.register_reviewer_lane(&fixture.head);
+    let retired_run = "run-0000000000000224";
+    let retired_reviewer = reviewer_session_handle(
+        &run_session_handle(retired_run).expect("the retired run session derives"),
+        1,
+    )
+    .expect("the retired reviewer session derives");
+    fixture.seed_workspace(
+        "R1",
+        &format!("{ISSUE}-rev1"),
+        &fixture.reviewer_lane,
+        &format!("rev-{ISSUE}-r1"),
+        &retired_reviewer.session_id,
+        1,
+    );
+    // The residue's worker never settled, exactly as measured: the lane is
+    // still `working` while its run is terminal in the ledger.
+    std::fs::write(fixture.state.join("R1.state"), "working").expect("still working");
+    let params = lane_review_params(&format!("issues-{ISSUE}-rev1"), 30);
+    let plan = plan_with_review_step(params.clone());
+    let writer = fixture.write_verdict_when_prompted(passing_verdict(&fixture));
+    let outcome = run_lane_review_step(&fixture, &plan, &params, &[retired_run.to_string()]);
+    writer.join().expect("the reviewer's write completes");
+
+    assert_eq!(outcome.status, "succeeded", "{outcome:?}");
+    let retired = outcome
+        .result
+        .get("retired_reviewer_lanes")
+        .and_then(Val::as_array)
+        .expect("the reclaim receipt");
+    assert_eq!(retired.len(), 1, "{retired:?}");
+    assert_eq!(
+        retired[0].get("retired").and_then(Val::as_bool),
+        Some(true),
+        "the terminal generation's registration is closed: {retired:?}"
+    );
+    assert_eq!(
+        retired[0].get("lane").and_then(Val::as_str),
+        Some(retired_reviewer.session_id.as_str()),
+        "the reclaim names the terminal generation's own reviewer lane"
+    );
+    assert_eq!(
+        retired[0]
+            .get("checkout_removal")
+            .and_then(|removal| removal.get("removed"))
+            .and_then(Val::as_bool),
+        Some(true),
+        "the terminal generation's stale checkout is cleared: {retired:?}"
+    );
+    let rows = fixture.rows();
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with(&format!("agent start rev-{ISSUE}-r1 "))),
+        "the successor binds its own agent in the reclaimed lane: {rows:?}"
+    );
+    let closed = rows
+        .iter()
+        .position(|row| row == "workspace close R1")
+        .expect("the terminal generation's registration is closed");
+    let opened = rows
+        .iter()
+        .rposition(|row| row.starts_with("worktree open"))
+        .expect("the successor's lane is created");
+    assert!(
+        closed < opened,
+        "the residue is reclaimed BEFORE the successor binds: {rows:?}"
+    );
+    let (_, head) = fixture.observed_prompt();
+    assert_eq!(
+        head, fixture.head,
+        "the successor bound the lane created at the certified head"
+    );
+    assert!(
+        !fixture.workspace_ids().contains(&"R1".to_string()),
+        "the terminal generation's registration is gone"
     );
 }
 

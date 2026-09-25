@@ -119,11 +119,19 @@ The leg runs, in order:
    reclaims the LEDGER-TERMINAL generations' reviewer lanes of that same
    identity first — their registrations closed, their stale checkouts cleared,
    both recorded on the step outcome (`retired_reviewer_lanes`) — while a live
-   or foreign holder is never adopted (its refusal stands). Once the verdict
-   is consumed the lane is removed (`reviewer_lane_cleanup`; a refused removal
-   is recorded verbatim and the residue stays reclaimable). The bare-subprocess
-   fallback has no lane registration and keeps the run's lane checkout as its
-   anchor, unchanged;
+   or foreign holder is never adopted (its refusal stands). This bind step
+   resolves that terminal set from the run ledger exactly like the run's own
+   lane bind (issue #224): the reviewer lane exists FOR the review and is left
+   behind when its run completes, so an unresolvable set would leave the next
+   run of the same issue refused `refusal.lane.name_collision` until an
+   operator closed the old workspace by hand. Once the verdict is consumed the
+   lane is removed (`reviewer_lane_cleanup`): the close is WAITED for, bounded
+   by the step's own effective deadline, under the cleanup step's confirmed
+   settle discipline (issue #224 — at the instant the verdict lands the
+   reviewer is still `working`, so a single close retires nothing), and a
+   refused removal is recorded verbatim and the residue stays reclaimable.
+   The bare-subprocess fallback has no lane registration and keeps the run's
+   lane checkout as its anchor, unchanged;
 4. the reviewer is started through the SAME role-bound adapter the rest of the
    spine uses (`Start`, then the bounded review brief as `Prompt`), in its own
    lane checkout, under the registry-resolved binding, with the reviewer lane

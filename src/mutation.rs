@@ -87,6 +87,17 @@ pub const CLEANUP_DEADLINE_DEFAULT_SECS: u64 = PROMPT_DEADLINE_DEFAULT_SECS;
 /// the workspace of a lane that is still alive.
 const LANE_SETTLE_SAMPLE_INTERVAL_SECS: u64 = COLLECT_STOP_INTERVAL_SECS;
 
+/// What a lane outliving its own recorded work MEANS for the step that waits
+/// for it to settle (issue #224): the clause the bounded wait's park states.
+/// One fact: p8's cleanup waits for the worker outliving its own PUBLISH (the
+/// landing proof already holds), p6's verdict consume waits for the reviewer
+/// outliving the VERDICT it wrote (the verdict is already consumed) — the same
+/// timing condition, named for the step that hit it.
+const LANE_OUTLIVED_PUBLISH: &str =
+    "the delivery is already verified landed, so the lane outliving its own publish";
+const LANE_OUTLIVED_REVIEW: &str =
+    "the verdict this lane wrote is already consumed, so the lane outliving its own review";
+
 /// Documented default deadline (seconds) for one review step's verdict wait
 /// (`review_evidence`): the reviewer's own round trip — read the certified
 /// head, review it, write the verdict — is the prompt tier's round trip, so
@@ -4391,11 +4402,21 @@ fn collection_park(
 /// the next read-back.
 ///
 /// Returns `Ok(())` once the workspace is closed. `Err(outcome)` is terminal:
-/// [`code::LANE_TIMEOUT`] when the step's own effective deadline expires with
-/// the lane still unsettled (the workspace, checkout and branch untouched, the
-/// bounded retries unspent), or the close's own typed refusal.
+/// [`code::LANE_TIMEOUT`] when the caller's bound expires with the lane still
+/// unsettled (the workspace, checkout and branch untouched, the bounded
+/// retries unspent), or the close's own typed refusal.
+///
+/// `outlived` names what the timing condition MEANS for the waiting step — the
+/// clause its park states. Two callers share this wait: p8's cleanup (the
+/// worker outliving its own PUBLISH, the landing proof already holding) and
+/// p6's verdict consume (the reviewer outliving the VERDICT it wrote, already
+/// consumed) — see [`LANE_OUTLIVED_PUBLISH`] / [`LANE_OUTLIVED_REVIEW`].
 fn await_settled_lane(
     bound: Duration,
+    // What the lane outliving its own work MEANS for the caller's step: the
+    // clause the park states (p8: its publish is already verified landed; p6:
+    // the verdict it wrote is already consumed). One fact, two callers.
+    outlived: &str,
     mut observe: impl FnMut(
         Duration,
     ) -> Result<crate::adapters::PaneSample, crate::adapters::ProcessFailure>,
@@ -4413,7 +4434,12 @@ fn await_settled_lane(
     loop {
         let now = elapsed();
         if now >= bound {
-            return Err(lane_settle_park(bound_secs, now, last_state.as_deref()));
+            return Err(lane_settle_park(
+                bound_secs,
+                now,
+                last_state.as_deref(),
+                outlived,
+            ));
         }
         // The read-back is evidence for the settle, so it may never outlive
         // the bound: its budget is what the bound has left, floored at one
@@ -4462,7 +4488,12 @@ fn await_settled_lane(
 /// The bounded lane-settle wait's park (issue #224): `effect.lane_timeout` as
 /// `ambiguous`, its bound and the live state it last read named, the workspace
 /// preserved and the bounded retries unspent.
-fn lane_settle_park(bound_secs: u64, waited: Duration, last_state: Option<&str>) -> EffectOutcome {
+fn lane_settle_park(
+    bound_secs: u64,
+    waited: Duration,
+    last_state: Option<&str>,
+    outlived: &str,
+) -> EffectOutcome {
     let observed = match last_state {
         Some(state) => format!("lane is still {state}; preserve its workspace"),
         None => "the lane's own read-back could not be taken; preserve its workspace".to_string(),
@@ -4471,10 +4502,9 @@ fn lane_settle_park(bound_secs: u64, waited: Duration, last_state: Option<&str>)
         status: "ambiguous",
         code: Some(code::LANE_TIMEOUT.to_string()),
         message: Some(format!(
-            "{observed}; the delivery is already verified landed, so the lane outliving \
-             its own publish is a timing condition: the bounded wait of {bound_secs}s \
+            "{observed}; {outlived} is a timing condition: the bounded wait of {bound_secs}s \
              for a CONFIRMED settled turn expired (waited {}ms); the workspace is preserved \
-             and cleanup parked without redispatch",
+             and the step parked without redispatch",
             waited.as_millis()
         )),
         result: object(vec![
@@ -5188,26 +5218,93 @@ fn ensure_reviewer_lane(
 
 /// Remove the reviewer leg's own lane once its verdict is consumed (issue
 /// #210): the lane exists FOR the review, so a consumed review leaves no
-/// orphan workspace and no orphan checkout. Refusals — a workspace whose agent
-/// is not settled, a checkout git will not remove — are recorded on the step
-/// outcome and never forced; the residue stays reclaimable (#190).
+/// orphan workspace and no orphan checkout. Refusals — a checkout git will not
+/// remove — are recorded on the step outcome and never forced; the residue
+/// stays reclaimable (#190).
+///
+/// Issue #224: at the instant the verdict is consumed the reviewer is still
+/// `working` — it has just written the verdict — so the single close that
+/// retired nothing refused `refusal.lane.busy` on EVERY measured run (30 of 30
+/// recorded p6 receipts, 2026-09-19..2026-09-25), and the registration, the
+/// pane and the checkout then outlived the run forever: the next run of the
+/// same issue collided with the deterministic lane name and needed an
+/// operator to close the workspace by hand. The close is therefore WAITED for,
+/// bounded by the step's own effective deadline, under the cleanup step's own
+/// confirmed-settle discipline ([`await_settled_lane`], issue #170 N7): a lane
+/// that is still working, that starts working again between the confirmation
+/// and the close, or that only flaps a stop MID-TURN is never closed from
+/// here, and a typed refusal that is not the busy timing condition returns at
+/// once, never waited on.
+///
+/// The receipt keeps the close's OWN last read verbatim — a still-working lane
+/// still records its `refusal.lane.busy` (issue #260 NB-2) — and records the
+/// wait beside it (`waited_ms`, plus the wait's own terminal `wait` outcome
+/// when it did not close: the `effect.lane_timeout` park names its bound and
+/// the state it last read). Nothing here consumes a bounded retry: the step
+/// still SUCCEEDS with its receipt, and a parked wait leaves the workspace,
+/// the checkout and the branch reclaimable exactly as before.
 fn remove_reviewer_lane(
     ctx: &EffectContext<'_>,
     reviewer: &crate::adapters::SessionHandle,
     lane: &Path,
+    bound: Duration,
 ) -> Val {
-    let workspace = match crate::adapters::close_lane_workspace(
-        reviewer,
-        lane,
-        ctx.env,
-        crate::adapters::ADAPTER_TIMEOUT,
-    ) {
-        Ok(()) => object(vec![("closed", bool_(true))]),
-        Err(err) => object(vec![
-            ("closed", bool_(false)),
-            ("code", string(err.code)),
-            ("message", string(&err.message)),
+    let mut close_lane = || {
+        crate::adapters::close_lane_workspace(
+            reviewer,
+            lane,
+            ctx.env,
+            crate::adapters::ADAPTER_TIMEOUT,
+        )
+    };
+    let started = std::time::Instant::now();
+    let waited = await_settled_lane(
+        bound,
+        LANE_OUTLIVED_REVIEW,
+        |remaining| crate::adapters::observe_pane_worker(reviewer, lane, remaining, ctx.env),
+        &mut close_lane,
+        || started.elapsed(),
+        std::thread::sleep,
+    );
+    let waited_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+    let workspace = match waited {
+        Ok(()) => object(vec![
+            ("closed", bool_(true)),
+            ("waited_ms", integer(waited_ms)),
         ]),
+        Err(outcome) => {
+            // The receipt carries the close's OWN last read verbatim — the
+            // still-working lane keeps its `refusal.lane.busy` literal (issue
+            // #260 NB-2) — and, beside it, the wait's own terminal outcome
+            // (the `effect.lane_timeout` park when the bound expired), so the
+            // timing is diagnosable without reading the wait's internals.
+            match close_lane() {
+                Ok(()) => object(vec![
+                    ("closed", bool_(true)),
+                    ("waited_ms", integer(waited_ms)),
+                ]),
+                Err(err) => object(vec![
+                    ("closed", bool_(false)),
+                    ("code", string(err.code)),
+                    ("message", string(&err.message)),
+                    ("waited_ms", integer(waited_ms)),
+                    (
+                        "wait",
+                        object(vec![
+                            ("bound_secs", integer(bound.as_secs() as i64)),
+                            (
+                                "code",
+                                string(outcome.code.as_deref().unwrap_or(code::LANE_TIMEOUT)),
+                            ),
+                            (
+                                "message",
+                                string(outcome.message.as_deref().unwrap_or_default()),
+                            ),
+                        ]),
+                    ),
+                ]),
+            }
+        }
     };
     let checkout = if workspace.get("closed").and_then(Val::as_bool) == Some(true) {
         let lane_text = lane.to_string_lossy().into_owned();
@@ -6299,9 +6396,12 @@ fn review_self_dispatch(
     // count forward (the resumed leg is never re-prompted).
     let reviewer_lane_cleanup = match leg.execution {
         crate::adapters::ExecutionMode::Headless => None,
-        crate::adapters::ExecutionMode::HerdrPane => {
-            Some(remove_reviewer_lane(ctx, &reviewer, &worktree))
-        }
+        crate::adapters::ExecutionMode::HerdrPane => Some(remove_reviewer_lane(
+            ctx,
+            &reviewer,
+            &worktree,
+            Duration::from_secs(deadline),
+        )),
     };
     // Issue #238: a recorded review FAIL is a normal, expected outcome of the
     // review step — never a terminal, silent one. The run's fix round is
@@ -8916,6 +9016,7 @@ fn effect_cleanup(ctx: &EffectContext<'_>) -> EffectOutcome {
         let started = std::time::Instant::now();
         let waited = await_settled_lane(
             Duration::from_secs(bound),
+            LANE_OUTLIVED_PUBLISH,
             |remaining| {
                 crate::adapters::observe_pane_worker(&session, &worktree, remaining, ctx.env)
             },
@@ -9236,6 +9337,7 @@ mod tests {
         let flap = ["working", "idle", "working", "done", "working"];
         let outcome = await_settled_lane(
             Duration::from_secs(30),
+            LANE_OUTLIVED_PUBLISH,
             |_| {
                 reads.set(reads.get() + 1);
                 let state = match flap.get(reads.get() - 1) {
@@ -9283,6 +9385,7 @@ mod tests {
         let closes = Cell::new(0usize);
         let outcome = await_settled_lane(
             Duration::from_secs(60),
+            LANE_OUTLIVED_PUBLISH,
             |_| {
                 reads.set(reads.get() + 1);
                 if reads.get() == 1 {
@@ -9322,6 +9425,7 @@ mod tests {
         let closes = Cell::new(0usize);
         let outcome = await_settled_lane(
             Duration::from_secs(12),
+            LANE_OUTLIVED_PUBLISH,
             |_| {
                 reads.set(reads.get() + 1);
                 Ok(pane_sample("idle", "idle", Some(reads.get())))
@@ -9349,6 +9453,7 @@ mod tests {
         let closes = Cell::new(0usize);
         let outcome = await_settled_lane(
             Duration::from_secs(120),
+            LANE_OUTLIVED_PUBLISH,
             |_| {
                 reads.set(reads.get() + 1);
                 if reads.get() == 1 || reads.get() == 5 {
@@ -9390,6 +9495,7 @@ mod tests {
         let elapsed = Cell::new(Duration::ZERO);
         let outcome = await_settled_lane(
             Duration::from_secs(600),
+            LANE_OUTLIVED_PUBLISH,
             |_| Ok(pane("idle")),
             || {
                 Err(crate::adapters::AdapterError::refusal(
@@ -9422,6 +9528,7 @@ mod tests {
         let closes = Cell::new(0usize);
         let outcome = await_settled_lane(
             Duration::from_secs(30),
+            LANE_OUTLIVED_PUBLISH,
             |_| {
                 Err(crate::adapters::ProcessFailure {
                     code: crate::adapters::CODE_INCOMPLETE_IDENTITY,

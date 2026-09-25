@@ -2515,6 +2515,48 @@ fn fanout_step_kind(step: &Val) -> bool {
     }
 }
 
+/// The step kinds whose dispatch resolves the run's issue's ledger-TERMINAL
+/// lane generations before the effect runs (issue #190, extended by #222 and
+/// #224): exactly the kinds that BIND a lane generation.
+///
+/// One fact, two readers: the resolution in `method_apply` below and the bind
+/// effects that may retire residue with it. `worktree_create` creates (or
+/// reclaims) the run's own implementer lane, `harness_start` registers the
+/// worker's pane in it, and `review_evidence` binds the REVIEWER leg's own
+/// lane checkout (issue #210) and starts its worker there — the measured #224
+/// defect was that leg's residue (its registration, its pane and its checkout
+/// outliving a completed run) refusing the NEXT run's bind with
+/// `refusal.lane.name_collision`, and a reviewer-leg bind that resolved
+/// nothing could not reclaim a thing. Nothing else pays for the resolution:
+/// a step that binds no lane has no residue to reclaim, and only a bind step
+/// may retire.
+fn lane_binding_step_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "harness_start" | "worktree_create" | "review_evidence"
+    )
+}
+
+/// The lane generations one step dispatch resolves from durable state before
+/// the effect runs: the run's issue's ledger-TERMINAL generations for a BIND
+/// kind ([`lane_binding_step_kind`]) and nothing at all for any other kind.
+///
+/// The resolution is a pure function of the ledger row set — never of the
+/// substrate, and never of a name read back from it — so a caller can only
+/// retire exactly what the ledger records as terminal for THIS repository
+/// issue, and a live run's lane is unreachable by construction.
+fn resolved_lane_generations(
+    state: &State,
+    repository: &str,
+    issue_number: i64,
+    kind: &str,
+) -> Result<Vec<String>, StateError> {
+    if !lane_binding_step_kind(kind) {
+        return Ok(Vec::new());
+    }
+    state.retired_run_ids(repository, issue_number)
+}
+
 /// Renew the run's OWN lapsed host-resource proof at dispatch time (issue
 /// #198), from a measurement the daemon takes NOW — the supervisor's own act,
 /// exactly like the run's lapsed grant window (issue #184).
@@ -3642,14 +3684,21 @@ fn method_apply_from(shared: &Arc<Shared>, request: &Request, supervised: bool) 
     // branch behind in the integration clone, and those are what block the
     // next run's lane creation. The resolution is scoped to this repository
     // issue, so a sibling issue's run can never be in it.
-    let retired_run_ids: Vec<String> = if kind == "harness_start" || kind == "worktree_create" {
+    //
+    // Issue #224: `review_evidence` resolves it too — the reviewer leg BINDS
+    // its own lane generation (`ensure_reviewer_lane`), and the 30 measured
+    // p6 receipts' residue was exactly that leg's registration, pane and
+    // checkout outliving its completed run, refusing the next run's bind with
+    // `refusal.lane.name_collision`. One fact, one place: the closed set lives
+    // in [`lane_binding_step_kind`].
+    let retired_run_ids: Vec<String> = if lane_binding_step_kind(&kind) {
         let state = match shared.lock_state() {
             Ok(state) => state,
             Err(message) => {
                 return resolve_apply_refusal(shared, request, &key, "state.unavailable", message);
             }
         };
-        match state.retired_run_ids(&plan.repository, plan.issue_number) {
+        match resolved_lane_generations(&state, &plan.repository, plan.issue_number, &kind) {
             Ok(ids) => ids,
             Err(err) => {
                 drop(state);
@@ -11515,6 +11564,120 @@ mod tests {
             LEGACY_CRASH_POINT_ENV, "HERDR_FLEET_CRASH_POINT",
             "pre-rename env var name"
         );
+    }
+
+    /// Issue #224: the kinds whose dispatch resolves the run's issue's
+    /// ledger-TERMINAL lane generations are exactly the BIND kinds — the run's
+    /// own lane create, the worker's bind in it, and the reviewer leg's own
+    /// lane bind. The reviewer leg is the one the measured defect left behind:
+    /// an excluded `review_evidence` resolved nothing, so the effect's own
+    /// reclaim loop (`ensure_reviewer_lane`) could never retire the previous
+    /// generation's registration and the next run of the same issue was
+    /// refused `refusal.lane.name_collision` until an operator closed the
+    /// workspace by hand. Nothing else resolves the set (a reclaim is a
+    /// bind-time authority), so no other kind pays for the state read.
+    #[test]
+    fn the_bind_kinds_resolve_the_issues_terminal_lane_generations() {
+        for kind in ["harness_start", "worktree_create", "review_evidence"] {
+            assert!(lane_binding_step_kind(kind), "{kind}");
+        }
+        for kind in [
+            "checkout",
+            "prompt",
+            "collect_outcome",
+            "merge",
+            "cleanup",
+            "branch_delete",
+            "approve",
+            "",
+        ] {
+            assert!(!lane_binding_step_kind(kind), "{kind}");
+        }
+    }
+
+    /// Issue #224 (AC2, the dispatch half): a reviewer-leg bind's step — and
+    /// every other BIND kind — resolves the ledger-TERMINAL generations of the
+    /// run's OWN repository issue before the effect runs, and no other kind
+    /// resolves anything. This is the half that was missing: `review_evidence`
+    /// presented an empty set, so the effect's own reclaim loop had no
+    /// authority and the next run of the same issue was refused
+    /// `refusal.lane.name_collision` until an operator closed the old
+    /// workspace by hand. The live generation is never in the set, and neither
+    /// is another issue's or another repository's run.
+    #[test]
+    fn a_review_steps_dispatch_resolves_the_issues_terminal_lane_generations() {
+        use crate::state::{Retention, State};
+        let path = std::env::temp_dir().join(format!(
+            "canter-224-dispatch-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let state = State::open(&path, Retention::default()).expect("open state");
+        let repository = "example-org/widgets";
+        let at = "2026-09-25T00:00:00Z";
+        let grant_id = "gr_0000000000000224";
+        let doc = Val::parse_json(&format!(
+            r#"{{"schema":"hf-grant/v1","grant_id":"{grant_id}","repository":"{repository}",
+                "issue":{{"number":224,"revision":"{}"}},
+                "workflow_hash":"{}","policy_hash":"{}","phase":"merge",
+                "scope":"worktrees/issues/224","caps":["read","worktree","spawn","prompt"],
+                "expires_at":"2999-01-01T00:00:00Z","state_epoch":1,
+                "created_at":"2026-09-25T00:00:00Z"}}"#,
+            "a".repeat(40),
+            "b".repeat(64),
+            "c".repeat(64),
+        ))
+        .expect("grant document");
+        state.issue_grant(&doc).expect("issue grant");
+        for run in ["run-0000000000000224a", "run-0000000000000224b"] {
+            state
+                .start_instance(run, grant_id, "fleet-doctrine-1", at)
+                .expect("instance");
+        }
+        // ONE terminal generation of this issue — the run whose reviewer lane
+        // was left behind — while the other run is still live.
+        state
+            .release_run(
+                "run-0000000000000224a",
+                "the generation whose reviewer lane was left behind",
+                "ik_224-dispatch",
+                at,
+            )
+            .expect("release");
+
+        assert_eq!(
+            resolved_lane_generations(&state, repository, 224, "review_evidence").expect("resolve"),
+            vec!["run-0000000000000224a".to_string()],
+            "the reviewer-leg bind resolves the terminal generation and never the live run"
+        );
+        assert_eq!(
+            resolved_lane_generations(&state, repository, 224, "harness_start").expect("resolve"),
+            vec!["run-0000000000000224a".to_string()],
+            "the run's own bind resolves the same set"
+        );
+        assert!(
+            resolved_lane_generations(&state, repository, 224, "cleanup")
+                .expect("resolve")
+                .is_empty(),
+            "a step that binds no lane pays for no resolution"
+        );
+        assert!(
+            resolved_lane_generations(&state, repository, 225, "review_evidence")
+                .expect("resolve")
+                .is_empty(),
+            "another issue's runs are never in the set"
+        );
+        assert!(
+            resolved_lane_generations(&state, "example-org/other", 224, "review_evidence")
+                .expect("resolve")
+                .is_empty(),
+            "another repository's runs are never in the set"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
