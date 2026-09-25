@@ -6,6 +6,37 @@ release process activates (docs/RELEASING.md), then semver applies.
 
 ## [Unreleased]
 
+### Fixed (issue #224 — a completed run leaves no reviewer lane behind)
+
+- The verdict-consume path (p6) WAITS, bounded by the step's own effective
+  deadline, for the reviewer lane to settle before it closes the workspace and
+  removes the checkout (`remove_reviewer_lane`), on the cleanup step's own
+  confirmed-settle discipline (`await_settled_lane`, issue #170 N7): the
+  measured defect was that the verdict is consumed while the reviewer's own
+  turn is still `working`, so the single close refused
+  `refusal.lane.busy` — recorded on 30 of 30 p6 receipts (2026-09-19..
+  2026-09-25) — and the registration, the pane and the checkout outlived the
+  run forever. A lane that is still working, that starts working again
+  between the confirmation and the close, or that only flaps a stop mid-turn
+  is never closed; the receipt keeps the close's own refusal verbatim and
+  records the wait beside it (`waited_ms`, plus the `effect.lane_timeout`
+  park when the bound expires), and the step still succeeds — no bounded
+  retry is ever spent on the timing.
+- The next run's reviewer-leg bind RECLAIMS that residue without an operator:
+  the daemon resolves the run's issue's ledger-terminal generations for the
+  reviewer-leg bind (`lane_binding_step_kind`: `harness_start`,
+  `worktree_create`, `review_evidence`) exactly as it already did for the
+  implementer lane's bind, so `ensure_reviewer_lane` retires the terminal
+  generation's own registration (ownership-verified: this leg's own checkout,
+  exactly that generation's lane token) instead of refusing
+  `refusal.lane.name_collision`. A live or foreign holder is still refused
+  verbatim, never adopted or renamed.
+- Witnesses: `tests/review_dispatch.rs` drives the REAL effect path for the
+  settle-then-close (RED at the base commit: `closed=false`,
+  `refusal.lane.busy`), for the bounded park that preserves the lane, and for
+  the successor's reclaim of an unsettled terminal generation; `src/daemon.rs`
+  pins the resolved kind set against a real ledger.
+
 ### Fixed (issue #231 — native lanes' build scratch belongs to the lane, and disk pressure is typed)
 
 - A lane's build scratch is derived from its own leg

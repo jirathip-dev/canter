@@ -203,6 +203,12 @@ can run with **no harness credentials** (AC7).
     lane is never retired: a run that is not terminal still holds its issue's
     unique ownership, so it is never in the retired set, and a live foreign
     lane still refuses `refusal.lane.name_collision`.
+    The bind steps that resolve that set are the ones that bind a lane
+    generation: the run's own `worktree_create` / `harness_start`, and the
+    reviewer leg's own lane bind in `review_evidence` (issue #210) — the leg
+    whose registration, pane and checkout outlive a completed run precisely
+    because it is created for one review (issue #224). A step that binds no
+    lane resolves nothing: a reclaim is a bind-time authority.
     Git resolves the actual repository root, including an isolated clone's
     own named repo group; no checkout is moved or sandbox boundary changed.
     Herdr can create a repository-root workspace for a new group as well as
