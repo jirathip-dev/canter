@@ -254,69 +254,88 @@ fn install_plan_declares_the_unit_environment_and_log_capture() {
     );
     assert_eq!(exit, 0, "install-plan exits 0: {stdout} {stderr}");
 
+    // The unit text and the declarations are read from the PARSED envelope:
+    // inside the JSON document a `"` is escaped, so raw-substring assertions
+    // against the unit only hold on the launchd branch (a Linux-runner
+    // lesson: the systemd branch renders `Environment="PATH=…"`).
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).expect("json envelope");
+    let data = &envelope["data"];
+
     // The plan output names the environment the unit declares and the log
     // capture, so the operator can read both without opening the plist.
-    assert!(
-        stdout.contains("\"environment\""),
-        "plan data carries the declared environment: {stdout}"
-    );
-    assert!(
-        stdout.contains(&format!("\"PATH\":\"{path}\"")),
+    assert_eq!(
+        data["environment"]["PATH"].as_str(),
+        Some(path.as_str()),
         "the unit's PATH is the invoking PATH: {stdout}"
     );
-    assert!(
-        stdout.contains(&format!("\"HOME\":\"{home}\"")),
+    assert_eq!(
+        data["environment"]["HOME"].as_str(),
+        Some(home.as_str()),
         "the unit's HOME is the invoking HOME: {stdout}"
     );
-    assert!(
-        stdout.contains(&format!(
-            "\"stdout\":\"{}/daemon.out.log\"",
-            state_dir.display()
-        )),
+    assert_eq!(
+        data["logs"]["stdout"].as_str(),
+        Some(format!("{}/daemon.out.log", state_dir.display()).as_str()),
         "the plan names the captured stdout log: {stdout}"
     );
-    assert!(
-        stdout.contains(&format!(
-            "\"stderr\":\"{}/daemon.err.log\"",
-            state_dir.display()
-        )),
+    assert_eq!(
+        data["logs"]["stderr"].as_str(),
+        Some(format!("{}/daemon.err.log", state_dir.display()).as_str()),
         "the plan names the captured stderr log: {stdout}"
     );
 
+    let unit = data["unit"].as_str().expect("unit text");
     if cfg!(target_os = "macos") {
         assert!(
-            stdout.contains("<key>EnvironmentVariables</key>"),
-            "the plist declares EnvironmentVariables: {stdout}"
+            unit.contains("<key>EnvironmentVariables</key>"),
+            "the plist declares EnvironmentVariables: {unit}"
         );
         assert!(
-            stdout.contains(&format!("<string>{path}</string>")),
-            "the plist declares the invoking PATH: {stdout}"
+            unit.contains(&format!("<string>{path}</string>")),
+            "the plist declares the invoking PATH: {unit}"
         );
         assert!(
-            stdout.contains("<key>StandardOutPath</key>")
-                && stdout.contains("<key>StandardErrorPath</key>"),
-            "the plist captures stdout/stderr: {stdout}"
+            unit.contains("<key>StandardOutPath</key>")
+                && unit.contains("<key>StandardErrorPath</key>"),
+            "the plist captures stdout/stderr: {unit}"
+        );
+        assert!(
+            unit.contains(&format!(
+                "<string>{}/daemon.out.log</string>",
+                state_dir.display()
+            )),
+            "the plist names the captured stdout log: {unit}"
         );
     } else {
         assert!(
-            stdout.contains(&format!("Environment=\"PATH={path}\"")),
-            "the unit declares the invoking PATH: {stdout}"
+            unit.contains(&format!("Environment=\"PATH={path}\"")),
+            "the unit declares the invoking PATH: {unit}"
         );
         assert!(
-            stdout.contains("StandardOutput=append:") && stdout.contains("StandardError=append:"),
-            "the unit captures stdout/stderr: {stdout}"
+            unit.contains("StandardOutput=append:") && unit.contains("StandardError=append:"),
+            "the unit captures stdout/stderr: {unit}"
         );
     }
 
     // The install steps name the state dir and the log capture, so a failed
     // start is diagnosable from the plan alone.
+    let steps: Vec<String> = data["steps"]
+        .as_array()
+        .expect("steps")
+        .iter()
+        .map(|step| step.as_str().unwrap_or_default().to_string())
+        .collect();
     assert!(
-        stdout.contains(&format!("mkdir -p {}", state_dir.display())),
-        "the install steps prepare the state dir the logs live in: {stdout}"
+        steps
+            .iter()
+            .any(|step| step.contains(&format!("mkdir -p {}", state_dir.display()))),
+        "the install steps prepare the state dir the logs live in: {steps:?}"
     );
     assert!(
-        stdout.contains("daemon.out.log") && stdout.contains("daemon.err.log"),
-        "the install steps name the captured logs: {stdout}"
+        steps
+            .iter()
+            .any(|step| step.contains("daemon.out.log") && step.contains("daemon.err.log")),
+        "the install steps name the captured logs: {steps:?}"
     );
 }
 
