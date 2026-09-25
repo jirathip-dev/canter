@@ -450,6 +450,17 @@ pub mod codes {
     /// held `run.retry` pays for, derived and spent by the run's own
     /// supervision; nothing else is derived while it holds.
     pub const FIX_REDISPATCH: &str = "supervision.fix_round_redispatched";
+    /// The run's fix-round re-dispatch has spent every bound it can be paid
+    /// from (issue #294): the leg's checkout is gone AND the shared per-(run,
+    /// step) bounded budget is spent with no unconsumed authorization left, so
+    /// a further re-dispatch is refused by the engine before any effect
+    /// (`refusal.run.retry_bound`). The condition is STATIC — nothing about
+    /// waiting changes it — so the run parks terminally, typed, naming the
+    /// recorded refused dispatches and the engine's own code instead of
+    /// re-applying the step on every check forever. An explicit operator
+    /// authorization (`run.retry`) is what re-opens the one continuation, and
+    /// it is never required for the churn to stop.
+    pub const FIX_REDISPATCH_EXHAUSTED: &str = "supervision.fix_round_redispatch_exhausted";
     /// The next step's latest attempt was refused for capacity.
     pub const CAPACITY_BLOCKED: &str = "supervision.capacity_blocked";
     /// A step dispatch is in flight: legitimate long-running work.
@@ -1382,12 +1393,49 @@ fn fix_redispatched_intent(evidence: &SupervisionEvidence) -> Option<DispatchInt
     if !driver_dispatchable_kind(evidence, &fix.step, kind) {
         return None;
     }
+    // Issue #294: the re-dispatch is paid for by the run's held authorization
+    // or by the shared per-(run, step) bounded budget — the exact arithmetic
+    // the engine's own `refusal.run.retry_bound` refuses on. Once that budget
+    // is spent with no unconsumed authorization, every further re-dispatch is
+    // refused BEFORE any effect: a STATIC condition that re-applying the step
+    // on each check can never resolve. The continuation is therefore derived
+    // only while it can still be paid for, and the classification reports the
+    // exhausted park ([`codes::FIX_REDISPATCH_EXHAUSTED`]) instead of a
+    // promise the engine will refuse.
+    if !fix_redispatch_budget_remaining(evidence, &fix.step) {
+        return None;
+    }
     Some(DispatchIntent {
         instance_id: evidence.run.instance_id.clone(),
         step_id: fix.step.clone(),
         kind: kind.to_string(),
         reason: codes::FIX_REDISPATCH,
     })
+}
+
+/// Whether the run's shared per-(run, step) bounded budget can still pay for
+/// ONE dispatch of `step` (issue #294).
+///
+/// The run's own recorded retry authorizations are the bound: an UNCONSUMED
+/// authorization is exactly the one dispatch it pays for (issue #241), and a
+/// spent budget below [`crate::state::RUN_RETRY_MAX`] still has room for the
+/// engine to mint one. At the bound with nothing held, the engine refuses
+/// `refusal.run.retry_bound` before any effect — the same arithmetic the apply
+/// path's `record_run_retry` performs, read here from the recorded rows so the
+/// derivation and the engine agree by construction.
+fn fix_redispatch_budget_remaining(evidence: &SupervisionEvidence, step: &str) -> bool {
+    let mut spent = 0i64;
+    for retry in evidence
+        .retries
+        .iter()
+        .filter(|retry| retry.step_id == step)
+    {
+        if retry.consumed_at.is_empty() {
+            return true;
+        }
+        spent += 1;
+    }
+    spent < crate::state::RUN_RETRY_MAX
 }
 
 /// Whether the run's own recorded fix round has delivered a moved head its own
@@ -1858,10 +1906,28 @@ pub fn classify(
                 // checkout present) keeps the unchanged wait below: a worker
                 // that can still deliver is never reported over.
                 if let Some(lost) = fix_round_lane_lost(evidence) {
+                    let intent = fix_redispatched_intent(evidence);
+                    // Issue #294: the ONE continuation exists exactly while
+                    // the run's own bounds can still pay for it. Once the
+                    // leg's checkout is gone AND the shared bounded budget is
+                    // spent, waiting cannot change anything (the engine
+                    // refuses the re-dispatch before any effect): the run
+                    // parks terminally, typed, with the recorded refused
+                    // dispatches and the engine's own code named — instead of
+                    // re-applying the step on every check forever and
+                    // reporting `running`.
+                    if intent.is_none() && !fix_redispatch_budget_remaining(evidence, &lost.step) {
+                        return Verdict::new(
+                            "needs-attention",
+                            codes::FIX_REDISPATCH_EXHAUSTED,
+                            false,
+                            &fix_redispatch_exhausted_detail(lost, evidence),
+                        );
+                    }
                     return Verdict::new(
                         "needs-attention",
                         codes::FIX_LANE_LOST,
-                        fix_redispatched_intent(evidence).is_some(),
+                        intent.is_some(),
                         &fix_round_lane_lost_detail(
                             lost,
                             progress_age_secs(&evidence.progress_at, now_unix),
@@ -2145,6 +2211,41 @@ fn fix_round_lane_lost_detail(
         fix.lane,
         age_secs.unwrap_or(0),
         window_secs
+    )
+}
+
+/// The terminal park of a run whose fix-round re-dispatch is exhausted (issue
+/// #294): the leg's lane checkout is gone, the shared per-(run, step) bounded
+/// budget is spent, and every further re-dispatch is refused before any
+/// effect — a static condition no check can resolve. The detail names the
+/// lane, the step, the CONSECUTIVE refused dispatches the run's own records
+/// carry, the engine's own refusal code, and the certified head that still
+/// fails, so the park is readable from the same read (AC3; the #224 lesson).
+fn fix_redispatch_exhausted_detail(
+    fix: &crate::state::SupervisionFixRound,
+    evidence: &SupervisionEvidence,
+) -> String {
+    let code = evidence
+        .dispatch_refusal
+        .as_ref()
+        .map(|refusal| refusal.code.as_str())
+        .filter(|code| !code.is_empty())
+        .unwrap_or("refusal.run.retry_bound");
+    let refused = evidence
+        .attempts
+        .iter()
+        .filter(|(step, status, attempt_code)| {
+            step == &fix.step && status == "refused" && attempt_code == code
+        })
+        .count();
+    format!(
+        "{} (lane checkout gone and the re-dispatch of {:?} is exhausted: {refused} refused \
+         dispatches ({code}) against the spent {} bounded retries; the certified head {} still \
+         fails — nothing re-applies the step)",
+        fix.lane,
+        fix.step,
+        crate::state::RUN_RETRY_MAX,
+        fix.feature_head
     )
 }
 
@@ -3329,6 +3430,9 @@ pub fn render_human(doc: &Val) -> String {
             // no longer reported as waiting on it: the disposition says the
             // lane is gone and the driver re-dispatches the handoff's step.
             codes::FIX_LANE_LOST => format!("fix round lane gone: {detail}"),
+            codes::FIX_REDISPATCH_EXHAUSTED => {
+                format!("fix round re-dispatch exhausted: {detail}")
+            }
             _ => format!("fix round refused: {detail}"),
         });
     }
@@ -5393,6 +5497,83 @@ mod tests {
             "a continuation the driver may not derive is never reported eligible"
         );
         assert!(dispatch_intent(&row, &unbacked).is_none());
+
+        // (2c) AC2/AC5 (issue #294): the SAME dead lane on a run whose shared
+        //      bounded budget is already SPENT (the measured live shape:
+        //      `refusal.run.retry_bound` re-applied every ~15 minutes forever)
+        //      can no longer pay for the ONE continuation. Waiting cannot
+        //      change the condition, so the run is not re-dispatched at all:
+        //      it parks terminally, typed, with the consecutive refused
+        //      dispatches and the engine's own code named on the surface.
+        let mut exhausted = scene(Some(crate::state::FixLegState {
+            head: String::new(),
+            delivered: false,
+            lane: false,
+        }));
+        exhausted.retries = (1..=3)
+            .map(|attempt| crate::state::RunRetryRow {
+                retry_id: format!("rt_{attempt:016x}"),
+                instance_id: run.to_string(),
+                step_id: "p6".to_string(),
+                attempt,
+                authorized_at: "2026-09-24T03:33:50Z".to_string(),
+                consumed_at: "2026-09-24T03:34:50Z".to_string(),
+                consumed_key: format!("ik_run-0123456789abcdef-p6-{attempt}"),
+            })
+            .collect();
+        exhausted.attempts = vec![
+            ("p1".to_string(), "succeeded".to_string(), String::new()),
+            ("p5".to_string(), "succeeded".to_string(), String::new()),
+            (
+                "p6".to_string(),
+                "refused".to_string(),
+                "refusal.run.retry_bound".to_string(),
+            ),
+            (
+                "p6".to_string(),
+                "refused".to_string(),
+                "refusal.run.retry_bound".to_string(),
+            ),
+        ];
+        exhausted.dispatch_refusal = Some(crate::state::SupervisionDispatchRefusal {
+            step: "p6".to_string(),
+            code: "refusal.run.retry_bound".to_string(),
+            reason: String::new(),
+            at: "2026-09-25T01:22:40Z".to_string(),
+        });
+        let verdict = classify(&exhausted, &digest, &policy, now_unix);
+        println!(
+            "REDISPATCH EXHAUSTED class={} reason={} detail={} eligible={}",
+            verdict.class, verdict.reason, verdict.detail, verdict.eligible
+        );
+        assert_eq!(verdict.class, "needs-attention");
+        assert_eq!(verdict.reason, codes::FIX_REDISPATCH_EXHAUSTED);
+        assert_ne!(verdict.reason, codes::FIX_LANE_LOST);
+        assert!(
+            !verdict.eligible,
+            "an exhausted re-dispatch is never eligible"
+        );
+        assert!(
+            verdict
+                .detail
+                .contains("2 refused dispatches (refusal.run.retry_bound)"),
+            "the consecutive refused dispatches and the engine's own code are \
+             named: {}",
+            verdict.detail
+        );
+        assert!(
+            dispatch_intent(&row, &exhausted).is_none(),
+            "a re-dispatch the run's own bound can no longer pay for is never \
+             derived: nothing re-applies the step"
+        );
+        // The discrimination: the SAME scene with one authorization still
+        // held IS re-dispatched (case (2)/(3) above) — only the spent budget
+        // changed.
+        assert!(
+            dispatch_intent(&row, &gone).is_some(),
+            "the positive control: the same lane-gone run with budget left is \
+             still re-dispatched"
+        );
 
         // (3) AC3: the ONE continuation is the re-dispatch of the handoff's own
         //     step — the exact step the held bounded retry authorizes, so the
