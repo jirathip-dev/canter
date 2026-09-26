@@ -40,21 +40,106 @@ const SECRET_DIGEST: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abc
 const HEAD_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const BASE_A: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
-/// The no-progress ceiling of a recorded-state wait, in seconds (issue #232).
+/// The no-progress ceiling of a recorded-state wait, counted in the RUN'S OWN
+/// machinery instead of wall-clock seconds (issue #310).
 ///
-/// Progress-driven, never a fixed wall-clock bound: the driver wakes
-/// semantically on each committed step and otherwise re-checks on its bounded
-/// timer fallback (`canter::supervision::DEFAULT_CHECK_INTERVAL_SECS`, 60 s),
-/// so one starved wake legitimately leaves the recorded frontier, the attempt
-/// ledger or a queue item's status unchanged for a little over a minute on a
-/// loaded host. Every wait below that observes one of those records therefore
-/// fails only after this much time with NO durable change — any new recorded
-/// attempt, committed check or frontier move resets the ceiling — and names
-/// the progress observed and the elapsed time. Two driver ticks, so a single
-/// starved wake can never fail a witness, and it stays inside the CI test
-/// driver's per-suite budget (`scripts/ci-test-driver.py`,
-/// `PER_SUITE_SECONDS = 300`).
-const NO_PROGRESS_SECS: u64 = 120;
+/// Every wait below watches a run a real daemon is serving: the driver commits
+/// exactly ONE supervision check per pass over the run, so the run's own
+/// committed check count is the machinery's progress clock, and the gap
+/// between two committed checks is what this host actually needed for one
+/// pass. A FIXED wall-clock ceiling cannot tell "the run is stuck" from "the
+/// runner is busy" — the same correct pass simply takes longer on a loaded
+/// machine — and the old `NO_PROGRESS_SECS = 120` bound was exactly that: a
+/// false-red generator (issue #310). The ceiling is derived from the run's own
+/// observed machinery instead:
+///
+///   * the frontier may stand still across up to `NO_PROGRESS_CHECKS` of the
+///     run's own committed checks — the load-invariant form, because a slower
+///     host stretches the work and the tick that measures it by the same
+///     factor, so the number of passes a correct advance needs does not grow
+///     with load; and
+///   * the wall clock allowed is `NO_PROGRESS_CHECKS` x the cadence those
+///     checks are observed to take here, floored by the cadence the run's own
+///     recorded authorization declares — so a machinery that stops ticking
+///     altogether still fails after its own declared cadence, rather than never.
+///
+/// The ceiling never sits BELOW the fixed budget it replaces: the fixtures'
+/// declared cadence is 5 s per pass, so 24 of the run's own passes is the same
+/// 120 s the old constant allowed. When the machinery's own cadence is slower
+/// — the loaded runner — the ceiling grows with it instead of cutting the run
+/// off at a number the machine never saw.
+///
+/// A genuinely stuck run still fails either way, naming the frontier, the
+/// passes observed and the cadence measured ([`NoProgress`]); a correct run on
+/// a busy runner can no longer fail because the machine is busy.
+const NO_PROGRESS_CHECKS: i64 = 24;
+
+/// One run's machinery-driven no-progress watcher (issue #310): fed each
+/// sample of a wait's own progress signature, the run's committed check count
+/// and the step (if any) it currently has in flight, it answers
+/// `Some(reason)` exactly when the ceiling above has passed.
+struct NoProgress {
+    last_progress: Instant,
+    progress: String,
+    checks_at_progress: i64,
+    /// The newest observed gap between two of the run's committed checks, and
+    /// the floor the run's own recorded policy declares for its cadence.
+    last_check_seen: Option<(i64, Instant)>,
+    cadence_secs: u64,
+    floor_secs: u64,
+}
+
+impl NoProgress {
+    /// `checks` and `check_interval_secs` come from the run's own supervision
+    /// status ([`cursor_sample`]): its committed check count and the cadence
+    /// its recorded authorization declares.
+    fn new(checks: i64, check_interval_secs: u64) -> Self {
+        let floor_secs = check_interval_secs.max(1);
+        NoProgress {
+            last_progress: Instant::now(),
+            progress: String::new(),
+            checks_at_progress: checks,
+            last_check_seen: None,
+            cadence_secs: floor_secs,
+            floor_secs,
+        }
+    }
+
+    /// ONE sample: `signature` is the wait's own observed durable state,
+    /// `checks` the run's committed check count and `in_flight` the step the
+    /// machinery is working on (empty when idle). A changed signature — or the
+    /// run's own clock being seeded for the first time — resets the ceiling.
+    fn sample(&mut self, signature: &str, checks: i64, in_flight: &str) -> Option<String> {
+        let now = Instant::now();
+        match self.last_check_seen {
+            Some((last, at)) if checks > last => {
+                let gap = now.duration_since(at).as_secs().max(1);
+                self.cadence_secs = gap.max(self.floor_secs);
+                self.last_check_seen = Some((checks, now));
+            }
+            None => self.last_check_seen = Some((checks, now)),
+            _ => {}
+        }
+        if signature != self.progress {
+            self.progress = signature.to_string();
+            self.last_progress = now;
+            self.checks_at_progress = checks;
+            return None;
+        }
+        let passes = checks - self.checks_at_progress;
+        let elapsed = now.duration_since(self.last_progress).as_secs();
+        let budget = self.cadence_secs.saturating_mul(NO_PROGRESS_CHECKS as u64);
+        if passes >= NO_PROGRESS_CHECKS || elapsed >= budget {
+            return Some(format!(
+                "no progress for {passes} of the run's own committed check(s), {elapsed}s of the \
+                 {budget}s its own {}-s cadence allows; frontier {signature:?}; in flight: \
+                 {in_flight:?}",
+                self.cadence_secs
+            ));
+        }
+        None
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Builders (the #84/#85/#95 fixture shape)
@@ -1039,25 +1124,32 @@ fn the_run_dispatches_its_own_reviewer_at_the_certified_head() {
 
     // NO client dispatch of any step happens from here on: the run's own
     // supervisor owns the committed spine. Poll its own status surface
-    // (bounded, no fixed sleep) until the delivery completes the run.
+    // (bounded by the run's own machinery, no fixed sleep) until the delivery
+    // completes the run.
+    let seeded = cursor_sample(&fixture.socket, &run, 699);
+    let mut watch = NoProgress::new(seeded.checks, seeded.cadence_secs);
     let mut timeline: Vec<String> = Vec::new();
     let mut id = 700u64;
-    let deadline = Instant::now() + Duration::from_secs(120);
     let attempts = loop {
         id += 1;
-        let (status, step, kind, attempts) = cursor_sample(&fixture.socket, &run, id);
+        let sample = cursor_sample(&fixture.socket, &run, id);
         timeline.push(format!(
-            "t{} status={status} next={step}/{kind} attempts={attempts:?}",
-            id - 700
+            "t{} status={} next={}/{} attempts={:?}",
+            id - 700,
+            sample.status,
+            sample.step,
+            sample.kind,
+            sample.attempts
         ));
-        if status == "done" {
-            break attempts;
+        if sample.status == "done" {
+            break sample.attempts;
         }
-        assert!(
-            Instant::now() < deadline,
-            "the supervisor never drove the spine:\n{}",
-            timeline.join("\n")
-        );
+        if let Some(stalled) = watch.sample(&sample.signature(), sample.checks, &sample.in_flight) {
+            panic!(
+                "the supervisor never drove the spine: {stalled};\n{}",
+                timeline.join("\n")
+            );
+        }
         std::thread::sleep(Duration::from_millis(250));
     };
     for step in ["p1", "s1", "o1", "r1"] {
@@ -2390,10 +2482,11 @@ fn the_real_daemon_advances_the_queue_to_the_next_issue_without_another_request(
     );
 
     // NO further client request: the daemon's own reconciliation (event wake
-    // or the bounded timer fallback) admits the next issue.
-    let started = Instant::now();
-    let mut last_progress = started;
-    let mut progress = String::new();
+    // or the bounded timer fallback) admits the next issue. The ceiling is
+    // run5's OWN machinery — the run whose recorded delivery drives the
+    // advance — never a fixed clock (issue #310).
+    let seeded = cursor_sample(&fixture.socket, &run5, 9_999);
+    let mut watch = NoProgress::new(seeded.checks, seeded.cadence_secs);
     let mut id = 100u64;
     let status = loop {
         id += 1;
@@ -2411,18 +2504,13 @@ fn the_real_daemon_advances_the_queue_to_the_next_issue_without_another_request(
         if advanced == "admitted" {
             break doc;
         }
-        if advanced != progress {
-            progress = advanced.clone();
-            last_progress = Instant::now();
+        let clock = cursor_sample(&fixture.socket, &run5, id + 500_000);
+        if let Some(stalled) = watch.sample(&advanced, clock.checks, &clock.in_flight) {
+            panic!(
+                "the queue never advanced to issue 6: {stalled} (status {advanced:?}); last: {}",
+                canter::canonical::canonical_text(&doc)
+            );
         }
-        let stalled = last_progress.elapsed().as_secs();
-        assert!(
-            stalled < NO_PROGRESS_SECS,
-            "the queue never advanced to issue 6: no progress for {stalled}s of {}s waited \
-             (status {advanced:?}); last: {}",
-            started.elapsed().as_secs(),
-            canter::canonical::canonical_text(&doc)
-        );
         std::thread::sleep(Duration::from_millis(50));
     };
     let run6 = live_item(&status, 6)
@@ -2629,58 +2717,106 @@ fn repos_with_lane_branch(fixture: &DaemonFixture) -> String {
 }
 
 /// ONE recorded cursor sample of a supervised run, read on the product's own
-/// read-only surface: `(run status, next step, next step kind, attempts)`.
-fn cursor_sample(
-    socket: &Path,
-    run: &str,
-    id: u64,
-) -> (String, String, String, Vec<(String, String)>) {
+/// read-only surface: the run's status, the frontier its next act would move
+/// (next step and kind), its recorded attempts, and the machinery clock behind
+/// them — the committed supervision checks, the step currently in flight and
+/// the cadence the run's recorded authorization declares (issue #310).
+struct CursorSample {
+    status: String,
+    step: String,
+    kind: String,
+    attempts: Vec<(String, String)>,
+    checks: i64,
+    in_flight: String,
+    cadence_secs: u64,
+}
+
+impl CursorSample {
+    /// The durable frontier this wait treats as progress (issues #232, #295):
+    /// the run's own recorded status, next step and attempts — what the
+    /// machinery's evidence MOVED the run to, never the tick count.
+    fn signature(&self) -> String {
+        format!(
+            "{}/{}/{}/{:?}",
+            self.status, self.step, self.kind, self.attempts
+        )
+    }
+
+    fn from_doc(doc: &Val) -> CursorSample {
+        let attempts = doc
+            .get("cursor")
+            .and_then(|cursor| cursor.get("attempts"))
+            .and_then(Val::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|attempt| {
+                (
+                    attempt
+                        .get("step")
+                        .and_then(Val::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    attempt
+                        .get("status")
+                        .and_then(Val::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                )
+            })
+            .collect();
+        CursorSample {
+            status: doc
+                .get("run")
+                .and_then(|run| run.get("status"))
+                .and_then(Val::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            step: doc
+                .get("cursor")
+                .and_then(|cursor| cursor.get("next_step"))
+                .and_then(Val::as_str)
+                .unwrap_or("")
+                .to_string(),
+            kind: doc
+                .get("cursor")
+                .and_then(|cursor| cursor.get("next_step_kind"))
+                .and_then(Val::as_str)
+                .unwrap_or("")
+                .to_string(),
+            attempts,
+            checks: doc
+                .get("evaluation")
+                .and_then(|evaluation| evaluation.get("checks"))
+                .and_then(Val::as_int)
+                .unwrap_or(0),
+            in_flight: doc
+                .get("cursor")
+                .and_then(|cursor| cursor.get("in_flight"))
+                .and_then(Val::as_str)
+                .unwrap_or("")
+                .to_string(),
+            cadence_secs: doc
+                .get("supervision")
+                .and_then(|row| row.get("policy"))
+                .and_then(|policy| policy.get("check_interval_secs"))
+                .and_then(Val::as_int)
+                .unwrap_or(0)
+                .max(0) as u64,
+        }
+    }
+}
+
+/// ONE cursor sample of a supervised run, read on the product's own read-only
+/// status surface ([`CursorSample`]).
+fn cursor_sample(socket: &Path, run: &str, id: u64) -> CursorSample {
     let doc = rpc_ok(
         socket,
         &fresh_id(id),
         "supervision.status",
         Some(supervision::status_params(run)),
     );
-    let attempts = doc
-        .get("cursor")
-        .and_then(|cursor| cursor.get("attempts"))
-        .and_then(Val::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .map(|attempt| {
-            (
-                attempt
-                    .get("step")
-                    .and_then(Val::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                attempt
-                    .get("status")
-                    .and_then(Val::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-            )
-        })
-        .collect();
-    (
-        doc.get("run")
-            .and_then(|run| run.get("status"))
-            .and_then(Val::as_str)
-            .unwrap_or("unknown")
-            .to_string(),
-        doc.get("cursor")
-            .and_then(|cursor| cursor.get("next_step"))
-            .and_then(Val::as_str)
-            .unwrap_or("")
-            .to_string(),
-        doc.get("cursor")
-            .and_then(|cursor| cursor.get("next_step_kind"))
-            .and_then(Val::as_str)
-            .unwrap_or("")
-            .to_string(),
-        attempts,
-    )
+    CursorSample::from_doc(&doc)
 }
 
 fn achieved(attempts: &[(String, String)], step: &str) -> bool {
@@ -2773,31 +2909,28 @@ fn the_supervisor_itself_drives_the_committed_merge_and_cleanup_to_the_last_step
     // not one transient cursor value — is what proves the progression.
     let mut timeline: Vec<String> = Vec::new();
     let mut id = 700u64;
-    let started = Instant::now();
-    let mut last_progress = started;
-    let mut progress = String::new();
+    let seeded = cursor_sample(&fixture.socket, &run5, 699);
+    let mut watch = NoProgress::new(seeded.checks, seeded.cadence_secs);
     let (next_step, next_kind, attempts) = loop {
         id += 1;
-        let (status, step, kind, attempts) = cursor_sample(&fixture.socket, &run5, id);
+        let sample = cursor_sample(&fixture.socket, &run5, id);
         timeline.push(format!(
-            "t{} status={status} next={step}/{kind} attempts={attempts:?}",
-            id - 700
+            "t{} status={} next={}/{} attempts={:?}",
+            id - 700,
+            sample.status,
+            sample.step,
+            sample.kind,
+            sample.attempts
         ));
-        if status == "done" {
-            break (step, kind, attempts);
+        if sample.status == "done" {
+            break (sample.step, sample.kind, sample.attempts);
         }
-        let observed = format!("{status}/{step}/{kind}/{attempts:?}");
-        if observed != progress {
-            progress = observed;
-            last_progress = Instant::now();
+        if let Some(stalled) = watch.sample(&sample.signature(), sample.checks, &sample.in_flight) {
+            panic!(
+                "the driver never drove the run's committed tail to its last step: {stalled}; \
+                 observed: {timeline:?}"
+            );
         }
-        let stalled = last_progress.elapsed().as_secs();
-        assert!(
-            stalled < NO_PROGRESS_SECS,
-            "the driver never drove the run's committed tail to its last step: no progress for \
-             {stalled}s of {}s waited; observed: {timeline:?}",
-            started.elapsed().as_secs()
-        );
         std::thread::sleep(Duration::from_millis(250));
     };
     eprintln!("SUPERVISOR_TAIL_TIMELINE={timeline:?}");
@@ -3365,16 +3498,19 @@ fn a_fix_rounds_delivered_head_is_re_bound_by_the_runs_own_machinery() {
     wait_ready(&fixture);
     let mut timeline: Vec<String> = Vec::new();
     let mut id = 700u64;
-    let started = Instant::now();
-    let mut last_progress = started;
-    let mut progress = String::new();
+    let seeded = cursor_sample(&fixture.socket, &run, 699);
+    let mut watch = NoProgress::new(seeded.checks, seeded.cadence_secs);
     let mut settled;
     loop {
         id += 1;
-        let (status, step, kind, attempts) = cursor_sample(&fixture.socket, &run, id);
+        let sample = cursor_sample(&fixture.socket, &run, id);
         timeline.push(format!(
-            "t{} status={status} next={step}/{kind} attempts={attempts:?}",
-            id - 700
+            "t{} status={} next={}/{} attempts={:?}",
+            id - 700,
+            sample.status,
+            sample.step,
+            sample.kind,
+            sample.attempts
         ));
         // The driver's own acts, read from the run's live surfaces: the
         // certificate moved to the DELIVERED head and the reviewer recorded its
@@ -3387,7 +3523,7 @@ fn a_fix_rounds_delivered_head_is_re_bound_by_the_runs_own_machinery() {
             .evidence_for_instance(&run)
             .expect("evidence read");
         let recorded = evidence.first().cloned();
-        settled = attempts.clone();
+        settled = sample.attempts.clone();
         if let (Some(certificate), Some(recorded)) = (&certificate, &recorded)
             && certificate.head == delivered
             && recorded.feature_head == delivered
@@ -3395,18 +3531,9 @@ fn a_fix_rounds_delivered_head_is_re_bound_by_the_runs_own_machinery() {
         {
             break;
         }
-        let observed = format!("{status}/{step}/{kind}/{attempts:?}");
-        if observed != progress {
-            progress = observed;
-            last_progress = Instant::now();
+        if let Some(stalled) = watch.sample(&sample.signature(), sample.checks, &sample.in_flight) {
+            panic!("the run never re-bound its fix delivery: {stalled}; observed: {timeline:?}");
         }
-        let stalled = last_progress.elapsed().as_secs();
-        assert!(
-            stalled < NO_PROGRESS_SECS,
-            "the run never re-bound its fix delivery: no progress for {stalled}s of {}s waited; \
-             observed: {timeline:?}",
-            started.elapsed().as_secs()
-        );
         std::thread::sleep(Duration::from_millis(250));
     }
     eprintln!("FIX_REBIND_TIMELINE={timeline:?}");
