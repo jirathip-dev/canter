@@ -953,6 +953,7 @@ fn p8_preserves_dirty_live_and_stale_lanes_then_closes_the_owned_workspace() {
         archive_root: None,
         review_root: None,
         retired_run_ids: &[],
+        live_sibling_run_ids: &[],
     };
     let dirty = fixture.worktree.join("keep.txt");
     fs::write(&dirty, "unfinished work").unwrap();
@@ -1178,6 +1179,7 @@ fn p8_waits_bounded_for_a_published_live_lane_and_still_refuses_an_unpublished_o
         archive_root: None,
         review_root: None,
         retired_run_ids: &[],
+        live_sibling_run_ids: &[],
     };
 
     // (a) The lane's own commit exists nowhere but its branch: the live lane is
@@ -1340,6 +1342,7 @@ fn p8_never_closes_a_flapping_live_lane_and_closes_it_after_the_settle() {
         archive_root: None,
         review_root: None,
         retired_run_ids: &[],
+        live_sibling_run_ids: &[],
     };
     fixture.seed("state", "working");
     let rows_before = fixture.rows().len();
@@ -1494,6 +1497,7 @@ fn run_harness_start_step(
         archive_root: None,
         review_root: None,
         retired_run_ids: retired,
+        live_sibling_run_ids: &[],
     };
     execute_step(&ctx)
 }
@@ -2574,6 +2578,7 @@ fn the_harness_start_step_starts_the_worker_in_the_lane_worktrees_pane() {
         archive_root: None,
         review_root: None,
         retired_run_ids: &[],
+        live_sibling_run_ids: &[],
     };
 
     let outcome = execute_step(&ctx);
@@ -2646,6 +2651,7 @@ fn a_plan_without_the_legs_own_lane_checkout_refuses_typed_on_the_pane_substrate
         archive_root: None,
         review_root: None,
         retired_run_ids: &[],
+        live_sibling_run_ids: &[],
     };
     let outcome = execute_step(&ctx);
     assert_eq!(outcome.status, "refused", "{:?}", outcome.message);
@@ -2700,6 +2706,7 @@ fn a_plan_without_the_legs_own_lane_checkout_refuses_typed_on_the_pane_substrate
         archive_root: None,
         review_root: None,
         retired_run_ids: &[],
+        live_sibling_run_ids: &[],
     };
     let outcome = execute_step(&ctx);
     assert_eq!(outcome.status, "refused", "{:?}", outcome.message);

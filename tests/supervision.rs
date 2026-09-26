@@ -3274,6 +3274,233 @@ fn a_released_generations_lane_residue_is_retired_by_the_next_submission() {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #306: the local-only residue half of #222
+// ---------------------------------------------------------------------------
+
+/// Issue #306 end-to-end witness over the daemon socket, the measured
+/// defect's exact shape: the previous generation is TERMINAL in the ledger and
+/// left its delivery as a LOCAL-ONLY lane branch (`issue-5`) with no live lane
+/// and no registered worktree. A fresh same-issue submission's worktree step
+/// used to refuse `refusal.worktree.branch_exists` and charge the run bounded
+/// retries; now it reclaims the residue — recorded on the step outcome AND in
+/// the journal, naming the branch, its tip and the issue — and the run reaches
+/// its bind with ZERO retry authorizations.
+#[test]
+fn a_fresh_submission_reclaims_the_previous_generations_local_only_branch() {
+    let fixture = DaemonFixture::new("lane-localonly");
+    let integration = fixture.dir.join("integration");
+    init_repo(&integration);
+    // The published refs must be a SEPARATE store for a local-only branch to
+    // exist at all: the fixture's own `origin` is the integration clone, so it
+    // is re-pointed at a bare mirror that carries `staging` and nothing else.
+    let origin = fixture.dir.join("origin.git");
+    git_output(
+        &fixture.dir,
+        &["init", "-q", "--bare", origin.to_str().unwrap()],
+    );
+    git_output(
+        &integration,
+        &["remote", "set-url", "origin", origin.to_str().unwrap()],
+    );
+    git_output(&integration, &["push", "-q", "origin", "staging"]);
+    let fakebin_hermes = write_fake_hermes(&fixture.dir);
+    let fakebin_herdr = write_fake_herdr(&fixture.dir);
+    let host_path = std::env::var("PATH").unwrap_or_default();
+    let daemon = fixture.spawn_with_path(&format!(
+        "{}:{}:{host_path}",
+        fakebin_herdr.display(),
+        fakebin_hermes.display()
+    ));
+    wait_ready(&fixture);
+
+    // The previous generation: ONE ledger-terminal run of this issue, and its
+    // delivery kept local-only (committed in the clone, never pushed).
+    let retired = "run-3063063063063066";
+    let at = "2026-09-06T00:00:00Z";
+    {
+        let state = fixture.seed();
+        seed_grant(&state, "gr_0000000000000097", 5);
+        state
+            .start_instance(retired, "gr_0000000000000097", "fleet-doctrine-1", at)
+            .expect("retired generation instance");
+        state
+            .release_run(
+                retired,
+                "the previous generation of this issue is terminal",
+                "ik_issue-306-retired",
+                at,
+            )
+            .expect("release the previous generation");
+    }
+    let scratch = fixture.dir.join("residue-306");
+    git_output(
+        &integration,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "issue-5",
+            scratch.to_str().unwrap(),
+            "staging",
+        ],
+    );
+    git_output(
+        &scratch,
+        &["commit", "--allow-empty", "-m", "retired delivery"],
+    );
+    let retired_tip = git_output(&integration, &["rev-parse", "issue-5"])
+        .trim()
+        .to_string();
+    git_output(
+        &integration,
+        &["worktree", "remove", scratch.to_str().unwrap()],
+    );
+    assert!(
+        git_output(&integration, &["ls-remote", "origin", "refs/heads/issue-5"])
+            .trim()
+            .is_empty(),
+        "the residue is local-only: the published store does not carry it"
+    );
+
+    // The fresh submission for the SAME issue: the lane worktree and the bind.
+    let (bound, digest) = {
+        let state = fixture.seed();
+        seed_grant(&state, "gr_0000000000000098", 5);
+        let mut steps = harness_pane_steps(HARNESS);
+        steps.truncate(2);
+        let request = qp::QueueRequest {
+            steps,
+            role_config: harness_binding_doc(),
+            ..observation_request(vec![selected("#5", REV_A)])
+        };
+        render_bound(&state, &request)
+    };
+    let submitted = rpc_ok(
+        &fixture.socket,
+        &fresh_id(1),
+        "queue.submit",
+        Some(harness_submit_params(
+            &idem_key("reclaim-local-only"),
+            &bound,
+            &digest,
+            "gr_0000000000000098",
+        )),
+    );
+    let successor = instance_of(&submitted, 5);
+    let lane = fixture.dir.join("worktrees/issues-5");
+    let created = apply_step(
+        &fixture,
+        &integration,
+        &bound,
+        &successor,
+        "gr_0000000000000098",
+        2,
+        "p1",
+        "reclaim-local-only-p1",
+    );
+    assert!(lane.is_dir(), "the lane worktree exists");
+    let reclaimed = created.get("reclaimed").expect("the reclaim is recorded");
+    println!("RECLAIMED {}", canter::canonical::canonical_text(reclaimed));
+    let residue = reclaimed
+        .as_array()
+        .and_then(|rows| rows.first())
+        .cloned()
+        .expect("one residue record");
+    assert_eq!(residue.get("issue").and_then(Val::as_int), Some(5));
+    assert_eq!(
+        residue
+            .get("generations")
+            .and_then(Val::as_array)
+            .and_then(|ids| ids.first())
+            .and_then(Val::as_str),
+        Some(retired)
+    );
+    let branch_residue = residue
+        .get("branch_residue")
+        .cloned()
+        .expect("the branch half is recorded");
+    assert_eq!(
+        branch_residue.get("removed").and_then(Val::as_bool),
+        Some(true),
+        "the local-only branch is reclaimed: {branch_residue:?}"
+    );
+    assert_eq!(
+        branch_residue.get("tip").and_then(Val::as_str),
+        Some(retired_tip.as_str()),
+        "the reclaimed tip stays recorded (the stale delivery is traceable)"
+    );
+    let new_head = git_output(&integration, &["rev-parse", "issue-5"])
+        .trim()
+        .to_string();
+    assert_eq!(
+        created.get("head").and_then(Val::as_str),
+        Some(new_head.as_str())
+    );
+    assert_ne!(
+        new_head, retired_tip,
+        "the lane is created at the base, not adopted"
+    );
+    let started = apply_step(
+        &fixture,
+        &integration,
+        &bound,
+        &successor,
+        "gr_0000000000000098",
+        3,
+        "p2",
+        "reclaim-local-only-p2",
+    );
+    assert!(
+        started.get("session_id").is_some(),
+        "the successor reached its bind: {}",
+        canter::canonical::canonical_text(&started)
+    );
+
+    shutdown(daemon);
+
+    // Reopen durable state after shutdown: the reclaim is in the journal, and
+    // the fresh run consumed ZERO retry authorizations on its FIRST attempts.
+    // The claim row IS the audited effect: its outcome names the step it
+    // resolved, and its durable response carries exactly the reclaim record
+    // the caller read back (branch, tip, issue, generation).
+    let state = fixture.seed();
+    let claim = state
+        .claim(&idem_key("reclaim-local-only-p1"))
+        .expect("claim")
+        .expect("the worktree step is journaled");
+    assert_eq!(claim.status, "spent");
+    let outcome =
+        Val::parse_json(claim.outcome.as_deref().expect("journal outcome")).expect("outcome json");
+    assert_eq!(
+        outcome.get("status").and_then(Val::as_str),
+        Some("succeeded"),
+        "the reclaiming worktree step is journaled as succeeded: {outcome:?}"
+    );
+    assert_eq!(outcome.get("step_id").and_then(Val::as_str), Some("p1"));
+    let response = Val::parse_json(claim.response.as_deref().expect("journal response"))
+        .expect("response json");
+    assert_eq!(
+        response
+            .get("result")
+            .and_then(|result| result.get("reclaimed")),
+        Some(reclaimed),
+        "the durable response carries the reclaim record"
+    );
+    assert!(
+        state.run_retries(&successor).expect("retries").is_empty(),
+        "no retry authorization was consumed by the fresh run"
+    );
+    assert_eq!(
+        state.run_step_attempts(&successor).expect("attempts"),
+        vec![
+            ("p1".to_string(), "succeeded".to_string()),
+            ("p2".to_string(), "succeeded".to_string())
+        ],
+        "the fresh run reached its bind on its FIRST attempt"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Issue #236: the operator's OWN lane retirement control
 // ---------------------------------------------------------------------------
 

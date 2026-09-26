@@ -364,6 +364,7 @@ fn run_review_step(
         role: None,
         session: Some(&fixture.session),
         retired_run_ids: &[],
+        live_sibling_run_ids: &[],
     })
 }
 
@@ -1238,6 +1239,7 @@ fn run_lane_review_step(
         role: None,
         session: Some(&fixture.session),
         retired_run_ids,
+        live_sibling_run_ids: &[],
     })
 }
 

@@ -4009,6 +4009,12 @@ fn symlinked_cleanup_targets_are_refused() {
 /// a ledger-terminal generation for THIS issue, a sibling lane that a LIVE
 /// issue holds, the stale artifacts, then the typed refusal (RED), the
 /// reclaim-and-create (GREEN), and `harness_start` (the run reaches `p3`).
+///
+/// Issue #306 updated the RED half: a LOCAL-ONLY branch with no live lane and
+/// no registered worktree is no longer refused but reclaimed (its own witness
+/// is `a_local_only_lane_branch_with_no_holder_is_reclaimed_by_the_next_worktree_step`).
+/// What still refuses here is the HOLDER: the residue checkout is DIRTY, so it
+/// is never forced and the branch it has checked out is never adopted.
 #[test]
 fn a_terminal_generations_lane_residue_is_reclaimed_with_its_own_code() {
     // The retired generation's lane identity IS this issue's lane identity
@@ -4082,32 +4088,35 @@ fn a_terminal_generations_lane_residue_is_reclaimed_with_its_own_code() {
     ]);
     let foreign_tip = git.head("issue-999");
 
-    // AC2 RED half: the stale branch is NOT recoverable from the remote (a
-    // local-only delivery), so it is never deleted. The collision is refused
-    // with its OWN typed code naming the branch — never `adapter.exit`.
+    // AC2 RED half (issue #306 keeps it): the retired generation's registered
+    // checkout still HOLDS the branch — and it is dirty, so nothing is forced
+    // — so the residue is not reclaimed and the collision is refused with its
+    // OWN typed code naming the branch — never `adapter.exit`.
+    std::fs::write(
+        lane.join("uncommitted.txt"),
+        b"the retired generation's uncommitted work",
+    )
+    .expect("dirty the residue checkout");
     let (code, message) = scenario.apply_err(222, "w1", None, None);
-    println!("STALE-BRANCH REFUSAL {code}: {message}");
+    println!("HELD-RESIDUE REFUSAL {code}: {message}");
     assert_eq!(
-        code, "refusal.worktree.branch_exists",
-        "the stale-branch collision has its own typed code: {message}"
+        code, "refusal.worktree.exists",
+        "a dirty registered residue checkout is refused, not forced: {message}"
     );
     assert!(
-        message.contains("issue-123"),
-        "the refusal names the branch: {message}"
-    );
-    assert!(
-        !lane.exists(),
-        "the retired generation's registered checkout was reclaimed"
+        lane.exists(),
+        "the dirty residue checkout is left exactly where it is"
     );
     assert_eq!(
         git.head("issue-123"),
         retired_tip,
-        "a local-only lane branch is never deleted"
+        "a branch a registered worktree holds is never deleted or adopted"
     );
 
     // AC2 GREEN half: published (recoverable from the remote) ⇒ reclaimed,
     // and the lane is created CLEAN at the recorded base (a refresh, not an
     // adoption of the retired delivery).
+    std::fs::remove_file(lane.join("uncommitted.txt")).expect("clean the residue checkout");
     git.run(&["push", "origin", "issue-123"]);
     let created = scenario.apply_ok(223, "w2", None, None);
     assert_eq!(
@@ -4116,7 +4125,24 @@ fn a_terminal_generations_lane_residue_is_reclaimed_with_its_own_code() {
     );
     let reclaimed = created.get("reclaimed").expect("the reclaim is recorded");
     println!("RECLAIMED {}", canter::canonical::canonical_text(reclaimed));
-    assert!(lane.exists(), "the new lane exists");
+    let residue = reclaimed
+        .as_array()
+        .and_then(|rows| rows.first())
+        .cloned()
+        .expect("one residue record per generation");
+    assert_eq!(residue.get("issue").and_then(Val::as_int), Some(123));
+    assert_eq!(
+        residue
+            .get("generations")
+            .and_then(Val::as_array)
+            .map(|ids| ids.len()),
+        Some(1),
+        "the reclaimed generation is named"
+    );
+    assert!(
+        lane.exists(),
+        "the reclaimed registered checkout was retired and the lane re-created"
+    );
     let new_head = git.head("HEAD");
     assert_eq!(
         created.get("head").and_then(Val::as_str),
@@ -4150,5 +4176,318 @@ fn a_terminal_generations_lane_residue_is_reclaimed_with_its_own_code() {
     assert!(
         git.run(&["worktree", "list"]).contains("issues-999"),
         "its registration is untouched"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #306: a retired generation's LOCAL-ONLY lane branch with no live lane
+// and no registered worktree IS reclaimable residue
+// ---------------------------------------------------------------------------
+
+/// The measured defect (issue #306): after a generation ended, the integration
+/// clone kept its lane branch as a LOCAL-ONLY delivery — the published branch
+/// on `origin` did not carry its tip — with no live lane and no registered
+/// worktree holding it, and every fresh run for the issue then refused its
+/// worktree step with `refusal.worktree.branch_exists`, charging the run
+/// bounded retries for a condition it did not create and leaving only a human
+/// able to clear it. Such a branch IS a retired generation's reclaimable
+/// residue: the successor reclaims it, records what it removed (branch, tip,
+/// issue, generation) and proceeds on its FIRST attempt.
+///
+/// The guard still bites, witnessed on the same daemon socket:
+///
+/// 1. a branch a REGISTERED worktree of the integration clone has checked out
+///    is never deleted or adopted — the refusal names the holder;
+/// 2. a branch whose issue still has another NON-TERMINAL generation
+///    (a run parked at `needs-attention` keeps that status) is left untouched
+///    — the refusal names the live generation — and the very same submission
+///    reclaims it once that generation is terminal.
+#[test]
+fn a_local_only_lane_branch_with_no_holder_is_reclaimed_by_the_next_worktree_step() {
+    // ---- The reclaim: the measured defect's exact shape -------------------
+    let retired = "run-3063063063063063";
+    let mut steps = vec![step(
+        "w1",
+        "worktree_create",
+        Some(object(vec![
+            ("branch", string("issue-123")),
+            ("worktree", string("issues-123")),
+        ])),
+    )];
+    steps.push(flow_steps()[1].clone());
+    let scenario = Scenario::new("i306rec", "2999-01-01T00:00:00Z", steps);
+
+    // The run ledger: ONE terminal generation of this repository issue, and no
+    // other (non-terminal) generation — the successor is the only live lane.
+    let at = "2026-09-06T00:00:00Z";
+    let state = State::open(&scenario.fixture.paths().db_path, Retention::default())
+        .expect("open state for the retired generation");
+    state
+        .start_instance(retired, GRANT_ID, "fleet-doctrine-1", at)
+        .expect("retired generation instance");
+    state
+        .release_run(
+            retired,
+            "the previous generation of this issue is terminal",
+            "ik_issue-306-retired",
+            at,
+        )
+        .expect("release the previous generation");
+    assert!(
+        state
+            .live_run_ids("example-org/widgets", 123, INSTANCE_ID)
+            .expect("live generations")
+            .is_empty(),
+        "the dispatching run is excluded; no other live generation exists"
+    );
+    drop(state);
+
+    // The residue: the retired generation's delivery commit, kept LOCAL-ONLY
+    // (never pushed) and with NOTHING holding it — its checkout is already
+    // gone, exactly the live shape issue #306 measured.
+    let git = Git::new(&scenario.repos.checkout);
+    let scratch = scenario.sandbox.path("residue-306");
+    git.run(&[
+        "worktree",
+        "add",
+        "-b",
+        "issue-123",
+        scratch.to_str().unwrap(),
+        "staging",
+    ]);
+    Git::new(&scratch).run(&[
+        "commit",
+        "--allow-empty",
+        "-m",
+        "retired local-only delivery",
+    ]);
+    let retired_tip = git.head("issue-123");
+    git.run(&["worktree", "remove", scratch.to_str().unwrap()]);
+    assert!(
+        !git.run(&["worktree", "list"]).contains("residue-306"),
+        "no registered worktree holds the branch any more"
+    );
+
+    let created = scenario.apply_ok(3061, "w1", None, None);
+    assert_eq!(
+        created.get("branch").and_then(Val::as_str),
+        Some("issue-123")
+    );
+    let reclaimed = created.get("reclaimed").expect("the reclaim is recorded");
+    println!("RECLAIMED {}", canter::canonical::canonical_text(reclaimed));
+    let residue = reclaimed
+        .as_array()
+        .and_then(|rows| rows.first())
+        .cloned()
+        .expect("one residue record per generation");
+    assert_eq!(
+        residue.get("issue").and_then(Val::as_int),
+        Some(123),
+        "the record names the issue it was reclaimed for"
+    );
+    assert_eq!(
+        residue
+            .get("generations")
+            .and_then(Val::as_array)
+            .and_then(|ids| ids.first())
+            .and_then(Val::as_str),
+        Some(retired),
+        "the record names the retired generation whose residue it was"
+    );
+    let branch_residue = residue
+        .get("branch_residue")
+        .cloned()
+        .expect("the branch half is recorded");
+    assert_eq!(
+        branch_residue.get("removed").and_then(Val::as_bool),
+        Some(true),
+        "the local-only branch IS reclaimed: {branch_residue:?}"
+    );
+    assert_eq!(
+        branch_residue.get("tip").and_then(Val::as_str),
+        Some(retired_tip.as_str()),
+        "the reclaimed tip stays recorded, so the stale delivery is traceable"
+    );
+    assert!(
+        branch_residue
+            .get("message")
+            .and_then(Val::as_str)
+            .unwrap_or_default()
+            .contains("no live lane and no registered worktree held it"),
+        "the record states WHY it was reclaimable: {branch_residue:?}"
+    );
+    let base = scenario.integration_base();
+    let lane = scenario.repos.worktrees_root.join("issues-123");
+    assert!(
+        lane.exists(),
+        "the lane is created where the refusal used to be"
+    );
+    let new_head = git.head("HEAD");
+    assert_eq!(
+        created.get("head").and_then(Val::as_str),
+        Some(new_head.as_str())
+    );
+    assert_eq!(new_head, base, "the lane starts at the recorded base");
+    assert_ne!(
+        new_head, retired_tip,
+        "not an adoption of the retired delivery"
+    );
+    assert_eq!(
+        git.head("issue-123"),
+        new_head,
+        "the reclaimed branch is re-created clean at the base"
+    );
+
+    // The run reaches `p3` (harness_start) with no operator action.
+    let harness = scenario.apply_ok(3062, "h1", None, None);
+    assert!(
+        harness.get("worktree_identity").is_some(),
+        "the run reached the bind: {}",
+        canter::canonical::canonical_text(&harness)
+    );
+
+    // ---- The guard: a held branch, and a live generation -----------------
+    let mut guarded_steps = vec![
+        step(
+            "w1",
+            "worktree_create",
+            Some(object(vec![
+                ("branch", string("issue-123")),
+                ("worktree", string("issues-123")),
+            ])),
+        ),
+        step(
+            "w2",
+            "worktree_create",
+            Some(object(vec![
+                ("branch", string("issue-123")),
+                ("worktree", string("issues-123")),
+            ])),
+        ),
+        step(
+            "w3",
+            "worktree_create",
+            Some(object(vec![
+                ("branch", string("issue-123")),
+                ("worktree", string("issues-123")),
+            ])),
+        ),
+    ];
+    guarded_steps.push(flow_steps()[1].clone());
+    let guarded = Scenario::new("i306hld", "2999-01-01T00:00:00Z", guarded_steps);
+    let retired2 = "run-3063063063063064";
+    let live = "run-3063063063063065";
+    let state = State::open(&guarded.fixture.paths().db_path, Retention::default())
+        .expect("open state for the guarded scenario");
+    state
+        .start_instance(retired2, GRANT_ID, "fleet-doctrine-1", at)
+        .expect("retired generation instance");
+    state
+        .release_run(
+            retired2,
+            "the previous generation of this issue is terminal",
+            "ik_issue-306-guarded",
+            at,
+        )
+        .expect("release the previous generation");
+    drop(state);
+    let git = Git::new(&guarded.repos.checkout);
+    // A registered worktree (a live lane's own checkout) HOLDS the branch.
+    let holder = guarded.sandbox.path("holder-306");
+    git.run(&[
+        "worktree",
+        "add",
+        "-b",
+        "issue-123",
+        holder.to_str().unwrap(),
+        "staging",
+    ]);
+    Git::new(&holder).run(&["commit", "--allow-empty", "-m", "held delivery"]);
+    let held_tip = git.head("issue-123");
+
+    let (code, message) = guarded.apply_err(3063, "w1", None, None);
+    println!("HELD-BRANCH REFUSAL {code}: {message}");
+    assert_eq!(
+        code, "refusal.worktree.branch_exists",
+        "the branch collision keeps its own typed code: {message}"
+    );
+    assert!(
+        message.contains("issue-123"),
+        "the refusal names the branch: {message}"
+    );
+    assert!(
+        message.contains("checked out by a registered worktree"),
+        "the refusal names the HOLDER clause: {message}"
+    );
+    assert!(
+        message.contains("holder-306"),
+        "the refusal names WHICH registration holds it: {message}"
+    );
+    assert_eq!(
+        git.head("issue-123"),
+        held_tip,
+        "a branch a registered worktree holds is never deleted or adopted"
+    );
+    assert!(holder.exists(), "the holder's checkout is untouched");
+
+    // A NON-TERMINAL generation of the issue — a run parked at
+    // `needs-attention` keeps this status — still needs the issue's one lane.
+    let state =
+        State::open(&guarded.fixture.paths().db_path, Retention::default()).expect("reopen state");
+    state
+        .start_instance(live, GRANT_ID, "fleet-doctrine-1", at)
+        .expect("live sibling generation");
+    drop(state);
+    git.run(&["worktree", "remove", holder.to_str().unwrap()]);
+    let (code, message) = guarded.apply_err(3064, "w2", None, None);
+    println!("LIVE-GENERATION REFUSAL {code}: {message}");
+    assert_eq!(code, "refusal.worktree.branch_exists", "{message}");
+    assert!(
+        message.contains(live),
+        "the refusal names the live generation that still needs the lane: {message}"
+    );
+    assert!(
+        message.contains("still needs the lane"),
+        "nothing was reclaimed for a live generation: {message}"
+    );
+    assert_eq!(
+        git.head("issue-123"),
+        held_tip,
+        "the branch of an issue with a live run is left untouched"
+    );
+
+    // The SAME submission shape reclaims the SAME branch once that generation
+    // is terminal — the live generation is the only difference.
+    let state =
+        State::open(&guarded.fixture.paths().db_path, Retention::default()).expect("reopen state");
+    state
+        .release_run(
+            live,
+            "the sibling generation went terminal",
+            "ik_issue-306-live-terminal",
+            at,
+        )
+        .expect("release the sibling generation");
+    drop(state);
+    let created = guarded.apply_ok(3065, "w3", None, None);
+    let reclaimed = created.get("reclaimed").expect("the reclaim is recorded");
+    let branch_residue = reclaimed
+        .as_array()
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get("branch_residue"))
+        .cloned()
+        .unwrap_or_else(null);
+    assert_eq!(
+        branch_residue.get("removed").and_then(Val::as_bool),
+        Some(true),
+        "the same branch is reclaimed once no live generation needs it: {branch_residue:?}"
+    );
+    assert_eq!(
+        branch_residue.get("tip").and_then(Val::as_str),
+        Some(held_tip.as_str())
+    );
+    assert!(
+        guarded.repos.worktrees_root.join("issues-123").exists(),
+        "the lane is created for the successor"
     );
 }

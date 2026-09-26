@@ -7219,14 +7219,16 @@ durable lane records — the ownership row that still names it the owner of its
 issue, its linked lane workspace, its registered lane checkout and its local
 lane branch — and nothing could retire them but hand-editing state or waiting
 for a successor run to reclaim them at its bind step. One audited transaction
-removes the leftover ownership rows and the same #190/#222 policy a bind step
-applies retires that run's OWN lane: the lane is derived from the run's own
+removes the leftover ownership rows and the same #190/#222 residue policy
+retires that run's OWN lane: the lane is derived from the run's own
 issue (its own implementer leg), the integration clone comes from the run's
 OWN recorded topology (a first-time topology may be presented with
 `--topology FILE`), a registration that is not this run's own one-pane lane
 workspace is refused and left untouched, and a local branch is deleted only
 when the published branch carries the same tip — a local-only delivery is
-never deleted. A run that is NOT terminal refuses typed
+never deleted by this control (the automatic reclaim at the next bind step
+reclaims an UNHELD local-only branch, issue #306). A run that is NOT terminal
+refuses typed
 `refusal.lane.live_run` and nothing is read, claimed or touched: a live lane
 still holds its issue's unique ownership (release such a run first if it can
 never progress). The operator `--reason`, the exact run identity and what was

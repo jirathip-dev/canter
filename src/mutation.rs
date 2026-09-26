@@ -1564,6 +1564,16 @@ pub struct EffectContext<'a> {
     /// run that is not terminal still holds its issue's unique ownership —
     /// so the retire can never close a live current generation.
     pub retired_run_ids: &'a [String],
+    /// This run's repository issue's OTHER generations that are NOT terminal
+    /// in the ledger (issue #306), resolved by the caller from durable state
+    /// and never from the substrate: the complement of
+    /// [`EffectContext::retired_run_ids`], with the dispatching run itself
+    /// excluded. `worktree_create` reclaims a retired generation's lane
+    /// residue only when this set is EMPTY: any other non-terminal generation
+    /// of the issue — including a run parked at `needs-attention` — still
+    /// needs (or may still be holding) the issue's one lane, so nothing of
+    /// that lane is deleted or adopted for it.
+    pub live_sibling_run_ids: &'a [String],
 }
 
 /// Outcome for a refused effect (preconditions are checked by the daemon
@@ -3034,6 +3044,17 @@ fn lane_integration_base(ctx: &EffectContext<'_>) -> Result<String, EffectOutcom
 /// would be charged to the run's bounded retry budget. The registration is
 /// cleared for exactly that path first (see
 /// [`clear_stale_lane_registration`]) and the repair rides the outcome.
+///
+/// Issue #306 adds the third shape at the same scope: the retired generation
+/// left its local lane branch behind as a LOCAL-ONLY delivery (the published
+/// branch on `origin` does not carry its tip) with no live lane and no
+/// registered worktree, so the successor's create refused
+/// `refusal.worktree.branch_exists` forever and the run was charged bounded
+/// retries for a condition it did not create. Such a branch IS a retired
+/// generation's reclaimable residue and is reclaimed (see
+/// [`reclaim_lane_residue`]'s #306 half); a branch a registered worktree
+/// holds, or one whose issue still has a live generation, keeps the refusal
+/// verbatim.
 fn effect_worktree_create(ctx: &EffectContext<'_>) -> EffectOutcome {
     let (branch, relative) = match worktree_create_inputs(ctx.params, &ctx.param_contract()) {
         Ok(inputs) => inputs,
@@ -3043,10 +3064,15 @@ fn effect_worktree_create(ctx: &EffectContext<'_>) -> EffectOutcome {
         Ok(path) => path,
         Err(err) => return refusal(err.code, err.message),
     };
-    // The reclaim authority is the run ledger (only a terminal generation of
-    // THIS issue is in the set): with no terminal generation nothing is
-    // touched and the duplicate-lane refusals below stay the answer.
-    let reclaimed = if ctx.retired_run_ids.is_empty() {
+    // The reclaim authority is the run ledger: only a terminal generation of
+    // THIS issue authorizes a reclaim at all, and only while the issue has NO
+    // other non-terminal generation (issue #306) — a live lane (a run parked
+    // at `needs-attention` included) still needs the issue's one lane, whose
+    // branch and checkout are derived from the issue number, so nothing of it
+    // is ever reclaimed from under a live generation. With either fact absent
+    // nothing is touched and the duplicate-lane refusals below stay the
+    // answer.
+    let reclaimed = if ctx.retired_run_ids.is_empty() || !ctx.live_sibling_run_ids.is_empty() {
         Vec::new()
     } else {
         reclaim_retired_lane_residue(ctx, &branch, &relative, &worktree)
@@ -3065,15 +3091,29 @@ fn effect_worktree_create(ctx: &EffectContext<'_>) -> EffectOutcome {
     }
     // Issue #222 AC2: the stale-branch collision is its own typed code that
     // NAMES the branch — never a raw git 255 resolved as `adapter.exit`.
+    // Issue #306 AC2: the refusal STANDS for every branch this reclaim may not
+    // reclaim — one a registered worktree of the integration clone has checked
+    // out (a live lane's own checkout, including a stale registration whose
+    // directory is gone), and one whose issue has another live generation.
     if local_ref_tip(ctx, &format!("refs/heads/{branch}")).is_some() {
+        let unresidue = if ctx.live_sibling_run_ids.is_empty() {
+            "a local-only branch is reclaimed only when no registered worktree of the \
+             integration clone holds it, and a held branch is never deleted or adopted"
+                .to_string()
+        } else {
+            format!(
+                "a live generation of this issue ({}) still needs the lane, so nothing is \
+                 reclaimed and a held branch is never deleted or adopted",
+                ctx.live_sibling_run_ids.join(", ")
+            )
+        };
         return refusal(
             code::WORKTREE_BRANCH_EXISTS,
             format!(
                 "the integration clone already has the local lane branch {branch:?} and it is not \
-                 a retired generation's reclaimable residue (a local-only branch is never deleted, \
-                 and a branch a live lane holds is never adopted); the duplicate lane cannot be \
-                 created at the recorded base — resolve {branch:?} (its owner, or an operator) and \
-                 re-dispatch{note}"
+                 a retired generation's reclaimable residue ({unresidue}); the duplicate lane \
+                 cannot be created at the recorded base — resolve {branch:?} (its owner, or an \
+                 operator) and re-dispatch{note}"
             ),
         );
     }
@@ -3191,6 +3231,34 @@ fn registered_worktree_paths_on(host: &ResidueHost<'_>) -> Vec<PathBuf> {
     }
 }
 
+/// The checkout the integration clone has the local branch `branch` checked
+/// out at, from the clone's own registration (`git worktree list --porcelain`
+/// pairs each registered path with the ref it has checked out) — `None` when
+/// no registered worktree holds it, so the branch is unheld residue. A
+/// registration whose directory is GONE still counts (git keeps its row),
+/// exactly like issue #282's stale entry: a branch a registration holds is
+/// never treated as unheld. The parse mirrors [`branch_worktree`]'s.
+fn registered_branch_holder_on(host: &ResidueHost<'_>, branch: &str) -> Option<String> {
+    let out = run_git_on(
+        host,
+        host.integration_repo,
+        &["worktree", "list", "--porcelain"],
+    )
+    .ok()?;
+    let wanted = format!("refs/heads/{branch}");
+    let mut current: Option<String> = None;
+    for line in out.stdout.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current = Some(path.trim().to_string());
+        } else if let Some(refname) = line.strip_prefix("branch ")
+            && refname.trim() == wanted
+        {
+            return current;
+        }
+    }
+    None
+}
+
 /// The comparable form of a lane checkout path even when the checkout itself
 /// is GONE (issue #282): the deepest EXISTING ancestor is canonicalized and
 /// the missing tail re-appended. Git reports resolved paths (on macOS
@@ -3273,6 +3341,24 @@ fn clear_stale_lane_registration(
     ])))
 }
 
+/// What the branch half does with a LOCAL-ONLY lane branch — one whose tip the
+/// published branch of `origin` does not carry. The two reclaim sites have
+/// deliberately different policies (issue #306 states the worktree step's;
+/// the operator control keeps its own), so the difference is a parameter, read
+/// at exactly one place.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LocalOnlyBranch {
+    /// The operator control's #222 policy: an explicit, human-issued
+    /// retirement never destroys the only copy of a delivery, so the branch
+    /// stays where it is and the refusal is recorded.
+    Preserve,
+    /// The bind step's #306 policy: a retired generation's local-only branch
+    /// that NO registered worktree holds is residue the successor's lane
+    /// creation must not be refused forever by — it is reclaimed, and the
+    /// recorded tip keeps the stale delivery traceable.
+    ReclaimUnheld,
+}
+
 /// Issue #222: reclaim the lane residue a ledger-TERMINAL generation of this
 /// repository issue left in the integration clone, and return one record of
 /// the attempt (removed, or refused with its reason). The residue set is
@@ -3283,14 +3369,22 @@ fn clear_stale_lane_registration(
 /// Policy, stated because the issue asks which one is implemented: the retired
 /// generation's REGISTERED lane checkout at this leg's own relative path is
 /// removed (never forced — a dirty or unregistered path is left alone), and
-/// its local lane branch is deleted only when the published branch on `origin`
-/// carries the same tip, i.e. when the branch is re-creatable from the remote
-/// (a refresh: the lane is then created clean at the recorded base). A branch
-/// whose content is NOT recoverable — a local-only delivery — is never
-/// deleted, and a branch a live lane holds cannot be deleted at all
-/// (`git branch -D` refuses a branch checked out in a worktree); both cases
-/// surface as `refusal.worktree.branch_exists` naming the branch instead of
-/// the raw git failure the issue measured.
+/// its local lane branch is deleted either when the published branch on
+/// `origin` carries the same tip (i.e. when the branch is re-creatable from the
+/// remote — a refresh: the lane is then created clean at the recorded base) or
+/// — issue #306 — when it is a LOCAL-ONLY delivery that no registered worktree
+/// of the integration clone has checked out. The #306 half is what keeps a
+/// successor off the bounded-retry ladder: the residual local-only branch
+/// refused every fresh run's worktree step with
+/// `refusal.worktree.branch_exists`, and the engine's policy left only a human
+/// able to clear it. Both deletion halves are scoped by the ledger — this
+/// function runs only for a ledger-TERMINAL generation of THIS issue, and the
+/// caller has established that the issue has no OTHER non-terminal generation
+/// — and a branch a registration holds is never deleted or adopted at all
+/// (`git branch -D` refuses a branch checked out in a worktree; the holder is
+/// read and recorded explicitly). Whatever still refuses surfaces as
+/// `refusal.worktree.branch_exists` naming the branch instead of the raw git
+/// failure the issue measured.
 fn reclaim_retired_lane_residue(
     ctx: &EffectContext<'_>,
     branch: &str,
@@ -3306,6 +3400,7 @@ fn reclaim_retired_lane_residue(
             worktree,
             ctx.worktrees_root,
             ctx.plan.issue_number as u64,
+            LocalOnlyBranch::ReclaimUnheld,
         ),
         Err(_) => Vec::new(),
     }
@@ -3377,6 +3472,10 @@ fn reclaim_build_residue(worktrees_root: &Path, issue: u64) -> Vec<Val> {
     records
 }
 
+// The arity covers the three residue halves plus the policy; the repo's own
+// convention for an internal dispatcher of this shape (see
+// `resolve_apply_effect` in src/daemon.rs).
+#[allow(clippy::too_many_arguments)]
 fn reclaim_lane_residue(
     host: &ResidueHost<'_>,
     generations: &[String],
@@ -3385,6 +3484,7 @@ fn reclaim_lane_residue(
     worktree: &Path,
     worktrees_root: &Path,
     issue: u64,
+    local_only: LocalOnlyBranch,
 ) -> Vec<Val> {
     let registered = registered_worktree_paths_on(host);
     let checkout = if !worktree.exists() {
@@ -3435,6 +3535,68 @@ fn reclaim_lane_residue(
                 ],
             )
         }
+        (Some(tip), published_tip) if local_only == LocalOnlyBranch::ReclaimUnheld => {
+            // Issue #306: a local-only delivery is a retired generation's
+            // reclaimable residue — unless a registration holds it. The read
+            // happens AFTER the checkout half above, so the very registration
+            // this reclaim just removed no longer counts as a holder.
+            match registered_branch_holder_on(host, branch) {
+                Some(holder) => object(vec![
+                    ("branch", string(branch)),
+                    ("tip", string(tip)),
+                    (
+                        "published_tip",
+                        published_tip.map(string).unwrap_or_else(null),
+                    ),
+                    ("holder", string(&holder)),
+                    ("removed", bool_(false)),
+                    (
+                        "message",
+                        string(
+                            "the local-only lane branch is checked out by a registered worktree \
+                             of the integration clone; a held branch is never deleted or adopted",
+                        ),
+                    ),
+                ]),
+                None => match run_git_on(host, host.integration_repo, &["branch", "-D", branch]) {
+                    Ok(_) => object(vec![
+                        ("branch", string(branch)),
+                        ("tip", string(tip)),
+                        (
+                            "published_tip",
+                            published_tip.map(string).unwrap_or_else(null),
+                        ),
+                        ("removed", bool_(true)),
+                        (
+                            "message",
+                            string(
+                                "the retired generation's local-only lane branch was \
+                                     reclaimed as residue: no live lane and no registered \
+                                     worktree held it, and the tip above keeps the stale \
+                                     delivery traceable",
+                            ),
+                        ),
+                    ]),
+                    Err(outcome) => object(vec![
+                        ("branch", string(branch)),
+                        ("tip", string(tip)),
+                        (
+                            "published_tip",
+                            published_tip.map(string).unwrap_or_else(null),
+                        ),
+                        ("removed", bool_(false)),
+                        (
+                            "code",
+                            string(outcome.code.as_deref().unwrap_or(code::MALFORMED_OUTPUT)),
+                        ),
+                        (
+                            "message",
+                            string(outcome.message.as_deref().unwrap_or_default()),
+                        ),
+                    ]),
+                },
+            }
+        }
         (Some(tip), published_tip) => object(vec![
             ("branch", string(branch)),
             ("tip", string(tip)),
@@ -3446,13 +3608,16 @@ fn reclaim_lane_residue(
             (
                 "message",
                 string(
-                    "the local branch is not recoverable from the published branch; a local-only \
-                     delivery is never deleted",
+                    "the local branch is not recoverable from the published branch; an explicit \
+                     operator retirement never deletes a local-only delivery (the automatic \
+                     reclaim at the next bind step does, and only while no registered worktree \
+                     holds it)",
                 ),
             ),
         ]),
     };
     vec![object(vec![
+        ("issue", Val::Int(issue as i64)),
         (
             "generations",
             Val::Arr(generations.iter().map(|id| string(id)).collect()),
@@ -3488,7 +3653,10 @@ pub fn lane_retirement_deadline_secs() -> u64 {
 /// 2. the registered lane checkout and the local lane branch in the
 ///    integration clone, under the #222 policy: only a checkout this clone
 ///    REGISTERS is removed, and a branch is deleted only when the published
-///    branch carries the same tip — a local-only delivery is never destroyed.
+///    branch carries the same tip — a local-only delivery is never destroyed
+///    by THIS control (issue #306 keeps the policy deliberately different from
+///    the automatic bind-step reclaim, which reclaims an unheld local-only
+///    branch; see [`LocalOnlyBranch`]).
 ///
 /// A refusal is recorded on the returned document (never forced, never
 /// retried implicitly). The caller has already proven the run is terminal:
@@ -3599,6 +3767,11 @@ pub fn retire_run_lane(
         &lane,
         worktrees_root,
         issue,
+        // Issue #306: the operator control keeps the #222 policy for a
+        // local-only branch — an explicit, human-issued retirement never
+        // destroys the only copy of a delivery. The automatic bind-step
+        // reclaim is the half that reclaims an UNHELD local-only branch.
+        LocalOnlyBranch::Preserve,
     );
     ok(object(vec![
         ("run", string(run)),

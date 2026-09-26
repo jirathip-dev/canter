@@ -414,7 +414,7 @@ the #85 submission).
 
 | level | identity | methods | effect of a control |
 | --- | --- | --- | --- |
-| run | one `run-` + 16 hex instance id | `run.pause` / `run.resume` / `run.retry` / `run.reevaluate` / `run.release` / `run.retire-lane` / `run.resolve` / `run.dispatch` / `run.status` | exactly this run: stop admitting new steps, lift THIS run's pause, authorize one bounded re-dispatch of one diagnosed step (authorization only), re-evaluate the run's own recorded checks by re-running its check producer at the same certified head (bounded, attributed, journaled; recomputation only), release a run that can never progress — its issue ownership and the occupancy it held are freed and it goes terminal (bookkeeping only), retire the stale LANE RECORDS of a run the ledger already records as terminal — its leftover issue ownership rows and its own lane's residue, derived from that run's own issue, under the same #190/#222 policy a bind step applies (a live run refuses `refusal.lane.live_run` and is never touched), resolve one diagnosed prompt from recorder-attributed evidence without an effect, or dispatch ONE committed-spine step with the caller's own step inputs |
+| run | one `run-` + 16 hex instance id | `run.pause` / `run.resume` / `run.retry` / `run.reevaluate` / `run.release` / `run.retire-lane` / `run.resolve` / `run.dispatch` / `run.status` | exactly this run: stop admitting new steps, lift THIS run's pause, authorize one bounded re-dispatch of one diagnosed step (authorization only), re-evaluate the run's own recorded checks by re-running its check producer at the same certified head (bounded, attributed, journaled; recomputation only), release a run that can never progress — its issue ownership and the occupancy it held are freed and it goes terminal (bookkeeping only), retire the stale LANE RECORDS of a run the ledger already records as terminal — its leftover issue ownership rows and its own lane's residue, derived from that run's own issue, under the #190/#222 residue policy this control applies itself (the automatic reclaim at a bind step additionally reclaims an UNHELD local-only lane branch, #306; this control never deletes one) (a live run refuses `refusal.lane.live_run` and is never touched), resolve one diagnosed prompt from recorder-attributed evidence without an effect, or dispatch ONE committed-spine step with the caller's own step inputs |
 | fleet | the whole run population | NONE — there is no `fleet.*` method in the closed set | a fleet-level hold is an operator policy expressed as the set of paused runs; every resume is fenced on the exact instance id, so no run control ever lifts another run's pause or anything fleet-wide |
 | lane | one handoff lane generation (`rp_` records) | `lane.*` only | a run control never ADDRESSES a lane identity (`rp_` records are never touched and a lane id never resolves to a run: it refuses `refusal.run.target`); `run.retire-lane` retires the lane of the ONE terminal run it addresses, derived from that run's own issue, and refuses every non-terminal run (`refusal.lane.live_run`) |
 
@@ -588,8 +588,10 @@ clears a repository/fleet-level hold or bypasses a gate.
   checkout; a different pane, another lane's binding or an unverifiable
   read-back is refused and recorded, never forced), its REGISTERED lane
   checkout in the integration clone, and its local lane branch only when the
-  published branch carries the same tip (a local-only delivery is never
-  deleted). The lane is DERIVED from the run's own repository issue (its own
+  published branch carries the same tip (THIS control never deletes a
+  local-only delivery; the automatic reclaim at a bind step reclaims an
+  UNHELD local-only branch, issue #306 — see spec-capabilities.md,
+  "A local-only lane branch is residue too"). The lane is DERIVED from the run's own repository issue (its own
   implementer leg: `issue-<N>` at `issues-<N>`), never from a caller-named
   path, and the integration clone comes from the run's own recorded topology.
   The control refuses typed BEFORE any claim or effect when the run is NOT
