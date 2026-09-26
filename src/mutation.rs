@@ -4046,10 +4046,10 @@ fn observed_worktree_branch(
         // certificate may only ever state a head its own delivery branch
         // holds.
         if let Some(expected) = expected {
-            let head = match run_git(ctx, worktree, &["rev-parse", "--verify", "HEAD"]) {
-                Ok(out) => out.stdout.trim().to_string(),
-                Err(outcome) => return Err(outcome),
-            };
+            let head = run_git(ctx, worktree, &["rev-parse", "--verify", "HEAD"])?
+                .stdout
+                .trim()
+                .to_string();
             match run_git(
                 ctx,
                 worktree,
