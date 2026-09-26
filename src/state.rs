@@ -249,6 +249,16 @@ pub const DISPATCH_REFUSAL_REASON_MAX: usize = 300;
 /// operator's measurement — never needs a bounded retry authorization to
 /// reach the step (`run status`'s `remedy` decision names it, and the
 /// admission gate itself still decides the presented proof).
+///
+/// Issue #307: the same read, once more, for a claim the daemon's OWN restart
+/// reconciliation (or its executor reaper) found still in flight and marked
+/// `ambiguous` with [`INTERRUPTED_CODE`]. That step's effect never resolved —
+/// nothing about the work changed and nothing was refused typed — so the
+/// interruption is the DAEMON's lifecycle event, never the run's own attempt:
+/// the step's re-dispatch is the plain continuation of the armed run, and the
+/// run's bounded retry budget is never charged for a restart. The interruption
+/// stays readable as its own separate record (the reconciled claim outcome and
+/// the `reconcile.*` journal row), never as one of the run's retries.
 pub fn step_attempt_diagnosed(status: &str, code: &str) -> bool {
     if !matches!(status, "failed" | "refused" | "ambiguous") {
         return false;
@@ -256,7 +266,17 @@ pub fn step_attempt_diagnosed(status: &str, code: &str) -> bool {
     code != crate::mutation::code::GRANT_EXPIRED
         && code != crate::lifecycle::code::PROOF_STALE
         && code != crate::lifecycle::code::PROOF_MISSING
+        && code != INTERRUPTED_CODE
 }
+
+/// The outcome code the daemon stamps on a claim it found still IN FLIGHT
+/// (issue #307): `serve`'s restart reconciliation and the apply executor's
+/// reaper both mark such a claim `ambiguous` with it, so an effect that never
+/// resolved is recorded as the daemon's own lifecycle event. The producer (the
+/// daemon) and the reader ([`step_attempt_diagnosed`], the ONE diagnosis
+/// predicate behind the bounded-retry fence) share this spelling, so the two
+/// can never drift apart.
+pub const INTERRUPTED_CODE: &str = "state.interrupted";
 
 /// The NEWEST recorded attempt of ONE step of one run, out of the durable
 /// attempt rows ([`State::run_step_attempts_with_codes`], oldest first): the
