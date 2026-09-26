@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -28,7 +29,7 @@ class SweepTests(unittest.TestCase):
         self.now = 0.0
         self.calls = 0
         self.alive = set(range(100001, 100129))
-        self.rows = {pid: (1, pid, "/synthetic-target/debug/fixture") for pid in self.alive}
+        self.rows = {pid: (1, pid, "S", "/synthetic-target/debug/fixture") for pid in self.alive}
         self.enterContext(contextlib.redirect_stdout(io.StringIO()))
         self.enterContext(patch.object(driver.time, "monotonic", side_effect=lambda: self.now))
         self.enterContext(patch.object(driver.time, "sleep", side_effect=self.advance))
@@ -107,6 +108,77 @@ class SweepTests(unittest.TestCase):
         with patch.object(driver.os, "killpg"):
             driver.reap_group(child, **kwargs)
         self.assertLessEqual(self.now, 0.2)
+
+    def test_snapshot_carries_the_state_column_into_the_row(self):
+        # The state column is what tells a running process from one that has
+        # already exited; the snapshot must keep it (issue #301).
+        with patch.object(driver.subprocess, "run", return_value=Mock(stdout="100 3 3 Z [sh] <defunct>\n")) as run:
+            rows = driver.process_table(deadline=5)
+        self.assertEqual(rows, {100: (3, 3, "Z", "[sh] <defunct>")})
+        self.assertEqual(run.call_args.args[0][-1], "pid=,ppid=,sess=,state=,command=")
+
+    def rows_with_a_defunct_shell(self):
+        # The ubuntu runner's own snapshot row: a shell that has exited and
+        # still awaits its reap, inside the suite's session.
+        rows = dict(self.rows)
+        rows[100200] = (1, 100200, "Z", "[sh] <defunct>")
+        return rows
+
+    def test_a_defunct_process_is_not_a_survivor_while_live_rows_still_are(self):
+        # Issue #301: the ubuntu runner counted a transient `[sh] <defunct>`
+        # in the suite's own session as a leak. An exited process holds no
+        # resources and only its parent can reap it, so it is never a
+        # survivor this sweep could reclaim — while the live rows of the very
+        # same snapshot stay leaks.
+        live = set(self.rows)
+        with patch.object(driver, "process_table", return_value=self.rows_with_a_defunct_shell()):
+            found, remaining = driver.sweep_survivors(Path("/synthetic-target"), {100200}, deadline=12)
+        self.assertEqual(remaining, [], "nothing defunct may remain to report")
+        self.assertEqual({row[0] for row in found}, live)
+
+    def test_defunct_exclusion_is_load_bearing(self):
+        # The classifier — not the snapshot — is what excludes the defunct
+        # row: disabling it reproduces the pre-fix reading of the runner's
+        # process table, so a regression cannot pass by narrowing the snapshot.
+        with patch.object(driver, "is_defunct", return_value=False), patch.object(driver, "process_table", return_value=self.rows_with_a_defunct_shell()):
+            found, _ = driver.sweep_survivors(Path("/synthetic-target"), {100200}, deadline=12)
+        self.assertIn(100200, {row[0] for row in found})
+
+
+@unittest.skipUnless(sys.platform == "linux", "the runner-row witness needs /proc session identity")
+class RealProcessSweepTests(unittest.TestCase):
+    """The sweep against the kernel's process table, not a fabricated snapshot.
+
+    This is the exact shape the ubuntu runner produced (issue #301): a helper
+    shell in the suite's own session that has exited while its exit status
+    still waits to be reaped. It must not read as a leak, while a live helper
+    in the same session still must.
+    """
+
+    def spawn(self, body):
+        return subprocess.Popen(["/bin/sh", "-c", body], start_new_session=True)
+
+    def test_an_exited_helper_is_no_leak_and_a_live_helper_still_is(self):
+        exited = self.spawn("exit 0")
+        live = self.spawn("sleep 60")
+        sessions = {exited.pid, live.pid}
+        try:
+            wait_until = time.monotonic() + 5
+            while time.monotonic() < wait_until and driver.proc_stat(exited.pid)[0] != "Z":
+                time.sleep(0.01)
+            self.assertEqual(driver.proc_stat(exited.pid)[0], "Z", "precondition: the helper exited and awaits its reap")
+            pids = {row[0] for row in driver.matching_processes(Path("/unused-target"), sessions, time.monotonic() + 5)}
+            self.assertIn(live.pid, pids, "a live helper of the same session is still a survivor")
+            self.assertNotIn(exited.pid, pids, "an exited helper is not a survivor")
+            # Discriminating control: the pre-fix sweep counted the exited
+            # helper, so the exclusion above really is the fix at work.
+            with patch.object(driver, "is_defunct", return_value=False):
+                prefix = {row[0] for row in driver.matching_processes(Path("/unused-target"), sessions, time.monotonic() + 5)}
+            self.assertIn(exited.pid, prefix, "the pre-fix reading counted the exited helper")
+        finally:
+            live.kill()
+            live.wait(timeout=3)
+            exited.wait(timeout=3)
 
 
 class InvocationTests(unittest.TestCase):

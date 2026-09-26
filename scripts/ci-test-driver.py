@@ -66,32 +66,32 @@ def select_suites(name: str | None, group: int | None = None) -> list[list[str]]
         raise SystemExit(f"unknown suite {name!r}; choose one of: {choices}") from None
 
 
-def process_table(deadline: float) -> dict[int, tuple[int, int, str]]:
+def process_table(deadline: float) -> dict[int, tuple[int, int, str, str]]:
     budget = deadline - time.monotonic()
     if budget <= 0:
         raise TimeoutError("survivor sweep deadline exhausted before snapshot")
     output = subprocess.run(
-        ["ps", "-Aww", "-o", "pid=,ppid=,sess=,command="],
+        ["ps", "-Aww", "-o", "pid=,ppid=,sess=,state=,command="],
         check=True,
         capture_output=True,
         text=True,
         timeout=min(5, budget),
     ).stdout
-    rows: dict[int, tuple[int, int, str]] = {}
+    rows: dict[int, tuple[int, int, str, str]] = {}
     for line in output.splitlines():
         if time.monotonic() >= deadline:
             raise TimeoutError("survivor sweep deadline exhausted parsing snapshot")
-        fields = line.strip().split(None, 3)
-        if len(fields) != 4:
+        fields = line.strip().split(None, 4)
+        if len(fields) != 5:
             continue
         try:
-            rows[int(fields[0])] = (int(fields[1]), int(fields[2]), fields[3])
+            rows[int(fields[0])] = (int(fields[1]), int(fields[2]), fields[3], fields[4])
         except ValueError:
             continue
     return rows
 
 
-def ancestor_pids(rows: dict[int, tuple[int, int, str]]) -> set[int]:
+def ancestor_pids(rows: dict[int, tuple[int, int, str, str]]) -> set[int]:
     ancestors = {os.getpid()}
     pid = os.getppid()
     while pid > 0 and pid not in ancestors:
@@ -101,6 +101,18 @@ def ancestor_pids(rows: dict[int, tuple[int, int, str]]) -> set[int]:
             break
         pid = parent[0]
     return ancestors
+
+
+def is_defunct(state: str) -> bool:
+    """Whether a snapshot state is an exited process awaiting its parent's reap.
+
+    A defunct (zombie) process holds none of the resources a leak is about —
+    no address space, no open descriptors — and no signal this sweep sends can
+    reap it, so counting it false-reds a healthy run: the ubuntu runner's
+    process table carried a transient `[sh] <defunct>` in the suite's own
+    session and the sweep read it as `leaked 1 process(es)` (issue #301).
+    """
+    return state.startswith("Z")
 
 
 def matching_processes(
@@ -116,9 +128,11 @@ def matching_processes(
         str(target_dir.resolve()) + os.sep,
     }
     found = []
-    for pid, (ppid, sid, command) in rows.items():
+    for pid, (ppid, sid, state, command) in rows.items():
         if time.monotonic() >= deadline:
             raise TimeoutError("survivor sweep deadline exhausted selecting snapshot")
+        if is_defunct(state):
+            continue
         if pid not in excluded and (
             any(marker in command for marker in markers)
             or (session_ids is not None and sid in session_ids)
