@@ -56,6 +56,22 @@ impl RecordingDispatch {
             .map(|intent| intent.step_id.clone())
             .collect()
     }
+
+    /// The successive FRONTIERS the driver acted on: consecutive re-dispatches
+    /// of the step that is still the frontier collapse into one entry, so only
+    /// a step the evidence MOVED the frontier to adds one. A tick that lands
+    /// between a check's commit and a read legitimately re-dispatches the
+    /// still-current frontier (issue #295), so the live intent COUNT is never
+    /// the observation — the frontier the evidence moved to is.
+    fn frontiers(&self) -> Vec<String> {
+        let mut moved: Vec<String> = Vec::new();
+        for step in self.steps() {
+            if moved.last() != Some(&step) {
+                moved.push(step);
+            }
+        }
+        moved
+    }
 }
 
 impl SupervisedDispatch for RecordingDispatch {
@@ -428,17 +444,24 @@ where
     }
 }
 
-/// Wait until the recorded dispatch intents reach `count`, then return them.
-fn wait_for_steps(
+/// Wait until `count` successive frontiers have been recorded, then return
+/// that fixed, counted prefix. A re-dispatch of the step that is STILL the
+/// frontier adds no entry, so the read observes the evidence the driver
+/// classified (which frontier it moved to), never how many ticks happened to
+/// land inside one 50 ms sampling window (issue #295). When the deadline
+/// passes first the caller gets the short prefix it holds, and its assertion
+/// reports the frontier that never arrived.
+fn wait_for_frontiers(
     dispatcher: &Arc<RecordingDispatch>,
     count: usize,
     deadline: Duration,
 ) -> Vec<String> {
     let started = Instant::now();
     loop {
-        let steps = dispatcher.steps();
-        if steps.len() >= count || started.elapsed() >= deadline {
-            return steps;
+        let mut frontiers = dispatcher.frontiers();
+        if frontiers.len() >= count || started.elapsed() >= deadline {
+            frontiers.truncate(count);
+            return frontiers;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -591,8 +614,13 @@ fn a_settled_worker_moves_the_frontier_on_the_next_tick() {
         TICK_DEADLINE,
     )
     .expect("the boot pass commits a check");
+    // The BOOT check dispatches the frontier it classified: the read is the
+    // FIRST frontier the driver acted on (the fixed prefix of length 1), not
+    // the whole recording — a later tick that lands before this read
+    // re-dispatches the same live frontier, which is not what this assertion
+    // observes (issue #295).
     assert_eq!(
-        dispatcher.steps(),
+        wait_for_frontiers(&dispatcher, 1, TICK_DEADLINE),
         vec!["p1".to_string()],
         "the boot check dispatches the frontier"
     );
@@ -621,16 +649,19 @@ fn a_settled_worker_moves_the_frontier_on_the_next_tick() {
     .expect("the next tick classifies the advanced frontier");
     assert_eq!(advanced.last_check_reason, codes::DISPATCH);
     // The frontier the NEXT check dispatched is the step the settled worker
-    // moved the run to: read from the intent the check itself produced.
-    let steps = wait_for_steps(&dispatcher, 2, TICK_DEADLINE);
+    // moved the run to: read as the fixed, counted prefix of the frontiers
+    // (p1 then p2) — the settled step is not re-dispatched and the next step
+    // is, however many ticks re-dispatched the current frontier meanwhile
+    // (issue #295).
+    let frontiers = wait_for_frontiers(&dispatcher, 2, TICK_DEADLINE);
     assert_eq!(
-        steps,
+        frontiers,
         vec!["p1".to_string(), "p2".to_string()],
         "the settled frontier step is not re-dispatched and the next step is"
     );
     println!(
         "frontier: boot intent={} next intent={} checks={} waited={:?}",
-        steps[0], steps[1], advanced.checks, waited
+        frontiers[0], frontiers[1], advanced.checks, waited
     );
 
     wake.signal_stop();
