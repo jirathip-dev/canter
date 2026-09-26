@@ -699,6 +699,18 @@ clears a repository/fleet-level hold or bypasses a gate.
   one fresh snapshot reconciliation per armed run (missed windows are
   skipped, never replayed). A persisted event cursor that retention moved
   past falls back to a fresh snapshot wake.
+- **Retirement (issue #311)**: a run the engine's own record has made
+  terminal (`done` | `invalidated`) is no longer supervised. The transaction
+  that records the transition retires the run's `supervisions` row in the
+  SAME transaction (`desired: disabled`, `retired_state` naming the terminal
+  state that caused it and `retired_at` the instant) — the release, the
+  delivery that completes the run's committed spine, and the grant/epoch
+  invalidation all carry it — so no operator action and no later pass is
+  involved, and a row a pre-fix fleet still carries ARMED for a terminal run
+  is retired by the ONE check that observes it. A retired row is never
+  scheduled a pass again (the due set selects `armed` rows only), a live
+  state keeps being classified exactly as before, and a `paused` run keeps
+  its row and remains ineligible.
 - `supervision.arm` requires `params.idempotency_key` and
   `params.instance_id` (`run-` + 16 hex) and renders `hf-supervision-arm/v1`:
   the run, the armed supervision row (its id, generation, authorization
@@ -723,7 +735,10 @@ clears a repository/fleet-level hold or bypasses a gate.
   eligibility REPORT, the freshness of the last check, the last check
   (time, class, reason, wake), the NEXT ELIGIBLE CHECK with its reason, the
   observed meaningful-progress marker (time, age, source), the continuation
-  report count and the folded pending wake. No claim, no journal write and
+  report count and the folded pending wake, and — issue #311 — the retirement
+  record (`retired_state`: the terminal run state that retired the
+  supervision, `retired_at`: the instant; both `''` when it was never
+  retired). No claim, no journal write and
   no marker movement: a read, a heartbeat or a rendered status is never
   progress. Issue #261 AC4: an ADMITTED run that carries no supervision row
   at all is not a bare not-found — the read answers `hf-supervision/v1` with

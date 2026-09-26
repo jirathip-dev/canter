@@ -429,11 +429,19 @@ fn item_ordinal(items: &[canter::state::QueueSubmissionItemRow], number: i64) ->
 
 /// Drive ONE reconciliation exactly like the driver does: read the snapshot,
 /// build the plan from the pure function, commit it.
+///
+/// Issue #311: a run the engine's own record has made terminal (`done` /
+/// `invalidated`) is RETIRED — its supervision is never scheduled again, so a
+/// replay of a finished run reaches no check at all and answers `None` (no
+/// fresh verified delivery), exactly like a run with no verified delivery.
 fn reconcile(state: &State, run: &str, boot: bool) -> Option<supervision::VerifiedDelivery> {
     let row = state
         .supervision_by_id(run)
         .expect("supervision read")
         .expect("armed run");
+    if row.desired != "armed" {
+        return None;
+    }
     let evidence = state
         .supervision_evidence(run)
         .expect("evidence read")
@@ -1337,18 +1345,30 @@ fn a_verified_delivery_advances_the_cursor_once_and_never_twice_across_restart()
     assert_eq!(advance.get("dispatched").and_then(Val::as_int), Some(1));
     assert!(matches!(advance.get("held"), Some(Val::Null)));
 
-    // DUPLICATE EVENT: the same delivery replayed five more times (and the
-    // next run's own reconciliations, which see no evidence) dispatch
-    // nothing and never rewrite the consumed record.
+    // DUPLICATE EVENT: the delivering run is RETIRED by its own completion
+    // (issue #311), so replaying its delivery five more times reaches no check
+    // at all (nothing is scheduled again), and the next run's own
+    // reconciliations — which see no evidence — dispatch nothing and never
+    // rewrite the consumed record.
     let consumed_before = advances[0].clone();
     for _ in 0..5 {
-        let replayed = reconcile(&state, &run5, false);
         assert_eq!(
-            replayed,
-            Some(delivery.clone()),
-            "the delivery is still recognized"
+            reconcile(&state, &run5, false),
+            None,
+            "a finished run is never scheduled a check again"
         );
     }
+    // The retirement removes the SCHEDULE, never the record: a pure read of
+    // the same evidence still recognizes the delivery it consumed.
+    let recorded = state
+        .supervision_evidence(&run5)
+        .expect("evidence read")
+        .expect("evidence");
+    assert_eq!(
+        supervision::verified_delivery(&recorded).map(|row| row.evidence_id),
+        Some(delivery.evidence_id.clone()),
+        "the recorded delivery is still recognized"
+    );
     for _ in 0..2 {
         assert_eq!(reconcile(&state, &run6, false), None);
     }
@@ -1379,10 +1399,31 @@ fn a_verified_delivery_advances_the_cursor_once_and_never_twice_across_restart()
     );
     drop(state);
 
-    // RESTART / REPLAY: the fence is durable, not in-memory.
+    // RESTART / REPLAY: the fence is durable, not in-memory — the delivering
+    // run comes back RETIRED (its completion is on the row, so nothing is
+    // scheduled again) and a pure read of the same evidence still recognizes
+    // the delivery it consumed.
     let restarted = fixture.open();
-    let delivery_again = reconcile(&restarted, &run5, true).expect("delivery survives restart");
-    assert_eq!(delivery_again, delivery);
+    assert_eq!(
+        reconcile(&restarted, &run5, true),
+        None,
+        "a finished run is never scheduled a check again"
+    );
+    let retired = restarted
+        .supervision_by_id(&run5)
+        .expect("read")
+        .expect("row");
+    assert_eq!(retired.retired_state, "done");
+    assert!(!retired.retired_at.is_empty());
+    let recorded = restarted
+        .supervision_evidence(&run5)
+        .expect("read")
+        .expect("evidence");
+    assert_eq!(
+        supervision::verified_delivery(&recorded).map(|row| row.evidence_id),
+        Some(delivery.evidence_id.clone()),
+        "the recorded delivery survives the restart"
+    );
     assert_eq!(
         restarted
             .queue_advance_rows(&submission.submission_id)
@@ -1890,8 +1931,13 @@ fn a_delivering_run_with_committed_steps_after_the_delivery_stays_live_until_its
     assert_eq!(state.list_instances().expect("instances").len(), 2);
     reconcile(&state, &run5, false);
     let completed = state.supervision_by_id(&run5).unwrap().unwrap();
-    assert_eq!(completed.last_check_class, "completed");
-    assert_eq!(completed.last_check_reason, supervision::codes::COMPLETED);
+    // Issue #311: the check that completes the run is its LAST one — the row
+    // is retired with the terminal state that caused it (and the instant)
+    // instead of being re-classified on every later tick.
+    assert_eq!(completed.desired, "disabled");
+    assert_eq!(completed.retired_state, "done");
+    assert!(!completed.retired_at.is_empty());
+    assert_eq!(run_status(&state, &run5), "done");
     let evidence = state.supervision_evidence(&run5).unwrap().unwrap();
     assert_eq!(supervision::next_unachieved_step(&evidence), None);
     println!(
@@ -1937,8 +1983,13 @@ fn releasing_a_verified_delivery_with_an_unexecuted_tail_never_reports_completed
     let state = fixture.open();
     assert_eq!(reconcile(&state, run, true), None);
     let row = state.supervision_by_id(run).unwrap().unwrap();
-    assert_eq!(row.last_check_class, "needs-attention");
-    assert_eq!(row.last_check_reason, supervision::codes::INVALIDATED);
+    // Issue #311: the release RETIRES the row — it is never scheduled again
+    // and it never reports completed; the terminal state it died on is the
+    // recorded retirement.
+    assert_eq!(row.desired, "disabled");
+    assert_eq!(row.retired_state, "invalidated");
+    assert!(!row.retired_at.is_empty());
+    assert_ne!(row.last_check_reason, supervision::codes::COMPLETED);
     let evidence = state.supervision_evidence(run).unwrap().unwrap();
     assert_eq!(evidence.run.status, "invalidated");
     assert_eq!(

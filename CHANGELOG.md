@@ -6,6 +6,26 @@ release process activates (docs/RELEASING.md), then semver applies.
 
 ## [Unreleased]
 
+### Fixed (issue #311 — armed supervision is retired for a finished run)
+
+- A run the engine's own record has made terminal (`done` | `invalidated`) is
+  no longer supervised. The transaction that records the terminal transition —
+  the release, the delivery that completes the run's committed spine, and the
+  grant/epoch invalidation that invalidates bound runs — retires the run's
+  `supervisions` row in the SAME transaction (no operator action, no later
+  pass), and a row a pre-fix fleet still carries ARMED for a terminal run is
+  retired by the ONE check that observes it, after which the row is never
+  scheduled again. The retirement is recorded on the row itself —
+  `retired_state` (the terminal state that caused it) and `retired_at` (the
+  instant), schema v13 / `m0013_supervision_retirement_v13` — so a reader can
+  tell a retired-and-finished run from one that was never supervised, and the
+  `supervision.status` read carries both fields. A live state (`running`,
+  including a parked run, `blocked`, `human_queue`, `paused`) keeps being
+  classified exactly as before, and a paused run keeps its row and stays
+  ineligible. Measured shape this fixes: 75 of 80 armed rows on the live fleet
+  belonged to done/invalidated runs, and the driver still owed each of them a
+  classification pass on its own cadence.
+
 ### Fixed (issue #306 — a local-only lane branch with no live lane and no worktree is reclaimed)
 
 - The worktree step reclaimed a terminal generation's lane branch only when

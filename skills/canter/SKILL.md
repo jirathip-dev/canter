@@ -249,7 +249,7 @@ renderings until an authorized grant + daemon `apply` executes them.
   socket, migrates state, reconciles interrupted claims, and serves —
   read-only commands never need the daemon.
 - State/journal/backup: `docs/contracts/spec-state.md` (migrations
-  m0001-m0012, audit/event journals, backup/restore with retention);
+  m0001-m0013, audit/event journals, backup/restore with retention);
   restore rotates the epoch and invalidates prior grants.
 - Operations runbook: `docs/OPERATIONS.md` sections 5, 7, 8 (daemon
   lifecycle, cleanup/archives, recovery after crash/cold boot).

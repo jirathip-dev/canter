@@ -426,6 +426,12 @@ fn reconcile_at(
         .supervision_by_id(run)
         .expect("supervision read")
         .expect("armed run");
+    // Issue #311: a run the engine's own record has made terminal is RETIRED —
+    // its supervision is never scheduled again, so a replay of a finished run
+    // reaches no check at all and answers `None` (no fresh verified delivery).
+    if row.desired != "armed" {
+        return None;
+    }
     let evidence = state
         .supervision_evidence(run)
         .expect("evidence read")
@@ -576,6 +582,16 @@ fn checks_of(doc: &Val) -> i64 {
 fn class_of(doc: &Val) -> String {
     evaluation(doc)
         .get("class")
+        .and_then(Val::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The recorded retirement of one supervision (issue #311): the terminal run
+/// state that retired it, `""` while it is still supervised.
+fn retirement_of(doc: &Val) -> String {
+    doc.get("supervision")
+        .and_then(|supervision| supervision.get("retired_state"))
         .and_then(Val::as_str)
         .unwrap_or_default()
         .to_string()
@@ -878,16 +894,13 @@ fn wait_for_item_status_within(
     }
 }
 
-/// Poll `supervision.status` until the run has committed `want` checks, with
-/// the same `POLICY_BOUND_SECS` no-progress ceiling as `wait_for_item_status`.
-fn wait_for_checks(fixture: &DaemonFixture, run: &str, want: i64) -> Val {
-    wait_for_checks_within(fixture, run, want, POLICY_BOUND_SECS)
-}
-
-/// The same, with an explicit NO-PROGRESS ceiling (issue #232): the recorded
-/// check count is the progress signature, so a newly committed check resets
-/// the ceiling and a genuinely stalled driver still fails, naming the progress
-/// observed and the elapsed time.
+/// Poll `supervision.status` until the run has committed `want` checks, with an
+/// explicit NO-PROGRESS ceiling (issue #232): the recorded check count is the
+/// progress signature, so a newly committed check resets the ceiling and a
+/// genuinely stalled driver still fails, naming the progress observed and the
+/// elapsed time. (Issue #311 removed the last caller that waited for a SECOND
+/// check of a run the engine had already made terminal — a retired run is never
+/// checked again.)
 fn wait_for_checks_within(fixture: &DaemonFixture, run: &str, want: i64, within_secs: u64) -> Val {
     let started = Instant::now();
     let mut last_progress = started;
@@ -911,6 +924,28 @@ fn wait_for_checks_within(fixture: &DaemonFixture, run: &str, want: i64, within_
             "run {run} never reached {want} recorded check(s): no progress for {stalled}s of {}s \
              waited (recorded {checks}); last: {last}",
             started.elapsed().as_secs()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Poll `supervision.status` until the run's supervision reads RETIRED (issue
+/// #311: a run the engine recorded terminal is retired, so it is never
+/// scheduled a pass again), with the same `POLICY_BOUND_SECS` ceiling as the
+/// check waits.
+fn wait_for_retirement(fixture: &DaemonFixture, run: &str) -> Val {
+    let started = Instant::now();
+    let mut id = 800u64;
+    loop {
+        id += 1;
+        let doc = supervision_status(fixture, run, id);
+        if !retirement_of(&doc).is_empty() {
+            return doc;
+        }
+        assert!(
+            started.elapsed().as_secs() < POLICY_BOUND_SECS,
+            "run {run} was never retired within {POLICY_BOUND_SECS}s: {}",
+            canter::canonical::canonical_text(&doc)
         );
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -1067,16 +1102,22 @@ fn crash_before_commit_row(point: &str, name: &str) {
     assert_no_effect_surface(&fixture);
 
     // 4. A second restart replays nothing: the consumed delivery is durable,
-    //    and the boot pass still commits exactly ONE fresh check of the run.
+    //    and the delivering run is RETIRED by its own completion (issue #311),
+    //    so the boot pass commits NO further check of it.
     let checks_before = checks_of(&supervision_status(&fixture, &seeded.run5, 650));
     shutdown(daemon);
     let daemon = fixture.spawn();
     wait_ready(&fixture);
-    let after = wait_for_checks(&fixture, &seeded.run5, checks_before + 1);
+    let after = wait_for_retirement(&fixture, &seeded.run5);
     assert_eq!(
-        class_of(&after),
-        "completed",
+        retirement_of(&after),
+        "done",
         "the delivering run completed"
+    );
+    assert_eq!(
+        checks_of(&after),
+        checks_before,
+        "a retired run is never checked again"
     );
     let settled = queue_status(&fixture, &seeded.submission_id, 700);
     assert_advance_doc_exactly_once(&settled, &seeded);
@@ -1137,8 +1178,9 @@ fn restart_matrix_after_commit_replays_nothing_and_keeps_one_dispatch() {
     //    delivery, one cursor row, one dispatched run.
     assert_advanced_exactly_once(&fixture, &seeded);
 
-    // 3. The restart must not repeat any of it. The boot pass still commits
-    //    exactly ONE fresh check of the run, and that check replays nothing.
+    // 3. The restart must not repeat any of it. The delivering run is RETIRED
+    //    by its own completion (issue #311), so the boot pass commits NO
+    //    further check of it and the durable read replays nothing.
     let checks_before = durable_checks(&fixture, &seeded.run5);
     assert!(
         checks_before >= 1,
@@ -1146,8 +1188,13 @@ fn restart_matrix_after_commit_replays_nothing_and_keeps_one_dispatch() {
     );
     let daemon = fixture.spawn();
     wait_ready(&fixture);
-    let after = wait_for_checks(&fixture, &seeded.run5, checks_before + 1);
-    assert_eq!(class_of(&after), "completed");
+    let after = wait_for_retirement(&fixture, &seeded.run5);
+    assert_eq!(retirement_of(&after), "done");
+    assert_eq!(
+        checks_of(&after),
+        checks_before,
+        "a retired run is never checked again"
+    );
     let settled = queue_status(&fixture, &seeded.submission_id, 710);
     assert_advance_doc_exactly_once(&settled, &seeded);
     assert_advanced_exactly_once(&fixture, &seeded);
@@ -1371,11 +1418,25 @@ fn state_harness_consumes_the_delivery_exactly_once_across_restart_and_a_moved_c
     let consumed = advances[0].clone();
 
     // Duplicate events and a fully elapsed progress window (the explicit
-    // clock jumps past the whole policy) still never move the cursor twice.
+    // clock jumps past the whole policy) still never move the cursor twice —
+    // and the run is RETIRED by its own completion (issue #311), so a replay
+    // reaches no check at all while the recorded delivery stays readable.
     for offset in [0, 1, 30, 3600, 86_400] {
-        let replayed = reconcile_at(&state, &seeded.run5, false, now + offset);
-        assert_eq!(replayed, Some(delivery.clone()));
+        assert_eq!(
+            reconcile_at(&state, &seeded.run5, false, now + offset),
+            None,
+            "a finished run is never scheduled a check again"
+        );
     }
+    let recorded = state
+        .supervision_evidence(&seeded.run5)
+        .expect("evidence read")
+        .expect("evidence");
+    assert_eq!(
+        supervision::verified_delivery(&recorded).map(|row| row.evidence_id),
+        Some(delivery.evidence_id.clone()),
+        "the recorded delivery is still recognized"
+    );
     assert_eq!(
         state
             .queue_advance_rows(&seeded.submission_id)
@@ -1387,11 +1448,13 @@ fn state_harness_consumes_the_delivery_exactly_once_across_restart_and_a_moved_c
     drop(state);
 
     // Restart: the fence is durable, so the boot reconciliation replays
-    // nothing and the dispatched item keeps its single deterministic identity.
+    // nothing (the delivering run is RETIRED — issue #311) and the dispatched
+    // item keeps its single deterministic identity.
     let restarted = fixture.open();
     assert_eq!(
         reconcile_at(&restarted, &seeded.run5, true, now + 172_800),
-        Some(delivery)
+        None,
+        "a finished run is never scheduled a check again"
     );
     assert_eq!(
         restarted
@@ -1501,9 +1564,13 @@ fn state_harness_paused_hold_survives_reopen_and_the_resume_advances_once() {
         advances[0].next_instance_id.as_deref(),
         Some(seeded.expected_run6.as_str())
     );
-    let replayed = reconcile_at(&restarted, &seeded.run5, false, now + 200_000)
-        .expect("the consumed delivery is still recognized");
-    assert_eq!(replayed, delivery);
+    // The resume advanced exactly once; the run is retired by that delivery
+    // (issue #311), so a further replay reaches no check at all.
+    assert_eq!(
+        reconcile_at(&restarted, &seeded.run5, false, now + 200_000),
+        None,
+        "a finished run is never scheduled a check again"
+    );
     assert_eq!(
         restarted
             .queue_advance_rows(&seeded.submission_id)
