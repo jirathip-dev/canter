@@ -98,6 +98,40 @@ def proc_stat(pid):
     return text.rsplit(")", 1)[1].split()
 
 
+def is_defunct(state):
+    """Whether a snapshot state is an exited process awaiting its parent's reap.
+
+    A defunct (zombie) process holds none of the resources a leak is about —
+    no address space, no open descriptors — and no signal reaps it, so
+    counting it false-reds a healthy run: the ubuntu runner's process table
+    carried a transient `[sh] <defunct>` in the suite's own session and both
+    CI layers read it as a leak (issue #301). The driver's per-suite survivor
+    sweep and this module's outer scope cleanup share the ONE discriminator.
+    """
+    return state.startswith("Z")
+
+
+def live_members(rows):
+    """The scope rows that are still running (the leak candidates).
+
+    A defunct row has already exited: the scope reaps it (`reap_adopted`, or
+    its own parent did before it left) and records it as evidence, but it is
+    never a leak — whether it presents defunct or live at snapshot time is a
+    race with its parent's death, which is exactly how the ubuntu runner's
+    residue job red on a healthy run (issue #301). A row that is gone
+    entirely is not running either.
+    """
+    live = {}
+    for pid, started in rows.items():
+        try:
+            if is_defunct(proc_stat(pid)[0]):
+                continue
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        live[pid] = started
+    return live
+
+
 def scope_snapshot(tag, deadline):
     rows = {}
     since = int(proc_stat(os.getpid())[19])
@@ -175,9 +209,14 @@ def ps_check(pids, path, deadline):
 def cleanup_scope(child, tag, log_dir, deadline, report=print):
     child.poll()
     found = scope_snapshot(tag, deadline)
+    # A defunct row is a process that has already exited: the scope reaps it
+    # (reap_adopted below, or its own parent did) but it is never a leak —
+    # counting it reds a healthy run on the timing of its parent's death
+    # (issue #301). Evidence keeps every adopted row; the decision does not.
+    live = live_members(found)
     seen = set(found) | {child.pid}
     ps_check(seen, log_dir / "ps-before.txt", deadline)
-    report(f"Scope cleanup: found={sorted(found)}", flush=True)
+    report(f"Scope cleanup: found={sorted(found)} live={sorted(live)}", flush=True)
     for signum in (signal.SIGTERM, signal.SIGKILL):
         # The leader's exit is NOT evidence its group died. Signal the whole
         # session-created group even when Popen already observed leader exit.
@@ -197,9 +236,9 @@ def cleanup_scope(child, tag, log_dir, deadline, report=print):
             time.sleep(0.05)
     child.poll()
     reap_adopted(child.pid)
-    remaining = scope_snapshot(tag, deadline)
+    remaining = live_members(scope_snapshot(tag, deadline))
     ps_code = ps_check(seen | set(remaining), log_dir / "ps-after.txt", deadline)
     report(f"Scope final: remaining={sorted(remaining)} ps_exit={ps_code}", flush=True)
     if remaining or ps_code != 1:
         raise RuntimeError(f"scope not empty: pids={sorted(remaining)} ps_exit={ps_code}")
-    return len(found)
+    return len(live)

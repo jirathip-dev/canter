@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Linux regression/witness: setsid + exec + anonymous argv cannot escape CI."""
+"""Linux regression/witness: setsid + exec + anonymous argv cannot escape CI,
+and a helper the scope adopts after it has already exited is never a leak."""
 import importlib.util
 import ctypes
 import fcntl
@@ -14,8 +15,17 @@ import threading
 import time
 import unittest
 from unittest.mock import Mock, patch
+import uuid
 
-from ci_test_processes import MARKER, has_marker, signal_members
+from ci_test_processes import (
+    MARKER,
+    cleanup_scope,
+    has_marker,
+    is_defunct,
+    live_members,
+    scope_snapshot,
+    signal_members,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 WRAPPER = ROOT / "scripts/ci-test-scope.py"
@@ -49,6 +59,30 @@ if sys.argv[2] == "kill-driver":
 if sys.argv[2] == "hang":
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     time.sleep(120)
+'''
+
+# The runner's own shape (issue #301): a helper shell that has exited inside
+# the scope while its parent leaves, so the scope's subreaper adopts it
+# defunct. The record is written only once the helper's state has settled, so
+# the witness never races the helper's exit; the fixture then leaves WITHOUT
+# reaping it — exactly how the runner's `sh` reached the scope's snapshot.
+ORPHAN = '''import json, os, sys, time
+from pathlib import Path
+child = os.fork()
+if child == 0:
+    os.execl("/bin/sh", "sh", "-c", sys.argv[2])
+limit = float(sys.argv[3]) if len(sys.argv) > 3 else 5.0
+started = time.monotonic()
+state = "?"
+while True:
+    state = Path(f"/proc/{child}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    if state == "Z" or time.monotonic() - started >= limit:
+        break
+    time.sleep(0.005)
+record = Path(sys.argv[1])
+temporary = record.with_name(record.name + ".tmp")
+temporary.write_text(json.dumps({"pid": child, "state": state}))
+os.replace(temporary, record)
 '''
 
 
@@ -117,6 +151,120 @@ class LinuxScopeTests(unittest.TestCase):
         with patch("ci_test_processes.proc_stat", return_value=["0"] * 19 + ["10"]), patch.object(Path, "read_bytes", side_effect=PermissionError("pre-existing service")) as read:
             self.assertFalse(has_marker(123, "abc", since=20))
             read.assert_not_called()
+
+    def subreaper(self):
+        # The wrapper this module witnesses installs itself as a child
+        # subreaper; an in-process witness must own the same adoption.
+        libc = ctypes.CDLL(None, use_errno=True)
+        self.assertEqual(libc.prctl(36, 1, 0, 0, 0), 0, "child subreaper")
+
+    def adopted_orphan(self, root, body, tag, limit="5"):
+        """Run the ORPHAN fixture and return (record, fixture process).
+
+        The fixture leaves one adopted helper behind: with body `exit 0` the
+        helper is defunct when its parent leaves (the runner's own shape), with
+        `sleep 120` it is still running."""
+        record = root / f"orphan-{uuid.uuid4().hex}.json"
+        fixture = root / "orphan.py"
+        fixture.write_text(ORPHAN)
+        argv = [sys.executable, "-u", str(fixture), str(record), body, limit]
+        env = dict(os.environ, **{MARKER: tag})
+        child = subprocess.Popen(
+            argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, start_new_session=True,
+        )
+        try:
+            data = wait_for_contract(record, argv, child, time.monotonic() + 10)
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=10)
+        return data, child
+
+    def test_a_defunct_adopted_helper_is_no_leak_and_the_classifier_is_load_bearing(self):
+        # Issue #301's runner shape through the real cleanup: the scope adopts
+        # a helper shell that has already exited. It is recorded as evidence
+        # and reaped — and never counted — while the pre-fix reading of the
+        # very same adoption (classifier disabled) counts it, so the exclusion
+        # is what keeps a healthy suite from reding.
+        self.subreaper()
+        with tempfile.TemporaryDirectory(prefix="canter-defunct-adoption-") as temporary:
+            root = Path(temporary)
+            tag = uuid.uuid4().hex
+            data, child = self.adopted_orphan(root, "exit 0", tag)
+            self.assertEqual(data["state"], "Z", "precondition: the adopted helper has exited")
+            rows = scope_snapshot(tag, time.monotonic() + 5)
+            self.assertIn(data["pid"], rows, "precondition: the adopted helper is inside the scope")
+            self.assertEqual(live_members(rows), {}, "an exited helper is never a live member")
+            found = cleanup_scope(child, tag, root, time.monotonic() + 5)
+            self.assertEqual(found, 0, "an exited helper is never a leak")
+            self.assertFalse(Path(f"/proc/{data['pid']}").exists(), "the adopted zombie is reaped, not left")
+            print(f"DEFUNCT_ADOPTION pid={data['pid']} found={found}")
+            control, control_child = self.adopted_orphan(root, "exit 0", tag)
+            with patch("ci_test_processes.is_defunct", return_value=False):
+                self.assertEqual(
+                    cleanup_scope(control_child, tag, root, time.monotonic() + 5), 1,
+                    "the pre-fix reading counted the exited helper",
+                )
+            print(f"DEFUNCT_ADOPTION_CONTROL pid={control['pid']} found=1")
+
+    def test_a_live_adopted_helper_is_still_a_leak(self):
+        # The bite half of the same discriminator: a helper that is still
+        # running when the scope adopts it is a leak, and the scope kills and
+        # reaps it — the shell together with any child it still holds.
+        self.subreaper()
+        with tempfile.TemporaryDirectory(prefix="canter-live-adoption-") as temporary:
+            root = Path(temporary)
+            tag = uuid.uuid4().hex
+            data, child = self.adopted_orphan(root, "sleep 120", tag, limit="0.2")
+            self.assertNotEqual(data["state"], "Z", "precondition: the adopted helper is running")
+            rows = scope_snapshot(tag, time.monotonic() + 5)
+            live = live_members(rows)
+            self.assertIn(data["pid"], live, "a live adopted helper is inside the scope")
+            found = cleanup_scope(child, tag, root, time.monotonic() + 5)
+            # The shell may hold a live child of its own (dash forks the
+            # command); every live member is one leak, and all of them die.
+            self.assertGreaterEqual(found, 1, "a live adopted helper is a leak")
+            self.assertEqual(found, len(live), "the scope counts exactly its live members")
+            for pid in live:
+                self.assertFalse(Path(f"/proc/{pid}").exists(), f"leaked pid {pid} is killed and reaped")
+            print(f"LIVE_ADOPTION pid={data['pid']} found={found} family={sorted(live)}")
+
+    def test_the_runner_shape_ends_green_through_the_scope_wrapper(self):
+        # End-to-end on the wrapper the ubuntu job runs: a scope whose residue
+        # is a helper shell the scope adopts after it exited must end with the
+        # suite's own status (here 0), not a forced red. The decision itself
+        # (defunct excluded, live counted) is witnessed above on the same
+        # kernel objects; whether a snapshot catches the defunct row is
+        # timing, and ps-before carries it whenever it is seen.
+        with tempfile.TemporaryDirectory(prefix="canter-defunct-scope-") as temporary:
+            root = Path(temporary)
+            record = root / "orphan.json"
+            fixture = root / "orphan.py"
+            fixture.write_text(ORPHAN)
+            argv = [
+                sys.executable, "-u", str(WRAPPER), "--seconds", "25",
+                "--log-dir", str(root / "logs"), "--",
+                sys.executable, "-u", str(fixture), str(record), "exit 0",
+            ]
+            env = dict(os.environ, CARGO_TARGET_DIR=str(root / "target"))
+            child = subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            try:
+                data = wait_for_contract(record, argv, child, time.monotonic() + 10)
+                output, _ = child.communicate(timeout=30)
+                self.assertEqual(child.returncode, 0, output)
+                self.assertEqual(data["state"], "Z", "precondition: the adopted helper has exited")
+                self.assertIn("Scope cleanup: found=", output, output)
+                self.assertIn("remaining=[] ps_exit=1", output, output)
+                print(f"DEFUNCT_SCOPE pid={data['pid']} exit={child.returncode}\n{(root / 'logs/ps-before.txt').read_text()}")
+            finally:
+                if child.poll() is None:
+                    child.terminate()
+                    try:
+                        child.wait(timeout=20)
+                    except subprocess.TimeoutExpired:
+                        child.kill()
+                        child.wait(timeout=3)
 
     def test_signal_rechecks_pid_identity_and_keeps_denial_visible(self):
         with patch("ci_test_processes.proc_stat", return_value=["0"] * 19 + ["new"]), patch("ci_test_processes.os.kill") as kill:
@@ -332,6 +480,33 @@ time.sleep(120)
             if read_fd is not None:
                 os.close(read_fd)
             os.close(write_fd)
+
+
+class ScopeLeakDecisionTests(unittest.TestCase):
+    """Platform-independent pin on the scope's leak decision (issue #301): a
+    row that has exited is never a leak, a running row always is, and a row
+    that has gone entirely is neither."""
+
+    def state_of(self, pid):
+        states = {1: "R", 2: "Z", 3: "D"}
+        if pid == 4:
+            raise FileNotFoundError(pid)
+        if pid == 5:
+            raise ProcessLookupError(pid)
+        return [states[pid], str(pid)] + ["0"] * 18
+
+    def test_live_members_drops_defunct_and_gone_rows(self):
+        rows = {1: "1", 2: "2", 3: "3", 4: "4", 5: "5"}
+        with patch("ci_test_processes.proc_stat", side_effect=self.state_of):
+            self.assertEqual(
+                live_members(rows), {1: "1", 3: "3"},
+                "only running rows are leak candidates",
+            )
+
+    def test_the_defunct_classifier_is_the_shared_discriminator(self):
+        self.assertTrue(is_defunct("Z"))
+        for running in ("R", "S", "D", "T"):
+            self.assertFalse(is_defunct(running), running)
 
 
 class WitnessContractTests(unittest.TestCase):

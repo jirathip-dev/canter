@@ -15,7 +15,13 @@ import sys
 import tempfile
 import time
 
-from ci_test_processes import MARKER, fixture_environment, has_marker, proc_stat
+from ci_test_processes import (
+    MARKER,
+    fixture_environment,
+    has_marker,
+    is_defunct,
+    proc_stat,
+)
 
 # CI pre-builds every test executable in its own bounded step, so this
 # deadline measures serial suite execution rather than a cold compilation.
@@ -101,18 +107,6 @@ def ancestor_pids(rows: dict[int, tuple[int, int, str, str]]) -> set[int]:
             break
         pid = parent[0]
     return ancestors
-
-
-def is_defunct(state: str) -> bool:
-    """Whether a snapshot state is an exited process awaiting its parent's reap.
-
-    A defunct (zombie) process holds none of the resources a leak is about —
-    no address space, no open descriptors — and no signal this sweep sends can
-    reap it, so counting it false-reds a healthy run: the ubuntu runner's
-    process table carried a transient `[sh] <defunct>` in the suite's own
-    session and the sweep read it as `leaked 1 process(es)` (issue #301).
-    """
-    return state.startswith("Z")
 
 
 def matching_processes(
