@@ -156,10 +156,14 @@ worktree (the builder enforces the same).
 `scripts/accept-bump.py` bumps an installed candidate: it installs the build
 to BOTH the acceptance target and the path the service unit launches, ad-hoc
 re-signs both, restarts through the supervisor, and proves that exactly one
-pid holds the socket and that pid is running the installed build (typed
-refusals — never a success on a stale daemon; `docs/OPERATIONS.md` section
-10.1 is the runbook). It is operator tooling — run it by hand, never from CI —
-and it is self-tested in disposable roots with a fake `launchctl`:
+pid holds the socket and that pid is running the installed build — naming
+every holder when the count is not one, and refusing when the bump left a new
+PPID-1 `canter daemon` behind (typed refusals — never a success on a stale
+daemon; `docs/OPERATIONS.md` section 10.1 is the runbook). It is operator
+tooling — run it by hand, never from CI — and it is self-tested in disposable
+roots with a fake `launchctl`, which also reap every daemon the scenarios
+start on every exit path (a SIGKILLed pass included, via a guardian watching
+the disposable workspace):
 
 ```console
 $ python3 scripts/test-accept-bump.py

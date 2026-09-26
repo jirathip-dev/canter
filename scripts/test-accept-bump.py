@@ -12,12 +12,20 @@ installed CLI:
 * verify — exactly ONE pid holds the socket, that pid's executable sha256 IS
   the installed build's sha256, and the log records pid, started_at, sha256;
 * refusals — a daemon that never comes up, a socket held by a superseded
-  build, two holders, a supervisor that launches another path, an unloaded
-  job, a refused restart, an unresolved holder executable, a lease naming
-  another pid, diverging installed paths, a non-fast-forward move and a failed
-  build each exit non-zero with their typed `bump.refusal.<code>`, and never
-  print DONE;
-* idempotence — a second bump at the same candidate leaves one socket holder.
+  build, two holders (each named with its executable), a supervisor that
+  launches another path, an unloaded job, a refused restart, an unresolved
+  holder executable, a lease naming another pid, diverging installed paths, a
+  non-fast-forward move and a failed build each exit non-zero with their
+  typed `bump.refusal.<code>`, and never print DONE;
+* idempotence — a second bump at the same candidate leaves one socket holder;
+* census (issue #316) — the bump takes the PPID-1 `canter daemon` census
+  before the restart and after the verify, records both counts, and refuses
+  (`bump.refusal.orphans`) naming every NEW daemon when the count grew; a
+  pre-existing orphan never blocks a bump;
+* daemon ownership (issue #316) — every scenario daemon the harness starts is
+  reaped on every exit path (a failing pass included, witnessed by a nested
+  failing pass), a killed harness is still reaped by its guardian, and the
+  suite FAILS if any scenario daemon outlives it.
 
 Usage:
   python3 scripts/test-accept-bump.py [--bin PATH] [--lsof PATH]
@@ -40,6 +48,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -186,7 +195,12 @@ sys.exit(2)
 
 # Fake `lsof` variants: a fixed holder set (two holders / no executable row).
 LSOF_HOLDERS_SHIM = r'''#!/usr/bin/env python3
-"""Fake `lsof` for scripts/test-accept-bump.py: a TWO-holder socket."""
+"""Fake `lsof` for scripts/test-accept-bump.py: a TWO-holder socket.
+
+One holder resolves an executable and the other does not, so the refusal's
+per-holder naming (pid + exe, `unresolved` when it cannot be read) is
+observable rather than assumed.
+"""
 import os
 import sys
 
@@ -198,6 +212,8 @@ if argv[:1] == ["-U"]:
         print("canter  %d jirathip    4u  unix 0x0000000000000000      0t0 %s" % (pid, socket))
     sys.exit(0)
 if "-Fn" in argv:
+    if "-p" in argv and argv[argv.index("-p") + 1] == "11111":
+        print("n/tmp/orphan-one/canter")
     sys.exit(0)
 sys.exit(2)
 '''
@@ -303,6 +319,292 @@ def git(args: list[str], cwd: str | None = None) -> subprocess.CompletedProcess:
                           stderr=subprocess.STDOUT, text=True, check=False)
 
 
+# --- scenario-daemon ownership (issue #316) --------------------------------
+#
+# Every scenario daemon the harness starts runs with
+# `--socket <workspace>/<scenario>/state/canter/canter.sock` and is reparented
+# to PPID 1 the moment the fake supervisor's launcher exits. That argv is the
+# daemon's ONLY durable owner record, and it is what the two sweeps below use:
+# the harness reaps its own workspace on every exit path, and the guardian
+# (a separate process) reaps it again if the harness is killed outright.
+
+SOCKET_SUFFIX = "/state/canter/canter.sock"
+
+
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def process_rows() -> list[tuple[int, int, str]]:
+    """(pid, ppid, command) for every host process (`ps -axww`)."""
+    proc = subprocess.run(["ps", "-axww", "-o", "pid=,ppid=,command="],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, check=False)
+    rows: list[tuple[int, int, str]] = []
+    for line in (proc.stdout or "").splitlines():
+        fields = line.split(None, 2)
+        if len(fields) < 3:
+            continue
+        try:
+            rows.append((int(fields[0]), int(fields[1]), fields[2].strip()))
+        except ValueError:
+            continue
+    return rows
+
+
+def wait_reaped(pid: int, timeout: float = 10.0) -> bool:
+    """True when `pid` is truly gone (a zombie of OUR child is reaped first)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not alive(pid):
+            return True
+        try:
+            reaped, _status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            reaped = pid  # not our child: whoever owns it reaps it
+        except OSError:
+            reaped = pid
+        if reaped == pid:
+            return not alive(pid)
+        time.sleep(0.05)
+    return not alive(pid)
+
+
+def daemons_under(root: str, skip: set[int], suffix: str = SOCKET_SUFFIX) -> dict[int, str]:
+    """Scenario daemons whose command names a socket under `root`.
+
+    Scoped by construction: the marker is the scored socket suffix plus the
+    root's own socket needle (`<root><suffix>`), so a foreign daemon (another
+    lane's, or the real one) can never match. Callers that own a whole
+    workspace pass `suffix=""` — every fixture socket is still required to
+    carry the scored suffix.
+    """
+    forms = {root, os.path.realpath(root)}
+    needles = {form.rstrip("/") + suffix for form in forms}
+    found: dict[int, str] = {}
+    for pid, _ppid, command in process_rows():
+        if pid in skip or SOCKET_SUFFIX not in command:
+            continue
+        if any(needle in command for needle in needles):
+            found[pid] = command
+    return found
+
+
+def reap_daemons(root: str, skip: set[int], grace: float = 5.0,
+                 suffix: str = SOCKET_SUFFIX) -> dict[int, str]:
+    """SIGTERM every scenario daemon under `root`, SIGKILL the bounded survivors.
+
+    Returns whatever is still alive afterwards (empty == fully reaped), so a
+    caller can turn a leak into a failure instead of a silent residue.
+    """
+    found = daemons_under(root, skip, suffix)
+    if not found:
+        return {}
+    print("reap {}, SIGTERM {}".format(root, sorted(found)), flush=True)
+    for pid in found:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.time() + grace
+    while time.time() < deadline and daemons_under(root, skip, suffix):
+        time.sleep(0.05)
+    for pid in daemons_under(root, skip, suffix):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    deadline = time.time() + grace
+    while time.time() < deadline and daemons_under(root, skip, suffix):
+        time.sleep(0.05)
+    survivors = daemons_under(root, skip, suffix)
+    print("reap {}: remaining={}".format(root, sorted(survivors)), flush=True)
+    return survivors
+
+
+def host_census() -> list[tuple[int, str]]:
+    """The issue's reproducible measurement: PPID-1 `canter daemon run` rows."""
+    census: list[tuple[int, str]] = []
+    for pid, ppid, command in process_rows():
+        tokens = command.split()
+        if ppid != 1 or not tokens:
+            continue
+        if os.path.basename(tokens[0]) != "canter":
+            continue
+        if "daemon" not in tokens or "run" not in tokens:
+            continue
+        census.append((pid, command))
+    return census
+
+
+def start_stand_in_daemon(root: str) -> int:
+    """A REAL process whose argv names a socket under `root` (a stand-in)."""
+    socket_path = os.path.join(root, "state", "canter", "canter.sock")
+    os.makedirs(os.path.dirname(socket_path), exist_ok=True)
+    with open(os.path.join(root, "stand-in.log"), "ab") as out:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time\nwhile True: time.sleep(1)",
+             "--settled-stand-in", socket_path],
+            stdout=out, stderr=out, start_new_session=True)
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if proc.pid in daemons_under(root, skip=set()):
+            return proc.pid
+        time.sleep(0.05)
+    raise AssertionError("the stand-in daemon never showed up under {}".format(root))
+
+
+GUARDIAN_SRC = r'''#!/usr/bin/env python3
+"""scripts/test-accept-bump.py guardian: reap a killed harness's scenario daemons.
+
+Usage: guardian <harness-pid> <workspace-root>
+
+The harness reaps its own workspace on every exit path it can run Python on.
+A SIGKILLed harness runs none, so this process — outside it, started per
+suite — waits for the harness pid to disappear and then sweeps the SAME
+workspace: every `... daemon run --socket <workspace>/...canter.sock` process
+is SIGTERM'd, then SIGKILL'd, bounded, and the survivor set is recorded to
+`<workspace>/guardian.log`. It is path-scoped to the workspace it was given,
+so it can never touch a foreign daemon (another lane's, or the real one).
+"""
+import os
+import signal
+import subprocess
+import sys
+import time
+
+SOCKET_SUFFIX = "/state/canter/canter.sock"
+
+
+def alive(pid):
+    # `os.kill(pid, 0)` answers true for a ZOMBIE too, and a killed harness
+    # whose parent has not reaped it yet is exactly that: ask `ps` for the
+    # state and treat `Z` as gone.
+    proc = subprocess.run(["ps", "-p", str(pid), "-o", "stat="],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, check=False)
+    stat = (proc.stdout or "").strip()
+    return bool(stat) and "Z" not in stat
+
+
+def record(workspace, message):
+    # The durable record is a FILE inside the workspace the harness handed
+    # over: the guardian may be sweeping because the harness (and any pipe to
+    # it) is already gone, so the reap must never depend on stdout.
+    try:
+        with open(os.path.join(workspace, "guardian.log"), "a",
+                  encoding="utf-8") as handle:
+            handle.write(message + "\n")
+    except OSError:
+        pass
+    try:
+        print(message, flush=True)
+    except OSError:
+        pass
+
+
+def daemons_under(root, skip):
+    forms = {root, os.path.realpath(root)}
+    proc = subprocess.run(["ps", "-axww", "-o", "pid=,command="],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, check=False)
+    found = {}
+    for line in (proc.stdout or "").splitlines():
+        fields = line.split(None, 1)
+        if len(fields) < 2:
+            continue
+        try:
+            pid = int(fields[0])
+        except ValueError:
+            continue
+        command = fields[1]
+        if pid in skip or SOCKET_SUFFIX not in command:
+            continue
+        if any(form in command for form in forms):
+            found[pid] = command
+    return found
+
+
+def main(argv):
+    harness, workspace = int(argv[0]), argv[1]
+    skip = {harness, os.getpid()}
+    while alive(harness):
+        time.sleep(0.5)
+    found = daemons_under(workspace, skip)
+    if not found:
+        return 0
+    record(workspace, "guardian: SIGTERM {}".format(sorted(found)))
+    for pid in found:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.time() + 5
+    while time.time() < deadline and daemons_under(workspace, skip):
+        time.sleep(0.05)
+    for pid in daemons_under(workspace, skip):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    deadline = time.time() + 5
+    while time.time() < deadline and daemons_under(workspace, skip):
+        time.sleep(0.05)
+    remaining = daemons_under(workspace, skip)
+    record(workspace, "guardian: remaining={}".format(sorted(remaining)))
+    return 1 if remaining else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+'''
+
+# Fake `ps`: the driver's PPID-1 daemon census is a scripted table, so the
+# self-test proves the count/refusal logic without depending on this host's
+# live process population. Call 1 serves `before` (the census the bump takes
+# just before the restart), later calls serve `after`.
+PS_SHIM = r'''#!/usr/bin/env python3
+"""Fake `ps` for scripts/test-accept-bump.py: a scripted PPID-1 census."""
+import json
+import os
+
+SPEC = "@SPEC@"
+
+
+def main():
+    spec = json.load(open(SPEC, encoding="utf-8"))
+    try:
+        calls = int(open(spec["counter"], encoding="utf-8").read().strip() or "0")
+    except OSError:
+        calls = 0
+    calls += 1
+    with open(spec["counter"], "w", encoding="utf-8") as handle:
+        handle.write(str(calls))
+    rows = spec["before"] if calls == 1 else spec["after"]
+    print("  PID  PPID COMMAND")
+    for pid, ppid, command in rows:
+        print("%6d  %4d %s" % (pid, ppid, command))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+
+def write_ps_shim(directory: str, name: str, before, after) -> str:
+    """A fake `ps` serving `before` on its first call and `after` afterwards."""
+    spec = os.path.join(directory, name + ".json")
+    with open(spec, "w", encoding="utf-8") as handle:
+        json.dump({"before": before, "after": after,
+                   "counter": os.path.join(directory, name + "-calls")}, handle)
+    return write_shim(directory, name, PS_SHIM.replace("@SPEC@", spec))
+
+
 class Fixture:
     """One disposable bump root: home, bin dir, state, integration, supervisor."""
 
@@ -392,13 +694,6 @@ class Fixture:
                 events.append(json.loads(payload.strip()))
         return events
 
-    def supervisor_pid(self) -> int | None:
-        try:
-            with open(self.supervisor_state, encoding="utf-8") as handle:
-                return json.load(handle).get("pid")
-        except (OSError, ValueError):
-            return None
-
     # -- lifecycle ---------------------------------------------------------
 
     def start_stale_daemon(self) -> int:
@@ -422,24 +717,15 @@ class Fixture:
             time.sleep(0.1)
         raise AssertionError("stale daemon never took the socket")
 
-    def kill(self, pid: int | None) -> None:
-        if not pid:
-            return
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            try:
-                os.kill(pid, sig)
-            except OSError:
-                return
-            for _ in range(100):
-                try:
-                    os.kill(pid, 0)
-                except OSError:
-                    return
-                time.sleep(0.05)
-
     def cleanup(self) -> None:
-        for pid in self.holder_pids() + [self.supervisor_pid()]:
-            self.kill(pid)
+        """Reap every scenario daemon of THIS fixture by its own socket argv.
+
+        The argv is the daemon's durable owner record (the fake supervisor's
+        launcher is gone, and lsof sees only live descriptors), so this also
+        reaps a daemon a scenario failed to track — and it is what the suite's
+        final audit re-checks (issue #316).
+        """
+        reap_daemons(self.root, skip={os.getpid()})
 
     # -- driver invocation -------------------------------------------------
 
@@ -448,6 +734,7 @@ class Fixture:
                    sha: str | None = None, branch: str = "staging",
                    accept_target: str | None = None, cargo: str | None = None,
                    integration: str | None = None,
+                   ps: str | None = None,
                    verify_only: bool = False) -> subprocess.CompletedProcess:
         argv = [
             sys.executable, DRIVER,
@@ -465,6 +752,7 @@ class Fixture:
             "--lsof", lsof,
             "--codesign", codesign,
             "--cargo", cargo or shims.cargo,
+            "--ps", ps or shims.ps_stable,
         ]
         if verify_only:
             argv += ["--verify-only"]
@@ -477,6 +765,17 @@ class Fixture:
         env["HF_BUMP_SOCKET"] = self.socket
         return subprocess.run(argv, env=env, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, text=True, check=False)
+
+
+# The scripted census rows (the fake `ps` tables, issue #316): a foreign
+# daemon that predates the bump never blocks one; a NEW PPID-1 daemon after
+# the restart is exactly the leak `bump.refusal.orphans` must name.
+FOREIGN_DAEMON = ("/var/tmp/foreign-lane/bin/canter daemon run --socket "
+                  "/var/tmp/foreign-lane/state/canter/canter.sock")
+FOREIGN_TWO = ("/var/tmp/foreign-two/bin/canter daemon run --socket "
+               "/var/tmp/foreign-two/state/canter/canter.sock")
+LEFTOVER_DAEMON = ("/var/tmp/leftover-harness/bin/canter daemon run --socket "
+                   "/var/tmp/leftover-harness/state/canter/canter.sock")
 
 
 class Shims:
@@ -498,6 +797,19 @@ class Shims:
         shutil.copyfile(binary, env_bin)
         os.chmod(env_bin, 0o755)
         os.environ["HF_TEST_CARGO_BIN"] = env_bin
+        # The daemons a scenario starts are REAL processes; the supervisor,
+        # the daemon census and the guardian are the scripted boundaries.
+        self.ps_stable = write_ps_shim(
+            directory, "ps-stable",
+            [[70001, 1, FOREIGN_DAEMON]], [[70001, 1, FOREIGN_DAEMON]])
+        self.ps_preexisting = write_ps_shim(
+            directory, "ps-preexisting",
+            [[70001, 1, FOREIGN_DAEMON], [70002, 1, FOREIGN_TWO]],
+            [[70001, 1, FOREIGN_DAEMON], [70002, 1, FOREIGN_TWO]])
+        self.ps_growth = write_ps_shim(
+            directory, "ps-growth", [[70001, 1, FOREIGN_DAEMON]],
+            [[70001, 1, FOREIGN_DAEMON], [424242, 1, LEFTOVER_DAEMON]])
+        self.guardian = write_shim(directory, "guardian", GUARDIAN_SRC)
 
 
 class Suite:
@@ -596,6 +908,14 @@ class Suite:
                        or os.path.realpath(event.get("exe") or "")
                        == os.path.realpath(fixture.service_path),
                        "exe={}".format(event.get("exe")))
+            self.check("the done event carries both census counts (issue #316)",
+                       event.get("orphans_before") == 1
+                       and event.get("orphans_after") == 1,
+                       "event={}".format(event))
+        self.check("the bump logs the census before the restart and after the verify",
+                   "orphans_before count=1 pids=[70001]" in fixture.log_text()
+                   and "orphans_after count=1 pids=[70001]" in fixture.log_text(),
+                   "log={}".format(fixture.log_text().strip()[-600:]))
         self.check("exactly one socket holder", len(fixture.holder_pids()) == 1,
                    "holders={}".format(fixture.holder_pids()))
         return fixture
@@ -689,6 +1009,10 @@ class Suite:
                                   wait=NO_START_WAIT_SECS)
         self.expectation("two socket holders", proc, 14,
                          "bump.refusal.socket_holders", fixture)
+        self.check("the refusal names each holder with its executable (issue #316 AC1)",
+                   "pid=11111 exe=/tmp/orphan-one/canter" in proc.stderr
+                   and "pid=22222 exe=unresolved" in proc.stderr,
+                   "stderr={}".format(proc.stderr.strip()[-500:]))
         fixture.cleanup()
 
     def scenario_pid_exe_unresolved(self) -> None:
@@ -769,6 +1093,131 @@ class Suite:
         self.expectation("accept target not installable", proc, 7,
                          "bump.refusal.install", fixture)
 
+    def scenario_orphans(self) -> None:
+        """The bump refuses when its own census grew (issue #316 AC2).
+
+        The fake `ps` serves a NEW PPID-1 daemon on the census taken after the
+        restart; the bump must refuse 18, name that pid and its command, and
+        never print DONE. The control leg is a census that ALREADY carried
+        foreign orphans (before == after): a pre-existing leak must never
+        block a bump.
+        """
+        fixture = self.fixture("orphans")
+        fixture.write_spec(mode="start")
+        proc = fixture.run_driver(self.shims, self.lsof, self.codesign,
+                                  ps=self.shims.ps_growth)
+        self.expectation("census grew across the bump", proc, 18,
+                         "bump.refusal.orphans", fixture)
+        self.check("the refusal names the new orphan and its command (issue #316 AC2)",
+                   "pid=424242" in proc.stderr and "leftover-harness" in proc.stderr,
+                   "stderr={}".format(proc.stderr.strip()[-500:]))
+        self.check("the log records both census counts and both pid sets",
+                   "orphans_before count=1 pids=[70001]" in fixture.log_text()
+                   and "orphans_after count=2 pids=[70001, 424242]"
+                   in fixture.log_text(),
+                   "log={}".format(fixture.log_text().strip()[-700:]))
+        fixture.cleanup()
+
+        control = self.fixture("orphans_preexisting")
+        control.write_spec(mode="start")
+        proc = control.run_driver(self.shims, self.lsof, self.codesign,
+                                  ps=self.shims.ps_preexisting)
+        self.check("pre-existing orphans do not fail the bump", proc.returncode == 0,
+                   "got {} log={}".format(proc.returncode,
+                                          control.log_text().strip()[-400:]))
+        self.check("pre-existing orphans are counted, not cleared",
+                   "orphans_before count=2 pids=[70001, 70002]" in control.log_text()
+                   and "orphans_after count=2 pids=[70001, 70002]"
+                   in control.log_text(),
+                   "log={}".format(control.log_text().strip()[-700:]))
+        control.cleanup()
+
+    def scenario_daemon_ownership(self) -> None:
+        """The sweep reaps a REAL scenario daemon (issue #316 AC3/AC4).
+
+        The stand-in is a real process whose argv carries a socket under the
+        scored root: the same shape every scenario daemon has. The sweep must
+        find it, kill it, and report nothing left — the primitive the suite's
+        exit audit and the guardian both use.
+        """
+        scratch = os.path.join(self.workspace, "reap-witness")
+        pid = start_stand_in_daemon(scratch)
+        self.check("a scenario daemon is found by its own socket argv",
+                   daemons_under(scratch, skip=set()).get(pid),
+                   "found={}".format(daemons_under(scratch, skip=set())))
+        survivors = reap_daemons(scratch, skip=set())
+        self.check("the sweep leaves no scenario daemon behind", not survivors,
+                   "survivors={}".format(survivors))
+        self.check("the reaped daemon is gone", wait_reaped(pid), "pid={}".format(pid))
+        self.check("a foreign daemon can never match the sweep",
+                   not daemons_under("/var/tmp/foreign-lane", skip=set()),
+                   "found={}".format(daemons_under("/var/tmp/foreign-lane", skip=set())))
+
+    def scenario_guardian(self) -> None:
+        """A KILLED harness is still reaped: the guardian owns the workspace.
+
+        The measured defect (issue #316) was exactly this: a harness killed
+        mid-pass ran no `finally`, and its scenario daemons survived it. The
+        guardian is a separate process watching the harness pid; the stand-in
+        harness below is SIGKILLed and the stand-in daemon must still die.
+        """
+        scratch = os.path.join(self.workspace, "guardian-witness")
+        daemon_pid = start_stand_in_daemon(scratch)
+        harness = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(600)"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        guardian = subprocess.Popen(
+            [sys.executable, self.shims.guardian, str(harness.pid), scratch],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            os.kill(harness.pid, signal.SIGKILL)
+            harness.wait(timeout=10)
+            deadline = time.time() + 30
+            while time.time() < deadline and daemons_under(scratch, skip=set()):
+                time.sleep(0.25)
+            remaining = daemons_under(scratch, skip=set())
+            self.check("the guardian reaps a killed harness's daemon",
+                       not remaining and wait_reaped(daemon_pid),
+                       "remaining={} daemon_pid={}".format(remaining, daemon_pid))
+            self.check("the guardian exits 0 with an empty workspace",
+                       guardian.wait(timeout=15) == 0,
+                       "guardian exit={} output={}".format(
+                           guardian.returncode, (guardian.stdout.read() or "")[-300:]))
+        finally:
+            if guardian.poll() is None:
+                guardian.kill()
+
+    def scenario_failure_path(self) -> None:
+        """A FAILING pass still reaps its scenarios (issue #316 AC3).
+
+        The nested pass runs the same suite with a fake `lsof` that never
+        resolves a holder executable, so its scenarios fail (exit 1); the
+        point is that its own reap still empties the workspace before it
+        exits. Its kept workspace is swept and removed here.
+        """
+        proc = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "--bin", self.binary,
+             "--lsof", self.shims.lsof_no_exe, "--keep", "--skip-nested"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            check=False)
+        kept = ""
+        for line in (proc.stdout or "").splitlines():
+            if line.startswith("kept: "):
+                kept = line[len("kept: "):].strip()
+        self.check("the nested failing pass exits non-zero", proc.returncode != 0,
+                   "nested exit={} tail={}".format(
+                       proc.returncode, (proc.stdout or "")[-400:]))
+        self.check("the nested pass kept its workspace for inspection", bool(kept),
+                   "stdout tail={}".format((proc.stdout or "")[-400:]))
+        if kept:
+            try:
+                surviving = daemons_under(kept, skip=set(), suffix="")
+                self.check("a FAILING pass still left no scenario daemon",
+                           not surviving, "survivors={}".format(surviving))
+            finally:
+                shutil.rmtree(kept, ignore_errors=True)
+
     def scenario_full_mode(self) -> None:
         fixture = self.fixture("full_mode")
         head, _side = self.make_source_fixture(fixture)
@@ -843,12 +1292,50 @@ class Suite:
         return head, side
 
 
+class Interrupted(Exception):
+    """The harness caught a termination signal and is reaping on the way out."""
+
+
+SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
+def install_reap_handlers(received: list[int]) -> None:
+    """Termination signals still reap: every handler exits through the finally.
+
+    A second signal restores the default disposition, so a harness that cannot
+    get through its reap never traps the operator in it.
+    """
+    def handler(signum, _frame):
+        received.append(signum)
+        signal.signal(signum, signal.SIG_DFL)
+        raise Interrupted("signal {}".format(signum))
+    for signum in SIGNALS:
+        signal.signal(signum, handler)
+
+
+def start_guardian(workspace: str, shims: "Shims") -> subprocess.Popen:
+    """The kill-proof half: reap the workspace if THIS harness is killed.
+
+    A `kill -9` runs no Python, so the guardian is a separate process watching
+    this pid; it sweeps the same workspace the suite owns (and only that one)
+    the moment the harness is gone. Its durable record is the file it writes
+    inside the workspace (`guardian.log`); THIS process hands it DEVNULL, never
+    a pipe that dies with the harness.
+    """
+    return subprocess.Popen(
+        [sys.executable, shims.guardian, str(os.getpid()), workspace],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True)
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="test-accept-bump.py")
     parser.add_argument("--bin", default=os.path.join(REPO, "target", "release", "canter"))
     parser.add_argument("--lsof", default="lsof")
     parser.add_argument("--keep", action="store_true",
                         help="keep the disposable roots for inspection")
+    parser.add_argument("--skip-nested", action="store_true",
+                        help="skip the nested failing-pass witness (a nested pass sets this)")
     return parser.parse_args(argv)
 
 
@@ -867,8 +1354,15 @@ def main(argv: list[str]) -> int:
     workspace = tempfile.mkdtemp(prefix="hf-bump-", dir="/tmp")
     shims = Shims(os.path.join(workspace, "shims"), binary)
     suite = Suite(binary, workspace, lsof, codesign, shims)
+    host_before = host_census()
     print("== accept-bump self-test: bin={} lsof={} codesign={}".format(
         binary, lsof, codesign), flush=True)
+    print("harness pass census (PPID-1 `canter daemon run`) before: count={} "
+          "pids={}".format(len(host_before),
+                           [pid for pid, _command in host_before]), flush=True)
+    guardian = start_guardian(workspace, shims)
+    received: list[int] = []
+    install_reap_handlers(received)
     try:
         suite.scenario_usage()
         suite.scenario_happy_path()
@@ -887,12 +1381,37 @@ def main(argv: list[str]) -> int:
         suite.scenario_sign_verification()
         suite.scenario_install_divergence()
         suite.scenario_install_failure()
+        suite.scenario_orphans()
+        suite.scenario_daemon_ownership()
+        suite.scenario_guardian()
+        if not args.skip_nested:
+            suite.scenario_failure_path()
         suite.scenario_full_mode()
+    except Interrupted as exc:
+        print("interrupted: {}".format(exc), flush=True)
+    except Exception:
+        report = "a scenario raised:\n{}".format(traceback.format_exc())
+        suite.failures.append(report)
+        print("FAIL: {}".format(report), flush=True)
     finally:
+        # Issue #316 AC3: every scenario daemon is reaped on EVERY exit path,
+        # and whatever survived is a failure, not a residue.
         for fixture in suite.fixtures:
             fixture.cleanup()
+        surviving = reap_daemons(workspace, skip={os.getpid(), guardian.pid},
+                                 suffix="")
+        if surviving:
+            leak = "scenario daemons outlived the harness: {}".format(
+                ", ".join("pid={} {}".format(pid, command)
+                          for pid, command in sorted(surviving.items())))
+            suite.failures.append(leak)
+            print("FAIL: {}".format(leak), flush=True)
+        host_after = host_census()
+        print("harness pass census (PPID-1 `canter daemon run`) after: count={} "
+              "pids={}".format(len(host_after),
+                               [pid for pid, _command in host_after]), flush=True)
         if args.keep:
-            print("kept: {}".format(workspace))
+            print("kept: {}".format(workspace), flush=True)
         else:
             shutil.rmtree(workspace, ignore_errors=True)
     if suite.failures:
@@ -900,6 +1419,10 @@ def main(argv: list[str]) -> int:
         for failure in suite.failures:
             print("  - {}".format(failure))
         return 1
+    if received:
+        print("\naccept-bump self-test: interrupted (signal {}) after reaping; "
+              "{} check(s) passed".format(received[0], len(suite.checks)))
+        return 130
     print("\naccept-bump self-test: all {} checks passed".format(len(suite.checks)))
     return 0
 

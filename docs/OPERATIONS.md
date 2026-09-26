@@ -772,7 +772,18 @@ launching that path?" — the diagnosis half of the same proof.
    postdates the install — so a superseded daemon that still holds the socket
    cannot pass even though the file at its executable path was just replaced.
    The bump log (`<state>/accept/bump.log`) records the daemon pid,
-   `started_at` and the installed sha256.
+   `started_at` and the installed sha256. A count that is not one fails the
+   bump and names every holder (`pid=<pid> exe=<path|unresolved>`), so the
+   refusal itself is the reader's inventory of the socket.
+6. **census** (issue #316) — count the `canter daemon` processes reparented
+   to PPID 1 once BEFORE the restart and once after `verify`
+   (`ps -o pid,ppid,command -ax`), record both counts and their pids in the
+   bump log and in the `bump.done` event, and refuse
+   (`bump.refusal.orphans`) naming each NEW one when the count grew across
+   the bump. A supervised daemon is reparented to PPID 1 the moment its
+   launcher exits, so an unowned leak is exactly a PPID-1 `canter daemon`
+   row: a pre-existing orphan a previous run leaked never blocks a bump, and
+   a bump that ADDS one never reports DONE.
 
 Success prints `DONE` plus one machine-readable line. Every other outcome is a
 typed refusal with a non-zero exit status, and `DONE` is **never** printed for
@@ -791,10 +802,11 @@ a daemon that is not the installed build:
 | `bump.refusal.supervisor_not_loaded` | 11 | the job is not loaded (section 5.1) |
 | `bump.refusal.restart` | 12 | the supervisor refused the restart |
 | `bump.refusal.daemon_not_up` | 13 | no pid held the socket before the deadline |
-| `bump.refusal.socket_holders` | 14 | more than one pid holds the socket |
+| `bump.refusal.socket_holders` | 14 | more than one pid holds the socket (each holder is named with its executable) |
 | `bump.refusal.stale_daemon` | 15 | the holder's executable is not the installed build |
 | `bump.refusal.pid_exe_unresolved` | 16 | the holder's executable could not be resolved |
 | `bump.refusal.lease` | 17 | the lease does not name the socket holder |
+| `bump.refusal.orphans` | 18 | the bump left new PPID-1 daemon processes |
 
 Witness the result directly (the bump log's sha256 is the identity of the
 bytes the daemon actually executes, i.e. post-sign):
@@ -805,10 +817,18 @@ $ ps -p <pid> -o comm=                        # the executable that pid runs
 $ shasum -a 256 ~/.local/bin/canter           # must equal the bump log's sha256
 $ codesign -v ~/.local/bin/canter \
     ~/.local/state/canter/accept/target/release/canter
+$ ps -o pid,ppid,command -ax | grep 'canter daemon'   # the PPID-1 census
 ```
 
+The last line is the reproducible before/after measurement: the bump log's
+`orphans_before`/`orphans_after` counts are exactly its PPID-1 rows, taken at
+the restart and after the verify.
+
 The driver is self-tested (disposable roots, fake `launchctl`, no host
-activation):
+activation). The self-test also OWNS the daemons its scenarios start (issue
+#316): every one is stopped on every exit path it can run Python on, a
+SIGKILLed harness is still reaped by a guardian watching the same disposable
+workspace, and a pass that leaves any scenario daemon behind FAILS:
 
 ```console
 $ python3 scripts/test-accept-bump.py          # needs target/release/canter
