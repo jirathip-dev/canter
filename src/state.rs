@@ -4949,6 +4949,43 @@ impl State {
         Ok(out)
     }
 
+    /// The repository issues whose recorded queue ownership is LIVE (issue
+    /// #236): the issues whose `queue_ownership` row names a run recording an
+    /// owned status — `new`, `running`, `paused`, `human_queue` or `blocked`,
+    /// the SAME set the admission conflict re-derives from the run rows
+    /// (`owned_runs_locked`, `admit_queue_item_in_tx`) and the preview
+    /// classifies by (`crate::queue_preview::OWNED_RUN_STATES`).
+    ///
+    /// A lane record left by a TERMINAL run — a completion recorded before
+    /// the row was freed, an invalidated run the operator has not retired yet
+    /// (`run.retire-lane`, #262) — names no live owner: the admission would
+    /// replace it inside its own transaction, and the shipped dedupe
+    /// contract reads exactly "a live row in the recorded ownership set"
+    /// (`docs/contracts/spec-intake.md`). Only live ownership is returned, so
+    /// a leftover terminal run's row can never hold fresh work as if it were
+    /// a live lane. Ordered by issue number, so one durable state renders one
+    /// decision.
+    pub fn live_owned_issues(&self, repository: &str) -> Result<Vec<i64>, StateError> {
+        let conn = self.lock("live_owned_issues")?;
+        let mut statement = conn
+            .prepare(
+                "SELECT o.issue_number FROM queue_ownership o
+                   JOIN instances i ON i.instance_id = o.instance_id
+                  WHERE o.repository = ?1
+                    AND i.status IN ('new', 'running', 'paused', 'human_queue', 'blocked')
+                  ORDER BY o.issue_number",
+            )
+            .map_err(|err| StateError::from_sqlite("live_owned_issues: prepare", err))?;
+        let rows = statement
+            .query_map(params![repository], |row| row.get::<_, i64>(0))
+            .map_err(|err| StateError::from_sqlite("live_owned_issues: query_map", err))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|err| StateError::from_sqlite("live_owned_issues: row", err))?);
+        }
+        Ok(out)
+    }
+
     /// Every durable queue-advance row of one submission, oldest delivery
     /// first (issue #96; read-only — the queue readback and the focused tests
     /// read this).
@@ -17417,6 +17454,100 @@ mod tests {
             .retire_run_lane_records("run-0000000000000000", "unknown", "ik_run-236-unknown")
             .expect_err("unknown run");
         assert_eq!(err.code, "state.not_found");
+    }
+
+    /// Issue #236: `live_owned_issues` reads LIVE ownership — the same set the
+    /// admission conflict re-derives from the run rows and the preview
+    /// classifies by — so a lane record left by a TERMINAL run (an invalidated
+    /// run the operator has not retired yet, a completion recorded before the
+    /// row was freed) never holds an item as if it were a live lane, while a
+    /// live run's own row is always named. The read never mutates the
+    /// records: retiring them stays the operator control's (#262) or the
+    /// admission's replace-on-admit.
+    #[test]
+    fn live_owned_issues_ignores_a_terminal_runs_lane_record_and_names_a_live_one() {
+        let path = temp_db("live-owned-issues.db");
+        let state = State::open(&path, Retention::default()).expect("open");
+        let at = "2026-09-06T00:00:00Z";
+        state.issue_grant(&sample_grant_doc()).expect("issue");
+        // One run that will be terminal and one live run, each holding its
+        // issue's ownership row — the leftover lane record vs live ownership.
+        state
+            .start_instance(
+                "run-236236236236abcd",
+                "gr_0123456789abcdef",
+                "fleet-doctrine-1",
+                at,
+            )
+            .expect("start terminal");
+        state
+            .start_instance(
+                "run-236236236236beef",
+                "gr_0123456789abcdef",
+                "fleet-doctrine-1",
+                at,
+            )
+            .expect("start live");
+        {
+            let conn = Connection::open(&path).expect("open raw");
+            for (number, work_item, instance) in [
+                (123, "wi_0123456789abcd01", "run-236236236236abcd"),
+                (124, "wi_0123456789abcd02", "run-236236236236beef"),
+            ] {
+                conn.execute(
+                    "INSERT INTO queue_ownership (repository, issue_number, work_item,
+                                                  submission_id, instance_id, created_at)
+                     VALUES ('example-org/widgets', ?1, ?2, 'qs_0123456789abcdef', ?3, ?4)",
+                    params![number, work_item, instance, at],
+                )
+                .expect("seed the ownership row");
+            }
+            // The terminal transition: a run the engine recorded terminal
+            // while its lane record survives — exactly the shape an unretired
+            // invalidation leaves.
+            conn.execute(
+                "UPDATE instances SET status = 'invalidated'
+                  WHERE instance_id = 'run-236236236236abcd'",
+                [],
+            )
+            .expect("terminal");
+        }
+        assert_eq!(
+            state
+                .live_owned_issues("example-org/widgets")
+                .expect("live"),
+            vec![124],
+            "only the live run's issue is live-owned; the terminal run's lane \
+             record names no live owner"
+        );
+        assert_eq!(
+            state.queue_ownership_rows().expect("rows").len(),
+            2,
+            "the read filters ownership; it never retires a record"
+        );
+        assert_eq!(
+            state
+                .live_owned_issues("example-org/other")
+                .expect("scoped"),
+            Vec::<i64>::new(),
+            "another repository's rows are never named"
+        );
+        // A release retires the live run's ownership in the same operation, so
+        // the live set empties with it.
+        state
+            .release_run(
+                "run-236236236236beef",
+                "the live run is freed",
+                "ik_live-owned-release",
+                at,
+            )
+            .expect("release");
+        assert_eq!(
+            state
+                .live_owned_issues("example-org/widgets")
+                .expect("live"),
+            Vec::<i64>::new()
+        );
     }
 
     #[test]
