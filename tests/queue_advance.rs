@@ -3138,6 +3138,15 @@ fn a_fix_rounds_delivered_head_is_re_bound_by_the_runs_own_machinery() {
     // The repair leg's OWN checkout (issue #256): the engine creates it as a
     // DETACHED `worktree add` at the certified head, and the leg lands its
     // repair there — the state the run's own collector re-observes.
+    //
+    // Issue #272: the lane is left EXACTLY as the engine created it — still
+    // detached. A real repair leg commits in this checkout without attaching a
+    // branch (measured on the live `impl-261-r2` leg: `[detached HEAD c0d30ef]
+    // …`), and the run's feature branch is already checked out in the run's
+    // own lane, so no branch can be attached here. The collection must bind
+    // the run's recorded delivery branch and verify this checkout holds
+    // exactly that branch's revision — a witness that attaches a branch of its
+    // own would hide the shape the engine's own machinery has to observe.
     let fix_lane = fix_rebind_lane(&fixture);
     let repair_branch = canter::lane::lane_checkout(5, "implementer", 2);
     git(
@@ -3150,7 +3159,6 @@ fn a_fix_rounds_delivered_head_is_re_bound_by_the_runs_own_machinery() {
             &reviewed,
         ],
     );
-    git(&fix_lane, &["checkout", "-q", "-b", &repair_branch]);
     std::fs::write(fix_lane.join("repair.txt"), "the repair\n").expect("write repair");
     git(&fix_lane, &["add", "repair.txt"]);
     git(
@@ -3417,6 +3425,16 @@ fn a_fix_rounds_delivered_head_is_re_bound_by_the_runs_own_machinery() {
         "the run's own collection certified the head its handoff delivered: {certificate:?}"
     );
     assert_eq!(certificate.step_id, "o1", "the run's own collector step");
+    // The re-collect observed the leg's DETACHED checkout, so the delivery
+    // branch it records is the run's own recorded binding — and only because
+    // that checkout held EXACTLY its revision (verified by the collection
+    // before either was named). A certificate that named the leg's detached
+    // HEAD under any other branch, or any branch under another head, would be
+    // a binding the delivery does not carry.
+    assert_eq!(
+        certificate.branch, "issue-5",
+        "the certificate names the run's own delivery branch: {certificate:?}"
+    );
 
     // (3) AC4: the reviewer's verdict IS recorded at the delivered head, so the
     //     run's durable evidence no longer reads `FAIL at the pre-fix head`
@@ -3450,6 +3468,11 @@ fn a_fix_rounds_delivered_head_is_re_bound_by_the_runs_own_machinery() {
     assert!(
         recollect.contains(&repair_branch),
         "the re-collect observed the repair leg's OWN checkout: {recollect}"
+    );
+    assert!(
+        recollect.contains(r#""branch":"issue-5""#),
+        "the re-collect presents the run's own recorded delivery branch (never the leg's detached \
+         HEAD under a fabricated branch): {recollect}"
     );
     // The driver's own dispatch keys are `<run>-<step>-<second>`; the run's own
     // re-evaluation re-dispatches on its fresh lane round under the same

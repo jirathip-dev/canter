@@ -539,3 +539,164 @@ fn collection_stopped_without_delta_is_still_refused() {
 fn collection_waits_for_pane_delivery_without_operator_dispatch() {
     supervised_collection("delta");
 }
+
+/// Issue #272: the collection's bound-branch rule over a DETACHED worker
+/// checkout — the shape the engine's own repair lane has.
+///
+/// `ensure_fix_lane` creates the repair leg's lane with `git worktree add
+/// --detach` (the run's feature branch is already checked out in the run's own
+/// lane), and the live repair leg committed there detached (`[detached HEAD
+/// c0d30ef] …`), so the re-collect that re-establishes the delivery binding
+/// observes a branch-less checkout whose HEAD is the delivered head. The
+/// collection binds the run's RECORDED branch when — and only when — that
+/// checkout holds EXACTLY the bound branch's revision; a checkout at any other
+/// revision, or a bound branch that does not exist here, refuses typed before
+/// any worker is polled. A branch is never fabricated for a checkout that
+/// carries none, and the certificate may only ever state a head its own
+/// delivery branch holds.
+#[test]
+fn collection_binds_the_recorded_branch_for_a_detached_checkout_at_its_tip() {
+    use canter::mutation::{EffectContext, bind_plan, execute_step, run_session_handle};
+    let fixture = DaemonFixture::new("collect-detached-bound-branch");
+    let root = fixture.dir.join("worktrees");
+    std::fs::create_dir_all(&root).unwrap();
+    let lane = root.join("issues-5");
+    init_repo(&lane);
+    let base = git_output(&lane, &["rev-parse", "HEAD"]).trim().to_string();
+    // The run's own delivery branch, one commit ahead of the collection base:
+    // the commit the repair leg's own checkout holds after its delivery.
+    git_output(&lane, &["checkout", "-q", "-b", "issue-5"]);
+    std::fs::write(lane.join("repair.txt"), "the delivered repair\n").unwrap();
+    git_output(&lane, &["add", "-A"]);
+    git_output(&lane, &["commit", "-qm", "the delivered repair"]);
+    let delivered = git_output(&lane, &["rev-parse", "HEAD"]).trim().to_string();
+    let session = run_session_handle("run-0000000000000005").unwrap();
+    let bin = write_fake_herdr(&fixture.dir);
+    let worker = fixture.dir.join("herdr-state");
+    std::fs::create_dir_all(&worker).unwrap();
+    for (name, value) in [
+        ("name", "impl-5".to_string()),
+        ("pane", "w1:p1".to_string()),
+        ("cwd", lane.to_string_lossy().to_string()),
+        ("lane", session.session_id.clone()),
+        ("generation", session.identity.generation.to_string()),
+        ("state", "unknown".to_string()),
+    ] {
+        std::fs::write(worker.join(name), value).unwrap();
+    }
+    let env = std::collections::BTreeMap::from([
+        (
+            "PATH".to_string(),
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        ),
+        (
+            "HOME".to_string(),
+            fixture.dir.to_string_lossy().to_string(),
+        ),
+    ]);
+    let steps = Val::Arr(vec![
+        object(vec![
+            ("id", string("prompt")),
+            ("kind", string("prompt")),
+            (
+                "params",
+                object(vec![
+                    ("harness_key", string(HARNESS)),
+                    ("kind", string("hermes")),
+                    ("worktree", string("issues-5")),
+                    ("payload", string("bounded work")),
+                ]),
+            ),
+        ]),
+        object(vec![
+            ("id", string("collect")),
+            ("kind", string("collect_outcome")),
+        ]),
+    ]);
+    let plan = bind_plan(&plan_doc_with_steps(steps, 5)).unwrap();
+    let collect = |branch: &str| {
+        let params = object(vec![
+            ("worktree", string("issues-5")),
+            ("branch", string(branch)),
+            ("base_head", string(&base)),
+            // A 3 s no-progress window: short enough to park the accepted
+            // control fast, long enough that the fake live worker's own row is
+            // never racing a one-second subprocess budget under load.
+            ("deadline_secs", integer(3)),
+        ]);
+        execute_step(&EffectContext {
+            plan: &plan,
+            step_id: "collect",
+            kind: "collect_outcome",
+            params: Some(&params),
+            repository: "example-org/widgets",
+            integration_branch: "staging",
+            production_branches: &[],
+            publish_route: "push",
+            worktrees_root: &root,
+            integration_repo: &lane,
+            observed_feature_head: None,
+            observed_integration_base: None,
+            env: &env,
+            role: None,
+            session: Some(&session),
+            archive_root: None,
+            review_root: None,
+            retired_run_ids: &[],
+        })
+    };
+    let log = fixture.dir.join("herdr-argv.txt");
+    // (1) Detached at the bound branch's own tip: the collection ACCEPTS the
+    //     location (the fake live worker IS read) and the injected no-progress
+    //     window parks the wait — the delivery binding was re-established.
+    git_output(&lane, &["checkout", "-q", "--detach", &delivered]);
+    let accepted = collect("issue-5");
+    assert_eq!(accepted.code.as_deref(), Some("effect.worker_timeout"));
+    assert!(
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("agent get impl-5"),
+        "the accepted location observes the worker"
+    );
+    std::fs::remove_file(&log).unwrap();
+    // (2) Detached at a revision the bound branch no longer holds (the branch
+    //     moved on): refused typed, BEFORE any worker is polled — the
+    //     certificate may not state a head its own branch does not carry.
+    git_output(&lane, &["checkout", "-q", "issue-5"]);
+    std::fs::write(lane.join("later.txt"), "a later commit\n").unwrap();
+    git_output(&lane, &["add", "-A"]);
+    git_output(
+        &lane,
+        &["commit", "-qm", "a commit the checkout does not hold"],
+    );
+    git_output(&lane, &["checkout", "-q", "--detach", &delivered]);
+    let moved = collect("issue-5");
+    assert_eq!(
+        moved.code.as_deref(),
+        Some("refusal.worker.output_location")
+    );
+    assert!(
+        moved
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("is detached at"),
+        "the refusal names the observed head and its own bound branch: {moved:?}"
+    );
+    assert!(
+        !log.exists(),
+        "a checkout at another revision must refuse before polling"
+    );
+    // (3) Detached with NO such bound branch here: refused typed, unchanged —
+    //     a branch is never fabricated for a checkout that carries none.
+    git_output(&lane, &["checkout", "-q", "--detach", &delivered]);
+    let absent = collect("issue-9");
+    assert_eq!(
+        absent.code.as_deref(),
+        Some("refusal.worker.output_location")
+    );
+    assert!(
+        !log.exists(),
+        "a checkout with no bound branch must refuse before polling"
+    );
+}
