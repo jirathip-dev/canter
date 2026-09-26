@@ -477,6 +477,7 @@ fn collection_invalid_base_refuses_before_any_worker_poll() {
             archive_root: None,
             review_root: None,
             retired_run_ids: &[],
+            live_sibling_run_ids: &[],
         })
     };
     let log = fixture.dir.join("herdr-argv.txt");
@@ -643,6 +644,7 @@ fn collection_binds_the_recorded_branch_for_a_detached_checkout_at_its_tip() {
             archive_root: None,
             review_root: None,
             retired_run_ids: &[],
+            live_sibling_run_ids: &[],
         })
     };
     let log = fixture.dir.join("herdr-argv.txt");

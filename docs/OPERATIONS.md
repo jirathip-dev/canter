@@ -632,8 +632,12 @@ $ ./target/release/canter daemon status --json    # exit 0 — live again
   its issue's unique ownership — release such a run first
   (`run release`) if it can never progress. The retirement is one
   hash-chained journal claim; a local-only lane branch is never destroyed
-  (the document records `branch_residue.removed: false` for it), and the
-  #190/#222 automatic reclaim at the next bind step is unchanged.
+  (the document records `branch_residue.removed: false` for it). The
+  automatic reclaim at the next bind step is not idle about that shape: an
+  UNHELD local-only branch — no live lane and no registered worktree holding
+  it, with the issue's generations terminal — is reclaimed as residue
+  (issue #306), while a branch a registration has checked out, or one whose
+  issue still has a live run, keeps `refusal.worktree.branch_exists`.
 
 ### 8.1 Integration branch deleted (staging)
 

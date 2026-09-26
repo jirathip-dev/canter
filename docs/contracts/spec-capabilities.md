@@ -209,6 +209,23 @@ can run with **no harness credentials** (AC7).
     whose registration, pane and checkout outlive a completed run precisely
     because it is created for one review (issue #224). A step that binds no
     lane resolves nothing: a reclaim is a bind-time authority.
+    **A local-only lane branch is residue too (issue #306)**: the lane BRANCH
+    of a terminal generation is deleted under that same authority whether the
+    published branch on `origin` carries its tip (a refresh) or not — a
+    LOCAL-ONLY delivery whose branch no registered worktree of the integration
+    clone has checked out is reclaimable residue, because the successor's
+    worktree step would otherwise be refused `refusal.worktree.branch_exists`
+    forever and charged bounded retries for a condition it did not create. The
+    reclaim record names the branch, its tip, the issue and the generation, so
+    a stale delivery stays traceable after the fact. The guard is the ledger
+    authority itself: the reclaim runs only for a ledger-TERMINAL generation of
+    THIS issue and only while the issue has NO other non-terminal generation —
+    a run parked at `needs-attention` keeps a non-terminal status, still holds
+    its issue's unique ownership, and still needs the issue's one lane — and a
+    branch a registration has checked out (a live lane's own checkout,
+    including a stale registration whose directory is gone) is refused, never
+    deleted or adopted. The operator control `run.retire-lane` keeps its own,
+    stricter policy: it never deletes a local-only delivery.
     Git resolves the actual repository root, including an isolated clone's
     own named repo group; no checkout is moved or sandbox boundary changed.
     Herdr can create a repository-root workspace for a new group as well as

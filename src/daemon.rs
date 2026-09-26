@@ -3693,23 +3693,52 @@ fn method_apply_from(shared: &Arc<Shared>, request: &Request, supervised: bool) 
     // checkout outliving its completed run, refusing the next run's bind with
     // `refusal.lane.name_collision`. One fact, one place: the closed set lives
     // in [`lane_binding_step_kind`].
-    let retired_run_ids: Vec<String> = if lane_binding_step_kind(&kind) {
-        let state = match shared.lock_state() {
-            Ok(state) => state,
-            Err(message) => {
-                return resolve_apply_refusal(shared, request, &key, "state.unavailable", message);
-            }
+    //
+    // Issue #306: the same bind kinds also resolve the issue's OTHER
+    // non-terminal generations — the complement of the retired set, never the
+    // dispatching run itself. A worktree step may only reclaim a retired
+    // generation's lane residue when the issue has NO other live lane: a run
+    // parked at `needs-attention` is still non-terminal and still needs its
+    // issue's lane, so nothing of its branch is ever deleted or adopted (the
+    // same guard `run.retire-lane` applies).
+    let (retired_run_ids, live_run_ids): (Vec<String>, Vec<String>) =
+        if lane_binding_step_kind(&kind) {
+            let state = match shared.lock_state() {
+                Ok(state) => state,
+                Err(message) => {
+                    return resolve_apply_refusal(
+                        shared,
+                        request,
+                        &key,
+                        "state.unavailable",
+                        message,
+                    );
+                }
+            };
+            let retired =
+                match resolved_lane_generations(&state, &plan.repository, plan.issue_number, &kind)
+                {
+                    Ok(ids) => ids,
+                    Err(err) => {
+                        drop(state);
+                        return resolve_apply_refusal(shared, request, &key, err.code, err.message);
+                    }
+                };
+            let live = match state.live_run_ids(
+                &plan.repository,
+                plan.issue_number,
+                &parsed.instance_id,
+            ) {
+                Ok(ids) => ids,
+                Err(err) => {
+                    drop(state);
+                    return resolve_apply_refusal(shared, request, &key, err.code, err.message);
+                }
+            };
+            (retired, live)
+        } else {
+            (Vec::new(), Vec::new())
         };
-        match resolved_lane_generations(&state, &plan.repository, plan.issue_number, &kind) {
-            Ok(ids) => ids,
-            Err(err) => {
-                drop(state);
-                return resolve_apply_refusal(shared, request, &key, err.code, err.message);
-            }
-        }
-    } else {
-        Vec::new()
-    };
     // Issue #193: the reviewer's OWN written verdict is consumed from the
     // daemon-owned review root (outside every lane worktree, so a reviewer's
     // write never dirties the lane the cleanup step must remove).
@@ -3733,6 +3762,7 @@ fn method_apply_from(shared: &Arc<Shared>, request: &Request, supervised: bool) 
         role: run_binding.role.as_ref(),
         session: run_binding.session.as_ref(),
         retired_run_ids: &retired_run_ids,
+        live_sibling_run_ids: &live_run_ids,
     };
     let effect = crate::mutation::execute_step(&ctx);
     let mut result = effect.result;
@@ -5222,10 +5252,12 @@ fn method_run_release(shared: &Arc<Shared>, request: &Request) -> String {
 /// - the durable lane records the run still holds (the leftover ownership
 ///   rows that name it the owner of its issue, removed in one transaction
 ///   with the `run.retire-lane` audit record), and
-/// - its lane residue under the SAME #190/#222 policy a bind step applies —
-///   the run's own linked lane workspace, its registered lane checkout, and
-///   its local lane branch only when the published branch carries the same
-///   tip (a local-only delivery is never deleted). The lane is the run's own
+/// - its lane residue under the #190/#222 residue policy this control applies
+///   itself — the run's own linked lane workspace, its registered lane
+///   checkout, and its local lane branch only when the published branch
+///   carries the same tip (this control never deletes a local-only delivery;
+///   the automatic reclaim at a bind step reclaims an UNHELD local-only
+///   branch, issue #306). The lane is the run's own
 ///   implementer leg (derived, never presented) and the integration clone is
 ///   the run's own recorded topology; a first-time topology can be presented
 ///   exactly as the dispatch surface accepts one.

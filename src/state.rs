@@ -3270,6 +3270,42 @@ impl State {
         Ok(out)
     }
 
+    /// The runs of one repository issue that are NOT terminal in the ledger
+    /// (issue #306): every row that is not one of [`State::retired_run_ids`]'s
+    /// terminal (`invalidated`/`done`) generations, EXCLUDING the dispatching
+    /// run itself — the caller is always a run of this issue, and it is live
+    /// by definition. This is the complement of the retired set, read as the
+    /// same "a run that is not terminal still holds its issue's unique
+    /// ownership" fact the admission conflict reads, so a caller can prove
+    /// that the issue has NO other live lane before it reclaims anything the
+    /// remaining generations may still need. Ordered by instance id, so the
+    /// caller's record is deterministic.
+    pub fn live_run_ids(
+        &self,
+        repository: &str,
+        issue_number: i64,
+        exclude: &str,
+    ) -> Result<Vec<String>, StateError> {
+        let conn = self.lock("live_run_ids")?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT instance_id FROM instances
+                  WHERE repository = ?1 AND issue_number = ?2
+                    AND status NOT IN ('invalidated', 'done')
+                    AND instance_id <> ?3
+                  ORDER BY instance_id",
+            )
+            .map_err(|err| StateError::from_sqlite("live_run_ids: prepare", err))?;
+        let rows = stmt
+            .query_map(params![repository, issue_number, exclude], |row| row.get(0))
+            .map_err(|err| StateError::from_sqlite("live_run_ids: read", err))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|err| StateError::from_sqlite("live_run_ids: row", err))?);
+        }
+        Ok(out)
+    }
+
     /// Issue #236: retire the durable LANE RECORDS one run that can never
     /// progress still holds — its leftover `queue_ownership` row(s), the
     /// claim that still names this run as the owner of its repository issue.
@@ -16851,6 +16887,89 @@ mod tests {
                 "run-00000000000000a1".to_string(),
                 "run-00000000000000a2".to_string()
             ]
+        );
+    }
+
+    /// Issue #306: the runs of one repository issue that are NOT terminal —
+    /// the complement of the retired set the live-generation guard reads —
+    /// EXCLUDING the dispatching run itself. A terminal generation is never in
+    /// it, a live sibling always is (a run parked at `needs-attention` keeps a
+    /// non-terminal status), and another issue/repository never is.
+    #[test]
+    fn live_run_ids_lists_the_issues_other_non_terminal_generations() {
+        let path = temp_db("live-runs.db");
+        let state = State::open(&path, Retention::default()).expect("open");
+        for (grant_id, issue) in [("gr_0000000000000021", 306), ("gr_0000000000000022", 307)] {
+            let doc = Val::parse_json(&format!(
+                r#"{{"schema":"hf-grant/v1","grant_id":"{grant_id}","repository":"example-org/widgets",
+                    "issue":{{"number":{issue},"revision":"{}"}},
+                    "workflow_hash":"{}","policy_hash":"{}","phase":"merge",
+                    "scope":"worktrees/issues/{issue}","caps":["read","worktree","spawn","prompt"],
+                    "expires_at":"2999-01-01T00:00:00Z","state_epoch":1,
+                    "created_at":"2026-09-18T00:00:00Z"}}"#,
+                "a".repeat(40),
+                "b".repeat(64),
+                "c".repeat(64),
+            ))
+            .expect("grant doc");
+            state.issue_grant(&doc).expect("issue grant");
+        }
+        let at = "2026-09-18T00:00:00Z";
+        for (run, grant) in [
+            ("run-00000000000000a1", "gr_0000000000000021"),
+            ("run-00000000000000a2", "gr_0000000000000021"),
+            ("run-00000000000000b1", "gr_0000000000000022"),
+        ] {
+            state
+                .start_instance(run, grant, "fleet-doctrine-1", at)
+                .expect("start");
+        }
+        // Two live generations of issue 306 and one live run of another issue:
+        // the dispatching run is excluded from its own set, the sibling is in
+        // it, and nothing else is.
+        assert_eq!(
+            state
+                .live_run_ids("example-org/widgets", 306, "run-00000000000000a1")
+                .expect("live"),
+            vec!["run-00000000000000a2".to_string()]
+        );
+        assert_eq!(
+            state
+                .live_run_ids("example-org/widgets", 306, "run-00000000000000a2")
+                .expect("live"),
+            vec!["run-00000000000000a1".to_string()],
+            "the dispatching run is excluded from its own set and the sibling is in it"
+        );
+        assert!(
+            state
+                .live_run_ids("example-org/other", 306, "run-00000000000000a1")
+                .expect("live")
+                .is_empty(),
+            "another repository's runs are never in the set"
+        );
+        // A terminal generation leaves the set: the complement of the retired
+        // set is read as one fact.
+        state
+            .release_run(
+                "run-00000000000000a2",
+                "the sibling generation went terminal",
+                "ik_live-0001",
+                at,
+            )
+            .expect("release");
+        assert!(
+            state
+                .live_run_ids("example-org/widgets", 306, "run-00000000000000a1")
+                .expect("live")
+                .is_empty(),
+            "a terminal sibling is not a live generation"
+        );
+        assert_eq!(
+            state
+                .live_run_ids("example-org/widgets", 307, "run-00000000000000a1")
+                .expect("live"),
+            vec!["run-00000000000000b1".to_string()],
+            "the other issue's live run is resolved for its own issue"
         );
     }
 

@@ -6,6 +6,40 @@ release process activates (docs/RELEASING.md), then semver applies.
 
 ## [Unreleased]
 
+### Fixed (issue #306 — a local-only lane branch with no live lane and no worktree is reclaimed)
+
+- The worktree step reclaimed a terminal generation's lane branch only when
+  the published branch on `origin` carried the same tip, so a LOCAL-ONLY
+  delivery whose checkout was already gone refused every fresh run for the
+  issue with `refusal.worktree.branch_exists` and charged the run bounded
+  retries for a condition it did not create — the measured `p2` refusals of
+  `run-8fc332b9042d5593` (#301, 3 retries), `run-e85fcdaf016f3dbf` (#302, 2)
+  and `run-ca4ef27d34d3c9fd` (#236, 2), and only a human could clear the
+  branch. Such a branch IS reclaimable residue now: the successor's worktree
+  step deletes it, records the branch, its tip, the issue and the generation
+  it reclaimed (the claim row is the audited effect, so a stale delivery stays
+  traceable), and creates its lane at the recorded base on its FIRST attempt.
+- The guard is the ledger authority, unchanged in kind: a reclaim needs a
+  ledger-TERMINAL generation of THIS issue and the issue must have NO other
+  non-terminal generation (`State::live_run_ids`, excluding the dispatching
+  run) — a run parked at `needs-attention` keeps a non-terminal status, still
+  holds its issue's unique ownership and still needs the issue's one lane, so
+  nothing of its branch is touched. A branch a registered worktree of the
+  integration clone has checked out (a live lane's own checkout, including a
+  stale registration whose directory is gone) is never deleted or adopted:
+  `refusal.worktree.branch_exists` stands verbatim and names the holder. The
+  operator control `run.retire-lane` keeps its own stricter policy — it never
+  deletes a local-only delivery.
+- Witnesses: `tests/mutation_engine.rs`
+  (`a_local_only_lane_branch_with_no_holder_is_reclaimed_by_the_next_worktree_step`:
+  the reclaim over the real daemon socket, the held-branch refusal naming the
+  holder, and the live-generation refusal naming the live run — plus the
+  updated #222 witness); `tests/supervision.rs`
+  (`a_fresh_submission_reclaims_the_previous_generations_local_only_branch`:
+  a real `queue.submit` + `p1`/`p2` whose worktree step reclaims the residue
+  with ZERO retry authorizations and reaches the bind); `src/state.rs` pins
+  `live_run_ids` against a real ledger.
+
 ### Fixed (issue #224 — a completed run leaves no reviewer lane behind)
 
 - The verdict-consume path (p6) WAITS, bounded by the step's own effective
