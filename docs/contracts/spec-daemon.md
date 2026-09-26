@@ -106,6 +106,17 @@ remain usable without it; SQLite owns state; no network control API).
   the run's recorded proof has lapsed (one audited `host.proof.renewal`
   record; see [spec-lifecycle.md](spec-lifecycle.md) §4.1), and an
   unmeasurable host keeps the typed `refusal.admission.proof_stale`.
+- A claim the restart reconciliation interrupted is the same class once more
+  (issue #307): the in-flight effect simply never resolved — nothing about
+  the work changed and nothing was refused typed — so the interruption the
+  reconciliation records (its `ambiguous` outcome carries the typed
+  `state.interrupted` error, the same recorded shape the executor reaper
+  already writes for the same fact) is never a STEP diagnosis. The step's
+  re-dispatch is the plain continuation of the armed run: it neither demands
+  nor consumes a bounded retry, the run's budget is never charged for a
+  restart, and the interruption stays readable as its own record (the
+  reconciled claim outcome plus the `reconcile.*` journal entry) instead of
+  as one of the run's retries.
 - Unknown methods are refused with a typed refusal (never guessed).
 
 ## Lifecycle methods (issue #9)

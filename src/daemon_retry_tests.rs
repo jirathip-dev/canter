@@ -281,6 +281,42 @@ impl Fixture {
             .resolve_claim(&key, "apply", "spent", &outcome, Some("{}"))
             .expect("resolve the seeded attempt");
     }
+
+    /// Journal ONE apply claim for (run, step) and leave it IN FLIGHT — the
+    /// exact durable state a daemon killed with the effect unresolved leaves
+    /// behind (issue #307: "the first attempt simply never resolved").
+    /// Returns the claim key.
+    fn seed_inflight_attempt(&self, step: &str, stem: &str) -> String {
+        let key = format!("ik_seed-{step}-{stem}");
+        let request_id = "f00dfeed".to_string();
+        let line = canonical_text(&object(vec![
+            ("schema", string("hf-rpc-request/v1")),
+            ("id", string(&request_id)),
+            ("method", string("apply")),
+            (
+                "params",
+                object(vec![
+                    ("idempotency_key", string(&key)),
+                    ("instance_id", string(&self.run)),
+                    ("step", string(step)),
+                ]),
+            ),
+        ]));
+        let state = self.shared.lock_state().unwrap();
+        state
+            .journal_intent(
+                "mutate.checkout",
+                &format!("canter:{}:{step}", self.run),
+                &key,
+                &request_id,
+                "apply",
+                None,
+                None,
+                &line,
+            )
+            .expect("journal the in-flight claim");
+        key
+    }
 }
 
 impl Drop for Fixture {
@@ -790,5 +826,148 @@ fn a_present_lane_is_never_repaired_and_still_consumes_its_bounded_retries() {
     assert!(
         fixture.intent().is_none(),
         "the frontier is still fenced once the budget is spent on real failures"
+    );
+}
+
+/// Issue #307: a daemon restart (or any interrupted-claim reconciliation)
+/// re-dispatched a mid-flight step and charged the RUN a bounded retry for a
+/// cause the run does not own. The in-flight claim's interruption is the
+/// daemon's own lifecycle event — nothing about the work changed and nothing
+/// was refused typed — so the run's ledger shows it separately (the
+/// reconciled claim outcome + the `reconcile.*` journal record) and charges
+/// ZERO retries, while the run's own next diagnosis still spends exactly one.
+#[test]
+fn a_restart_interrupted_claim_reconciles_without_charging_the_runs_bounded_retry() {
+    let fixture = Fixture::new("restart-interrupted");
+    let now = time::unix_now();
+    // The daemon died with p2's effect in flight: the claim is journaled and
+    // never resolved (the measured shape — "NO outcome row ever").
+    let interrupted_key = fixture.seed_inflight_attempt("p2", "307-inflight");
+    assert_eq!(
+        fixture
+            .shared
+            .lock_state()
+            .unwrap()
+            .claims_in_flight()
+            .unwrap()
+            .len(),
+        1,
+        "exactly the interrupted claim is in flight when the process died"
+    );
+    // The next boot reconciles BEFORE it serves, through the daemon's OWN
+    // restart-reconciliation function.
+    let reconciled = {
+        let state = fixture.shared.lock_state().unwrap();
+        reconcile_claims(
+            &state,
+            &fixture.shared.log,
+            &fixture.shared.paths.checkpoints_dir,
+        )
+        .unwrap()
+    };
+    assert_eq!(reconciled, 1, "the in-flight claim is the one reconciled");
+    // The interruption is its OWN recorded fact: the reconciled claim outcome
+    // carries the daemon's interruption code, the journal carries the
+    // reconcile record, and the run's retry ledger carries NOTHING.
+    {
+        let state = fixture.shared.lock_state().unwrap();
+        let claim = state.claim(&interrupted_key).unwrap().unwrap();
+        assert_eq!(claim.status, "ambiguous");
+        let outcome = Val::parse_json(claim.outcome.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            outcome
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(Val::as_str),
+            Some(crate::state::INTERRUPTED_CODE)
+        );
+        let (_, journal) = state.journal_tail(0, 1000).unwrap();
+        assert!(
+            journal.iter().any(|line| line.contains("reconcile.apply")),
+            "the reconcile record is its own journal row"
+        );
+        assert_eq!(
+            state
+                .run_step_attempts(&fixture.run)
+                .unwrap()
+                .last()
+                .unwrap(),
+            &("p2".to_string(), "ambiguous".to_string()),
+            "the interruption is the step's newest recorded attempt"
+        );
+    }
+    assert!(
+        fixture.retries().is_empty(),
+        "reconciliation charges nothing: {:?}",
+        fixture.retries()
+    );
+    // The driver's continuation of the interrupted step is a plain dispatch —
+    // no park, and no authorization demanded for a daemon lifecycle event.
+    let intent = fixture
+        .intent()
+        .expect("the interrupted step's continuation is dispatchable");
+    assert_eq!(intent.step_id, "p2");
+    assert_eq!(intent.reason, crate::supervision::codes::DISPATCH);
+    // The resumed step resolves through the REAL apply engine: un-obstruct the
+    // effect, let the driver re-dispatch it, and watch it land.
+    std::fs::remove_dir(fixture.root.join("worktrees/lane")).unwrap();
+    fixture
+        .tick(now)
+        .expect("the interrupted step resolves on its own re-dispatch");
+    assert!(
+        fixture.retries().is_empty(),
+        "an interrupted in-flight effect charges the run NOTHING: {:?}",
+        fixture.retries()
+    );
+    let attempts = fixture.attempts();
+    assert_eq!(
+        attempts
+            .iter()
+            .filter(|(step, status)| step == "p2" && status == "ambiguous")
+            .count(),
+        1,
+        "the interruption stays visible as its own attempt: {attempts:?}"
+    );
+    assert_eq!(
+        attempts.last().unwrap(),
+        &("p2".to_string(), "succeeded".to_string()),
+        "the step's effect resolves once, typed and journaled"
+    );
+    {
+        let state = fixture.shared.lock_state().unwrap();
+        assert_eq!(
+            state
+                .instance_by_id(&fixture.run)
+                .unwrap()
+                .unwrap()
+                .current_node,
+            "p2",
+            "the run's last achieved step is the interrupted one, resolved exactly once"
+        );
+        let (_, journal) = state.journal_tail(0, 1000).unwrap();
+        assert!(
+            !journal.iter().any(|line| line.contains("mutate.run.retry")),
+            "zero operator keys anywhere in the drive"
+        );
+    }
+    // Control: the SAME fixture, one diagnosis the run owns. The fence is
+    // exactly as tight as before — one bounded retry, minted and consumed by
+    // the dispatch it pays for — and the interruption never counted against
+    // the budget (this is attempt 1, not 2).
+    fixture.seed_attempt("p3", "ambiguous", crate::mutation::code::REVIEW_TIMEOUT);
+    fixture
+        .tick(now + 5)
+        .expect("a diagnosed step is re-dispatched within the budget");
+    let retries = fixture.retries();
+    assert_eq!(retries.len(), 1, "exactly one bounded retry: {retries:?}");
+    assert_eq!(retries[0].step_id, "p3");
+    assert_eq!(retries[0].attempt, 1);
+    assert!(
+        !retries[0].consumed_at.is_empty(),
+        "the retry is consumed by the dispatch it pays for"
+    );
+    assert!(
+        retries[0].consumed_key.starts_with("ik_run-"),
+        "{retries:?}"
     );
 }

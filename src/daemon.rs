@@ -3052,9 +3052,9 @@ impl Drop for ApplyClaim<'_> {
                 self.key,
                 "ambiguous",
                 null(),
-                Some(("state.interrupted", message.to_string())),
+                Some((crate::state::INTERRUPTED_CODE, message.to_string())),
             );
-            let response = err_response(&self.request.id, "state.interrupted", message);
+            let response = err_response(&self.request.id, crate::state::INTERRUPTED_CODE, message);
             state.resolve_claim(
                 self.key,
                 "apply",
@@ -10320,8 +10320,17 @@ fn replay(shared: &Arc<Shared>, response: &str) -> String {
 }
 
 /// A typed hf-outcome/v1 document for daemon-owned operations.
+///
+/// Issue #307: an `ambiguous` resolution is a NON-SUCCESS resolution like the
+/// other two, and it carries its typed error exactly like the apply executor's
+/// own [`apply_outcome`] does — the restart reconciliation's interruption must
+/// name ITSELF in the durable record (`state.interrupted`), or the record
+/// cannot tell "the daemon restarted under the step" apart from a diagnosis
+/// the run owns. Without this the reconcile wrote `error: null` for an
+/// ambiguous claim while the reaper wrote the code, so the SAME interruption
+/// fact had two different recorded shapes.
 fn daemon_outcome(key: &str, status: &str, error: Val) -> Val {
-    let failed = status == "failed" || status == "refused";
+    let unsuccessful = matches!(status, "failed" | "refused" | "ambiguous");
     object(vec![
         ("schema", string("hf-outcome/v1")),
         ("plan_id", string(DAEMON_PLAN_ID)),
@@ -10329,8 +10338,8 @@ fn daemon_outcome(key: &str, status: &str, error: Val) -> Val {
         ("status", string(status)),
         ("idempotency_key", string(key)),
         ("observed_at", string(&time::rfc3339_now())),
-        ("result", if failed { null() } else { object(vec![]) }),
-        ("error", if failed { error } else { null() }),
+        ("result", if unsuccessful { null() } else { object(vec![]) }),
+        ("error", if unsuccessful { error } else { null() }),
     ])
 }
 
@@ -10503,7 +10512,7 @@ fn reconcile_claims(
             &claim.key,
             "ambiguous",
             error_val(
-                "state.interrupted",
+                crate::state::INTERRUPTED_CODE,
                 "the operation was interrupted before its outcome was journaled; \
                  restart reconciliation marks it ambiguous — external review is required \
                  before retrying with a new key",
