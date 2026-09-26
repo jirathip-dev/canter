@@ -119,7 +119,10 @@ impl Val {
 
     /// Parse TOML text through the `toml` crate into a [`Val`].
     pub fn parse_toml(text: &str) -> Result<Val, String> {
-        let de = toml::de::Deserializer::new(text);
+        // `toml` 1.x parses through `Deserializer::parse`, which returns the
+        // deserializer as a `Result` (the 0.8 `new` constructor was not
+        // fallible); propagate the parse error as this module's `String`.
+        let de = toml::de::Deserializer::parse(text).map_err(|err| err.to_string())?;
         Val::deserialize(de).map_err(|err| err.to_string())
     }
 }
