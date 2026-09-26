@@ -4033,6 +4033,52 @@ fn observed_worktree_branch(
         .trim()
         .to_string();
     if branch.is_empty() {
+        // Issue #272: a DETACHED worker checkout binds the run's RECORDED
+        // branch when — and only when — it holds exactly that branch's own
+        // revision. The engine's own repair lane is a `git worktree add
+        // --detach` checkout (the run's feature branch is already checked out
+        // in the run's own lane), so the repair leg's work is committed there
+        // detached and the re-collect that re-establishes the certificate
+        // binding observes exactly that checkout. The branch is never
+        // fabricated for a checkout that carries none: it is the collection's
+        // own committed binding, and the agreement between the bound branch
+        // and the observed head is verified here BEFORE either is named — the
+        // certificate may only ever state a head its own delivery branch
+        // holds.
+        if let Some(expected) = expected {
+            let head = run_git(ctx, worktree, &["rev-parse", "--verify", "HEAD"])?
+                .stdout
+                .trim()
+                .to_string();
+            match run_git(
+                ctx,
+                worktree,
+                &["rev-parse", "--verify", &format!("refs/heads/{expected}")],
+            ) {
+                Ok(bound) if bound.stdout.trim() == head => return Ok(expected.to_string()),
+                Ok(bound) => {
+                    return Err(refusal(
+                        code::OUTPUT_LOCATION,
+                        format!(
+                            "worker output location {} is detached at {head}, not at the tip {} \
+                             of its own bound branch {expected:?}",
+                            worktree.display(),
+                            bound.stdout.trim()
+                        ),
+                    ));
+                }
+                Err(_) => {
+                    return Err(refusal(
+                        code::OUTPUT_LOCATION,
+                        format!(
+                            "worker output location {} is detached and its own bound branch \
+                             {expected:?} does not exist here",
+                            worktree.display()
+                        ),
+                    ));
+                }
+            }
+        }
         return Err(refusal(
             code::OUTPUT_LOCATION,
             format!(

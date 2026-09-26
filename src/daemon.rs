@@ -2278,13 +2278,16 @@ fn bind_delivered_review_head(shared: &Arc<Shared>, instance_id: &str, head: &mu
 /// by the repair leg's own recorded lane checkout — the only recorded state
 /// that names the head the handoff delivered.
 ///
-/// The committed `branch` binding is dropped: the repair leg's checkout is the
-/// engine's OWN `git worktree add --detach` checkout (a fresh branch cannot be
-/// attached while the run's feature branch is checked out in the implementer
-/// lane), so a branch pinned from the run's plan could never be the branch that
-/// checkout holds. The collection observes the branch the leg's work left it
-/// on, and a checkout left with no branch refuses typed — a branch is never
-/// fabricated for it. Everything else (the run's own collection base,
+/// The committed `branch` binding is PRESENTED, never dropped and never
+/// re-spelled: it is the run's own recorded binding, and the collection
+/// accepts the repair leg's own `git worktree add --detach` checkout (the
+/// engine creates it that way — the run's feature branch is already checked
+/// out in the run's lane) only while that checkout holds EXACTLY the bound
+/// branch's revision. The delivery branch and the observed head must agree
+/// before either is named, so the certificate can only ever state a head its
+/// own delivery branch holds, and a branch is still never fabricated for a
+/// checkout that carries none — a detached checkout at any other revision
+/// refuses typed. Everything else (the run's own collection base,
 /// `requires_delta`) stays the committed step's own binding: the re-collect is
 /// the same collection over the repair leg's checkout and nothing is invented.
 /// A handoff whose recorded checkout cannot be read back names no head to
@@ -2327,7 +2330,6 @@ fn recollect_step_params(
             crate::mutation::code::FIX_UNBOUND
         ));
     };
-    params.remove("branch");
     params.insert("worktree".to_string(), string(&worktree));
     Ok(Val::Obj(params))
 }

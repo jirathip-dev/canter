@@ -922,6 +922,18 @@ clears a repository/fleet-level hold or bypasses a gate.
   (`refusal.delivery.unbound`) before any effect runs. A collection that cannot
   name the 40-hex head and slug branch it observed is a typed non-success
   (`refusal.collect.unbound`), never a `succeeded` outcome that bound nothing.
+  **A DETACHED worker checkout binds the recorded branch only at its revision
+  (issue #272)**: the engine's own repair lane is created by `git worktree add
+  --detach` (the run's feature branch is already checked out in the run's own
+  lane) and the repair leg's work is committed there detached, so the
+  re-collect that re-establishes the binding after a moved fix delivery
+  presents the collection's own committed `branch` binding over that checkout.
+  The collection accepts it only while the checkout holds EXACTLY that
+  branch's revision; a checkout at another revision, or a bound branch absent
+  from the checkout's repository, refuses typed
+  (`refusal.worker.output_location`) before any worker is polled. A branch is
+  never fabricated for a checkout that carries none, and the certificate can
+  only ever state a head its own delivery branch holds.
   Once a verdict is recorded against a head, the delivery is FROZEN at exactly
   that head: with the published integration ref unchanged, the merge consumes
   the delivery branch only when it is AT that head — a commit that landed on
