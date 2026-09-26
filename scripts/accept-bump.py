@@ -33,8 +33,20 @@ What this driver does instead
    sha256; require the daemon lease to name that same pid and to record a
    start that postdates the install (a superseded daemon that still holds the
    socket cannot pass); record the daemon pid, ``started_at`` and sha256.
+   A count that is not one fails the bump and NAMES every holder (pid and
+   resolved executable), so the refusal itself is the reader's inventory.
 6. Every failure exits non-zero with a typed ``bump.refusal.<code>`` and the
    run NEVER prints DONE for a daemon that is not the installed build.
+
+The bump also OWNS the host residue it could create (issue #316): a daemon
+process is reparented to PPID 1 the moment its supervisor starts it, so a
+bump that leaks its predecessor survives as a PPID-1 ``canter daemon`` with
+no owner. The driver therefore takes a census of those processes BEFORE the
+restart and again after ``verify``, records both counts in the log and in the
+``bump.done`` event, and refuses (``bump.refusal.orphans``, exit 18) naming
+each NEW one when the count grew across the bump. A pre-existing orphan a
+previous run leaked never blocks a new bump; a bump that adds one always
+fails.
 
 Operator tooling: run by hand, never from CI. Public-data rule: no host paths
 are committed — every runtime path comes from arguments or environment-derived
@@ -64,6 +76,7 @@ Exit codes (typed refusal table; 0 is the only success):
  15  bump.refusal.stale_daemon           holder's executable is not the build
  16  bump.refusal.pid_exe_unresolved     holder's executable unresolvable
  17  bump.refusal.lease                  lease does not name the socket holder
+ 18  bump.refusal.orphans                the bump left new PPID-1 daemon processes
 """
 
 from __future__ import annotations
@@ -104,6 +117,7 @@ REFUSALS = (
     ("bump.refusal.stale_daemon", 15, "the socket is held by a pid running something other than the installed build"),
     ("bump.refusal.pid_exe_unresolved", 16, "the socket holder's executable could not be resolved"),
     ("bump.refusal.lease", 17, "the daemon lease does not name the socket holder"),
+    ("bump.refusal.orphans", 18, "the bump left new canter daemon processes reparented to ppid 1"),
 )
 EXIT_BY_CODE = {code: status for code, status, _meaning in REFUSALS}
 
@@ -167,6 +181,7 @@ class Bump:
         self.tool_lsof = args.lsof
         self.tool_codesign = args.codesign
         self.tool_cargo = args.cargo
+        self.tool_ps = args.ps
         self.uid = os.getuid()
         self.service_path = os.path.join(self.bin_dir, "canter")
         self.installed_sha = ""
@@ -384,6 +399,66 @@ class Bump:
                 return line[1:]
         return None
 
+    def daemon_census(self) -> list[tuple[int, str]]:
+        """Every ``canter daemon run`` process reparented to PPID 1 (issue #316).
+
+        A supervised daemon is the supervisor's own child, so a live daemon
+        always shows PPID 1 once its launcher exits: this is the host-level
+        measurement a bump owns. The count must not grow across a bump, and
+        every NEW pid is what ``bump.refusal.orphans`` names.
+        """
+        proc = subprocess.run(
+            [self.tool_ps, "-axww", "-o", "pid=,ppid=,command="],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            check=False)
+        self.log("census tool exit={} argv={}".format(
+            proc.returncode, " ".join([self.tool_ps, "-axww", "-o", "pid=,ppid=,command="])))
+        census: list[tuple[int, str]] = []
+        for line in (proc.stdout or "").splitlines():
+            fields = line.split(None, 2)
+            if len(fields) < 3:
+                continue
+            try:
+                pid = int(fields[0])
+                ppid = int(fields[1])
+            except ValueError:
+                continue
+            command = fields[2].strip()
+            tokens = command.split()
+            if ppid != 1 or not tokens:
+                continue
+            if os.path.basename(tokens[0]) != "canter":
+                continue
+            if "daemon" not in tokens or "run" not in tokens:
+                continue
+            census.append((pid, command))
+        return census
+
+    def census_line(self, label: str, census: list[tuple[int, str]]) -> str:
+        return "{}={} pids={}".format(
+            label, len(census), [pid for pid, _command in census])
+
+    def holder_identities(self, holders: list[int]) -> str:
+        """``pid=<pid> exe=<path|unresolved>`` for every holder, in order."""
+        named = []
+        for pid in holders:
+            exe = self.pid_executable(pid)
+            named.append("pid={} exe={}".format(pid, exe or "unresolved"))
+        return "; ".join(named)
+
+    def refuse_new_orphans(self, before: list[tuple[int, str]],
+                           after: list[tuple[int, str]]) -> None:
+        """A bump leaves no NEW PPID-1 daemon (issue #316 AC2)."""
+        if len(after) <= len(before):
+            return
+        known = {pid for pid, _command in before}
+        new = [(pid, command) for pid, command in after if pid not in known]
+        named = "; ".join("pid={} {}".format(pid, command) for pid, command in new)
+        raise Refusal(
+            "bump.refusal.orphans",
+            "the daemon census grew across the bump (before={} after={}): {}".format(
+                len(before), len(after), named or "no new pid identifiable"))
+
     def lease_facts(self) -> tuple[int | None, str | None]:
         try:
             with open(self.lease, encoding="utf-8") as handle:
@@ -472,7 +547,8 @@ class Bump:
         if len(last_holders) > 1:
             raise Refusal("bump.refusal.socket_holders",
                           "{} pids hold {}: {}".format(
-                              len(last_holders), self.socket, last_holders))
+                              len(last_holders), self.socket,
+                              self.holder_identities(last_holders)))
         if last_reason is not None:
             raise Refusal(*last_reason)
         raise Refusal("bump.refusal.pid_exe_unresolved",
@@ -505,16 +581,30 @@ class Bump:
                      "verify-only" if self.verify_only else "bump", self.sha,
                      self.candidate, self.socket, self.service_path,
                      self.accept_target, self.label, self.uid))
+        orphans_before: list[tuple[int, str]] = []
+        orphans_after: list[tuple[int, str]] = []
         try:
             if self.verify_only:
                 self.certify_installed()
+                orphans_before = self.daemon_census()
+                orphans_after = orphans_before
+                self.log("orphans {}".format(
+                    self.census_line("census", orphans_before)))
             else:
                 self.reconcile()
                 self.build()
                 self.install()
                 self.check_supervisor()
+                orphans_before = self.daemon_census()
+                self.log("orphans_before {}".format(
+                    self.census_line("count", orphans_before)))
                 self.restart()
             pid, exe, sha, started_at = self.verify()
+            if not self.verify_only:
+                orphans_after = self.daemon_census()
+                self.log("orphans_after {}".format(
+                    self.census_line("count", orphans_after)))
+                self.refuse_new_orphans(orphans_before, orphans_after)
         except Refusal as refusal:
             self.log("{}: {}".format(refusal.code, refusal.message))
             self.log(json.dumps({
@@ -529,6 +619,8 @@ class Bump:
             "candidate_sha256": getattr(self, "candidate_sha", None),
             "mode": "verify-only" if self.verify_only else "bump",
             "socket_holders": 1, "accept_target": self.accept_target,
+            "orphans_before": len(orphans_before),
+            "orphans_after": len(orphans_after),
             "service_path": self.service_path, "reconciled": self.reconciled}))
         self.log("DONE (pid={} started_at={} sha256={})".format(pid, started_at, sha))
         return 0
@@ -575,6 +667,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--lsof", default="lsof", help="lsof binary")
     parser.add_argument("--codesign", default="codesign", help="codesign binary")
     parser.add_argument("--cargo", default="cargo", help="cargo binary")
+    parser.add_argument("--ps", default="ps",
+                        help="process-table binary for the PPID-1 daemon census (issue #316)")
     args = parser.parse_args(argv)
     if args.sha is not None and not SHA_RE.match(args.sha):
         parser.error("--sha must be 40 lowercase hex characters")

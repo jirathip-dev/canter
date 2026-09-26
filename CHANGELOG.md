@@ -6,6 +6,40 @@ release process activates (docs/RELEASING.md), then semver applies.
 
 ## [Unreleased]
 
+### Fixed (issue #316 — the bump owns its socket inventory and its daemons, and the harness reaps its own)
+
+- The bump's socket-holder invariant is checkable exactly as its heading
+  claims: when more than one pid holds the bumped socket, the refusal names
+  every holder — `pid=<pid> exe=<path|unresolved>` per holder through the same
+  injected `lsof` boundary — instead of a bare pid list, so a reader can tell
+  WHICH process holds the socket without a second probe
+  (`bump.refusal.socket_holders`, exit 14). Measured defect: `pgrep -f "canter
+  daemon" | head -1` named a leaked probe daemon (binary since deleted) rather
+  than the live one, and the host read-back printed five holders under a
+  heading that says "must be exactly one" while exiting 0.
+- `scripts/accept-bump.py` censuses the `canter daemon` processes reparented
+  to PPID 1 (`ps -o pid,ppid,command -ax`, injectable via `--ps`) once before
+  the restart and once after `verify`, records both counts and their pids in
+  the bump log and in the `bump.done` event, and refuses
+  (`bump.refusal.orphans`, exit 18) naming each NEW one when the count grew
+  across the bump. A supervised daemon is reparented to PPID 1 the moment its
+  launcher exits, so an unowned leak IS a PPID-1 row: a pre-existing orphan
+  never blocks a bump, and a bump that adds one never prints DONE.
+- `scripts/test-accept-bump.py` reaps every daemon its scenarios start on
+  every exit path it can run Python on — success, failed checks, a raised
+  scenario and SIGINT/SIGTERM/SIGHUP all converge on one audit that FAILS the
+  pass when any scenario daemon is still alive — and a guardian process
+  started per suite sweeps the same disposable workspace the moment the
+  harness pid is gone. That covers the measured leak exactly: `happy`,
+  `verify_only`, `idempotence` and `lease` scenario daemons survived a killed
+  harness by two days, reparented to PPID 1. The pass also prints the
+  host-level PPID-1 census before and after it, the same measurement the
+  runbook documents.
+- The runbook ([docs/OPERATIONS.md](docs/OPERATIONS.md) section 10.1) gains
+  the census step, the `bump.refusal.orphans` row and the census read-back
+  command; [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) records the self-test's
+  daemon ownership.
+
 ### Fixed (issue #236 — a terminal run's lane record never holds an item)
 
 - `queue intake`'s dedupe reads LIVE ownership — the row of a run recording
