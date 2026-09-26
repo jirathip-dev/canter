@@ -1060,6 +1060,66 @@ fn capacity_holds_park_items_as_waiting_without_consuming_slots() {
     assert_eq!(state.list_instances().expect("instances").len(), 1);
     assert!(state.queue_ownership_rows().expect("ownership").is_empty());
 }
+
+#[test]
+fn a_per_harness_cap_hold_names_the_harness_that_occupies_the_cap() {
+    // Issue #236 (item 2/AC2): the cap_harness refusal must name WHAT occupies
+    // the cap. The submit path records the item's own wait message, and the
+    // count alone never says which harness is saturated — the harness key the
+    // submission bound is the actionable fact, and it is the same clause the
+    // preview hold and the daemon's own fan-out gate render.
+    let fixture = StateFixture::new("harness-hold");
+    let state = fixture.open();
+    state
+        .issue_grant(&grant_doc("gr_000000000000000b", 5, REV_A, &GRANT_CAPS))
+        .expect("issue grant");
+
+    let mut plan = plan_for(
+        &state,
+        "qs_0000000000000004",
+        &"c".repeat(64),
+        vec![(
+            5,
+            REV_A,
+            Some("gr_000000000000000b"),
+            SubmissionVerdict::Approved,
+        )],
+        // The attested occupancy on this submission's harness key is already
+        // at its declared cap; the global and per-repository axes have room.
+        Some(2),
+    );
+    plan.admission_caps = ConcurrencyCaps {
+        global: 8,
+        per_repository: 3,
+        per_harness: 2,
+    };
+    let (_, items) = state.submit_queue_run(&plan).expect("submission commits");
+    assert_eq!(
+        (items[0].status.as_str(), items[0].reason.as_deref()),
+        ("waiting", Some("refusal.admission.cap_harness"))
+    );
+    assert!(items[0].instance_id.is_none());
+    let message = items[0]
+        .message
+        .as_deref()
+        .expect("the hold carries its producer's own message");
+    assert!(
+        message.contains(&format!("{:?}", HARNESS)),
+        "the per-harness hold must name the harness that occupies the cap \
+         ({HARNESS:?}): {message}"
+    );
+    assert!(
+        message.contains("(2) is reached (2 attested lanes on harness \"lane-1\")"),
+        "the per-harness hold keeps its count, its cap and the harness clause the \
+         sibling producers render: {message}"
+    );
+    // The durable read-back carries the same message an operator reads.
+    let (_, persisted) = state
+        .queue_submission_by_id("qs_0000000000000004")
+        .expect("read")
+        .expect("the submission exists");
+    assert_eq!(persisted[0].message.as_deref(), Some(message));
+}
 // ---------------------------------------------------------------------------
 // Wire contract: submit, status readback, double-click, refusal-no-effects
 // ---------------------------------------------------------------------------

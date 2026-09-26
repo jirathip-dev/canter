@@ -1487,23 +1487,30 @@ fn submission_item_lines(doc: &Val) -> Vec<String> {
     doc.get("items")
         .and_then(Val::as_array)
         .map(|items| {
-            items
-                .iter()
-                .map(|item| {
-                    let id = item.get("id").and_then(Val::as_str).unwrap_or("item");
-                    let status = item
-                        .get("status")
-                        .and_then(Val::as_str)
-                        .unwrap_or("unknown");
-                    let reason = item.get("reason").and_then(Val::as_str);
-                    let instance = item.get("instance_id").and_then(Val::as_str);
-                    match (reason, instance) {
-                        (Some(reason), _) => format!("{id} {status} [{reason}]"),
-                        (None, Some(instance)) => format!("{id} {status} -> run {instance}"),
-                        (None, None) => format!("{id} {status}"),
-                    }
-                })
-                .collect()
+            let mut lines = Vec::new();
+            for item in items {
+                let id = item.get("id").and_then(Val::as_str).unwrap_or("item");
+                let status = item
+                    .get("status")
+                    .and_then(Val::as_str)
+                    .unwrap_or("unknown");
+                let reason = item.get("reason").and_then(Val::as_str);
+                let instance = item.get("instance_id").and_then(Val::as_str);
+                lines.push(match (reason, instance) {
+                    (Some(reason), _) => format!("{id} {status} [{reason}]"),
+                    (None, Some(instance)) => format!("{id} {status} -> run {instance}"),
+                    (None, None) => format!("{id} {status}"),
+                });
+                // #236: the item's own message — for a wait that is the
+                // occupancy (the count, the cap and the lanes holding it) the
+                // producer named — is rendered here too, so the board's
+                // committed view shows the same actionable wait reason
+                // `queue status` does instead of a bare refusal code.
+                if let Some(message) = item.get("message").and_then(Val::as_str) {
+                    lines.push(format!("    {message}"));
+                }
+            }
+            lines
         })
         .unwrap_or_default()
 }
@@ -2059,5 +2066,49 @@ mod tests {
             "usage.queue_submission.preview"
         );
         assert!(console.attempt().is_none());
+    }
+
+    #[test]
+    fn the_committed_membership_lines_carry_the_occupancy_a_wait_names() {
+        // Issue #236 (item 4): the board's committed view shows the SAME
+        // occupancy `queue status` shows — the wait reason is actionable (who
+        // holds the slot), not a bare refusal code.
+        let occupancy = "the per-repository concurrency cap (2) is reached (2 active lanes: \
+                         example-org/widgets#5 (run-cap-0001 on worktrees/issues/5)); the item \
+                         waits";
+        let doc = object(vec![(
+            "items",
+            Val::Arr(vec![
+                object(vec![
+                    ("id", string("example-org/widgets#7")),
+                    ("status", string("waiting")),
+                    ("reason", string("refusal.admission.cap_repository")),
+                    ("message", string(occupancy)),
+                    ("instance_id", null()),
+                ]),
+                object(vec![
+                    ("id", string("example-org/widgets#8")),
+                    ("status", string("admitted")),
+                    ("reason", null()),
+                    ("message", null()),
+                    ("instance_id", string("run-admitted-0001")),
+                ]),
+            ]),
+        )]);
+        let lines = submission_item_lines(&doc);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(
+            lines[0],
+            "example-org/widgets#7 waiting [refusal.admission.cap_repository]"
+        );
+        assert_eq!(
+            lines[1],
+            format!("    {occupancy}"),
+            "the item's own message is rendered, not a re-derived one"
+        );
+        assert_eq!(
+            lines[2],
+            "example-org/widgets#8 admitted -> run run-admitted-0001"
+        );
     }
 }

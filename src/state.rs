@@ -1049,6 +1049,11 @@ struct FanoutSlots<'a> {
     /// occupancy renderer (#236). Ordered by run id, so one durable state
     /// renders one message.
     counted_lanes: Vec<crate::lifecycle::LaneFootprint>,
+    /// The submission's bound role-configuration key — the harness key the
+    /// per-harness axis is about. The count alone never says WHICH harness is
+    /// saturated, so the hold names it exactly as the preview hold and the
+    /// daemon's own fan-out gate do (#236).
+    harness_key: &'a str,
     harness_lanes: Option<i64>,
     admitted_global: i64,
     admitted_repository: i64,
@@ -1100,9 +1105,9 @@ impl FanoutSlots<'_> {
             Some(lanes) => Some((
                 crate::lifecycle::code::CAP_HARNESS,
                 format!(
-                    "the per-harness concurrency cap ({}) is reached ({lanes} attested lanes); \
-                     the item waits",
-                    self.caps.per_harness
+                    "the per-harness concurrency cap ({}) is reached ({lanes} attested lanes on \
+                     harness {:?}); the item waits",
+                    self.caps.per_harness, self.harness_key
                 ),
             )),
             None => Some((
@@ -4968,6 +4973,7 @@ impl State {
             caps: &plan.admission_caps,
             repository: &plan.repository,
             counted_lanes,
+            harness_key: &plan.role_key,
             harness_lanes: plan.harness_lanes,
             admitted_global: 0,
             admitted_repository: 0,
@@ -5324,6 +5330,7 @@ impl State {
             caps: &caps,
             repository: &submission.repository,
             counted_lanes,
+            harness_key: &submission.role_key,
             harness_lanes: submission.harness_lanes,
             admitted_global: 0,
             admitted_repository: 0,
@@ -14369,6 +14376,7 @@ fn advance_queue_in_tx(
                     caps: &caps,
                     repository: &submission.repository,
                     counted_lanes,
+                    harness_key: &submission.role_key,
                     harness_lanes: submission.harness_lanes,
                     admitted_global: 0,
                     admitted_repository: 0,
@@ -16008,6 +16016,7 @@ mod tests {
             caps: &caps,
             repository: "example-org/widgets",
             counted_lanes: lanes,
+            harness_key: "lane-1",
             harness_lanes: Some(0),
             admitted_global: 0,
             admitted_repository: 0,
@@ -16025,6 +16034,40 @@ mod tests {
             assert!(
                 message.contains(needle),
                 "the refusal names {needle}: {message}"
+            );
+        }
+    }
+
+    /// #236: the per-harness cap hold names the HARNESS that occupies the cap —
+    /// the count and the cap alone never say which harness is saturated, and
+    /// the clause is the one the preview hold and the daemon's fan-out gate
+    /// render.
+    #[test]
+    fn the_per_harness_cap_hold_names_the_harness_that_occupies_the_cap() {
+        let caps = crate::lifecycle::ConcurrencyCaps {
+            global: 8,
+            per_repository: 3,
+            per_harness: 2,
+        };
+        let slots = FanoutSlots {
+            caps: &caps,
+            repository: "example-org/widgets",
+            counted_lanes: Vec::new(),
+            harness_key: "lane-1",
+            harness_lanes: Some(2),
+            admitted_global: 0,
+            admitted_repository: 0,
+            admitted_harness: 0,
+        };
+        let (code, message) = slots.hold().expect("the per-harness cap holds");
+        assert_eq!(code, crate::lifecycle::code::CAP_HARNESS);
+        for needle in [
+            "the per-harness concurrency cap (2)",
+            "2 attested lanes on harness \"lane-1\"",
+        ] {
+            assert!(
+                message.contains(needle),
+                "the hold names {needle}: {message}"
             );
         }
     }
