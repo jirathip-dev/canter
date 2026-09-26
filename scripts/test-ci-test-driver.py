@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -107,6 +108,44 @@ class SweepTests(unittest.TestCase):
         with patch.object(driver.os, "killpg"):
             driver.reap_group(child, **kwargs)
         self.assertLessEqual(self.now, 0.2)
+
+
+@unittest.skipUnless(sys.platform == "linux", "the runner-row witness needs /proc session identity")
+class RealProcessSweepTests(unittest.TestCase):
+    """The sweep against the kernel's process table, not a fabricated snapshot.
+
+    This is the exact shape the ubuntu runner produced (issue #301): a helper
+    shell in the suite's own session that has exited while its exit status
+    still waits to be reaped. It must not read as a leak, while a live helper
+    in the same session still must.
+    """
+
+    def spawn(self, body):
+        return subprocess.Popen(["/bin/sh", "-c", body], start_new_session=True)
+
+    def test_an_exited_helper_is_no_leak_and_a_live_helper_still_is(self):
+        exited = self.spawn("exit 0")
+        live = self.spawn("sleep 60")
+        sessions = {exited.pid, live.pid}
+        try:
+            wait_until = time.monotonic() + 5
+            while time.monotonic() < wait_until and driver.proc_stat(exited.pid)[0] != "Z":
+                time.sleep(0.01)
+            self.assertEqual(driver.proc_stat(exited.pid)[0], "Z", "precondition: the helper exited and awaits its reap")
+            pids = {row[0] for row in driver.matching_processes(Path("/unused-target"), sessions, time.monotonic() + 5)}
+            self.assertIn(live.pid, pids, "a live helper of the same session is still a survivor")
+            self.assertNotIn(exited.pid, pids, "an exited helper is not a survivor")
+            # Discriminating control: the pre-fix reading of the same snapshot
+            # counted the exited helper, so the exclusion above is the fix at
+            # work. create=True keeps this witness meaningful before the
+            # classifier exists at all.
+            with patch.object(driver, "is_defunct", return_value=False, create=True):
+                prefix = {row[0] for row in driver.matching_processes(Path("/unused-target"), sessions, time.monotonic() + 5)}
+            self.assertIn(exited.pid, prefix, "the pre-fix reading counted the exited helper")
+        finally:
+            live.kill()
+            live.wait(timeout=3)
+            exited.wait(timeout=3)
 
 
 class InvocationTests(unittest.TestCase):
