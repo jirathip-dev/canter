@@ -476,6 +476,36 @@ before it is remembered and returned:
   audit row was pruned) reports a loss and falls back to a fresh snapshot
   wake for every armed run.
 
+## Supervision retirement additions (issue #311)
+
+- **Columns (m0013/schema v13, purely additive)**: `supervisions.retired_state`
+  records the TERMINAL run state that retired the supervision (`done` |
+  `invalidated`; `''` when it was never retired) and `supervisions.retired_at`
+  the instant it was retired (`''` until then). No existing table or row is
+  touched.
+- **Retirement rides the transition the engine already records**: the
+  transaction that records a run's terminal transition — `run release`, the
+  delivery that completes the run's own committed spine (issue #152), and the
+  grant/epoch invalidation that invalidates bound runs — flips that run's
+  supervision to `disabled` and records the terminal state and instant in the
+  SAME transaction. No operator action and no later pass is involved, and a
+  row a pre-fix fleet still carries (a terminal run whose supervision is
+  `armed`) is retired by the ONE check that observes it — the boot pass
+  reconciles every armed run exactly once — after which it is never scheduled
+  again. `supervisions.desired` therefore stays the closed set
+  `armed` | `disabled`; retiring is a recorded decision NOT to supervise.
+- **What a reader tells apart**: a retired-and-finished run carries a row
+  whose `retired_state`/`retired_at` name the cause and the instant
+  (`supervision.status` renders both inside its `supervision` block, and the
+  human rendering names the retirement); an operator-disabled row carries `''`
+  in both; a run that was never supervised carries no row at all (the #261
+  unarmed read).
+- **Live states are untouched**: a `running` run (including a parked
+  `needs-attention` one), a `blocked` or `human_queue` run keeps being
+  classified exactly as before, and a `paused` run keeps its row and remains
+  ineligible — the retirement only ever removes rows whose run the engine's
+  own record has made terminal.
+
 ## Queue-advance additions (issue #96)
 
 - **Tables (m0012/schema v12, purely additive)**: `queue_advances` (one row

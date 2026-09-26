@@ -30,7 +30,7 @@ use crate::time;
 use crate::value::{Val, bool_, integer, null, object, string};
 
 /// The schema version this binary understands (also `PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 13;
 
 /// Bounded-retention defaults (rows kept besides the chain genesis).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2234,6 +2234,10 @@ impl State {
             run_m0012(&mut conn)?;
             user_version = M0012_APPLIES_TO;
         }
+        if user_version == M0013_APPLIES_FROM {
+            run_m0013(&mut conn)?;
+            user_version = M0013_APPLIES_TO;
+        }
         match user_version {
             v if v == SCHEMA_VERSION => {
                 for (migration_id, _, _) in MIGRATIONS {
@@ -2345,6 +2349,7 @@ impl State {
                 row.get(0)
             })
             .map_err(|err| StateError::from_sqlite("invalidate_grants: read", err))?;
+        let at = time::rfc3339_now();
         conn.execute(
             "UPDATE grants SET status = 'invalidated' WHERE status = 'active' AND state_epoch < ?1",
             params![epoch],
@@ -2354,9 +2359,15 @@ impl State {
             "UPDATE instances SET status = 'invalidated', updated_at = ?2
               WHERE state_epoch < ?1 AND status IN
                     ('new', 'running', 'paused', 'human_queue', 'blocked')",
-            params![epoch, time::rfc3339_now()],
+            params![epoch, at],
         )
         .map_err(|err| StateError::from_sqlite("invalidate_grants: instances", err))?;
+        // Issue #311: the runs THIS invalidation just made terminal stop being
+        // supervised with it — the epoch invalidation IS the engine's own
+        // record of the transition, so no operator action and no later pass is
+        // involved.
+        let runs = armed_runs_in_state_locked(&conn, "invalidated")?;
+        self.retire_terminal_supervisions_locked(&conn, &runs, "invalidated", &at)?;
         Ok(epoch)
     }
 
@@ -2953,6 +2964,12 @@ impl State {
             params![grant_id, at],
         )
         .map_err(|err| StateError::from_sqlite("invalidate_grant: instances", err))?;
+        // Issue #311: the runs THIS invalidation just made terminal stop being
+        // supervised with it — the grant invalidation IS the engine's own
+        // record of the transition, so no operator action and no later pass is
+        // involved.
+        let runs = armed_runs_in_state_locked(&conn, "invalidated")?;
+        self.retire_terminal_supervisions_locked(&conn, &runs, "invalidated", at)?;
         Ok(())
     }
 
@@ -3220,6 +3237,16 @@ impl State {
             reason
         );
         self.append_audit_locked(&tx, "run.release", &target, key, None, Some(&run.grant_id))?;
+        // Issue #311: a release is the engine's own record of a TERMINAL
+        // transition (`done` stays `done`, everything else becomes
+        // `invalidated`), so the released run's supervision is retired in THIS
+        // transaction — with no operator action and no later pass.
+        let terminal_state = if run.status == "done" {
+            "done"
+        } else {
+            "invalidated"
+        };
+        self.retire_terminal_supervision_locked(&tx, instance_id, terminal_state, at)?;
         let released = tx
             .query_row(
                 format!("{} WHERE instance_id = ?1", instance_select_sql()).as_str(),
@@ -11930,9 +11957,14 @@ const M0012_ID: &str = "m0012_queue_advances_v12";
 const M0012_APPLIES_FROM: i64 = 11;
 const M0012_APPLIES_TO: i64 = 12;
 
+/// Issue #311: the retirement record of one supervision.
+const M0013_ID: &str = "m0013_supervision_retirement_v13";
+const M0013_APPLIES_FROM: i64 = 12;
+const M0013_APPLIES_TO: i64 = 13;
+
 /// Ordered migration chain (id, applies_from, applies_to). The runner in
 /// [`State::open`] applies every pending migration before serving.
-const MIGRATIONS: [(&str, i64, i64); 12] = [
+const MIGRATIONS: [(&str, i64, i64); 13] = [
     (M0001_ID, M0001_APPLIES_FROM, M0001_APPLIES_TO),
     (M0002_ID, M0002_APPLIES_FROM, M0002_APPLIES_TO),
     (M0003_ID, M0003_APPLIES_FROM, M0003_APPLIES_TO),
@@ -11945,16 +11977,17 @@ const MIGRATIONS: [(&str, i64, i64); 12] = [
     (M0010_ID, M0010_APPLIES_FROM, M0010_APPLIES_TO),
     (M0011_ID, M0011_APPLIES_FROM, M0011_APPLIES_TO),
     (M0012_ID, M0012_APPLIES_FROM, M0012_APPLIES_TO),
+    (M0013_ID, M0013_APPLIES_FROM, M0013_APPLIES_TO),
 ];
 
-/// Ordered migration-chain identifiers (`m0001`..`m0011`), exposed for the
+/// Ordered migration-chain identifiers (`m0001`..`m0013`), exposed for the
 /// release provenance chain (issue #10): `canter --version` prints
 /// them so a release archive's provenance record can bind the exact
 /// state-schema migration chain of the binary it ships.
 pub fn migration_chain_ids() -> &'static [&'static str] {
     const IDS: [&str; MIGRATIONS.len()] = [
         M0001_ID, M0002_ID, M0003_ID, M0004_ID, M0005_ID, M0006_ID, M0007_ID, M0008_ID, M0009_ID,
-        M0010_ID, M0011_ID, M0012_ID,
+        M0010_ID, M0011_ID, M0012_ID, M0013_ID,
     ];
     &IDS
 }
@@ -13360,6 +13393,14 @@ pub struct SupervisionRow {
     pub next_check_reason: String,
     /// Authorized at (RFC3339 UTC).
     pub armed_at: String,
+    /// The terminal run state that RETIRED this supervision (issue #311):
+    /// `done` | `invalidated` when the run reached that terminal state (the
+    /// row is then `disabled` and never scheduled a pass again), `''` when
+    /// the supervision was never retired.
+    pub retired_state: String,
+    /// When the retirement was recorded (RFC3339 UTC; `''` when never
+    /// retired).
+    pub retired_at: String,
     /// Last row update (RFC3339 UTC).
     pub updated_at: String,
 }
@@ -13643,7 +13684,7 @@ pub struct SupervisionCheckPlan {
     pub marker: String,
     /// The recorded evidence family that moved the marker.
     pub marker_source: &'static str,
-    /// Next eligible check (Unix seconds).
+    /// The next eligible check (Unix seconds).
     pub next_check_unix: i64,
     /// Why the next check is eligible.
     pub next_check_reason: &'static str,
@@ -13726,6 +13767,8 @@ fn supervision_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<Supervision
         next_check_unix: row.get(21)?,
         next_check_reason: row.get(22)?,
         armed_at: row.get(23)?,
+        retired_state: row.get(25)?,
+        retired_at: row.get(26)?,
         updated_at: row.get(24)?,
     })
 }
@@ -13737,7 +13780,8 @@ fn supervision_select_sql() -> &'static str {
             progress_timeout_secs, progress_marker, progress_at, progress_source, checks,
             continuation_reports, continuation_open, continuation_since, last_check_at,
             last_check_class, last_check_reason, last_check_trigger, next_check_at,
-            next_check_unix, next_check_reason, armed_at, updated_at
+            next_check_unix, next_check_reason, armed_at, updated_at,
+            retired_state, retired_at
        FROM supervisions"
 }
 
@@ -13767,6 +13811,30 @@ fn supervision_run_of_target(target: &str) -> Option<&str> {
     target
         .split(':')
         .find(|segment| crate::formats::is_run_id(segment))
+}
+
+/// Every ARMED supervised run whose recorded instance status is `state`
+/// (issue #311): the rows a terminal transition of that state left armed —
+/// exactly the rows an invalidation retires with the transition it records.
+/// A run that carries no armed supervision is never named.
+fn armed_runs_in_state_locked(conn: &Connection, state: &str) -> Result<Vec<String>, StateError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT s.instance_id
+               FROM supervisions s
+               JOIN instances i ON i.instance_id = s.instance_id
+              WHERE s.desired = 'armed' AND i.status = ?1
+              ORDER BY s.instance_id",
+        )
+        .map_err(|err| StateError::from_sqlite("armed_runs_in_state: prepare", err))?;
+    let rows = statement
+        .query_map(params![state], |row| row.get::<_, String>(0))
+        .map_err(|err| StateError::from_sqlite("armed_runs_in_state: query", err))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|err| StateError::from_sqlite("armed_runs_in_state: row", err))?);
+    }
+    Ok(out)
 }
 
 /// One recorded retry row as the classification reads it.
@@ -14976,6 +15044,65 @@ impl State {
         Ok(out)
     }
 
+    /// Retire the supervision of ONE run the engine's own record has made
+    /// terminal (issue #311), inside the CALLER's transaction.
+    ///
+    /// The row stops being `armed` — so it is never scheduled a pass again —
+    /// and the retirement is RECORDED on the row itself: the run identity is
+    /// the row's own key, `retired_state` names the terminal run state that
+    /// caused it (`done` | `invalidated`) and `retired_at` the instant. A
+    /// reader can therefore tell a retired-and-finished run from one that was
+    /// never supervised. The run's pending wake slot is dropped with the arm
+    /// it can no longer consume.
+    ///
+    /// `false` when the run carries no armed supervision: then nothing is
+    /// written and nothing is created (this is a retirement, never an arming
+    /// control), so a run that was never supervised stays that way.
+    fn retire_terminal_supervision_locked(
+        &self,
+        conn: &Connection,
+        instance_id: &str,
+        terminal_state: &str,
+        at: &str,
+    ) -> Result<bool, StateError> {
+        let affected = conn
+            .execute(
+                "UPDATE supervisions
+                    SET desired = 'disabled', retired_state = ?2, retired_at = ?3, updated_at = ?3
+                  WHERE instance_id = ?1 AND desired = 'armed'",
+                params![instance_id, terminal_state, at],
+            )
+            .map_err(|err| StateError::from_sqlite("retire_terminal_supervision: update", err))?;
+        if affected == 0 {
+            return Ok(false);
+        }
+        conn.execute(
+            "DELETE FROM supervision_triggers WHERE instance_id = ?1",
+            params![instance_id],
+        )
+        .map_err(|err| StateError::from_sqlite("retire_terminal_supervision: consume", err))?;
+        Ok(true)
+    }
+
+    /// Retire the armed supervision of every run in `runs` — the runs ONE
+    /// invalidation just made terminal (issue #311) — inside the CALLER's
+    /// transaction; the count of rows actually retired is returned.
+    fn retire_terminal_supervisions_locked(
+        &self,
+        conn: &Connection,
+        runs: &[String],
+        terminal_state: &str,
+        at: &str,
+    ) -> Result<usize, StateError> {
+        let mut retired = 0;
+        for run in runs {
+            if self.retire_terminal_supervision_locked(conn, run, terminal_state, at)? {
+                retired += 1;
+            }
+        }
+        Ok(retired)
+    }
+
     /// Every ARMED run, ordered by run identity: the boot sweep reconciles
     /// each exactly once (a fresh snapshot), so a restart after any number of
     /// missed windows still yields one check per run, never a catch-up storm.
@@ -15539,6 +15666,39 @@ impl State {
             ],
         )
         .map_err(|err| StateError::from_sqlite("commit_supervision_check: update", err))?;
+        // Issue #96: the ONE bounded continuation effect — a fresh verified
+        // delivery of this run advances the already-authorized queue cursor
+        // and admits the next eligible approved issue ATOMICALLY with the
+        // reconciliation that recognized it. The whole advance re-reads the
+        // delivery, the membership and the idempotency fence under this same
+        // guard (see `advance_queue_in_tx`); a refusal inside it rolls the
+        // check back rather than committing a half an advance.
+        if let Some(delivery) = &plan.advance {
+            advance_queue_in_tx(self, &tx, delivery, &plan.instance_id, &plan.at)?;
+        }
+        // Issue #311: this check RETIRES the supervision of a run the engine's
+        // own record has made terminal — the run this check's advance just
+        // completed (`done` is written above, in this same transaction), or one
+        // that was already terminal when the check ran (a transition recorded
+        // before any retirement existed). It runs AFTER the advance on purpose:
+        // the advance arms its continuation from the delivering run's own
+        // authorization, read from the very row this retirement flips. The row
+        // then stops being armed — never scheduled a pass again — and records
+        // the terminal state that caused it and the instant.
+        let terminal: Option<String> = tx
+            .query_row(
+                "SELECT status FROM instances WHERE instance_id = ?1",
+                params![plan.instance_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| StateError::from_sqlite("commit_supervision_check: terminal", err))?;
+        if let Some(state) = terminal
+            .as_deref()
+            .and_then(crate::supervision::terminal_run_state)
+        {
+            self.retire_terminal_supervision_locked(&tx, &plan.instance_id, state, &plan.at)?;
+        }
         let updated: Option<SupervisionRow> = tx
             .query_row(
                 format!("{} WHERE instance_id = ?1", supervision_select_sql()).as_str(),
@@ -15553,16 +15713,6 @@ impl State {
                 "the supervision row vanished inside its own transaction",
             ));
         };
-        // Issue #96: the ONE bounded continuation effect — a fresh verified
-        // delivery of this run advances the already-authorized queue cursor
-        // and admits the next eligible approved issue ATOMICALLY with the
-        // reconciliation that recognized it. The whole advance re-reads the
-        // delivery, the membership and the idempotency fence under this same
-        // guard (see `advance_queue_in_tx`); a refusal inside it rolls the
-        // check back rather than committing a half an advance.
-        if let Some(delivery) = &plan.advance {
-            advance_queue_in_tx(self, &tx, delivery, &plan.instance_id, &plan.at)?;
-        }
         tx.commit()
             .map_err(|err| StateError::from_sqlite("commit_supervision_check: commit", err))?;
         // Issue #98, restart-matrix boundary (d): the whole advance is durable.
@@ -15931,6 +16081,45 @@ CREATE TABLE queue_advances (
     at TEXT NOT NULL,
     PRIMARY KEY (submission_id, delivered_ordinal)
 );
+";
+
+/// Run the m0013 migration (issue #311): the supervision retirement record.
+fn run_m0013(conn: &mut Connection) -> Result<(), StateError> {
+    let tx = conn
+        .transaction()
+        .map_err(|err| StateError::from_sqlite("migrate m0013: begin", err))?;
+    let checksum = sha256_hex(M0013_SQL.as_bytes());
+    tx.execute_batch(M0013_SQL)
+        .map_err(|err| StateError::from_sqlite("migrate m0013", err))?;
+    tx.execute(
+        "INSERT INTO schema_migrations (migration_id, applies_from, applies_to, checksum, applied_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            M0013_ID,
+            M0013_APPLIES_FROM,
+            M0013_APPLIES_TO,
+            checksum,
+            time::rfc3339_now()
+        ],
+    )
+    .map_err(|err| StateError::from_sqlite("migrate m0013: bookkeeping", err))?;
+    tx.pragma_update(None, "user_version", M0013_APPLIES_TO)
+        .map_err(|err| StateError::from_sqlite("migrate m0013: user_version", err))?;
+    tx.commit()
+        .map_err(|err| StateError::from_sqlite("migrate m0013: commit", err))?;
+    Ok(())
+}
+
+/// Supervision retirement columns added by m0013 (issue #311), purely
+/// additive: a supervision whose run reached a terminal state is retired —
+/// it stops being scheduled a pass — and the retirement is RECORDED on the
+/// row itself: `retired_state` names the terminal run state that caused it
+/// (`done` | `invalidated`) and `retired_at` the instant it was retired.
+/// Both are `''` for a row that was never retired, so a reader can tell a
+/// retired-and-finished run from one that was never supervised.
+const M0013_SQL: &str = "\
+ALTER TABLE supervisions ADD COLUMN retired_state TEXT NOT NULL DEFAULT '';
+ALTER TABLE supervisions ADD COLUMN retired_at TEXT NOT NULL DEFAULT '';
 ";
 
 #[cfg(test)]
@@ -17343,11 +17532,12 @@ mod tests {
         assert_eq!(grant.status, "active");
         assert_eq!(grant.state_epoch, 1);
         assert_eq!(state.current_epoch().expect("epoch"), 1);
-        assert_eq!(SCHEMA_VERSION, 12);
+        assert_eq!(SCHEMA_VERSION, 13);
         {
-            let conn = state.lock("test: m0005..m0012 bookkeeping").expect("lock");
+            let conn = state.lock("test: m0005..m0013 bookkeeping").expect("lock");
             for migration_id in [
                 M0005_ID, M0006_ID, M0007_ID, M0008_ID, M0009_ID, M0010_ID, M0011_ID, M0012_ID,
+                M0013_ID,
             ] {
                 let recorded: i64 = conn
                     .query_row(

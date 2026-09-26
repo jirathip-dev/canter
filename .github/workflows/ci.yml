@@ -369,6 +369,7 @@ jobs:
           "--test supervision_dispatch_refusal",
           "--test supervision_pass_deadline",
           "--test supervision_reparse",
+          "--test supervision_retirement",
           "--test tui_board",
           "--test tui_live_wiring",
           "--test tui_operator",

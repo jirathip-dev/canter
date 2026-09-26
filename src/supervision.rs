@@ -120,6 +120,21 @@ pub const AUTHORIZATION_SCHEMA: &str = "hf-supervision-authorization/v1";
 /// authorization block is presented at all is no row).
 pub const DESIRED: [&str; 2] = ["armed", "disabled"];
 
+/// The engine's own TERMINAL run states (issue #311): a run that reaches one
+/// of these can never progress again, so its supervision is retired — it
+/// stops being `armed` and is never scheduled a pass again — with the
+/// terminal state recorded on the row.
+pub const TERMINAL_RUN_STATES: [&str; 2] = ["done", "invalidated"];
+
+/// The terminal run state `status` names, when it is one of
+/// [`TERMINAL_RUN_STATES`]: the state a retirement records as its cause.
+pub fn terminal_run_state(status: &str) -> Option<&'static str> {
+    TERMINAL_RUN_STATES
+        .iter()
+        .copied()
+        .find(|state| *state == status)
+}
+
 /// Closed classification vocabulary (issue #95 AC3).
 pub const CLASSES: [&str; 11] = [
     "healthy",
@@ -2481,6 +2496,13 @@ pub fn status_doc(
                     }),
                 ),
                 ("armed_at", string(&row.armed_at)),
+                // Issue #311: the retirement record — `retired_state` names
+                // the terminal run state that retired this supervision and
+                // `retired_at` the instant it did, so a reader tells a
+                // retired-and-finished run from a never-supervised one (and
+                // from a merely disabled row, for which both stay empty).
+                ("retired_state", string(&row.retired_state)),
+                ("retired_at", string(&row.retired_at)),
                 ("owner_generation", integer(row.owner_generation)),
                 ("run_generation", integer(row.run_generation)),
                 (
@@ -3399,6 +3421,16 @@ pub fn render_human(doc: &Val) -> String {
                 .unwrap_or(false)
         ),
     ];
+    // Issue #311: a RETIRED supervision renders its cause and instant — a
+    // retired-and-finished run is never presented as a plain disabled row.
+    let retired_at = text(&supervision, "retired_at");
+    if !retired_at.is_empty() {
+        lines.push(format!(
+            "retired {} (the run is {}: this supervision is never scheduled again)",
+            retired_at,
+            text(&supervision, "retired_state")
+        ));
+    }
     // Issue #219: a standing failure is rendered WITH its raw message — the
     // same reason the durable record carries, so a human read tells a rejected
     // push from a refused merge without opening a daemon log.
@@ -5049,6 +5081,8 @@ mod tests {
             next_check_unix: 0,
             next_check_reason: codes::DISPATCH.to_string(),
             armed_at: at.to_string(),
+            retired_state: String::new(),
+            retired_at: String::new(),
             updated_at: at.to_string(),
         }
     }

@@ -41,8 +41,8 @@ $ cargo build --release --locked
 $ ./target/release/canter --version        # exit 0
 canter 0.1.0
 ...
-state schema version: 12
-migration chain: m0001_initial_state_v1, m0002_workflow_engine_instances_v2, m0003_control_plane_evidence_v3, m0004_schedules_lifecycle_v4, m0005_lane_replacements_v5, m0006_lane_checkpoints_v6, m0007_lane_successors_v7, m0008_lane_replacement_profiles_v8, m0009_queue_submissions_v9, m0010_run_controls_v10, m0011_supervision_v11, m0012_queue_advances_v12
+state schema version: 13
+migration chain: m0001_initial_state_v1, m0002_workflow_engine_instances_v2, m0003_control_plane_evidence_v3, m0004_schedules_lifecycle_v4, m0005_lane_replacements_v5, m0006_lane_checkpoints_v6, m0007_lane_successors_v7, m0008_lane_replacement_profiles_v8, m0009_queue_submissions_v9, m0010_run_controls_v10, m0011_supervision_v11, m0012_queue_advances_v12, m0013_supervision_retirement_v13
 document schema families: hf-config/v1, hf-policy/v1, hf-output/v1, hf-error/v1, ...
 ```
 
