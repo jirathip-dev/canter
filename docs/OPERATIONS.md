@@ -510,7 +510,12 @@ with a fresh interactive TTY for production-branch effects.
    row exists. Minting is NOT authorization: the returned `gr_` id is
    presented at the board / `queue submit` point, which stays the
    authorization. `grants.list` shows live grants; `grants.revoke` cancels
-   one.
+   one. Each invocation opens its own authorization window (content-addressed
+   over the binding and the issuance key), so a lapsed or expired window is
+   replaced by a fresh mint rather than refused — the expire → re-mint →
+   rebind → continue sequence is documented in
+   [WORKFLOW.md](WORKFLOW.md), "Operator workflow: grant windows and revision
+   rebinds".
 3. **Apply.** `apply` executes **one plan step per request** and requires
    `params.idempotency_key` (`ik_` + 8-64 `[a-z0-9-]`). The daemon
    recomputes the digest before anything is journaled, then revalidates
