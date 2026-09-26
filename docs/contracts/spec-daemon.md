@@ -67,7 +67,10 @@ remain usable without it; SQLite owns state; no network control API).
   workflow hash, policy hash, phase, scope, caps, live state epoch) AND the
   issuance idempotency key. A fresh key therefore opens a fresh authorization
   window without extending or replacing an earlier live/expired row; replaying
-  one key remains exactly-once and returns its recorded response.
+  one key remains exactly-once and returns its recorded response. The id is
+  the only uniqueness fence left: a presented document whose `grant_id` is
+  already recorded refuses `state.grant_exists` (the same issuance window
+  presented again), and re-minting the same binding is never a collision.
   Minting is not authorization: the
   grant only becomes authority at the board / `queue submit` point.
 - `apply` **requires** `params.idempotency_key` (`ik_` format): an apply
