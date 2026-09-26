@@ -6,6 +6,20 @@ release process activates (docs/RELEASING.md), then semver applies.
 
 ## [Unreleased]
 
+### Fixed (issue #236 — a terminal run's lane record never holds an item)
+
+- `queue intake`'s dedupe reads LIVE ownership — the row of a run recording
+  an owned status (`new`, `running`, `paused`, `human_queue`, `blocked`), the
+  SAME set the admission conflict re-derives from the run rows and the
+  preview classifies by — so a lane record left by a TERMINAL run (an
+  invalidated run the operator has not retired yet with `run retire-lane`, a
+  completion recorded before the row was freed) no longer holds its issue as
+  `intake.owned` forever. This matches the shipped dedupe contract ("a live
+  row in the recorded ownership set", `docs/contracts/spec-intake.md`): the
+  issue is selectable again instead of waiting as if a live lane owned it.
+  The read never mutates a record — retiring a leftover row stays the
+  operator control's (#262) or the admission's replace-on-admit.
+
 ### Fixed (issue #311 — armed supervision is retired for a finished run)
 
 - A run the engine's own record has made terminal (`done` | `invalidated`) is

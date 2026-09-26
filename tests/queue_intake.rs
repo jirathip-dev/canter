@@ -19,8 +19,12 @@ use std::time::{Duration, Instant};
 
 use canter::canonical::sha256_hex;
 use canter::client::Connection;
-use canter::state::{Retention, State};
-use canter::value::Val;
+use canter::lifecycle::ConcurrencyCaps;
+use canter::plan::DOCTRINE_WORKFLOW_ID;
+use canter::state::{
+    QueueSubmissionItemPlan, QueueSubmissionPlan, Retention, State, SubmissionVerdict,
+};
+use canter::value::{Val, object};
 
 const HARNESS: &str = "lane-1";
 
@@ -604,5 +608,180 @@ fn the_commit_leg_commits_one_run_per_admitted_item_over_a_live_daemon() {
         state.queue_ownership_rows().expect("ownership").len(),
         2,
         "one ownership row per admitted item"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #236: a lane record left by a terminal run never holds an item
+// ---------------------------------------------------------------------------
+
+/// The fixture repository's `owner/name` identity (derived from the config's
+/// origin, exactly as `queue intake` derives it).
+const IDENTITY: &str = "example-org/widgets";
+/// The revision the fixture grants bind.
+const ISSUE_REV: &str = "1111111111111111111111111111111111111111";
+/// The role-configuration revision the plan records (a fixed opaque value;
+/// submission admission re-derives the live ownership facts, not this pin).
+const ROLE_REVISION: &str = "2222222222222222222222222222222222222222";
+const PLAN_WORKFLOW_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const PLAN_POLICY_HASH: &str = "feedface01234567feedface01234567feedface01234567feedface01234567";
+
+/// One valid `hf-grant/v1` document for `number` under the fixture identity.
+fn grant_doc(grant_id: &str, number: i64) -> Val {
+    Val::parse_json(&format!(
+        r#"{{"schema":"hf-grant/v1","grant_id":"{grant_id}","repository":"{IDENTITY}",
+            "issue":{{"number":{number},"revision":"{ISSUE_REV}"}},
+            "workflow_hash":"{PLAN_WORKFLOW_HASH}","policy_hash":"{PLAN_POLICY_HASH}",
+            "phase":"merge","scope":"worktrees/issues/{number}",
+            "caps":["read","worktree","spawn","merge"],
+            "expires_at":"2999-01-01T00:00:00Z","state_epoch":1,
+            "created_at":"2026-09-06T00:00:00Z"}}"#
+    ))
+    .expect("grant document")
+}
+
+/// One submission plan over the fixture store, one approved item per
+/// `(issue, grant)` pair — the same recorded path `queue submit` uses.
+fn plan_for(state: &State, submission_id: &str, items: &[(i64, &str)]) -> QueueSubmissionPlan {
+    let epoch = state.current_epoch().expect("epoch");
+    QueueSubmissionPlan {
+        submission_id: submission_id.to_string(),
+        repository: IDENTITY.to_string(),
+        state_epoch: epoch,
+        digest: "a".repeat(64),
+        role_key: HARNESS.to_string(),
+        role_revision: ROLE_REVISION.to_string(),
+        workflow_id: DOCTRINE_WORKFLOW_ID.to_string(),
+        workflow_hash: PLAN_WORKFLOW_HASH.to_string(),
+        boundary_phase: "merge".to_string(),
+        integration_branch: "staging".to_string(),
+        completion_branch: "staging".to_string(),
+        boundary_caps: vec!["read".to_string(), "merge".to_string()],
+        request_line: canter::canonical::canonical_text(&object(vec![])),
+        admission_caps: ConcurrencyCaps {
+            global: 8,
+            per_repository: 4,
+            per_harness: 4,
+        },
+        harness_lanes: Some(0),
+        items: items
+            .iter()
+            .enumerate()
+            .map(|(ordinal, (number, grant_id))| QueueSubmissionItemPlan {
+                ordinal: ordinal as i64,
+                work_item: canter::queue_preview::IssueId::parse(&format!("#{number}"), IDENTITY)
+                    .expect("issue id")
+                    .work_item(),
+                issue_number: *number,
+                issue_revision: ISSUE_REV.to_string(),
+                grant_id: Some((*grant_id).to_string()),
+                resume_digest: None,
+                verdict: SubmissionVerdict::Approved,
+            })
+            .collect(),
+        supervision: None,
+        at: "2026-09-06T02:00:00Z".to_string(),
+    }
+}
+
+/// Issue #236: a lane record left by a TERMINAL run never holds an item.
+/// `queue intake`'s dedupe reads LIVE ownership — the shipped contract's
+/// "a live row in the recorded ownership set" (`spec-intake.md`) — the SAME
+/// set the admission conflict re-derives from the run rows and the preview
+/// classifies by, so a leftover row can no longer pin an issue as if a live
+/// lane held it. The control in the same store: a genuinely LIVE run's row
+/// still holds its issue, and the terminal run's row is untouched by the
+/// read (retiring it stays the operator control's, #262).
+#[test]
+fn a_terminal_runs_lane_record_does_not_hold_an_item() {
+    let fixture = Fixture::new("owned-terminal", true);
+    fixture.seed();
+    // The recorded shape, through the same submission path the queue uses:
+    // TWO admitted runs, then ONE made terminal while its lane record
+    // survives — a material edit invalidates its grant, and the leftover row
+    // is exactly what `run.retire-lane` exists to retire.
+    {
+        let state = State::open(&fixture.db(), Retention::default()).expect("open state");
+        for (grant_id, number) in [("gr_0000000000000003", 3), ("gr_0000000000000007", 7)] {
+            state
+                .issue_grant(&grant_doc(grant_id, number))
+                .expect("grant");
+        }
+        let (_, items) = state
+            .submit_queue_run(&plan_for(
+                &state,
+                "qs_00000000000000aa",
+                &[(3, "gr_0000000000000003"), (7, "gr_0000000000000007")],
+            ))
+            .expect("submission commits");
+        for item in &items {
+            assert_eq!(item.status, "admitted", "both items are admitted: {item:?}");
+        }
+        state
+            .invalidate_grant("gr_0000000000000003", "2026-09-06T02:01:00Z")
+            .expect("invalidate");
+        let rows = state.queue_ownership_rows().expect("ownership");
+        assert_eq!(
+            rows.len(),
+            2,
+            "the invalidation keeps the lane records for the operator control to retire: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.issue_number == 3),
+            "the terminal run's lane record survives: {rows:?}"
+        );
+        assert_eq!(
+            state.live_owned_issues(IDENTITY).expect("live"),
+            vec![7],
+            "only the live run's issue is live-owned"
+        );
+    }
+
+    // The dry run over the SAME store reads LIVE ownership: issue 3 is
+    // selectable again — its lane record names no live owner — while issue 7
+    // is held by its genuinely live run.
+    let out = run(&fixture, &intake_args(&fixture, &["--dry-run"]));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let items = data_field(&out, "items");
+    let Some(Val::Arr(items)) = Some(items) else {
+        panic!("items must be an array");
+    };
+    let statuses: Vec<(i64, String)> = items
+        .iter()
+        .map(|item| {
+            (
+                item.get("number").and_then(Val::as_int).unwrap_or(-1),
+                item.get("status")
+                    .and_then(Val::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        statuses,
+        vec![(3, "selected".to_string()), (7, "owned".to_string())],
+        "the terminal run's lane record never holds the item; the live run's row still does: {}",
+        stdout(&out)
+    );
+    // The held item's own recorded message names the live-ownership rule;
+    // the re-selectable item carries no hold at all.
+    let owned_message = items[1]
+        .get("message")
+        .and_then(Val::as_str)
+        .unwrap_or_default();
+    assert!(
+        owned_message.contains("already owned or queued"),
+        "the live owner's hold message: {owned_message:?}"
+    );
+    assert!(
+        items[0].get("message").and_then(Val::as_str).is_none(),
+        "no hold rides the re-selectable item: {:?}",
+        items[0]
     );
 }

@@ -5415,7 +5415,12 @@ fn execute_queue_intake(args: &QueueIntakeArgs, invocation: &Invocation) -> CmdR
         }
     };
     // Dedupe before submit: live ownership is read from the recorded state
-    // store (the same store the daemon writes), never inferred.
+    // store (the same store the daemon writes), never inferred. Issue #236:
+    // LIVE ownership only — the SAME set the admission conflict re-derives
+    // from the run rows and the preview classifies by. A lane record left by
+    // a terminal run (an unretired invalidation, a completion recorded before
+    // the row was freed) names no live owner and must never hold an item as
+    // if it were a live lane.
     let socket = effective_socket(args.socket.as_deref(), Some(&config));
     let paths = match derive_paths(socket) {
         Ok(paths) => paths,
@@ -5444,12 +5449,8 @@ fn execute_queue_intake(args: &QueueIntakeArgs, invocation: &Invocation) -> CmdR
             );
         }
     };
-    let owned: std::collections::BTreeSet<u64> = match state.queue_ownership_rows() {
-        Ok(rows) => rows
-            .into_iter()
-            .filter(|row| row.repository == identity)
-            .map(|row| row.issue_number as u64)
-            .collect(),
+    let owned: std::collections::BTreeSet<u64> = match state.live_owned_issues(&identity) {
+        Ok(numbers) => numbers.into_iter().map(|number| number as u64).collect(),
         Err(err) => {
             return error_result(
                 1,
