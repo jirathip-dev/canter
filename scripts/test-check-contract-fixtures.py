@@ -186,6 +186,35 @@ def run_discrimination(probe) -> None:
     _check(code == probe.REFUSE_MALFORMED,
            "evidence running status must refuse-malformed, got " + code)
 
+    # 10a. Evidence (issue #321): a check's declared scope is a closed set —
+    #      `diff` | `head` — and an annotated check is exactly
+    #      name|status|scope. Both survive the validator; a scope outside the
+    #      set refuses.
+    p = _tamper_copy(
+        "evidence/evidence.valid.json",
+        lambda b: b.replace(
+            b'{"name":"hosted-ci","status":"passed"}',
+            b'{"name":"hosted-ci","status":"passed","scope":"head"}', 1))
+    code, _msg = probe.validate_file(p, "hf-evidence")
+    _check(code == probe.ACCEPT,
+           "a scope-annotated evidence check must accept, got " + code)
+    p = _tamper_copy(
+        "evidence/evidence.valid.json",
+        lambda b: b.replace(
+            b'{"name":"hosted-ci","status":"passed"}',
+            b'{"name":"hosted-ci","status":"passed","scope":"running"}', 1))
+    code, _msg = probe.validate_file(p, "hf-evidence")
+    _check(code == probe.REFUSE_MALFORMED,
+           "an evidence check scope outside the closed set must refuse-malformed, got " + code)
+    p = _tamper_copy(
+        "evidence/evidence.valid.json",
+        lambda b: b.replace(
+            b'{"name":"hosted-ci","status":"passed"}',
+            b'{"name":"hosted-ci","status":"passed","scope":"head","note":"x"}', 1))
+    code, _msg = probe.validate_file(p, "hf-evidence")
+    _check(code == probe.REFUSE_MALFORMED,
+           "an evidence check with an unknown key must refuse-malformed, got " + code)
+
     # 10b. Board (issue #83): a reported-done run relabelled as verified
     #      without recorded evidence must refuse — verified delivery and
     #      reported status are separate axes.

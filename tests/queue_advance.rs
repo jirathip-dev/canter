@@ -4371,6 +4371,7 @@ fn the_supervisor_dispatch_capability_for_the_committed_tail_is_typed_and_closed
         );
         evidence.retries.push(canter::state::RunRetryRow {
             retry_id: "retry-tail".to_string(),
+            cause: String::new(),
             instance_id: RUN_ID.to_string(),
             step_id: step.to_string(),
             attempt: 1,

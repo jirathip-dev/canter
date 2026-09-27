@@ -541,6 +541,18 @@ pub mod codes {
     /// DERIVED from the same recorded facts the gate reads; a recomputation
     /// that comes back failing keeps this refusal exactly as it was.
     pub const DELIVERY_UNVERIFIED: &str = "supervision.delivery_unverified";
+    /// The same refused continuation, but the run's newest recorded review
+    /// evidence carries ONLY non-passing checks scoped OUTSIDE its own diff
+    /// (`scope: "head"`, issue #321): a census of the WHOLE head the delivery
+    /// sits on (every hosted check run of the head, failures belonging to
+    /// whatever else the head carries — another issue's defect), which a
+    /// recomputation at the same certified head can never clear. The run parks
+    /// typed with that cause NAMED: no review round is driven for this shape,
+    /// so none of the run's bounded retries is charged to chase a red the run
+    /// cannot fix, and the certified head stays unverified instead of being
+    /// re-reviewed into the same result. The bounded re-evaluation remains the
+    /// operator's own control once the head's beyond-diff reds clear.
+    pub const BLOCKED_OUTSIDE_DIFF: &str = "supervision.blocked_outside_diff";
     /// The next unachieved step HAS been attempted and its own recorded
     /// outcome is not `succeeded` (issue #148): the work ran and diagnosed a
     /// concrete failure/refusal, and the driver never re-dispatches a
@@ -1292,6 +1304,20 @@ fn reevaluation_intent(
     // re-run by anything but this control.
     unverified_delivery_refusal(evidence, frontier, frontier_kind)
         .or_else(|| recorded_fail_refusal(evidence, frontier, frontier_kind))?;
+    // Issue #321: a non-passing check that censuses the WHOLE head (scope
+    // `head`) is never, by itself, a reason to re-run the review — the
+    // failures belong to whatever else the head carries, and a recomputation
+    // at the same certified head re-reads them. The control is therefore not
+    // derived for that shape at all: the run parks typed
+    // ([`codes::BLOCKED_OUTSIDE_DIFF`]) with its bounded retries UNSPENT, and
+    // only the operator's own `run.reevaluate` reaches it once the head's
+    // beyond-diff reds clear. A MIXED failing set (one diff-scoped failure
+    // plus head-scoped ones) keeps this control reachable: the run's own red
+    // is what a recomputation can act on, and it is recomputed within the
+    // same bound.
+    if outside_diff_refusal(evidence, frontier, frontier_kind).is_some() {
+        return None;
+    }
     // The producer: the run's own check-producing step — the reviewed-evidence
     // step of the committed spine that declares its reviewer LEG (the only
     // shape that computes checks) and whose latest recorded attempt SUCCEEDED
@@ -1670,20 +1696,7 @@ fn delivery_evidence_subject(
     {
         return None;
     }
-    Some((
-        newest.evidence_id.clone(),
-        crate::mutation::EvidenceView {
-            evidence_id: newest.evidence_id.clone(),
-            feature_head: newest.feature_head.clone(),
-            integration_base: newest.integration_base.clone(),
-            workflow_hash: newest.workflow_hash.clone(),
-            policy_hash: newest.policy_hash.clone(),
-            verdict: newest.verdict.clone(),
-            reviewer: newest.reviewer.clone(),
-            checks: newest.checks.clone(),
-            created_at: newest.created_at.clone(),
-        },
-    ))
+    Some((newest.evidence_id.clone(), evidence_view_of(newest)))
 }
 
 /// The engine's own refusal of an already-bound record whose named checks are
@@ -1756,6 +1769,128 @@ fn recorded_fail_refusal(
     non_passing_refusal(step, &subject)
 }
 
+/// The engine's own refusal of an already-bound record whose non-passing
+/// checks are ALL scoped OUTSIDE the run's own diff (`scope: "head"`, issue
+/// #321): a census of the WHOLE head the delivery sits on — every hosted check
+/// run of the head, including the failures whatever else the head carries
+/// produced (another issue's defect).
+///
+/// This is the ONE non-passing shape a recomputation at the same certified
+/// head can never clear: re-running the review re-reads the same head-wide
+/// red. It therefore must not, by itself, drive a review round (the driver's
+/// own derivation, [`reevaluation_intent`], reads THIS function and nothing
+/// else for that decision), and its classification is its own typed park
+/// ([`codes::BLOCKED_OUTSIDE_DIFF`]) instead of the re-evaluation-driven
+/// [`codes::DELIVERY_UNVERIFIED`]. Both verdicts are read through the SAME
+/// subject as the other refusals: a `pass` whose checks are not all passing
+/// (issue #230) and the recorded `fail` a fix round was handed (issue #254) —
+/// the scope fact is the same in both.
+fn outside_diff_refusal(
+    evidence: &SupervisionEvidence,
+    step: &str,
+    kind: &str,
+) -> Option<UnverifiedDelivery> {
+    let subject = delivery_evidence_subject(evidence, step, kind)?;
+    let outside = crate::mutation::non_passing_checks_outside_diff(&subject.1).ok()?;
+    if outside.is_empty() {
+        return None;
+    }
+    // Every non-passing check must be outside the diff: one diff-scoped
+    // failure keeps the run's own recomputation the right remedy, and the
+    // refusal it derives is the ordinary one.
+    if crate::mutation::non_passing_checks(&subject.1).ok()?.len() != outside.len() {
+        return None;
+    }
+    Some(UnverifiedDelivery {
+        step: step.to_string(),
+        code: crate::mutation::code::EVIDENCE_FAILED.to_string(),
+        reason: crate::mutation::evidence_failed_message(&subject.0, &outside),
+    })
+}
+
+/// The park of a run whose delivery is blocked ONLY by checks scoped outside
+/// its own diff (issue #321): the recorded head-scoped failures named with
+/// their scope, the certified head that stands unverified, and the fact that
+/// no review round is driven for them and no bounded retry is charged — so a
+/// reader tells "this run is blocked by a red outside its diff" from "this run
+/// broke" from the status alone, and the run's budget stays intact.
+fn outside_diff_detail(refusal: &UnverifiedDelivery, evidence: &SupervisionEvidence) -> String {
+    let head = evidence
+        .newest_evidence
+        .as_ref()
+        .map(|newest| newest.feature_head.as_str())
+        .unwrap_or_default();
+    format!(
+        "{} ({}): the certified head {head} stands unverified on checks scoped to the WHOLE head \
+         — failures this delivery's own diff did not produce, which a re-review of the same head \
+         can never clear — so no review round is driven for it and the run's bounded retries are \
+         not charged",
+        refusal.reason, refusal.step
+    )
+}
+
+/// The recorded failure ONE bounded retry charge exists for (issue #321),
+/// read from the SAME facts the driver decided on: the step's own newest
+/// DIAGNOSED attempt (`diagnosed:<code>`) and/or the engine's own refusal of
+/// the run's newest review evidence (`consumer-refused: <message>`, whose
+/// non-passing checks name their scope) — so the durable retry row says WHY
+/// the charge was minted and a reader can tell "this run broke" from "this run
+/// was blocked by someone else's red". Bounded to [`RETRY_CAUSE_MAX`]; empty
+/// only when neither fact stands (a first dispatch of an undiagnosed step is
+/// never charged).
+pub fn retry_cause(evidence: &SupervisionEvidence, step: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some((_, status, code)) = evidence
+        .attempts
+        .iter()
+        .rev()
+        .find(|(attempted, _, _)| attempted == step)
+        && crate::state::step_attempt_diagnosed(status, code)
+    {
+        let label = if code.is_empty() {
+            status.as_str()
+        } else {
+            code.as_str()
+        };
+        parts.push(format!("diagnosed:{label}"));
+    }
+    if let Some(newest) = evidence.newest_evidence.as_ref() {
+        let view = evidence_view_of(newest);
+        if let Ok(non_passing) = crate::mutation::non_passing_checks(&view)
+            && !non_passing.is_empty()
+        {
+            parts.push(format!(
+                "consumer-refused: {}",
+                crate::mutation::evidence_failed_message(&newest.evidence_id, &non_passing)
+            ));
+        }
+    }
+    let cause = parts.join("; ");
+    cause.chars().take(RETRY_CAUSE_MAX).collect()
+}
+
+/// The bound of a recorded retry cause (issue #321): long enough to carry the
+/// step's diagnosis AND the engine's own refusal message, short enough that
+/// the durable row stays a row.
+pub const RETRY_CAUSE_MAX: usize = 300;
+
+/// The typed evidence view of one recorded evidence row (the state row mapped
+/// to the mutation-layer view), shared by every reader that derives a refusal
+/// or a cause from it so the two can never drift.
+fn evidence_view_of(newest: &crate::state::EvidenceRow) -> crate::mutation::EvidenceView {
+    crate::mutation::EvidenceView {
+        evidence_id: newest.evidence_id.clone(),
+        feature_head: newest.feature_head.clone(),
+        integration_base: newest.integration_base.clone(),
+        workflow_hash: newest.workflow_hash.clone(),
+        policy_hash: newest.policy_hash.clone(),
+        verdict: newest.verdict.clone(),
+        reviewer: newest.reviewer.clone(),
+        checks: newest.checks.clone(),
+        created_at: newest.created_at.clone(),
+    }
+}
+
 /// ONE derived refusal of a frontier the driver may not dispatch (issue #230):
 /// the engine's own code and message, exactly as the recorded facts imply
 /// them. Read-time only — nothing about it is written down.
@@ -1792,7 +1927,8 @@ fn refusal_doc(
             None => null(),
         };
     }
-    if verdict.reason == codes::DELIVERY_UNVERIFIED {
+    if verdict.reason == codes::DELIVERY_UNVERIFIED || verdict.reason == codes::BLOCKED_OUTSIDE_DIFF
+    {
         return match unverified_delivery_refusal(evidence, next_step, next_kind) {
             // No instant: this refusal is read-time, derived from the recorded
             // facts the gate reads, and nothing about it was written down.
@@ -2067,6 +2203,23 @@ pub fn classify(
     if let Some(refusal) = unverified_delivery_refusal(evidence, &next_step, &next_kind)
         && latest_attempt_for(evidence, &next_step).is_none()
     {
+        // Issue #321: when EVERY non-passing check of that evidence censuses
+        // the WHOLE head (scope `head`) — the failures belong to whatever else
+        // the head carries, not to this delivery's diff — the run does not get
+        // a review round: a recomputation at the same certified head re-reads
+        // the same head-wide red, so driving one would spend the run's bounded
+        // retries on a failure the run cannot fix. The park is its OWN typed
+        // code, with the head-scoped failures and the certified head named in
+        // the detail, and it is derived from the SAME recorded facts the
+        // refusal above reads.
+        if let Some(outside) = outside_diff_refusal(evidence, &next_step, &next_kind) {
+            return Verdict::new(
+                "needs-attention",
+                codes::BLOCKED_OUTSIDE_DIFF,
+                false,
+                &outside_diff_detail(&outside, evidence),
+            );
+        }
         return Verdict::new(
             "needs-attention",
             codes::DELIVERY_UNVERIFIED,
@@ -2461,6 +2614,11 @@ pub fn status_doc(
                 ("attempt", integer(retry.attempt)),
                 ("authorized_at", string(&retry.authorized_at)),
                 ("consumed_at", string(&retry.consumed_at)),
+                // Issue #321: the failure the charge exists for rides the
+                // ledger row itself — a reader tells "this run broke" from
+                // "this run was blocked by someone else's red" without the
+                // journal.
+                ("cause", string(&retry.cause)),
             ])
         })
         .collect();
@@ -3468,6 +3626,12 @@ pub fn render_human(doc: &Val) -> String {
             _ => format!("fix round refused: {detail}"),
         });
     }
+    // Issue #321: the run parked on a red OUTSIDE its own diff is rendered in
+    // words — the recorded head-scoped failures, the certified head and the
+    // fact that no review round chases them (and no bounded retry is charged).
+    if reason == codes::BLOCKED_OUTSIDE_DIFF && !detail.is_empty() {
+        lines.push(format!("blocked outside the diff: {detail}"));
+    }
     // Issue #230: a continuation the ENGINE refuses is rendered with the
     // engine's own code AND reason — an operator reading `supervision status`
     // sees why the named frontier never lands instead of a silent idle.
@@ -4069,6 +4233,7 @@ mod tests {
             }
             evidence.retries.push(crate::state::RunRetryRow {
                 retry_id: "rt_0123456789abcdef".into(),
+                cause: String::new(),
                 instance_id: run.into(),
                 step_id: "p2".into(),
                 attempt: 1,
@@ -4090,6 +4255,7 @@ mod tests {
             for attempt in 2..=crate::state::RUN_RETRY_MAX {
                 evidence.retries.push(crate::state::RunRetryRow {
                     retry_id: format!("rt_0123456789abcde{attempt}"),
+                    cause: String::new(),
                     instance_id: run.into(),
                     step_id: "p2".into(),
                     attempt,
@@ -5054,6 +5220,212 @@ mod tests {
         assert!(!verdict.eligible, "a diagnosed tail is never eligible");
     }
 
+    /// Issue #321: a review check that censuses the WHOLE head (`scope:
+    /// "head"`) must not, by itself, drive a review round — and the run must
+    /// not be exhausted by a red outside its own diff.
+    ///
+    /// The measured shape (`run-c4de4f2b91e9f36a`, issue #316): the newest
+    /// recorded evidence is a `pass` bound to the run's own pins at one exact
+    /// head whose ONLY non-passing check is the whole-head hosted census
+    /// (`hosted_ci_at_head_census_58_success_2_failure_1_skipped=failed
+    /// (scope head)`) — the two failing legs belong to OTHER issues' open
+    /// defects. The run's frontier is its own verified-delivery consumer
+    /// (`p7` merge), so the consumer is refused exactly as before, but the
+    /// driver's ONE recovery control (the bounded re-evaluation) is NOT
+    /// derived: a recomputation at the same certified head re-reads the same
+    /// head-wide red, so a round would spend the run's bounded retries on a
+    /// failure the run cannot fix. The park is its own typed code, with the
+    /// head-scoped failure NAMED (scope and all) and the budget untouched.
+    ///
+    /// The same run shape with one diff-scoped failure mixed in keeps the
+    /// recomputation reachable (the run's own red is what it can act on), and
+    /// a legacy record with no scope at all behaves exactly as it always did.
+    #[test]
+    fn a_whole_head_census_failure_never_drives_a_review_round() {
+        let policy = Policy {
+            check_interval_secs: 10,
+            progress_timeout_secs: 60,
+        };
+        let digest = "d".repeat(64);
+        let at = "2026-09-26T21:20:59Z";
+        let now_unix = time::unix_from_rfc3339("2026-09-26T21:21:59Z").expect("instant");
+        let steps = [
+            ("p1", "checkout"),
+            ("p2", "prompt"),
+            ("p6", "review_evidence"),
+            ("p7", "merge"),
+        ];
+        let evidence_id = "ev_12110e16ea9b7588";
+        let head = "e".repeat(40);
+        let census = "hosted_ci_at_head_census_58_success_2_failure_1_skipped";
+        // The recorded shape of the measured evidence, verbatim: a passed
+        // diff-scoped check beside the failed whole-head census, which
+        // declares its own scope.
+        let measured = format!(
+            r#"[{{"name":"pinned_head_is_checkout_head_and_porcelain_clean","status":"passed"}},{{"name":"{census}","status":"failed","scope":"head"}}]"#
+        );
+        // One diff-scoped failure (the run's OWN delivery) beside the same
+        // head-scoped census failure: a recomputation CAN act on the first.
+        let mixed = format!(
+            r#"[{{"name":"local_full_suite_raw_101","status":"failed"}},{{"name":"{census}","status":"failed","scope":"head"}}]"#
+        );
+        // A record written before the scope existed: one failed check, no
+        // scope — its meaning is unchanged.
+        let legacy = r#"[{"name":"local_full_suite_raw_101","status":"failed"}]"#;
+        let deliver = |checks: &str| -> SupervisionEvidence {
+            let mut run = run_row("run-0123456789abcdef");
+            run.caps = "[\"read\",\"merge\"]".to_string();
+            let mut evidence = evidence_for(
+                run,
+                Some(&digest),
+                &steps,
+                &[
+                    ("p1", "succeeded", ""),
+                    ("p2", "succeeded", ""),
+                    ("p6", "succeeded", ""),
+                ],
+                at,
+            );
+            evidence.item = Some(crate::state::QueueItemRef {
+                submission_id: "qs_0123456789abcdef".to_string(),
+                ordinal: 1,
+                work_item: "#7".to_string(),
+                issue_number: 7,
+                status: "admitted".to_string(),
+            });
+            // The plan declares its reviewer leg ("p6"), so the bounded
+            // re-evaluation HAS a producer to re-run — the negative controls
+            // below are therefore not vacuous.
+            evidence.reviewer_leg_steps = vec!["p6".to_string()];
+            evidence.newest_evidence = Some(crate::state::EvidenceRow {
+                evidence_id: evidence_id.to_string(),
+                instance_id: "run-0123456789abcdef".to_string(),
+                repository: "example-org/widgets".to_string(),
+                feature_head: head.clone(),
+                integration_base: "b".repeat(40),
+                workflow_hash: "a".repeat(64),
+                policy_hash: "b".repeat(64),
+                verdict: "pass".to_string(),
+                reviewer: "rev-316-r1".to_string(),
+                checks: checks.to_string(),
+                created_at: at.to_string(),
+            });
+            evidence
+        };
+        let row = supervision_row_for("run-0123456789abcdef", at);
+
+        // (1) The whole-head-only failing set: the run parks typed with the
+        //     outside-diff cause NAMED — never as the ordinary unverified
+        //     delivery, and never eligible.
+        let outside = deliver(&measured);
+        let verdict = classify(&outside, &digest, &policy, now_unix);
+        assert_eq!(verdict.class, "needs-attention");
+        assert_eq!(verdict.reason, codes::BLOCKED_OUTSIDE_DIFF);
+        assert!(
+            !verdict.eligible,
+            "a delivery blocked outside its diff is never an eligible continuation"
+        );
+        assert!(
+            verdict
+                .detail
+                .contains(&format!("{census}=failed (scope head)")),
+            "the park names the head-scoped failure with its scope: {}",
+            verdict.detail
+        );
+        assert!(
+            verdict.detail.contains(&head),
+            "the park names the certified head: {}",
+            verdict.detail
+        );
+        assert!(
+            verdict.detail.contains("no review round is driven"),
+            "the park states the rule it obeys: {}",
+            verdict.detail
+        );
+
+        // (2) The read carries the engine's own refusal, whose reason names
+        //     the check AND its scope — the gate names what it read.
+        let doc = status_doc(&row, &outside, None, &verdict, now_unix);
+        let refusal = doc
+            .get("evaluation")
+            .and_then(|evaluation| evaluation.get("refusal"))
+            .cloned()
+            .unwrap_or_else(null);
+        assert_eq!(
+            refusal.get("code").and_then(Val::as_str),
+            Some(crate::mutation::code::EVIDENCE_FAILED),
+        );
+        assert_eq!(
+            refusal.get("reason").and_then(Val::as_str),
+            Some(
+                format!(
+                    "review evidence {evidence_id} has failed/pending checks: \
+                     {census}=failed (scope head)"
+                )
+                .as_str()
+            ),
+            "the refusal names the failing check and its scope"
+        );
+        let human = render_human(&doc);
+        assert!(
+            human.contains("blocked outside the diff")
+                && human.contains(&format!("{census}=failed (scope head)")),
+            "the human read states the outside-diff cause: {human}"
+        );
+
+        // (3) NO review round is derived for it: the driver's ONE recovery
+        //     control stays unreachable, so nothing about this shape can
+        //     spend the run's bounded retries (each round's dispatch is the
+        //     charged re-dispatch).
+        assert!(
+            dispatch_intent(&row, &outside).is_none(),
+            "a whole-head census failure never drives a re-evaluation round"
+        );
+
+        // (4) The negative controls, on the SAME run/plan shape: one
+        //     diff-scoped failure keeps the recomputation reachable — mixed
+        //     with the census failure or alone (the legacy record).
+        for checks in [mixed.as_str(), legacy] {
+            let held = deliver(checks);
+            let verdict = classify(&held, &digest, &policy, now_unix);
+            assert_eq!(
+                verdict.reason,
+                codes::DELIVERY_UNVERIFIED,
+                "a diff-scoped failure keeps the ordinary refusal ({checks})"
+            );
+            let intent = dispatch_intent(&row, &held)
+                .expect("a diff-scoped failure still drives the recomputation");
+            assert_eq!(intent.step_id, "p6");
+            assert_eq!(intent.reason, codes::REEVALUATION);
+        }
+
+        // (5) The charge's recorded cause (issue #321 AC3), read from the
+        //     SAME facts the driver decided on: the whole-head census names
+        //     itself with its scope, so a reader tells "blocked by someone
+        //     else's red" from "this run broke".
+        assert_eq!(
+            retry_cause(&outside, "p6"),
+            format!(
+                "consumer-refused: review evidence {evidence_id} has failed/pending checks: \
+                 {census}=failed (scope head)"
+            )
+        );
+        let mut diagnosed = deliver(&measured);
+        diagnosed.attempts.push((
+            "p6".to_string(),
+            "failed".to_string(),
+            "adapter.exit".to_string(),
+        ));
+        assert_eq!(
+            retry_cause(&diagnosed, "p6"),
+            format!(
+                "diagnosed:adapter.exit; consumer-refused: review evidence {evidence_id} has \
+                 failed/pending checks: {census}=failed (scope head)"
+            ),
+            "both recorded facts are named, the diagnosis first"
+        );
+    }
+
     /// The durable supervision row of one run, as the status read builds it.
     fn supervision_row_for(run: &str, at: &str) -> crate::state::SupervisionRow {
         crate::state::SupervisionRow {
@@ -5413,6 +5785,7 @@ mod tests {
             evidence.fix_leg = leg;
             evidence.retries = vec![crate::state::RunRetryRow {
                 retry_id: "rt_0123456789abcdef".to_string(),
+                cause: String::new(),
                 instance_id: run.to_string(),
                 step_id: "p6".to_string(),
                 attempt: 2,
@@ -5547,6 +5920,7 @@ mod tests {
         exhausted.retries = (1..=3)
             .map(|attempt| crate::state::RunRetryRow {
                 retry_id: format!("rt_{attempt:016x}"),
+                cause: String::new(),
                 instance_id: run.to_string(),
                 step_id: "p6".to_string(),
                 attempt,
@@ -5690,6 +6064,7 @@ mod tests {
         };
         let retry_row = |step: &str, attempt: i64, consumed: bool| crate::state::RunRetryRow {
             retry_id: format!("rt_0123456789abcde{attempt}"),
+            cause: String::new(),
             instance_id: run.to_string(),
             step_id: step.to_string(),
             attempt,

@@ -478,7 +478,12 @@ clears a repository/fleet-level hold or bypasses a gate.
   already exists (`refusal.run.retry_pending`) and an exhausted attempt
   bound (`refusal.run.retry_bound`, three bounded retries per step). On
   success it records ONE single-use authorization (`run_retries`) and
-  NOTHING else: the request dispatches no step and spawns nothing. The
+  NOTHING else: the request dispatches no step and spawns nothing. Issue
+  #321: the row records the failure the charge exists for (`cause` — the
+  step's newest recorded diagnosis `diagnosed:<code>` and/or the engine's
+  own refusal of the newest review evidence `consumer-refused: <message>`,
+  whose non-passing checks name their scope), so the ledger tells "this run
+  broke" from "this run was blocked by someone else's red". The
   authorization is consumed by the ONE re-dispatch of that exact step — the
   run's own armed supervision performs it (issue #241: the held authorization
   is spent by the very re-dispatch it authorizes, recorded under that
@@ -1129,7 +1134,16 @@ clears a repository/fleet-level hold or bypasses a gate.
   derivation reads the recorded FAIL too (issue #254): when the run's newest
   recorded review evidence carries a non-passing check and its check producer
   already succeeded, the run's own bounded re-evaluation is driven at the
-  recorded head instead of the run parking on the FAIL.
+  recorded head instead of the run parking on the FAIL. Issue #321 narrows
+  that derivation: a failing set that is ENTIRELY outside the delivery's own
+  diff (every non-passing check declares `scope: "head"`) never drives a
+  re-evaluation at all — no recomputation of the same certified head can
+  clear a head-wide red — so the run parks as
+  `supervision.blocked_outside_diff` (class `needs-attention`,
+  `eligible:false`, detail naming the head-scoped checks WITH their scope and
+  the certified head) with the bounded retries UNSPENT. A MIXED failing set
+  keeps the control reachable, and every emitted line names each check's
+  scope, so a reader tells a red outside the diff from the run's own.
 - **Refused continuation dispatch (issue #141)**: when the engine refuses the
   driver's continuation of the frontier step BEFORE its claim (a fan-out
   admission refusal such as `refusal.admission.proof_stale`, a derived

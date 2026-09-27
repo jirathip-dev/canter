@@ -218,15 +218,15 @@ def checks():
         assert provenance_data["version"] == "0.1.0"
         assert provenance_data["platform"] == "linux-x86_64"
         schema_facts = provenance_data["schema_facts"]
-        assert schema_facts["state_schema_version"] == 14
+        assert schema_facts["state_schema_version"] == 15
         assert schema_facts["migration_chain"][0] == "m0001_initial_state_v1"
-        assert schema_facts["migration_chain"][-1] == "m0014_queue_advance_continuations_v14"
+        assert schema_facts["migration_chain"][-1] == "m0015_retry_causes_v15"
         assert "hf-config/v1" in schema_facts["document_schema_families"]
         assert "hf-schedule/v1" in schema_facts["document_schema_families"]
         assert "hf-board/v1" in schema_facts["document_schema_families"]
         assert len(schema_facts["document_schema_families"]) == 18
-        print("PASS: provenance binds source ref, state schema v14, migration "
-              "chain m0001..m0014, and all 18 document schema families")
+        print("PASS: provenance binds source ref, state schema v15, migration "
+              "chain m0001..m0015, and all 18 document schema families")
 
         # --- SBOM mirrors Cargo.lock (offline) ----------------------------------
         with tarfile.open(archive, "r:gz") as tar:

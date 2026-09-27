@@ -38,6 +38,17 @@ text at spawn time.
   ill-formed verdict is refused, not repaired; a `pending` check strands the
   tail and is refused. Write exactly the shape the prompt states; do not add
   or omit fields.
+- **Declare what each check observed.** Every check that censuses the WHOLE
+  head — a read of every hosted check run at the head, of state the
+  delivery's own diff did not produce — MUST carry an explicit
+  `"scope": "head"`. A check of this delivery's own diff may omit the scope
+  (`diff` is the default). The engine reads the scope and holds the delivery
+  to it: a non-passing head-scoped check never spends the run's bounded
+  retries chasing a red the run cannot fix, it parks the run as blocked
+  outside its own diff instead — and a head-scoped failure mislabelled as
+  the diff's (or hidden behind a passing diff check) is exactly the failure
+  the scope exists to make impossible. Declare the scope honestly; the
+  engine records what you write against the run.
 - **No self-approval.** The reviewer must be a different lane from the
   implementer that produced the head: a verdict from the implementing lane is
   refused (`refusal.evidence.reviewer_not_distinct`), and so is a review step

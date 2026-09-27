@@ -811,12 +811,22 @@ def validate_evidence(obj: dict) -> tuple[str, str]:
     if not isinstance(checks, list) or not checks:
         return _ref(REFUSE_MALFORMED, "evidence.checks must be a non-empty list")
     for check in checks:
-        if not isinstance(check, dict) or set(check) != {"name", "status"}:
-            return _ref(REFUSE_MALFORMED, "evidence check must have exactly name|status")
+        # Issue #321: a check may declare the SCOPE it observed — `diff` (the
+        # delivery's own diff; the default when omitted) or `head` (a census
+        # of the whole head the delivery sits on). Exactly name|status, or
+        # name|status|scope; any other shape stays refused.
+        if not isinstance(check, dict) or set(check) not in (
+            {"name", "status"},
+            {"name", "status", "scope"},
+        ):
+            return _ref(REFUSE_MALFORMED,
+                        "evidence check must have exactly name|status or name|status|scope")
         if not isinstance(check["name"], str) or not check["name"]:
             return _ref(REFUSE_MALFORMED, "evidence check name must be non-empty")
         if check["status"] not in {"passed", "failed", "pending"}:
             return _ref(REFUSE_MALFORMED, "evidence check status outside closed set")
+        if "scope" in check and check["scope"] not in {"diff", "head"}:
+            return _ref(REFUSE_MALFORMED, "evidence check scope outside closed set")
     if _expect_timestamp(obj, "created_at", "evidence"):
         return _ref(REFUSE_MALFORMED, "evidence.created_at invalid")
     return _ref(ACCEPT, "evidence ok")

@@ -761,6 +761,7 @@ fn a_lapse_refusal_is_a_continuation_not_a_bounded_retry() {
         (1..=crate::state::RUN_RETRY_MAX)
             .map(|attempt| crate::state::RunRetryRow {
                 retry_id: format!("rt_{attempt:016x}"),
+                cause: String::new(),
                 instance_id: fixture.run.clone(),
                 step_id: step.to_string(),
                 attempt,

@@ -6,6 +6,36 @@ release process activates (docs/RELEASING.md), then semver applies.
 
 ## [Unreleased]
 
+### Fixed (issue #321 — a whole-head census check earns no review round and no bounded retry)
+
+- A review check now declares the SCOPE it observed (`diff`, the default, or
+  `head` — a census of the whole head the delivery sits on). A non-passing
+  `head`-scoped check does not, by itself, drive a review round: a
+  recomputation at the same certified head re-reads the same head-wide red
+  (the failures belong to whatever else the head carries — another issue's
+  open defect), so the run parks typed as
+  `supervision.blocked_outside_diff` with the head-scoped failures and the
+  certified head named, eligible `false` and the bounded retries UNSPENT —
+  instead of charging round after round and parking retry-exhausted for a
+  red it cannot fix (the measured `run-c4de4f2b91e9f36a` / issue #316
+  shape). A MIXED failing set (one diff-scoped failure beside head-scoped
+  ones) keeps the bounded re-evaluation reachable, and the consumer refusal
+  itself is unchanged: the tail behind an unverified delivery is still never
+  driven.
+- Every bounded retry charge records the failure it exists for: the new
+  `run_retries.cause` column (m0015/schema v15, purely additive) carries the
+  step's newest diagnosis (`diagnosed:<code>`) and/or the engine's own
+  refusal of the newest review evidence (`consumer-refused: <message>`,
+  whose non-passing checks name their scope), so the ledger tells "this run
+  broke" from "this run was blocked by someone else's red".
+- Every rendering names the scope: a non-passing head-scoped check renders
+  `name=status (scope head)` in the consumer refusal, the supervision status
+  reason and the recorded retry cause; a diff-scoped check — and every
+  record written before the scope existed — renders exactly as before.
+- The reviewer brief and `skills/lane-reviewer/SKILL.md` state the rule, and
+  the contract fixtures prove the closed scope set bites (`scope:
+  "running"` refuses).
+
 ### Fixed (issue #324 — a cleared waiting item advances: the delivery continues the repository's next parked queue)
 
 - A verified delivery whose OWN committed submission carries nothing left to
