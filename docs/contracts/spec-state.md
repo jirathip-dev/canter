@@ -564,7 +564,17 @@ before it is remembered and returned:
   admitted (`refusal.queue.supervision_unarmed`): the run would be inert
   (issue #261). The winning admission flips the item (`admitted`, run bound),
   settles any recorded hold that named it and arms the new run with the
-  authorization its OWN submission committed.
+  authorization its OWN submission committed. A bare-exhaustion row is
+  re-opened when the delivering run COMPLETES: the real queue spine keeps its
+  merge and cleanup after the reviewed-evidence delivery (issue #152), so the
+  reconciliation that recognized the delivery wrote the exhaustion while the
+  run still held its counted slot and the parked candidate held for a reason
+  that was genuinely live then; when the run's last committed step lands, the
+  reconciliation that completes it and frees the slot re-evaluates the
+  repository's parked candidate in that same transaction and the same row
+  records which delivery consumed it — a slot freed by the run's own terminal
+  state is never foreclosed by the exhaustion written while the run was still
+  live (the live `qs_c1a6bb4c9c845674` / `run-3a6b16d09a297839` shape).
 - **Refusals do not advance**: a paused/invalidated/blocked/human-queued run
   is never a delivery (no cursor row is written), a failed verdict hides any
   older pass, a non-current evidence row refuses the planned advance, and an

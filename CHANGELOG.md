@@ -6,6 +6,29 @@ release process activates (docs/RELEASING.md), then semver applies.
 
 ## [Unreleased]
 
+### Fixed (issue #324 — the advance fires when the delivering run completes, not only at its delivery)
+
+- A bare-exhaustion cursor row is re-opened at the reconciliation that
+  COMPLETES the delivering run. The real queue spine keeps its merge and
+  cleanup after the reviewed-evidence delivery (issue #152), so the delivery
+  is recognized while the run is still live: the repository's parked
+  submission was re-evaluated against the live run and held for a reason that
+  was genuinely live then (`refusal.admission.cap_repository`, naming the run
+  that still kept the slot), and the delivering delivery's own cursor row
+  recorded a bare exhaustion. The old fence treated that exhaustion as final,
+  so a parked item whose only blocker was the delivering run's own occupancy
+  never advanced even after the run went terminal and freed the slot — the
+  reason text kept naming the `done` run as an active lane forever (the live
+  `qs_c1a6bb4c9c845674` / #276 / `run-3a6b16d09a297839` shape, and
+  `qs_1145c6357c3c7bae` / #277 before it). Now the completion reconciliation
+  re-opens the exhausted row, re-evaluates the repository's parked candidate
+  in the same transaction that frees the slot, and the same row records which
+  delivery consumed it. Every prior guarantee holds unchanged: a run that
+  stays live after the delivery (its tail still owed, #152) still holds the
+  slot and the item still waits; a `next_instance_id` dispatch stays final;
+  and a later delivery of the SAME delivering run is still spent — only the
+  completion reconciliation itself may spend the re-opened row.
+
 ### Fixed (issue #321 — a whole-head census check earns no review round and no bounded retry)
 
 - A review check now declares the SCOPE it observed (`diff`, the default, or

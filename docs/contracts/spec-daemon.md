@@ -1254,7 +1254,15 @@ clears a repository/fleet-level hold or bypasses a gate.
   refuses it but this delivery's ONE advance was already spent — so no item
   ever keeps a stale reason. A submission that committed no `armed` supervision
   authorization is never admitted (`refusal.queue.supervision_unarmed`): the
-  run would be inert (issue #261).
+  run would be inert (issue #261). The same re-evaluation also fires at the
+  delivering run's COMPLETION: the queue spine keeps its merge and cleanup
+  after the reviewed-evidence delivery (issue #152), so a delivery whose
+  recognition wrote a bare exhaustion recorded it while the run still held
+  its counted slot; when the run's last committed step lands, the
+  reconciliation that completes it and frees the slot re-opens that exhausted
+  row and advances the repository's parked candidate in the same transaction —
+  the run's terminal state frees the cap, and a slot freed by it is never
+  foreclosed by a cursor move written while the run was still live.
 
 ## Responses: `hf-rpc-response/v1`
 
