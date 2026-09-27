@@ -569,6 +569,17 @@ before it is remembered and returned:
   is never a delivery (no cursor row is written), a failed verdict hides any
   older pass, a non-current evidence row refuses the planned advance, and an
   unapproved plan is never a delivery.
+## Retry-charge attribution (issue #321)
+
+- **Column (m0015/schema v15, purely additive)**: `run_retries.cause` — the
+  recorded failure each bounded retry charge exists for, written WITH the row
+  (the step's own newest diagnosis `diagnosed:<code>`, and/or the engine's
+  own refusal of the newest review evidence `consumer-refused: <message>`,
+  whose non-passing checks name their scope). Bounded at the recording site;
+  `''` on every row written before the migration, so a legacy charge reads as
+  a legacy charge instead of a defaulted fact. Consumption never rewrites a
+  row's cause: a held authorization the operator minted keeps the cause it
+  was minted with. No existing table or row is touched.
 ## Fixture map
 
 Accept: `migration.valid.json` (0→1, checksummed), `audit.valid.jsonl`

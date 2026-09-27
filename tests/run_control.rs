@@ -907,11 +907,13 @@ fn state_bounded_retry_is_single_use_and_bounded() {
     );
 
     // First authorization: bounded, single use.
-    let first = state.record_run_retry(&run, "p1", AT).expect("authorized");
+    let first = state
+        .record_run_retry(&run, "p1", AT, "diagnosed:failed")
+        .expect("authorized");
     assert_eq!(first.attempt, 1);
     assert!(first.consumed_at.is_empty());
     let err = state
-        .record_run_retry(&run, "p1", AT)
+        .record_run_retry(&run, "p1", AT, "diagnosed:failed")
         .expect_err("an unconsumed authorization refuses a duplicate");
     assert_eq!(err.code, "refusal.run.retry_pending");
     assert_eq!(
@@ -931,7 +933,7 @@ fn state_bounded_retry_is_single_use_and_bounded() {
     // Bounded: three authorizations total, each consumed by one dispatch.
     for attempt in 2..=3 {
         let row = state
-            .record_run_retry(&run, "p1", AT)
+            .record_run_retry(&run, "p1", AT, "diagnosed:failed")
             .unwrap_or_else(|err| panic!("attempt {attempt}: {}", err.message));
         assert_eq!(row.attempt, attempt);
         assert!(matches!(
@@ -942,7 +944,7 @@ fn state_bounded_retry_is_single_use_and_bounded() {
         ));
     }
     let err = state
-        .record_run_retry(&run, "p1", AT)
+        .record_run_retry(&run, "p1", AT, "diagnosed:failed")
         .expect_err("the bound refuses a fourth retry");
     assert_eq!(err.code, "refusal.run.retry_bound");
     assert_eq!(state.run_retries(&run).unwrap().len(), 3);
@@ -2017,7 +2019,7 @@ fn state_retry_exhausted_run_frees_the_capacity_it_held() {
             Some("failed"),
         );
         let retry = state
-            .record_run_retry(&victim, "p1", AT)
+            .record_run_retry(&victim, "p1", AT, "diagnosed:failed")
             .unwrap_or_else(|err| panic!("attempt {attempt}: {}", err.message));
         assert!(matches!(
             state
@@ -2057,7 +2059,7 @@ fn state_retry_exhausted_run_frees_the_capacity_it_held() {
         Some("failed"),
     );
     let third = state
-        .record_run_retry(&victim, "p1", AT)
+        .record_run_retry(&victim, "p1", AT, "diagnosed:failed")
         .expect("the third authorization");
     assert!(matches!(
         state
@@ -2067,7 +2069,7 @@ fn state_retry_exhausted_run_frees_the_capacity_it_held() {
     ));
     spent.push(third.retry_id.clone());
     let err = state
-        .record_run_retry(&victim, "p1", AT)
+        .record_run_retry(&victim, "p1", AT, "diagnosed:failed")
         .expect_err("the budget is spent");
     assert_eq!(err.code, "refusal.run.retry_bound");
     assert_eq!(
@@ -2223,7 +2225,7 @@ fn state_release_refuses_while_an_unconsumed_authorization_exists() {
         Some("failed"),
     );
     let retry = state
-        .record_run_retry(&run, "p1", AT)
+        .record_run_retry(&run, "p1", AT, "diagnosed:failed")
         .expect("authorization recorded");
     assert!(retry.consumed_at.is_empty());
 
@@ -4431,7 +4433,7 @@ fn the_audited_operator_measurement_produces_the_proof_a_parked_run_needs() {
     );
     for consumed in ["250-spent-1", "250-spent-2", "250-spent-3"] {
         state
-            .record_run_retry(&plain, "p6", AT)
+            .record_run_retry(&plain, "p6", AT, "diagnosed:failed")
             .expect("bounded retry authorization");
         state
             .claim_run_retry(&plain, "p6", &idem_key(consumed), AT)
@@ -4525,7 +4527,7 @@ fn the_audited_operator_measurement_produces_the_proof_a_parked_run_needs() {
         canter::mutation::code::WORKER_TIMEOUT,
     );
     state
-        .record_run_retry(&unmeasurable, "p6", AT)
+        .record_run_retry(&unmeasurable, "p6", AT, "diagnosed:failed")
         .expect("first bounded retry");
     // A HELD authorization is itself the applicable control: minting another
     // refuses, and the ONE re-dispatch consumes it.
@@ -4592,13 +4594,13 @@ fn the_audited_operator_measurement_produces_the_proof_a_parked_run_needs() {
     // Spend the rest of the bound: each authorization is CONSUMED by the ONE
     // re-dispatch it authorizes before the next can be minted.
     state
-        .record_run_retry(&unmeasurable, "p6", AT)
+        .record_run_retry(&unmeasurable, "p6", AT, "diagnosed:failed")
         .expect("second bounded retry");
     state
         .claim_run_retry(&unmeasurable, "p6", &idem_key("250-consumed-2"), AT)
         .expect("consume the second authorization");
     state
-        .record_run_retry(&unmeasurable, "p6", AT)
+        .record_run_retry(&unmeasurable, "p6", AT, "diagnosed:failed")
         .expect("third bounded retry");
     state
         .claim_run_retry(&unmeasurable, "p6", &idem_key("250-consumed-3"), AT)
@@ -4855,7 +4857,7 @@ fn a_fix_round_whose_lane_checkout_is_gone_is_redispatched_by_the_engine_itself(
     let held = f
         .fixture
         .seed()
-        .record_run_retry(&f.run, "p6", AT)
+        .record_run_retry(&f.run, "p6", AT, "diagnosed:failed")
         .expect("the held authorization");
     println!(
         "HELD {} step={} authorized_at={} consumed_at={:?}",

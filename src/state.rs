@@ -30,7 +30,7 @@ use crate::time;
 use crate::value::{Val, bool_, integer, null, object, string};
 
 /// The schema version this binary understands (also `PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 14;
+pub const SCHEMA_VERSION: i64 = 15;
 
 /// Bounded-retention defaults (rows kept besides the chain genesis).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,6 +200,14 @@ pub struct RunRetryRow {
     pub consumed_at: String,
     /// The idempotency key of the dispatch that consumed it ('' otherwise).
     pub consumed_key: String,
+    /// WHICH recorded failure this charge exists for (issue #321), recorded
+    /// when the row is written: the step's own newest diagnosis
+    /// (`diagnosed:<code>`) and/or the engine's own refusal of the run's
+    /// newest review evidence (`consumer-refused: <the engine's message>`),
+    /// bounded. Empty on rows written before the column existed, so a reader
+    /// can tell a charge with a recorded cause from a legacy one instead of
+    /// reading a defaulted fact.
+    pub cause: String,
 }
 
 /// The outcome of checking one step dispatch against the bounded-retry
@@ -2269,6 +2277,10 @@ impl State {
             run_m0014(&mut conn)?;
             user_version = M0014_APPLIES_TO;
         }
+        if user_version == M0015_APPLIES_FROM {
+            run_m0015(&mut conn)?;
+            user_version = M0015_APPLIES_TO;
+        }
         match user_version {
             v if v == SCHEMA_VERSION => {
                 for (migration_id, _, _) in MIGRATIONS {
@@ -4228,7 +4240,7 @@ impl State {
         let mut statement = conn
             .prepare(
                 "SELECT retry_id, instance_id, step_id, attempt, authorized_at,
-                        consumed_at, consumed_key
+                        consumed_at, consumed_key, cause
                    FROM run_retries WHERE instance_id = ?1
                   ORDER BY step_id, attempt",
             )
@@ -4243,6 +4255,7 @@ impl State {
                     authorized_at: row.get(4)?,
                     consumed_at: row.get(5)?,
                     consumed_key: row.get(6)?,
+                    cause: row.get(7)?,
                 })
             })
             .map_err(|err| StateError::from_sqlite("run_retries: query", err))?;
@@ -4258,14 +4271,16 @@ impl State {
     /// the deterministic retry id derives from (run, step, attempt), and
     /// the bound is enforced here (row count); a still-unconsumed
     /// authorization for the same step refuses a second one (no duplicate
-    /// effect).
+    /// effect). `cause` is the recorded failure the charge exists for (issue
+    /// #321) — never a default: the caller names the fact it read.
     pub fn record_run_retry(
         &self,
         instance_id: &str,
         step_id: &str,
         at: &str,
+        cause: &str,
     ) -> Result<RunRetryRow, StateError> {
-        self.record_run_retry_inner(instance_id, step_id, at, "")
+        self.record_run_retry_inner(instance_id, step_id, at, "", cause)
     }
 
     /// Reserve and consume the run's bounded retry in one write, under the
@@ -4276,29 +4291,32 @@ impl State {
     /// authorized, recorded with that dispatch's idempotency key — the row is
     /// single use, so a second attempt still needs its own authorization. With
     /// no authorization held, supervision mints its own in the same write (the
-    /// bounded automatic retry, issue #179).
+    /// bounded automatic retry, issue #179); `cause` names the recorded
+    /// failure that charge exists for (issue #321), kept only on a row this
+    /// call mints — a held authorization keeps the cause it was minted with.
     pub(crate) fn consume_supervised_retry(
         &self,
         instance_id: &str,
         step_id: &str,
         at: &str,
         claim_key: &str,
+        cause: &str,
     ) -> Result<RunRetryRow, StateError> {
         self.ensure_writable()?;
-        let pending: Option<(String, i64, String)> = {
+        let pending: Option<(String, i64, String, String)> = {
             let conn = self.lock("consume_supervised_retry")?;
             conn.query_row(
-                "SELECT retry_id, attempt, authorized_at FROM run_retries
+                "SELECT retry_id, attempt, authorized_at, cause FROM run_retries
                   WHERE instance_id = ?1 AND step_id = ?2 AND consumed_at = ''
                   ORDER BY attempt LIMIT 1",
                 params![instance_id, step_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(|err| StateError::from_sqlite("consume_supervised_retry: pending", err))?
         };
-        let Some((retry_id, attempt, authorized_at)) = pending else {
-            return self.record_run_retry_inner(instance_id, step_id, at, claim_key);
+        let Some((retry_id, attempt, authorized_at, held_cause)) = pending else {
+            return self.record_run_retry_inner(instance_id, step_id, at, claim_key, cause);
         };
         let consumed = {
             let conn = self.lock("consume_supervised_retry")?;
@@ -4328,6 +4346,10 @@ impl State {
             authorized_at,
             consumed_at: at.to_string(),
             consumed_key: claim_key.to_string(),
+            // The cause the row was minted with, read beside the consumption
+            // (issue #321): a held authorization the operator minted keeps ITS
+            // cause, never the consuming dispatch's.
+            cause: held_cause,
         })
     }
 
@@ -4337,6 +4359,7 @@ impl State {
         step_id: &str,
         at: &str,
         claim_key: &str,
+        cause: &str,
     ) -> Result<RunRetryRow, StateError> {
         self.ensure_writable()?;
         let conn = self.lock("record_run_retry")?;
@@ -4377,8 +4400,8 @@ impl State {
         let retry_id = crate::run_control::retry_id(instance_id, step_id, attempt);
         conn.execute(
             "INSERT INTO run_retries (retry_id, instance_id, step_id, attempt, authorized_at,
-                    consumed_at, consumed_key)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    consumed_at, consumed_key, cause)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 retry_id,
                 instance_id,
@@ -4386,7 +4409,8 @@ impl State {
                 attempt,
                 at,
                 if claim_key.is_empty() { "" } else { at },
-                claim_key
+                claim_key,
+                cause
             ],
         )
         .map_err(|err| StateError::from_sqlite("record_run_retry: insert", err))?;
@@ -4398,6 +4422,7 @@ impl State {
             authorized_at: at.to_string(),
             consumed_at: if claim_key.is_empty() { "" } else { at }.to_string(),
             consumed_key: claim_key.to_string(),
+            cause: cause.to_string(),
         })
     }
 
@@ -12050,9 +12075,22 @@ const M0014_ID: &str = "m0014_queue_advance_continuations_v14";
 const M0014_APPLIES_FROM: i64 = 13;
 const M0014_APPLIES_TO: i64 = 14;
 
+/// Migration m0015 (issue #321: attributable retry charges). Purely additive:
+/// one `cause` column on `run_retries` — the recorded failure each bounded
+/// retry charge exists for, written with the row (the step's own newest
+/// diagnosis and/or the engine's own refusal of the run's newest review
+/// evidence, whose non-passing checks name their scope). It is `''` on rows
+/// written before the column existed, so a legacy charge is readable as a
+/// legacy charge rather than as a defaulted fact. No existing table or row is
+/// touched, so stored grants, instances, lane records, queue submissions,
+/// supervisions and prior retry authorizations are never reinterpreted.
+const M0015_ID: &str = "m0015_retry_causes_v15";
+const M0015_APPLIES_FROM: i64 = 14;
+const M0015_APPLIES_TO: i64 = 15;
+
 /// Ordered migration chain (id, applies_from, applies_to). The runner in
 /// [`State::open`] applies every pending migration before serving.
-const MIGRATIONS: [(&str, i64, i64); 14] = [
+const MIGRATIONS: [(&str, i64, i64); 15] = [
     (M0001_ID, M0001_APPLIES_FROM, M0001_APPLIES_TO),
     (M0002_ID, M0002_APPLIES_FROM, M0002_APPLIES_TO),
     (M0003_ID, M0003_APPLIES_FROM, M0003_APPLIES_TO),
@@ -12067,16 +12105,17 @@ const MIGRATIONS: [(&str, i64, i64); 14] = [
     (M0012_ID, M0012_APPLIES_FROM, M0012_APPLIES_TO),
     (M0013_ID, M0013_APPLIES_FROM, M0013_APPLIES_TO),
     (M0014_ID, M0014_APPLIES_FROM, M0014_APPLIES_TO),
+    (M0015_ID, M0015_APPLIES_FROM, M0015_APPLIES_TO),
 ];
 
-/// Ordered migration-chain identifiers (`m0001`..`m0014`), exposed for the
+/// Ordered migration-chain identifiers (`m0001`..`m0015`), exposed for the
 /// release provenance chain (issue #10): `canter --version` prints
 /// them so a release archive's provenance record can bind the exact
 /// state-schema migration chain of the binary it ships.
 pub fn migration_chain_ids() -> &'static [&'static str] {
     const IDS: [&str; MIGRATIONS.len()] = [
         M0001_ID, M0002_ID, M0003_ID, M0004_ID, M0005_ID, M0006_ID, M0007_ID, M0008_ID, M0009_ID,
-        M0010_ID, M0011_ID, M0012_ID, M0013_ID, M0014_ID,
+        M0010_ID, M0011_ID, M0012_ID, M0013_ID, M0014_ID, M0015_ID,
     ];
     &IDS
 }
@@ -13936,6 +13975,7 @@ fn retry_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRetryRow> {
         authorized_at: row.get(4)?,
         consumed_at: row.get(5)?,
         consumed_key: row.get(6)?,
+        cause: row.get(7)?,
     })
 }
 
@@ -15754,7 +15794,7 @@ impl State {
         let mut statement = conn
             .prepare(
                 "SELECT retry_id, instance_id, step_id, attempt, authorized_at, consumed_at,
-                        consumed_key
+                        consumed_key, cause
                    FROM run_retries WHERE instance_id = ?1 ORDER BY step_id, attempt",
             )
             .map_err(|err| StateError::from_sqlite("supervision_evidence: retries", err))?;
@@ -16660,6 +16700,43 @@ fn run_m0014(conn: &mut Connection) -> Result<(), StateError> {
 /// migration).
 const M0014_SQL: &str = "\
 ALTER TABLE queue_advances ADD COLUMN next_submission_id TEXT;
+";
+
+/// Run the m0015 migration (issue #321): the retry-charge cause column.
+fn run_m0015(conn: &mut Connection) -> Result<(), StateError> {
+    let tx = conn
+        .transaction()
+        .map_err(|err| StateError::from_sqlite("migrate m0015: begin", err))?;
+    let checksum = sha256_hex(M0015_SQL.as_bytes());
+    tx.execute_batch(M0015_SQL)
+        .map_err(|err| StateError::from_sqlite("migrate m0015", err))?;
+    tx.execute(
+        "INSERT INTO schema_migrations (migration_id, applies_from, applies_to, checksum, applied_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            M0015_ID,
+            M0015_APPLIES_FROM,
+            M0015_APPLIES_TO,
+            checksum,
+            time::rfc3339_now()
+        ],
+    )
+    .map_err(|err| StateError::from_sqlite("migrate m0015: bookkeeping", err))?;
+    tx.pragma_update(None, "user_version", M0015_APPLIES_TO)
+        .map_err(|err| StateError::from_sqlite("migrate m0015: user_version", err))?;
+    tx.commit()
+        .map_err(|err| StateError::from_sqlite("migrate m0015: commit", err))?;
+    Ok(())
+}
+
+/// The retry-charge cause column added by m0015 (issue #321), purely
+/// additive: one retry row = one bounded re-dispatch, and `cause` names the
+/// recorded failure that charge exists for (the step's own newest diagnosis
+/// and/or the engine's own refusal of the run's newest review evidence,
+/// whose non-passing checks name their scope). `''` on every row written
+/// before this migration — a legacy charge is readable as a legacy charge.
+const M0015_SQL: &str = "\
+ALTER TABLE run_retries ADD COLUMN cause TEXT NOT NULL DEFAULT '';
 ";
 
 #[cfg(test)]
@@ -18166,12 +18243,12 @@ mod tests {
         assert_eq!(grant.status, "active");
         assert_eq!(grant.state_epoch, 1);
         assert_eq!(state.current_epoch().expect("epoch"), 1);
-        assert_eq!(SCHEMA_VERSION, 14);
+        assert_eq!(SCHEMA_VERSION, 15);
         {
-            let conn = state.lock("test: m0005..m0014 bookkeeping").expect("lock");
+            let conn = state.lock("test: m0005..m0015 bookkeeping").expect("lock");
             for migration_id in [
                 M0005_ID, M0006_ID, M0007_ID, M0008_ID, M0009_ID, M0010_ID, M0011_ID, M0012_ID,
-                M0013_ID, M0014_ID,
+                M0013_ID, M0014_ID, M0015_ID,
             ] {
                 let recorded: i64 = conn
                     .query_row(

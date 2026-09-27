@@ -30,6 +30,15 @@ Normative rules:
 - `checks` is a non-empty list of named checks with closed statuses
   `passed` | `failed` | `pending`. A check with an unknown status is
   refused (`evidence.malformed.json` uses `running`).
+- Every check MAY declare the scope it observed (issue #321): the closed set
+  `diff` | `head`. `diff` is the default when the reviewer declares none —
+  the record keeps the meaning it always had — and `head` declares a census
+  of the WHOLE head the delivery sits on (every hosted check run of the
+  head, the failures whatever else the head carries produced). A scope
+  outside the closed set is refused like any other malformed check. The
+  scope is what makes "a red outside this delivery's diff" readable to the
+  engine instead of prose: a non-passing `head`-scoped check does not, by
+  itself, drive a review round (see "The check scope", below).
 - A `pass` verdict is only meaningful while every binding still matches the
   live state: **any relevant change invalidates the evidence**. Relevant =
   feature head moved, integration base advanced/changed, workflow document
@@ -283,6 +292,42 @@ either shape. The step still requires the `review` capability and phase at
 effect time, the reviewer's identity is still checked distinct, and the
 reviewer's dispatch passes the same fan-out admission gate (`harness_start` /
 `prompt` carry it) — the same caps, host-resource proof and overlap fence.
+
+## The check scope: a red outside the delivery's diff never spends the budget (issue #321)
+
+A check may declare the scope it observed (`diff`, the default, or `head` — a
+census of the whole head the delivery sits on). The engine reads it, and the
+rule is the one the measured defect demanded (`run-c4de4f2b91e9f36a`, issue
+#316: a whole-head hosted census whose two failing legs belonged to OTHER
+issues' open defects charged the run's bounded p6 retries through review
+round after review round):
+
+- the consumer refusal and every rendering NAME the scope: a non-passing
+  head-scoped check renders `name=status (scope head)` (a diff-scoped check
+  renders exactly as before), so the refusal, the status reason and the
+  retry-charge cause all say WHAT each failure observed;
+- a non-passing check that censuses the WHOLE head does not, by itself,
+  drive a review round: the driver derives NO `run.reevaluate` for that
+  shape. A recomputation at the same certified head re-reads the same
+  head-wide red — the failure belongs to whatever else the head carries —
+  so the run parks typed (`supervision.blocked_outside_diff`, eligible
+  `false`, detail naming the head-scoped checks and the certified head) with
+  the bounded retries UNSPENT, and only the operator's own `run.reevaluate`
+  reaches it once the head's beyond-diff reds clear;
+- a MIXED failing set (one diff-scoped failure beside head-scoped ones)
+  keeps the recomputation reachable: the run's own red is what the control
+  can act on, and it remains bounded by `RUN_REEVALUATION_MAX` / the shared
+  per-(run, step) budget exactly as before;
+- every bounded retry charge records the failure it exists for (m0015,
+  `run_retries.cause`): the step's own newest diagnosis
+  (`diagnosed:<code>`) and/or the engine's own refusal of the newest review
+  evidence (`consumer-refused: <message>`), so the ledger tells "this run
+  broke" from "this run was blocked by someone else's red".
+
+Nothing is loosened: the tail behind an unverified delivery is still never
+driven, `evidence_checks_passed()` still requires every check `passed`
+(scope included), and a record written before the scope existed reads as
+`diff` throughout.
 
 ## The FAIL handoff: the run's own fix round (issue #238)
 

@@ -1650,6 +1650,7 @@ pub fn retry_doc(
                 ("authorized_at", string(&retry.authorized_at)),
                 ("consumed_at", string(&retry.consumed_at)),
                 ("consumed_key", string(&retry.consumed_key)),
+                ("cause", string(&retry.cause)),
             ]),
         ),
         (

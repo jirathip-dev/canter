@@ -3209,6 +3209,9 @@ fn method_apply_from(shared: &Arc<Shared>, request: &Request, supervised: bool) 
     };
     let grant_id = parsed.grant_id.clone();
     let mut automatic_retry = false;
+    // Issue #321: the recorded failure the charge this dispatch may take
+    // exists for, read from the SAME evidence the eligibility was decided on.
+    let mut automatic_cause = String::new();
     let journaled = {
         let state = match shared.lock_state() {
             Ok(state) => state,
@@ -3263,6 +3266,9 @@ fn method_apply_from(shared: &Arc<Shared>, request: &Request, supervised: bool) 
                         intent.reason == crate::supervision::codes::RECOLLECT
                             && intent.step_id == parsed.step
                     });
+                if automatic_retry {
+                    automatic_cause = crate::supervision::retry_cause(&evidence, &parsed.step);
+                }
                 Ok(driven.is_some_and(|intent| intent.step_id == parsed.step))
             })();
             match eligible {
@@ -3294,6 +3300,7 @@ fn method_apply_from(shared: &Arc<Shared>, request: &Request, supervised: bool) 
                         &parsed.step,
                         &time::rfc3339_now(),
                         &key,
+                        &automatic_cause,
                     )
                 {
                     drop(state);
@@ -5166,7 +5173,28 @@ fn method_run_retry(shared: &Arc<Shared>, request: &Request) -> String {
             }
         }
         let row = state
-            .record_run_retry(&parsed.instance_id, &parsed.step, &time::rfc3339_now())
+            .record_run_retry(
+                &parsed.instance_id,
+                &parsed.step,
+                &time::rfc3339_now(),
+                // The recorded failure this authorization exists for (issue
+                // #321): the run's own recorded facts name it exactly (the
+                // step's newest diagnosis and/or the engine's own refusal of
+                // the newest review evidence). A run whose evidence cannot be
+                // read keeps the diagnosis word alone rather than inventing
+                // one — the authorization is never refused over its cause.
+                &match state.supervision_evidence(&parsed.instance_id) {
+                    Ok(Some(evidence)) => {
+                        let cause = crate::supervision::retry_cause(&evidence, &parsed.step);
+                        if cause.is_empty() {
+                            format!("diagnosed:{}", latest.as_deref().unwrap_or_default())
+                        } else {
+                            cause
+                        }
+                    }
+                    _ => format!("diagnosed:{}", latest.as_deref().unwrap_or_default()),
+                },
+            )
             .map_err(|err| (err.code, err.message))?;
         Ok(crate::run_control::retry_doc(
             &run,

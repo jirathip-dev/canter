@@ -1231,6 +1231,55 @@ pub fn evidence_matches_live(
     Ok(())
 }
 
+/// The scope ONE check of a review-evidence record declares (issue #321): the
+/// closed set [`CHECK_SCOPE_DIFF`] | [`CHECK_SCOPE_HEAD`]. `diff` is the
+/// default when the reviewer declares none — the record keeps the meaning it
+/// always had — and `head` declares a census of the WHOLE head the delivery
+/// sits on (every hosted check run of the head, failures another issue's diff
+/// produced), which a re-review of the same head can never clear.
+pub const CHECK_SCOPE_DIFF: &str = "diff";
+/// The scope of a check that observes the whole head, not this delivery's diff
+/// (issue #321).
+pub const CHECK_SCOPE_HEAD: &str = "head";
+
+/// The scope ONE check entry declares, read from the recorded entry itself:
+/// exactly [`CHECK_SCOPE_HEAD`] when declared, [`CHECK_SCOPE_DIFF`] for every
+/// other shape (absent, or a value the entry never validated). Reading is
+/// deliberately total — the strict validation lives at the recording
+/// boundary ([`review_verdict_facts`]) — so no consumer of a stored record
+/// can panic or drop a check on an unexpected value.
+pub fn check_scope(item: &Val) -> &'static str {
+    match item.get("scope") {
+        Some(Val::Str(scope)) if scope == CHECK_SCOPE_HEAD => CHECK_SCOPE_HEAD,
+        _ => CHECK_SCOPE_DIFF,
+    }
+}
+
+/// The rendering of ONE recorded check that is NOT `passed`, or `None` when it
+/// passed: `name=status`, with the declared scope appended for a check that
+/// censuses the whole head (issue #321), so every refusal message names WHAT
+/// each non-passing check observed — this delivery's own diff (the default,
+/// rendered exactly as it always was) or the whole head beyond it. `name` is
+/// PRESENTATION, never a precondition (fix round F1, finding B1; see
+/// [`non_passing_checks`]).
+fn render_non_passing_check(item: &Val) -> Option<String> {
+    // The status decision comes FIRST and depends on nothing else.
+    let status = match item.get("status") {
+        Some(Val::Str(status)) if status == "passed" => return None,
+        Some(Val::Str(status)) => status.as_str(),
+        _ => "unknown",
+    };
+    let name = item
+        .get("name")
+        .and_then(Val::as_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(UNNAMED_CHECK);
+    Some(match check_scope(item) {
+        CHECK_SCOPE_HEAD => format!("{name}={status} (scope head)"),
+        _ => format!("{name}={status}"),
+    })
+}
+
 /// The named checks of one evidence record that are NOT `passed`, rendered
 /// `name=status` (issue #230): the exact fact the consumer refuses on and the
 /// exact set a re-evaluation recomputes. Order is the recorded order.
@@ -1253,23 +1302,49 @@ pub fn non_passing_checks(evidence: &EvidenceView) -> Result<Vec<String>, Mutati
     let items = checks.as_array().ok_or_else(|| {
         MutationError::new(code::MALFORMED_OUTPUT, "evidence checks is not an array")
     })?;
+    Ok(items.iter().filter_map(render_non_passing_check).collect())
+}
+
+/// The named checks of one evidence record that are NOT `passed` AND are
+/// scoped OUTSIDE this delivery's own diff (`scope: "head"`, issue #321): a
+/// census of the whole head the delivery sits on, whose failures belong to
+/// whatever else the head carries — never a re-review of the same head's own
+/// remedy. Rendered exactly like [`non_passing_checks`] (the scope is in the
+/// rendering), in the recorded order. A record with no head-scoped
+/// non-passing check — every record written before the scope existed —
+/// returns an empty list, so nothing about a legacy record changes.
+pub fn non_passing_checks_outside_diff(
+    evidence: &EvidenceView,
+) -> Result<Vec<String>, MutationError> {
+    let checks = Val::parse_json(&evidence.checks).map_err(|err| {
+        MutationError::new(
+            code::MALFORMED_OUTPUT,
+            format!("evidence checks unparsable: {err}"),
+        )
+    })?;
+    let items = checks.as_array().ok_or_else(|| {
+        MutationError::new(code::MALFORMED_OUTPUT, "evidence checks is not an array")
+    })?;
     Ok(items
         .iter()
-        .filter_map(|item| {
-            // The status decision comes FIRST and depends on nothing else.
-            let status = match item.get("status") {
-                Some(Val::Str(status)) if status == "passed" => return None,
-                Some(Val::Str(status)) => status.as_str(),
-                _ => "unknown",
-            };
-            let name = item
-                .get("name")
-                .and_then(Val::as_str)
-                .filter(|name| !name.is_empty())
-                .unwrap_or(UNNAMED_CHECK);
-            Some(format!("{name}={status}"))
-        })
+        .filter(|item| check_scope(item) == CHECK_SCOPE_HEAD)
+        .filter_map(render_non_passing_check)
         .collect())
+}
+
+/// Whether the record's non-passing checks are ALL outside this delivery's own
+/// diff — at least one exists and every one of them censuses the whole head
+/// (`scope: "head"`, issue #321). This is the ONE recorded shape in which a
+/// recomputation at the same certified head can never clear the refusal (the
+/// failures belong to the head beyond the delivery's diff), so it must not, by
+/// itself, drive a review round; it is derived from the same two renderings
+/// every consumer reads, never from a second reading of the raw text.
+pub fn checks_blocked_outside_diff(evidence: &EvidenceView) -> Result<bool, MutationError> {
+    let outside = non_passing_checks_outside_diff(evidence)?;
+    if outside.is_empty() {
+        return Ok(false);
+    }
+    Ok(non_passing_checks(evidence)?.len() == outside.len())
 }
 
 /// The rendering fallback for a non-passing check that carries no usable name
@@ -5179,8 +5254,13 @@ fn review_brief(inputs: &ReviewEvidenceInputs, leg: &ReviewerLeg, verdict_path: 
          this run's review step consumes, so write it yourself as ONE JSON document to the exact \
          path {:?}: {{\"schema\":\"hf-evidence/v1\",\"feature_head\":\"{}\",\
          \"integration_base\":\"{}\",\"verdict\":\"pass|fail\",\"checks\":[{{\"name\":\"<check>\",\
-         \"status\":\"passed|failed\"}}]}} — every check must carry an explicit passed|failed \
-         status (a pending check can never be consumed), and a verdict that does not name \
+         \"status\":\"passed|failed\",\"scope\":\"diff|head\"}}]}} — every check must carry an explicit passed|failed \
+         status (a pending check can never be consumed), and every check that observes state the \
+         delivery's own diff did not produce — a census of the WHOLE head's hosted check runs, \
+         another issue's failures at the same head — carries an explicit \"scope\":\"head\"; a check \
+         of this delivery's own diff may omit the scope (\"diff\" is the default). A whole-head \
+         check's non-passing status does not by itself drive review rounds and never spends the \
+         run's bounded retries, so scoping it honestly is what the engine reads. A verdict that does not name \
          feature_head {} is refused. Your role is {:?} (registry revision {}); the engine records \
          your verdict verbatim and never fills one in.",
         inputs.feature_head,
@@ -6824,6 +6904,22 @@ fn review_verdict_facts(
                 return Err(refusal(
                     code::VERDICT_MALFORMED,
                     "every check status of the reviewer's verdict must be passed|failed",
+                ));
+            }
+        }
+        // The check's own declaration of what it observed (issue #321): this
+        // delivery's diff (the default when omitted) or the whole head the
+        // delivery sits on. A value outside the closed set is refused rather
+        // than silently read as the default.
+        match item.get("scope") {
+            None => {}
+            Some(Val::Str(scope)) if scope == CHECK_SCOPE_DIFF || scope == CHECK_SCOPE_HEAD => {}
+            Some(_) => {
+                return Err(refusal(
+                    code::VERDICT_MALFORMED,
+                    "a check scope of the reviewer's verdict must be diff|head (the check's own \
+                     declaration of what it observed: this delivery's diff, or the whole head it \
+                     sits on)",
                 ));
             }
         }
@@ -11183,6 +11279,110 @@ mod tests {
             .expect_err("still failing")
             .code,
             code::EVIDENCE_FAILED
+        );
+    }
+
+    /// Issue #321: a check's declared scope is readable and total — `head`
+    /// when declared, `diff` for every other shape (absent, non-string, an
+    /// unknown value) — and the readers SPLIT the non-passing set by it. A
+    /// legacy record (no scope anywhere) renders byte-identically to before,
+    /// so nothing about it changes; a whole-head census names its scope in
+    /// every refusal; the outside-diff set is exactly the head-scoped
+    /// non-passing checks.
+    #[test]
+    fn a_check_declares_its_scope_and_the_readers_split_on_it() {
+        let view_of = |checks: &str| EvidenceView {
+            evidence_id: "ev_0123456789abcdef".to_string(),
+            feature_head: "a".repeat(40),
+            integration_base: "b".repeat(40),
+            workflow_hash: "0".repeat(64),
+            policy_hash: "f".repeat(64),
+            verdict: "pass".to_string(),
+            reviewer: "reviewer-1".to_string(),
+            checks: checks.to_string(),
+            created_at: "2026-09-06T00:00:00Z".to_string(),
+        };
+        let census = "hosted_ci_at_head_census_58_success_2_failure_1_skipped";
+        let head_scoped = view_of(&format!(
+            r#"[{{"name":"{census}","status":"failed","scope":"head"}}]"#
+        ));
+        assert_eq!(
+            non_passing_checks(&head_scoped).expect("failing set"),
+            vec![format!("{census}=failed (scope head)")],
+            "a head-scoped check names its scope in every rendering"
+        );
+        assert_eq!(
+            non_passing_checks_outside_diff(&head_scoped).expect("outside diff"),
+            vec![format!("{census}=failed (scope head)")],
+        );
+        assert!(
+            checks_blocked_outside_diff(&head_scoped).expect("blocked"),
+            "the whole-head-only failing set IS the outside-diff shape"
+        );
+
+        // A MIXED set: the diff-scoped failure is rendered exactly as it
+        // always was, the head-scoped one carries its scope, and only the
+        // head-scoped check is in the outside-diff set.
+        let mixed = view_of(&format!(
+            r#"[{{"name":"local_full_suite_raw_101","status":"failed"}},{{"name":"{census}","status":"failed","scope":"head"}},{{"name":"hosted-ci","status":"passed","scope":"head"}}]"#
+        ));
+        assert_eq!(
+            non_passing_checks(&mixed).expect("failing set"),
+            vec![
+                "local_full_suite_raw_101=failed".to_string(),
+                format!("{census}=failed (scope head)")
+            ],
+            "order is the recorded order; a diff-scoped check renders unchanged"
+        );
+        assert_eq!(
+            non_passing_checks_outside_diff(&mixed).expect("outside diff"),
+            vec![format!("{census}=failed (scope head)")],
+            "a passed head-scoped check is not in the failing set"
+        );
+        assert!(
+            !checks_blocked_outside_diff(&mixed).expect("blocked"),
+            "one diff-scoped failure is not the outside-diff-only shape"
+        );
+
+        // The scope is read TOTALLY: only the declared `head` is head-scoped.
+        for (label, scope_literal) in [
+            ("absent", ""),
+            ("non-string", r#","scope":7"#),
+            ("null", r#","scope":null"#),
+            ("unknown", r#","scope":"running""#),
+        ] {
+            let view = view_of(&format!(
+                r#"[{{"name":"local","status":"failed"{scope_literal}}}]"#
+            ));
+            assert_eq!(
+                non_passing_checks(&view).expect("failing set"),
+                vec!["local=failed".to_string()],
+                "a {label} scope reads as `diff` (rendered as always)"
+            );
+            assert!(
+                non_passing_checks_outside_diff(&view)
+                    .expect("outside diff")
+                    .is_empty(),
+                "a {label} scope is never in the outside-diff set"
+            );
+            assert!(
+                !checks_blocked_outside_diff(&view).expect("blocked"),
+                "a {label} scope never satisfies the outside-diff shape"
+            );
+        }
+        // An all-passing record is never the outside-diff shape.
+        assert!(
+            non_passing_checks_outside_diff(&view_of(
+                r#"[{"name":"hosted-ci","status":"passed","scope":"head"}]"#
+            ))
+            .expect("outside diff")
+            .is_empty()
+        );
+        assert!(
+            !checks_blocked_outside_diff(&view_of(
+                r#"[{"name":"hosted-ci","status":"passed","scope":"head"}]"#
+            ))
+            .expect("blocked")
         );
     }
 
