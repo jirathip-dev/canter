@@ -25,7 +25,7 @@ use canter::lifecycle::ConcurrencyCaps;
 use canter::plan::DOCTRINE_WORKFLOW_ID;
 use canter::queue_executor as qx;
 use canter::queue_preview as qp;
-use canter::state::{QueueSubmissionPlan, Retention, State};
+use canter::state::{QueueSubmissionPlan, QueueSubmissionRow, Retention, State};
 use canter::supervision;
 use canter::value::{Val, integer, object, string};
 
@@ -1334,7 +1334,7 @@ fn a_verified_delivery_advances_the_cursor_once_and_never_twice_across_restart()
     assert_eq!(advances[0].next_instance_id.as_deref(), Some(run6.as_str()));
     assert_eq!(advances[0].reason, None);
     // The rendered submission document reports the committed cursor.
-    let doc = qx::submission_doc(&submission, &after, &advances);
+    let doc = qx::submission_doc(&submission, &after, &advances, &[]);
     let advance = doc.get("advance").expect("advance block");
     assert_eq!(
         advance.get("cursor_ordinal").and_then(Val::as_int),
@@ -1437,6 +1437,463 @@ fn a_verified_delivery_advances_the_cursor_once_and_never_twice_across_restart()
         .expect("read")
         .expect("submission");
     assert_eq!(item_of(&after_restart, 6).status, "admitted");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #324: a parked submission is continued by ANY verified delivery
+// ---------------------------------------------------------------------------
+
+/// The durable `queue.submit` journal row the daemon writes for EVERY
+/// submission (issue #261): the arming authorization a later admission of
+/// this submission reads its dispatch context from. A state-level submit
+/// leaves no such row, so a fixture whose submission parks every item writes
+/// it the same way the daemon does — otherwise nothing could ever arm what
+/// the parked item admits.
+fn journal_queue_submit(state: &State, key: &str, params: &Val) {
+    let request_line = canter::canonical::canonical_text(&object(vec![
+        ("method", string("queue.submit")),
+        ("params", params.clone()),
+    ]));
+    let (claim, _) = state
+        .journal_intent(
+            "mutate.queue.submit",
+            &format!("submission:{key}"),
+            key,
+            &format!("request-{key}"),
+            "queue.submit",
+            None,
+            None,
+            &request_line,
+        )
+        .expect("queue.submit intent");
+    assert!(
+        matches!(claim, canter::state::ClaimAttempt::Claimed),
+        "the submit claim must be fresh: {claim:?}"
+    );
+    let outcome = canter::canonical::canonical_text(&object(vec![("status", string("succeeded"))]));
+    let response =
+        canter::canonical::canonical_text(&object(vec![("ok", canter::value::bool_(true))]));
+    state
+        .resolve_claim(key, "queue.submit", "spent", &outcome, Some(&response))
+        .expect("resolve the submit claim");
+}
+
+/// Submit ONE single-item submission with an explicit recorded clock, so the
+/// continuation's deterministic "oldest submission first" order is a fact of
+/// the fixture. Returns the committed submission and its admitted run (if the
+/// item was admitted at submit time).
+fn submit_single(
+    state: &State,
+    issue: i64,
+    grant_id: &str,
+    caps: ConcurrencyCaps,
+    key: &str,
+    at: &str,
+) -> (QueueSubmissionRow, Option<String>) {
+    let (bound, digest) = render_bound(
+        state,
+        &request_with(vec![selected(&format!("#{issue}"), &[])]),
+    );
+    let params = submit_params_doc(
+        key,
+        &bound,
+        &digest,
+        &[(&format!("#{issue}"), grant_id)],
+        caps,
+        10,
+        60,
+    );
+    journal_queue_submit(state, key, &params);
+    let mut plan = submission_plan(
+        state,
+        key,
+        &bound,
+        &digest,
+        &[(&format!("#{issue}"), grant_id)],
+        caps,
+    );
+    plan.at = at.to_string();
+    let (submission, items) = state.submit_queue_run(&plan).expect("submit");
+    (submission, item_of(&items, issue).instance_id.clone())
+}
+
+/// The submission document a readback renders: the committed rows, this
+/// submission's own consumptions and the continuations that advanced it.
+fn submission_readback(state: &State, submission_id: &str) -> Val {
+    let (row, items) = state
+        .queue_submission_by_id(submission_id)
+        .expect("read")
+        .expect("submission");
+    let advances = state.queue_advance_rows(submission_id).expect("advances");
+    let continuations = state
+        .queue_continuation_rows(submission_id)
+        .expect("continuations");
+    qx::submission_doc(&row, &items, &advances, &continuations)
+}
+
+/// Issue #324. A submission can park EVERY item it selected (the
+/// per-repository slot was genuinely taken at submit time), and such a
+/// submission has no run of its own that could ever verify a delivery — so
+/// before this fix its cursor could never move: the item read `waiting` with
+/// `consumed 0 · dispatched 0` forever, with the cap free and nothing owning
+/// it. The next verified delivery of the SAME repository must re-evaluate it
+/// through its own committed admission inputs, admit it, and record which
+/// delivery consumed it — ONE item per delivery, with every other parked
+/// item's reason re-derived from live rows.
+#[test]
+fn a_verified_delivery_continues_the_repositorys_next_parked_submission() {
+    let fixture = Fixture::new("continuation");
+    let state = fixture.open();
+    seed_grant(&state, "gr_0000000000000007", 7);
+    seed_grant(&state, "gr_0000000000000008", 8);
+    seed_grant(&state, "gr_0000000000000009", 9);
+    // ONE per-repository slot: the later submissions park EVERY item they
+    // selected — exactly the live shape.
+    let caps = ConcurrencyCaps {
+        global: 4,
+        per_repository: 1,
+        per_harness: 4,
+    };
+    let (submission_a, run7) = submit_single(
+        &state,
+        7,
+        "gr_0000000000000007",
+        caps,
+        "ik_324-continuation-a",
+        "2026-01-02T00:00:00Z",
+    );
+    let run7 = run7.expect("issue 7 admitted");
+    let (submission_b, parked_b) = submit_single(
+        &state,
+        8,
+        "gr_0000000000000008",
+        caps,
+        "ik_324-continuation-b",
+        "2026-01-02T00:00:01Z",
+    );
+    assert_eq!(parked_b, None, "issue 8 parks: the only slot is taken");
+    let (submission_c, parked_c) = submit_single(
+        &state,
+        9,
+        "gr_0000000000000009",
+        caps,
+        "ik_324-continuation-c",
+        "2026-01-02T00:00:02Z",
+    );
+    assert_eq!(parked_c, None, "issue 9 parks too");
+    let (_, items_b) = state
+        .queue_submission_by_id(&submission_b.submission_id)
+        .expect("read")
+        .expect("submission b");
+    assert_eq!(item_of(&items_b, 8).status, "waiting");
+    // The holds were recorded at submit time and name the lane #7 held.
+    assert!(
+        item_of(&items_b, 8)
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("widgets#7"),
+        "the submit-time hold names the lane that held the slot"
+    );
+    // RED shape: a parked submission has no consumption at all, and no
+    // delivery of its own is possible — it can never move by itself.
+    assert!(
+        state
+            .queue_advance_rows(&submission_b.submission_id)
+            .expect("advances")
+            .is_empty()
+    );
+    assert!(
+        state
+            .queue_advance_rows(&submission_c.submission_id)
+            .expect("advances")
+            .is_empty()
+    );
+
+    // The delivery of #7's own run: reviewed PASS + every named check passed
+    // at HEAD_A, bound to the run's own pins — the engine records it verified.
+    let evidence_id = record_delivery(&state, &run7, HEAD_A);
+    let delivery = reconcile(&state, &run7, true).expect("a fresh verified delivery");
+    assert_eq!(delivery.submission_id, submission_a.submission_id);
+
+    // GREEN, ONE item per delivery: the delivery continues B (the oldest
+    // parked submission), its item is admitted under B's OWN committed
+    // admission inputs, and the consumption names this delivery.
+    let (_, items_b) = state
+        .queue_submission_by_id(&submission_b.submission_id)
+        .expect("read")
+        .expect("submission b");
+    let continued = item_of(&items_b, 8);
+    assert_eq!(continued.status, "admitted", "the parked item advances");
+    assert_eq!(continued.reason, None, "the cleared hold is gone");
+    let run8 = continued
+        .instance_id
+        .clone()
+        .expect("the continued run exists");
+    let continuations = state
+        .queue_continuation_rows(&submission_b.submission_id)
+        .expect("continuations");
+    assert_eq!(
+        continuations.len(),
+        1,
+        "one consumption, readable from the cursor it advanced"
+    );
+    assert_eq!(
+        continuations[0].submission_id, submission_a.submission_id,
+        "the consuming delivery is named"
+    );
+    assert_eq!(continuations[0].delivered_head, HEAD_A);
+    assert_eq!(continuations[0].evidence_id, evidence_id);
+    assert_eq!(continuations[0].next_ordinal, Some(0));
+    assert_eq!(
+        continuations[0].next_instance_id.as_deref(),
+        Some(run8.as_str())
+    );
+    assert_eq!(continuations[0].reason, None);
+    // The delivering submission's OWN cursor records what its delivery
+    // consumed — the #96 row, naming the continued submission.
+    let advances_a = state
+        .queue_advance_rows(&submission_a.submission_id)
+        .expect("advances");
+    assert_eq!(advances_a.len(), 1);
+    assert_eq!(
+        advances_a[0].next_submission_id.as_deref(),
+        Some(submission_b.submission_id.as_str())
+    );
+    assert_eq!(
+        advances_a[0].next_instance_id.as_deref(),
+        Some(run8.as_str())
+    );
+    // The admitted run is armed with the authorization ITS submission
+    // committed (issue #261): never an inert run.
+    let armed8 = state
+        .supervision_by_id(&run8)
+        .expect("read")
+        .expect("the continued run is supervised");
+    assert_eq!(armed8.desired, "armed");
+    assert_eq!(armed8.authorization_digest, submission_b.digest);
+
+    // C stayed parked — and its reason is LIVE: the hold names the lane that
+    // holds the slot NOW (#8), never the submit-time occupant (#7).
+    let (_, items_c) = state
+        .queue_submission_by_id(&submission_c.submission_id)
+        .expect("read")
+        .expect("submission c");
+    let still_parked = item_of(&items_c, 9);
+    assert_eq!(still_parked.status, "waiting");
+    assert_eq!(still_parked.instance_id, None);
+    assert_eq!(
+        still_parked.reason.as_deref(),
+        Some("refusal.admission.cap_repository")
+    );
+    let message = still_parked.message.clone().unwrap_or_default();
+    assert!(
+        message.contains("widgets#8"),
+        "the re-derived hold names the current occupant: {message}"
+    );
+    assert!(
+        !message.contains("widgets#7"),
+        "never the recorded submit-time occupant: {message}"
+    );
+    assert!(
+        state
+            .queue_advance_rows(&submission_c.submission_id)
+            .expect("c advances")
+            .is_empty(),
+        "one delivery advances at most one item"
+    );
+
+    // No SECOND delivery beyond the one that finds the item eligible is
+    // required: the next verified delivery (of B's own run) continues C, so
+    // the queue keeps moving with no operator key.
+    record_delivery(&state, &run8, HEAD_A);
+    let delivery8 = reconcile(&state, &run8, true).expect("the next verified delivery");
+    assert_eq!(delivery8.submission_id, submission_b.submission_id);
+    let (_, items_c) = state
+        .queue_submission_by_id(&submission_c.submission_id)
+        .expect("read")
+        .expect("submission c");
+    let continued_c = item_of(&items_c, 9);
+    assert_eq!(
+        continued_c.status, "admitted",
+        "the next parked item advances on the next delivery"
+    );
+    let run9 = continued_c
+        .instance_id
+        .clone()
+        .expect("the continued run exists");
+    let continuations_c = state
+        .queue_continuation_rows(&submission_c.submission_id)
+        .expect("c continuations");
+    assert_eq!(continuations_c.len(), 1);
+    assert_eq!(
+        continuations_c[0].submission_id, submission_b.submission_id,
+        "B's delivery consumed C's cursor"
+    );
+    assert_eq!(
+        continuations_c[0].next_instance_id.as_deref(),
+        Some(run9.as_str())
+    );
+    assert_eq!(
+        state.list_instances().expect("instances").len(),
+        3,
+        "one run per item, no duplicate owner"
+    );
+
+    // The readback the operator sees: the item admitted AND the admission's
+    // own record — which delivery advanced it, and what it dispatched.
+    let doc = submission_readback(&state, &submission_c.submission_id);
+    let advance = doc.get("advance").expect("advance block");
+    assert_eq!(advance.get("consumed").and_then(Val::as_int), Some(1));
+    assert_eq!(advance.get("dispatched").and_then(Val::as_int), Some(1));
+    assert!(matches!(advance.get("held"), Some(Val::Null)));
+    let rows = match advance.get("rows") {
+        Some(Val::Arr(rows)) => rows.clone(),
+        other => panic!("advance.rows must be an array: {other:?}"),
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("delivered_submission_id").and_then(Val::as_str),
+        Some(submission_b.submission_id.as_str())
+    );
+    assert_eq!(
+        rows[0].get("next_instance_id").and_then(Val::as_str),
+        Some(run9.as_str())
+    );
+
+    // RESTART: the continuation is durable, not an in-memory effect.
+    drop(state);
+    let restarted = fixture.open();
+    let (_, items_c) = restarted
+        .queue_submission_by_id(&submission_c.submission_id)
+        .expect("read")
+        .expect("submission c");
+    assert_eq!(item_of(&items_c, 9).status, "admitted");
+    assert_eq!(
+        restarted
+            .queue_continuation_rows(&submission_c.submission_id)
+            .expect("continuations")
+            .len(),
+        1
+    );
+}
+
+/// Issue #324 + #261. The continuation ADMITS runs, so it must arm what it
+/// admits: a submission that committed no `armed` authorization is never
+/// admitted by a delivery, and the item names exactly that hold.
+#[test]
+fn a_continuation_never_admits_a_run_nothing_can_drive() {
+    let fixture = Fixture::new("continuation-unarmed");
+    let state = fixture.open();
+    seed_grant(&state, "gr_0000000000000007", 7);
+    seed_grant(&state, "gr_0000000000000008", 8);
+    let caps = ConcurrencyCaps {
+        global: 4,
+        per_repository: 1,
+        per_harness: 4,
+    };
+    let (_, run7) = submit_single(
+        &state,
+        7,
+        "gr_0000000000000007",
+        caps,
+        "ik_324-unarmed-delivery-a",
+        "2026-01-02T00:00:00Z",
+    );
+    let run7 = run7.expect("issue 7 admitted");
+    // The parked submission committed NO supervision authorization.
+    let (bound, digest) = render_bound(&state, &request_with(vec![selected("#8", &[])]));
+    let mut params = submit_params_doc(
+        "ik_324-unarmed-parked-b",
+        &bound,
+        &digest,
+        &[("#8", "gr_0000000000000008")],
+        caps,
+        10,
+        60,
+    );
+    match &mut params {
+        Val::Obj(map) => {
+            map.remove("supervision");
+        }
+        other => panic!("params must be an object: {other:?}"),
+    }
+    // The daemon journals every `queue.submit` request line: this one carries
+    // no authorization block at all, which is the durable fact the
+    // continuation refuses to admit against.
+    journal_queue_submit(&state, "ik_324-unarmed-parked-b", &params);
+    let material = qx::parse_params(&params).expect("params parse");
+    let revalidated = qx::revalidate(&state, &material).expect("revalidate");
+    let plan = QueueSubmissionPlan {
+        submission_id: qx::submission_id(&material.digest, &material.idempotency_key),
+        repository: revalidated.request.repository.clone(),
+        state_epoch: material.epoch,
+        digest: material.digest.clone(),
+        role_key: revalidated.request.harness_key.clone(),
+        role_revision: material.role_revision.clone(),
+        workflow_id: revalidated.request.workflow_id.clone(),
+        workflow_hash: revalidated.request.workflow_hash.clone(),
+        boundary_phase: revalidated.request.boundary.phase.clone(),
+        integration_branch: revalidated.request.boundary.integration_branch.clone(),
+        completion_branch: revalidated.request.boundary.completion_branch.clone(),
+        boundary_caps: revalidated.request.boundary.caps.clone(),
+        request_line: canter::canonical::canonical_text(
+            &revalidated
+                .preview
+                .doc
+                .get("request")
+                .cloned()
+                .unwrap_or_else(|| material.preview.clone()),
+        ),
+        admission_caps: material.caps,
+        harness_lanes: material.harness_lanes,
+        supervision: None,
+        items: revalidated
+            .items
+            .iter()
+            .enumerate()
+            .map(|(ordinal, item)| canter::state::QueueSubmissionItemPlan {
+                ordinal: ordinal as i64,
+                work_item: item.work_item.clone(),
+                issue_number: item.issue_number,
+                issue_revision: item.revision.clone(),
+                grant_id: item.grant_id.clone(),
+                resume_digest: item.resume_digest.clone(),
+                verdict: item.verdict.clone(),
+            })
+            .collect(),
+        at: "2026-01-02T00:00:01Z".to_string(),
+    };
+    let (submission_b, items_b) = state.submit_queue_run(&plan).expect("submit");
+    assert_eq!(item_of(&items_b, 8).status, "waiting");
+
+    record_delivery(&state, &run7, HEAD_A);
+    reconcile(&state, &run7, true).expect("a fresh verified delivery");
+
+    let (_, after) = state
+        .queue_submission_by_id(&submission_b.submission_id)
+        .expect("read")
+        .expect("submission b");
+    let parked = item_of(&after, 8);
+    assert_eq!(
+        parked.status, "waiting",
+        "a submission that committed no authorization is never admitted"
+    );
+    assert_eq!(parked.instance_id, None);
+    assert_eq!(
+        parked.reason.as_deref(),
+        Some("refusal.queue.supervision_unarmed")
+    );
+    assert!(
+        parked
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("supervise arm"),
+        "the re-derived hold names the remedy: {:?}",
+        parked.message
+    );
+    assert_eq!(state.list_instances().expect("instances").len(), 1);
 }
 
 // ---------------------------------------------------------------------------

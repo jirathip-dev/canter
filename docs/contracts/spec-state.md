@@ -540,6 +540,31 @@ before it is remembered and returned:
   with the reason recorded and is never dispatched or marked done. A
   recorded hold is re-evaluated on later reconciliations and settled in
   place once a dispatch supersedes it.
+- **Continuation across submissions (issue #324; column m0014/schema v14)**:
+  a delivery whose OWN committed submission carries nothing left to dispatch
+  continues the repository's next parked submission instead of recording a
+  bare exhaustion — every committed submission of the SAME repository that
+  still parks an item is re-evaluated through its OWN committed admission
+  inputs (the SAME guard-verifying helper the submission, the advance and the
+  re-drive use), oldest submission first (`created_at`, then `submission_id`),
+  first `waiting` item in membership order, and the FIRST item whose refusal
+  reason has cleared is admitted. AT MOST ONE item advances per delivery: the
+  delivering delivery's row gains `next_submission_id` (the submission whose
+  cursor the dispatch advanced; `NULL` on every pre-#324 row and whenever the
+  dispatch stayed inside the delivering submission's own membership), and the
+  continued submission reads that same row as one of its own consumptions
+  (`queue_continuations` in the read; `consumed`/`dispatched` count it,
+  `cursor_ordinal` stays the position of the submission's OWN consumed
+  deliveries). No second delivery is required beyond the one that finds the
+  item eligible. Every other parked candidate carries the reason its own live
+  derivation produces on every delivery reconciliation — the hold that still
+  applies, or `queue.continuation_pending` when nothing refuses it but the
+  delivery's ONE advance was already spent — so no item keeps a stale reason.
+  A submission that committed no `armed` supervision authorization is never
+  admitted (`refusal.queue.supervision_unarmed`): the run would be inert
+  (issue #261). The winning admission flips the item (`admitted`, run bound),
+  settles any recorded hold that named it and arms the new run with the
+  authorization its OWN submission committed.
 - **Refusals do not advance**: a paused/invalidated/blocked/human-queued run
   is never a delivery (no cursor row is written), a failed verdict hides any
   older pass, a non-current evidence row refuses the planned advance, and an

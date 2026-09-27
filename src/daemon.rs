@@ -4684,7 +4684,11 @@ fn method_queue_submit(shared: &Arc<Shared>, request: &Request) -> String {
             let advances = guard
                 .queue_advance_rows(&row.submission_id)
                 .unwrap_or_default();
-            let doc = crate::queue_executor::submission_doc(&row, &items, &advances);
+            let continuations = guard
+                .queue_continuation_rows(&row.submission_id)
+                .unwrap_or_default();
+            let doc =
+                crate::queue_executor::submission_doc(&row, &items, &advances, &continuations);
             resolve_mutation_on(
                 &guard,
                 &shared.log,
@@ -4736,9 +4740,12 @@ fn method_queue_status(shared: &Arc<Shared>, request: &Request) -> String {
                 let advances = state
                     .queue_advance_rows(&row.submission_id)
                     .unwrap_or_default();
+                let continuations = state
+                    .queue_continuation_rows(&row.submission_id)
+                    .unwrap_or_default();
                 ok_response(
                     &request.id,
-                    crate::queue_executor::submission_doc(&row, &items, &advances),
+                    crate::queue_executor::submission_doc(&row, &items, &advances, &continuations),
                 )
             }
             Ok(None) => err_response(
@@ -4797,9 +4804,12 @@ fn method_queue_redrive(shared: &Arc<Shared>, request: &Request) -> String {
             let advances = state
                 .queue_advance_rows(&row.submission_id)
                 .unwrap_or_default();
+            let continuations = state
+                .queue_continuation_rows(&row.submission_id)
+                .unwrap_or_default();
             ok_response(
                 &request.id,
-                crate::queue_executor::submission_doc(&row, &items, &advances),
+                crate::queue_executor::submission_doc(&row, &items, &advances, &continuations),
             )
         }
         Ok(None) => err_response(
@@ -11384,7 +11394,10 @@ fn reconcile_queue_submission(
     let advances = state
         .queue_advance_rows(&row.submission_id)
         .unwrap_or_default();
-    let doc = crate::queue_executor::submission_doc(&row, &items, &advances);
+    let continuations = state
+        .queue_continuation_rows(&row.submission_id)
+        .unwrap_or_default();
+    let doc = crate::queue_executor::submission_doc(&row, &items, &advances, &continuations);
     let mut admitted = 0i64;
     let mut waiting = 0i64;
     let mut refused = 0i64;

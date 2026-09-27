@@ -6,6 +6,41 @@ release process activates (docs/RELEASING.md), then semver applies.
 
 ## [Unreleased]
 
+### Fixed (issue #324 — a cleared waiting item advances: the delivery continues the repository's next parked queue)
+
+- A verified delivery whose OWN committed submission carries nothing left to
+  dispatch now continues the repository's next parked submission instead of
+  recording a bare exhaustion. A submission can park EVERY item it selected
+  (the per-repository slot was genuinely taken at submit time), and such a
+  submission has no run of its own that could ever verify a delivery — so its
+  cursor could never move: the item read `waiting` with `consumed 0 ·
+  dispatched 0` forever, with the cap free and nothing owning it, exactly the
+  live `qs_1145c6357c3c7bae` / `wi_72c774651c565bc8` (issue #277) shape.
+- The continuation goes through the SAME guard-verifying admission helper the
+  submission, the advance and the re-drive use, with the parked submission's
+  OWN committed admission inputs (caps, occupancy attestation, grant, role
+  binding) and its OWN committed `armed` authorization — a submission that
+  committed none is never admitted and names
+  `refusal.queue.supervision_unarmed` (issue #261). Deterministic order:
+  oldest committed submission first (`created_at`, then `submission_id`), its
+  first `waiting` item in membership order.
+- AT MOST ONE item advances per delivery, and the consumption is recorded on
+  the delivering delivery's `queue_advances` row: `next_submission_id` (new
+  nullable column, m0014/schema v14, purely additive) names the submission
+  whose cursor the dispatch advanced, so `queue status --submission` reads the
+  same row from the cursor it advanced — which delivery advanced it, and what
+  it dispatched. No second delivery is required beyond the one that finds the
+  item eligible, and the delivered submission's own row still records the
+  dispatch that stayed inside its membership.
+- No item ever keeps a stale reason: every other parked candidate is
+  re-derived from live rows on every delivery reconciliation — the hold that
+  still applies (naming the CURRENT occupants), or the new stable code
+  `queue.continuation_pending` when nothing refuses it but the delivery's ONE
+  advance was already spent.
+- Test entry point: `tests/queue_advance.rs`
+  (`a_verified_delivery_continues_the_repositorys_next_parked_submission`,
+  `a_continuation_never_admits_a_run_nothing_can_drive`).
+
 ### Fixed (issue #316 — the bump owns its socket inventory and its daemons, and the harness reaps its own)
 
 - The bump's socket-holder invariant is checkable exactly as its heading
