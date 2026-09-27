@@ -70,6 +70,12 @@ pub mod advance {
     /// yet: the dependent stays held — never dispatched and never marked
     /// done from an unmet dependency.
     pub const DEPENDENCY_UNSETTLED: &str = "queue.dependency_unsettled";
+    /// The candidate's refusal reason has cleared — nothing refuses it now —
+    /// but exactly ONE item advances per verified delivery (issue #324), and
+    /// the delivery this read follows advanced another item of the same
+    /// repository first: the item stays parked and the NEXT verified delivery
+    /// admits it. Never a stale reason: this code says the hold is gone.
+    pub const CONTINUATION_PENDING: &str = "queue.continuation_pending";
 }
 
 /// Submission-local stable codes (the `submission.*` namespace). Admission
@@ -1448,20 +1454,29 @@ fn grant_binding_refusal(
 /// queue-cursor state — one row per consumed verified delivery, the cursor,
 /// and the CURRENT hold (if any). A read reports committed rows only; it
 /// never re-derives the cursor or hides a hold.
-pub fn advance_doc(advances: &[QueueAdvanceRow]) -> Val {
+///
+/// Issue #324: `continuations` are the committed consumptions of OTHER
+/// submissions' verified deliveries whose dispatch advanced THIS submission's
+/// cursor (`next_submission_id` points here). They are reported in the SAME
+/// rows — one row per consumed delivery, each naming the delivering
+/// submission — so the admission a delivery performed is readable from the
+/// cursor it advanced. `cursor_ordinal` stays the position of this
+/// submission's OWN consumed deliveries (a continuation consumes another
+/// submission's membership position, not one of this membership's).
+pub fn advance_doc(advances: &[QueueAdvanceRow], continuations: &[QueueAdvanceRow]) -> Val {
     let mut dispatched = 0i64;
     let mut held: Option<&QueueAdvanceRow> = None;
     let mut rows: Vec<Val> = Vec::new();
     let mut cursor = 0i64;
-    for row in advances {
+    for row in advances.iter().chain(continuations.iter()) {
         if row.next_instance_id.is_some() {
             dispatched += 1;
         }
         if row.reason.is_some() {
             held = Some(row);
         }
-        cursor = cursor.max(row.delivered_ordinal);
         rows.push(object(vec![
+            ("delivered_submission_id", string(&row.submission_id)),
             ("delivered_ordinal", integer(row.delivered_ordinal)),
             ("delivered_work_item", string(&row.delivered_work_item)),
             ("delivered_head", string(&row.delivered_head)),
@@ -1485,6 +1500,13 @@ pub fn advance_doc(advances: &[QueueAdvanceRow]) -> Val {
                     .unwrap_or_else(null),
             ),
             (
+                "next_submission_id",
+                row.next_submission_id
+                    .as_deref()
+                    .map(string)
+                    .unwrap_or_else(null),
+            ),
+            (
                 "reason",
                 row.reason.as_deref().map(string).unwrap_or_else(null),
             ),
@@ -1494,6 +1516,9 @@ pub fn advance_doc(advances: &[QueueAdvanceRow]) -> Val {
             ),
             ("at", string(&row.at)),
         ]));
+    }
+    for row in advances {
+        cursor = cursor.max(row.delivered_ordinal);
     }
     let held_doc = match held {
         Some(row) => object(vec![
@@ -1520,13 +1545,17 @@ pub fn advance_doc(advances: &[QueueAdvanceRow]) -> Val {
         ]),
         None => null(),
     };
+    let last_row = advances.last().or_else(|| continuations.last());
     object(vec![
         ("cursor_ordinal", integer(cursor)),
-        ("consumed", integer(advances.len() as i64)),
+        (
+            "consumed",
+            integer(advances.len() as i64 + continuations.len() as i64),
+        ),
         ("dispatched", integer(dispatched)),
         (
             "last",
-            match advances.last() {
+            match last_row {
                 Some(row) => object(vec![
                     ("delivered_ordinal", integer(row.delivered_ordinal)),
                     ("delivered_work_item", string(&row.delivered_work_item)),
@@ -1545,11 +1574,12 @@ pub fn advance_doc(advances: &[QueueAdvanceRow]) -> Val {
 /// submit response, the `queue.status` readback and restart reconciliation,
 /// so all three agree byte for byte (after canonicalization) — they are one
 /// pure projection of the committed rows (items plus the issue #96 advance
-/// rows).
+/// rows and the issue #324 continuation rows).
 pub fn submission_doc(
     row: &QueueSubmissionRow,
     items: &[QueueSubmissionItemRow],
     advances: &[QueueAdvanceRow],
+    continuations: &[QueueAdvanceRow],
 ) -> Val {
     let mut admitted = 0i64;
     let mut waiting = 0i64;
@@ -1669,7 +1699,7 @@ pub fn submission_doc(
             ]),
         ),
         ("items", Val::Arr(items_doc)),
-        ("advance", advance_doc(advances)),
+        ("advance", advance_doc(advances, continuations)),
         ("steps", Val::Arr(steps_doc)),
         ("statement", string(STATEMENT)),
         ("created_at", string(&row.created_at)),

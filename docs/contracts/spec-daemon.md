@@ -1216,6 +1216,31 @@ clears a repository/fleet-level hold or bypasses a gate.
   deliveries settle it and the superseding dispatch is recorded on the older
   delivery row. Nothing else is eligible: only items of that submission, no
   new issue creation, no speculative chain, and no LLM in the loop.
+- **Continuation across submissions (issue #324)**: the acceptance queue
+  commits ONE approved work item per submission, so a submission can park
+  EVERY item it selected (the per-repository slot was genuinely taken at
+  submit time). Such a submission has no run of its own that could ever
+  verify a delivery, so its cursor could never move: the item read `waiting`
+  with `consumed 0 · dispatched 0` forever, with the cap free and nothing
+  owning it. A delivery whose OWN committed submission carries nothing left
+  to dispatch now continues the repository's next parked submission: every
+  committed submission of the SAME repository that still parks an item is
+  re-evaluated through its OWN committed admission inputs — the same
+  guard-verifying admission path, its own approved caps and occupancy
+  attestation — and the FIRST item whose refusal reason has cleared is
+  admitted, oldest submission first (`created_at`, then `submission_id`), its
+  first `waiting` item in membership order. AT MOST ONE item advances per
+  delivery (`next_submission_id` on the delivering delivery's cursor row,
+  m0014, names the submission whose cursor that dispatch advanced; the
+  continued submission reads the same row through
+  `queue status --submission`), and NO second delivery is required beyond the
+  one that finds the item eligible. Every OTHER parked candidate carries the
+  reason its own live derivation produces on every such reconciliation — the
+  hold that still applies, or `queue.continuation_pending` when nothing
+  refuses it but this delivery's ONE advance was already spent — so no item
+  ever keeps a stale reason. A submission that committed no `armed` supervision
+  authorization is never admitted (`refusal.queue.supervision_unarmed`): the
+  run would be inert (issue #261).
 
 ## Responses: `hf-rpc-response/v1`
 

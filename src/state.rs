@@ -30,7 +30,7 @@ use crate::time;
 use crate::value::{Val, bool_, integer, null, object, string};
 
 /// The schema version this binary understands (also `PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// Bounded-retention defaults (rows kept besides the chain genesis).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -727,6 +727,14 @@ pub struct QueueRedriveOutcome {
 /// duplicate event, a replayed check or a crash/restart can never dispatch
 /// twice. The row records the dispatch (`next_*`, `next_instance_id`) or the
 /// recorded hold (`reason`/`message`).
+///
+/// Issue #324: when the delivering submission's own membership carries no
+/// item left to dispatch, the SAME consumption continues the repository's
+/// next parked submission, and `next_submission_id` names the submission
+/// whose cursor that dispatch advanced (`None` = the dispatch stayed inside
+/// this submission's own membership). The consuming delivery is therefore
+/// readable from BOTH cursors: this row, and the continued submission's
+/// continuation read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueueAdvanceRow {
     /// The already-authorized submission whose cursor moved.
@@ -745,6 +753,9 @@ pub struct QueueAdvanceRow {
     pub next_work_item: Option<String>,
     /// The dispatched run when the next item was admitted.
     pub next_instance_id: Option<String>,
+    /// The submission whose cursor the dispatch advanced, when it was NOT
+    /// this submission's own membership (issue #324; `None` = own).
+    pub next_submission_id: Option<String>,
     /// The stable hold code when the next item was held.
     pub reason: Option<String>,
     /// Bounded human message of the hold.
@@ -1175,13 +1186,20 @@ struct QueueAdmissionItem<'a> {
 /// grant's status/epoch/expiry/binding, the fan-out capacity and the declared
 /// scope overlap are re-derived from live rows HERE, before any write, and an
 /// admitted item commits its run row plus its unique ownership row in the
-/// same transaction. Shared by the #85 submission transaction and the #96
-/// verified-delivery advance, so both admit through ONE code path.
+/// same transaction. Shared by the #85 submission transaction, the #96
+/// verified-delivery advance and the #324 continuation sweep, so every
+/// admission goes through ONE code path.
+///
+/// `commit: false` evaluates the SAME decision and writes NOTHING (the
+/// deterministic run id is still returned for an admissible item): the
+/// continuation sweep reads its whole parked candidate set with it before it
+/// admits the ONE item the delivery advances.
 fn admit_queue_item_in_tx(
     tx: &rusqlite::Transaction<'_>,
     ctx: &QueueAdmission<'_>,
     item: &QueueAdmissionItem<'_>,
     slots: &mut FanoutSlots<'_>,
+    commit: bool,
 ) -> Result<AdmissionDecision, StateError> {
     let scope = format!("worktrees/issues/{}", item.issue_number);
     let mut rotation: Option<(String, String)> = None;
@@ -1494,6 +1512,15 @@ fn admit_queue_item_in_tx(
         "run-{}",
         &crate::canonical::sha256_hex(derived.as_bytes())[..16]
     );
+    // Issue #324: a NON-committing evaluation derives the SAME decision the
+    // committing one does, and writes nothing — one admitted item still
+    // consumes its slot on every axis.
+    if !commit {
+        slots.consume();
+        return Ok(AdmissionDecision::Admitted {
+            instance_id: run_id,
+        });
+    }
     tx.execute(
         "INSERT INTO instances (instance_id, repository, state_epoch, status,
                 workflow_id, workflow_hash, policy_hash, grant_id, issue_number,
@@ -2237,6 +2264,10 @@ impl State {
         if user_version == M0013_APPLIES_FROM {
             run_m0013(&mut conn)?;
             user_version = M0013_APPLIES_TO;
+        }
+        if user_version == M0014_APPLIES_FROM {
+            run_m0014(&mut conn)?;
+            user_version = M0014_APPLIES_TO;
         }
         match user_version {
             v if v == SCHEMA_VERSION => {
@@ -4997,6 +5028,19 @@ impl State {
         queue_advance_rows_locked(&conn, submission_id)
     }
 
+    /// Every recorded CONSUMPTION whose dispatch advanced this submission's
+    /// cursor from ANOTHER committed submission's verified delivery (issue
+    /// #324), oldest first — the continuation half of the cursor readback:
+    /// one row per consumed delivery, exactly the row the delivering
+    /// submission's own cursor carries. Read-only.
+    pub fn queue_continuation_rows(
+        &self,
+        submission_id: &str,
+    ) -> Result<Vec<QueueAdvanceRow>, StateError> {
+        let conn = self.lock("queue_continuation_rows")?;
+        queue_continuation_rows_locked(&conn, submission_id)
+    }
+
     /// Commit ONE durable queue submission in a single transaction (issue
     /// #85 AC2/AC3). Every state-derived decision — live ownership, grant
     /// status/expiry, scope overlap, concurrency capacity — is re-verified
@@ -5132,7 +5176,7 @@ impl State {
                         grant_id: item.grant_id.as_deref(),
                         resume_digest: item.resume_digest.as_deref(),
                     };
-                    admit_queue_item_in_tx(&tx, &admission, &candidate, &mut slots)?
+                    admit_queue_item_in_tx(&tx, &admission, &candidate, &mut slots, true)?
                 }
             };
             let (status, reason, message, instance_id) = match decision {
@@ -5540,7 +5584,7 @@ impl State {
                 grant_id: Some(item.grant_id.as_str()).filter(|grant| !grant.is_empty()),
                 resume_digest: None,
             };
-            match admit_queue_item_in_tx(&tx, &admission, &candidate, &mut slots)? {
+            match admit_queue_item_in_tx(&tx, &admission, &candidate, &mut slots, true)? {
                 AdmissionDecision::Admitted { instance_id } => {
                     // Issue #261: the admitted run is armed in the SAME
                     // transaction, with the SAME explicit authorization the
@@ -11999,9 +12043,16 @@ const M0013_ID: &str = "m0013_supervision_retirement_v13";
 const M0013_APPLIES_FROM: i64 = 12;
 const M0013_APPLIES_TO: i64 = 13;
 
+/// Issue #324: the continuation record of one queue-cursor advance — the
+/// delivery of ANOTHER committed submission that admitted this submission's
+/// next parked item.
+const M0014_ID: &str = "m0014_queue_advance_continuations_v14";
+const M0014_APPLIES_FROM: i64 = 13;
+const M0014_APPLIES_TO: i64 = 14;
+
 /// Ordered migration chain (id, applies_from, applies_to). The runner in
 /// [`State::open`] applies every pending migration before serving.
-const MIGRATIONS: [(&str, i64, i64); 13] = [
+const MIGRATIONS: [(&str, i64, i64); 14] = [
     (M0001_ID, M0001_APPLIES_FROM, M0001_APPLIES_TO),
     (M0002_ID, M0002_APPLIES_FROM, M0002_APPLIES_TO),
     (M0003_ID, M0003_APPLIES_FROM, M0003_APPLIES_TO),
@@ -12015,16 +12066,17 @@ const MIGRATIONS: [(&str, i64, i64); 13] = [
     (M0011_ID, M0011_APPLIES_FROM, M0011_APPLIES_TO),
     (M0012_ID, M0012_APPLIES_FROM, M0012_APPLIES_TO),
     (M0013_ID, M0013_APPLIES_FROM, M0013_APPLIES_TO),
+    (M0014_ID, M0014_APPLIES_FROM, M0014_APPLIES_TO),
 ];
 
-/// Ordered migration-chain identifiers (`m0001`..`m0013`), exposed for the
+/// Ordered migration-chain identifiers (`m0001`..`m0014`), exposed for the
 /// release provenance chain (issue #10): `canter --version` prints
 /// them so a release archive's provenance record can bind the exact
 /// state-schema migration chain of the binary it ships.
 pub fn migration_chain_ids() -> &'static [&'static str] {
     const IDS: [&str; MIGRATIONS.len()] = [
         M0001_ID, M0002_ID, M0003_ID, M0004_ID, M0005_ID, M0006_ID, M0007_ID, M0008_ID, M0009_ID,
-        M0010_ID, M0011_ID, M0012_ID, M0013_ID,
+        M0010_ID, M0011_ID, M0012_ID, M0013_ID, M0014_ID,
     ];
     &IDS
 }
@@ -14023,7 +14075,7 @@ fn queue_advance_rows_locked(
         .prepare(
             "SELECT submission_id, delivered_ordinal, delivered_work_item, delivered_head,
                     evidence_id, next_ordinal, next_work_item, next_instance_id, reason,
-                    message, at
+                    message, at, next_submission_id
                FROM queue_advances WHERE submission_id = ?1 ORDER BY delivered_ordinal",
         )
         .map_err(|err| StateError::from_sqlite("queue_advance_rows: prepare", err))?;
@@ -14033,6 +14085,32 @@ fn queue_advance_rows_locked(
     let mut out = Vec::new();
     for row in rows {
         out.push(row.map_err(|err| StateError::from_sqlite("queue_advance_rows: row", err))?);
+    }
+    Ok(out)
+}
+
+/// The recorded CONSUMPTIONS whose dispatch advanced `submission_id`'s cursor
+/// from another committed submission's verified delivery (issue #324), oldest
+/// first: the same `queue_advances` row shape, read from the continued
+/// submission's point of view (`next_submission_id` = this submission).
+fn queue_continuation_rows_locked(
+    conn: &Connection,
+    submission_id: &str,
+) -> Result<Vec<QueueAdvanceRow>, StateError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT submission_id, delivered_ordinal, delivered_work_item, delivered_head,
+                    evidence_id, next_ordinal, next_work_item, next_instance_id, reason,
+                    message, at, next_submission_id
+               FROM queue_advances WHERE next_submission_id = ?1 ORDER BY at, submission_id",
+        )
+        .map_err(|err| StateError::from_sqlite("queue_continuation_rows: prepare", err))?;
+    let rows = statement
+        .query_map(params![submission_id], advance_row_from)
+        .map_err(|err| StateError::from_sqlite("queue_continuation_rows: query", err))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|err| StateError::from_sqlite("queue_continuation_rows: row", err))?);
     }
     Ok(out)
 }
@@ -14051,6 +14129,7 @@ fn advance_row_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueAdvanceRow
         reason: row.get(8)?,
         message: row.get(9)?,
         at: row.get(10)?,
+        next_submission_id: row.get(11)?,
     })
 }
 
@@ -14228,7 +14307,7 @@ fn queue_advance_attempt_locked(
         .query_row(
             "SELECT submission_id, delivered_ordinal, delivered_work_item, delivered_head,
                     evidence_id, next_ordinal, next_work_item, next_instance_id, reason,
-                    message, at
+                    message, at, next_submission_id
                FROM queue_advances WHERE submission_id = ?1 AND delivered_ordinal = ?2",
             params![delivery.submission_id, delivery.item_ordinal],
             advance_row_from,
@@ -14302,6 +14381,363 @@ fn delivery_completes_run(
             .rfind(|(id, _, _, _)| id == step)
             .is_some_and(|(_, status, _, _)| status == "succeeded")
     }))
+}
+
+/// Issue #324: the continuation ONE consumed delivery owes when its own
+/// committed submission carries nothing left to dispatch.
+///
+/// The acceptance queue commits ONE approved work item per submission, so a
+/// submission can park EVERY item it selected (the per-repository slot was
+/// genuinely occupied at submit time). Such a submission has no run of its
+/// own that could ever verify a delivery, so its cursor could never move: the
+/// item read `waiting` forever — with the cap free and no live owner — while
+/// the submission's own statement promised it is admitted later "by the ONE
+/// verified delivery that advances this queue cursor". This is that advance,
+/// read repository-wide: every committed submission of the SAME repository
+/// that still parks an item is re-evaluated through its OWN committed
+/// admission inputs — the SAME guard-verifying helper the submission, the
+/// advance and the re-drive use — and the FIRST item whose refusal reason has
+/// cleared (the cap free, the item unowned, its grant live) is admitted. AT
+/// MOST ONE item advances per delivery, and the delivering delivery's cursor
+/// row records it (`next_submission_id`), so any verified delivery in the
+/// window advances the next eligible approved issue with no operator key.
+///
+/// Deterministic order: committed submissions oldest first (`created_at`,
+/// then `submission_id`), and within a submission its first `waiting` item in
+/// membership order — the same candidate the advance considers inside one
+/// submission. EVERY other parked candidate carries the reason its own live
+/// admission derivation produces — the hold that still applies, or
+/// `queue.continuation_pending` when nothing refuses it but this delivery's
+/// ONE advance was spent — so no item ever keeps a stale reason. A submission
+/// that committed no arming authorization is never admitted: the run would be
+/// inert (issue #261), and the item names exactly that.
+fn advance_repository_continuation_in_tx(
+    state: &State,
+    tx: &rusqlite::Transaction<'_>,
+    repository: &str,
+    delivering_submission: &str,
+    at: &str,
+) -> Result<Option<(String, i64, String, String)>, StateError> {
+    let parked = parked_submissions_locked(tx, repository, delivering_submission)?;
+    // Pass ONE: find the ONE item this delivery advances. Nothing is written
+    // for any candidate yet, so the winning admission below is decided from
+    // exactly the rows every other candidate was read from.
+    let mut chosen: Option<(QueueSubmissionRow, QueueSubmissionItemRow)> = None;
+    for submission in &parked {
+        let Some(candidate) = first_parked_item(tx, submission)? else {
+            continue;
+        };
+        if let ParkedDecision::Admitted { .. } =
+            evaluate_parked_item(state, tx, submission, &candidate, at, false)?
+        {
+            chosen = Some((submission.clone(), candidate));
+            break;
+        }
+    }
+    // Pass TWO: commit the ONE admission the delivery owes.
+    let advanced = match chosen {
+        Some((submission, candidate)) => {
+            commit_parked_admission(state, tx, &submission, &candidate, at)?
+        }
+        None => None,
+    };
+    // Pass THREE: every OTHER parked candidate carries the reason its live
+    // rows produce NOW — after the advance took its slot — so the read can
+    // never show a hold that no longer exists.
+    for submission in &parked {
+        let Some(candidate) = first_parked_item(tx, submission)? else {
+            continue;
+        };
+        if let Some((advanced_submission, advanced_ordinal, _, _)) = &advanced
+            && advanced_submission == &submission.submission_id
+            && *advanced_ordinal == candidate.ordinal
+        {
+            continue;
+        }
+        match evaluate_parked_item(state, tx, submission, &candidate, at, false)? {
+            ParkedDecision::Admitted { .. } => settle_parked_reason_locked(
+                tx,
+                &candidate,
+                crate::queue_executor::advance::CONTINUATION_PENDING,
+                &format!(
+                    "nothing refuses issue {} any more (the cap is free, the item is not owned \
+                     and its grant is live), but exactly ONE item advances per verified delivery \
+                     and this delivery advanced another item of {:?}; the next verified delivery \
+                     admits this one",
+                    candidate.issue_number, submission.repository
+                ),
+            )?,
+            ParkedDecision::Held { code, message } => {
+                settle_parked_reason_locked(tx, &candidate, &code, &message)?;
+            }
+        }
+    }
+    Ok(advanced)
+}
+
+/// Every committed submission of `repository` that still parks at least one
+/// item, oldest first (`created_at`, then `submission_id`) — the
+/// deterministic "next eligible approved issue" order of the continuation.
+fn parked_submissions_locked(
+    tx: &rusqlite::Transaction<'_>,
+    repository: &str,
+    delivering_submission: &str,
+) -> Result<Vec<QueueSubmissionRow>, StateError> {
+    let mut statement = tx
+        .prepare(&format!(
+            "{} WHERE repository = ?1 AND submission_id <> ?2
+               AND EXISTS (SELECT 1 FROM queue_submission_items i
+                            WHERE i.submission_id = queue_submissions.submission_id
+                              AND i.status = 'waiting')
+              ORDER BY created_at, submission_id",
+            queue_submission_select_sql()
+        ))
+        .map_err(|err| StateError::from_sqlite("queue_advance: parked submissions", err))?;
+    let rows = statement
+        .query_map(
+            params![repository, delivering_submission],
+            queue_submission_row_from,
+        )
+        .map_err(|err| StateError::from_sqlite("queue_advance: parked submissions query", err))?;
+    let mut parked = Vec::new();
+    for row in rows {
+        parked.push(row.map_err(|err| {
+            StateError::from_sqlite("queue_advance: parked submissions row", err)
+        })?);
+    }
+    Ok(parked)
+}
+
+/// Commit ONE parked item's admission (the delivery's continuation): the
+/// membership flip, the settlement of any recorded hold that named the item,
+/// and the run's supervision arm — with the authorization the submission
+/// committed, so the admitted run is never inert (issue #261).
+fn commit_parked_admission(
+    state: &State,
+    tx: &rusqlite::Transaction<'_>,
+    submission: &QueueSubmissionRow,
+    candidate: &QueueSubmissionItemRow,
+    at: &str,
+) -> Result<Option<(String, i64, String, String)>, StateError> {
+    let Some((instance_id, arming)) =
+        evaluate_parked_item(state, tx, submission, candidate, at, true)?.into_admitted()
+    else {
+        // The live facts moved between the two evaluations (nothing can write
+        // between them under this guard, so this is a diagnosed no-op):
+        // nothing is invented, the next delivery re-derives it.
+        return Ok(None);
+    };
+    tx.execute(
+        "UPDATE queue_submission_items
+            SET status = 'admitted', reason = NULL, message = NULL, instance_id = ?3
+          WHERE submission_id = ?1 AND ordinal = ?2",
+        params![submission.submission_id, candidate.ordinal, instance_id],
+    )
+    .map_err(|err| StateError::from_sqlite("queue_advance: continuation admit", err))?;
+    // A recorded hold that named THIS item is settled by the dispatch that
+    // superseded it (the same rule the delivering submission's own cursor
+    // applies), so a read can never report a stale hold.
+    tx.execute(
+        "UPDATE queue_advances
+            SET next_instance_id = ?3, reason = NULL, message = NULL, at = ?4
+          WHERE submission_id = ?1 AND next_ordinal = ?2 AND next_instance_id IS NULL",
+        params![submission.submission_id, candidate.ordinal, instance_id, at],
+    )
+    .map_err(|err| StateError::from_sqlite("queue_advance: continuation hold settled", err))?;
+    arm_supervision_in_tx(
+        tx,
+        &instance_id,
+        &arming,
+        &submission.digest,
+        &submission.boundary_phase,
+        submission.state_epoch,
+        at,
+    )?;
+    Ok(Some((
+        submission.submission_id.clone(),
+        candidate.ordinal,
+        candidate.work_item.clone(),
+        instance_id,
+    )))
+}
+
+/// The first parked (`waiting`) item of one committed submission, in
+/// membership order — the candidate the advance and the continuation both
+/// consider.
+fn first_parked_item(
+    tx: &rusqlite::Transaction<'_>,
+    submission: &QueueSubmissionRow,
+) -> Result<Option<QueueSubmissionItemRow>, StateError> {
+    let items = submission_items_locked(tx, &submission.submission_id)?;
+    Ok(items.into_iter().find(|item| item.status == "waiting"))
+}
+
+/// The outcome of evaluating one parked item under a submission's OWN
+/// committed admission inputs.
+enum ParkedDecision {
+    /// The item is admissible right now: `instance_id` is the run the
+    /// committing evaluation created (or the deterministic run id a
+    /// non-committing evaluation derived), `arming` the authorization the
+    /// submission committed.
+    Admitted {
+        instance_id: String,
+        arming: SupervisionAuthorizationPlan,
+    },
+    /// The item's reason still holds: the re-derived code and message.
+    Held { code: String, message: String },
+}
+
+impl ParkedDecision {
+    fn into_admitted(self) -> Option<(String, SupervisionAuthorizationPlan)> {
+        match self {
+            ParkedDecision::Admitted {
+                instance_id,
+                arming,
+            } => Some((instance_id, arming)),
+            ParkedDecision::Held { .. } => None,
+        }
+    }
+}
+
+/// Re-evaluate ONE parked item exactly as a fresh admission of its own
+/// submission would — its declared dependencies first, then the shared
+/// guard-verifying admission helper over the submission's OWN approved
+/// inputs, caps and occupancy attestation. `commit: false` writes nothing.
+fn evaluate_parked_item(
+    state: &State,
+    tx: &rusqlite::Transaction<'_>,
+    submission: &QueueSubmissionRow,
+    candidate: &QueueSubmissionItemRow,
+    at: &str,
+    commit: bool,
+) -> Result<ParkedDecision, StateError> {
+    // A submission that committed no arming authorization can never be
+    // admitted: the run would be inert (issue #261).
+    let Some(arming) =
+        State::submission_arming_authorization_locked(tx, &submission.submission_id)?
+    else {
+        return Ok(ParkedDecision::Held {
+            code: crate::queue_executor::codes::SUPERVISION_UNARMED.to_string(),
+            message: format!(
+                "submission {} committed no `armed` supervision authorization, so nothing can \
+                 drive a run it admits; re-submit the parked item with `--supervise arm`",
+                submission.submission_id
+            ),
+        });
+    };
+    let items = submission_items_locked(tx, &submission.submission_id)?;
+    let dependencies =
+        bound_selected_dependencies(&submission.request_line, &submission.repository);
+    let requires = dependencies
+        .iter()
+        .find(|(number, _)| *number == candidate.issue_number)
+        .map(|(_, requires)| requires.clone())
+        .unwrap_or_default();
+    let mut unmet: Option<i64> = None;
+    for dependency in &requires {
+        if !dependency_met_locked(tx, &items, *dependency)? {
+            unmet = Some(*dependency);
+            break;
+        }
+    }
+    if let Some(dependency) = unmet {
+        let in_set = items.iter().any(|item| item.issue_number == dependency);
+        let (code, message) = if in_set {
+            (
+                crate::queue_executor::advance::DEPENDENCY_UNSETTLED,
+                format!(
+                    "issue {} declares the dependency #{dependency}, whose delivery is \
+                     not verified yet; the item stays held and is never dispatched or \
+                     marked done from an unmet dependency",
+                    candidate.issue_number
+                ),
+            )
+        } else {
+            (
+                crate::queue_executor::advance::DEPENDENCY_UNRESOLVED,
+                format!(
+                    "issue {} declares the dependency #{dependency}, which is not part \
+                     of this submission's selected set; this queue can never settle it, \
+                     so the item stays held",
+                    candidate.issue_number
+                ),
+            )
+        };
+        return Ok(ParkedDecision::Held {
+            code: code.to_string(),
+            message,
+        });
+    }
+    let epoch = current_epoch_locked(tx)?;
+    let counted_lanes = counted_lane_footprints(tx, "queue_advance: continuation lanes")?;
+    let owned = owned_runs_locked(tx, &submission.repository)?;
+    let caps = crate::lifecycle::ConcurrencyCaps {
+        global: usize::try_from(submission.caps_global).unwrap_or(0),
+        per_repository: usize::try_from(submission.caps_per_repository).unwrap_or(0),
+        per_harness: usize::try_from(submission.caps_per_harness).unwrap_or(0),
+    };
+    let mut slots = FanoutSlots {
+        caps: &caps,
+        repository: &submission.repository,
+        counted_lanes,
+        harness_key: &submission.role_key,
+        harness_lanes: submission.harness_lanes,
+        admitted_global: 0,
+        admitted_repository: 0,
+        admitted_harness: 0,
+    };
+    let admission = QueueAdmission {
+        state,
+        repository: &submission.repository,
+        submission_id: &submission.submission_id,
+        epoch,
+        at,
+        workflow_id: &submission.workflow_id,
+        workflow_hash: &submission.workflow_hash,
+        ownership: &owned,
+    };
+    let candidate_item = QueueAdmissionItem {
+        issue_number: candidate.issue_number,
+        issue_revision: &candidate.issue_revision,
+        work_item: &candidate.work_item,
+        grant_id: Some(candidate.grant_id.as_str()).filter(|grant| !grant.is_empty()),
+        resume_digest: None,
+    };
+    match admit_queue_item_in_tx(tx, &admission, &candidate_item, &mut slots, commit)? {
+        AdmissionDecision::Admitted { instance_id } => Ok(ParkedDecision::Admitted {
+            instance_id,
+            arming,
+        }),
+        AdmissionDecision::Waiting { code, message } => Ok(ParkedDecision::Held {
+            code: code.to_string(),
+            message,
+        }),
+        AdmissionDecision::Refused { code, message } => Ok(ParkedDecision::Held {
+            code: code.to_string(),
+            message,
+        }),
+    }
+}
+
+/// Write a re-derived reason back onto a parked item's own row, only when it
+/// differs from what is recorded: a reader never keeps a reason the engine's
+/// admission derivation no longer produces (issue #324).
+fn settle_parked_reason_locked(
+    tx: &rusqlite::Transaction<'_>,
+    item: &QueueSubmissionItemRow,
+    code: &str,
+    message: &str,
+) -> Result<(), StateError> {
+    if item.reason.as_deref() == Some(code) && item.message.as_deref() == Some(message) {
+        return Ok(());
+    }
+    tx.execute(
+        "UPDATE queue_submission_items SET reason = ?3, message = ?4
+          WHERE submission_id = ?1 AND ordinal = ?2",
+        params![item.submission_id, item.ordinal, code, message],
+    )
+    .map_err(|err| StateError::from_sqlite("queue_advance: continuation reason", err))?;
+    Ok(())
 }
 
 /// Commit the queue-cursor advance of ONE fresh verified delivery (issue
@@ -14457,8 +14893,7 @@ fn advance_queue_in_tx(
             return Ok(());
         }
     }
-    let (next_ordinal, next_work_item, next_instance_id, reason, message) = match &attempt.candidate
-    {
+    let (base_ordinal, base_work_item, base_instance, reason, message) = match &attempt.candidate {
         None => (None, None, None, None, None),
         Some(candidate) => {
             if let Some(dependency) = attempt.unmet_dependency {
@@ -14560,7 +14995,7 @@ fn advance_queue_in_tx(
                     grant_id: Some(candidate.grant_id.as_str()).filter(|grant| !grant.is_empty()),
                     resume_digest: None,
                 };
-                match admit_queue_item_in_tx(tx, &admission, &candidate_item, &mut slots)? {
+                match admit_queue_item_in_tx(tx, &admission, &candidate_item, &mut slots, true)? {
                     AdmissionDecision::Admitted { instance_id } => {
                         tx.execute(
                             "UPDATE queue_submission_items
@@ -14640,6 +15075,32 @@ fn advance_queue_in_tx(
             }
         }
     };
+    // Issue #324: the ONE continuation a delivery whose OWN membership
+    // carried nothing left to dispatch owes — the repository's next parked
+    // submission is re-evaluated through its own committed admission inputs
+    // and admitted when its reason has cleared. One delivery advances AT MOST
+    // ONE item, and the cursor row below records which delivery consumed it
+    // (`next_submission_id`); a delivery that held or dispatched its own item
+    // is already spent and never reaches this sweep.
+    let (mut next_ordinal, mut next_work_item, mut next_instance_id) =
+        (base_ordinal, base_work_item, base_instance);
+    let mut next_submission_id: Option<String> = None;
+    if next_instance_id.is_none()
+        && reason.is_none()
+        && let Some((continued, continued_ordinal, continued_work_item, continued_instance)) =
+            advance_repository_continuation_in_tx(
+                state,
+                tx,
+                &submission.repository,
+                &submission.submission_id,
+                at,
+            )?
+    {
+        next_submission_id = Some(continued);
+        next_ordinal = Some(continued_ordinal);
+        next_work_item = Some(continued_work_item);
+        next_instance_id = Some(continued_instance);
+    }
     // Issue #98, restart-matrix boundary (c1): the dispatch phase finished
     // (run row, ownership row, membership flip and the dispatched run's own
     // supervision arm all written) and the cursor row is not yet recorded.
@@ -14653,8 +15114,8 @@ fn advance_queue_in_tx(
     tx.execute(
         "INSERT INTO queue_advances (submission_id, delivered_ordinal, delivered_work_item,
                 delivered_head, evidence_id, next_ordinal, next_work_item, next_instance_id,
-                reason, message, at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                reason, message, at, next_submission_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(submission_id, delivered_ordinal) DO UPDATE SET
                 next_ordinal = excluded.next_ordinal,
                 next_work_item = excluded.next_work_item,
@@ -14662,7 +15123,9 @@ fn advance_queue_in_tx(
                                            excluded.next_instance_id),
                 reason = excluded.reason,
                 message = excluded.message,
-                at = excluded.at",
+                at = excluded.at,
+                next_submission_id = COALESCE(queue_advances.next_submission_id,
+                                             excluded.next_submission_id)",
         params![
             submission.submission_id,
             delivery.item_ordinal,
@@ -14674,7 +15137,8 @@ fn advance_queue_in_tx(
             next_instance_id,
             reason,
             message,
-            at
+            at,
+            next_submission_id
         ],
     )
     .map_err(|err| StateError::from_sqlite("queue_advance: record", err))?;
@@ -16157,6 +16621,45 @@ fn run_m0013(conn: &mut Connection) -> Result<(), StateError> {
 const M0013_SQL: &str = "\
 ALTER TABLE supervisions ADD COLUMN retired_state TEXT NOT NULL DEFAULT '';
 ALTER TABLE supervisions ADD COLUMN retired_at TEXT NOT NULL DEFAULT '';
+";
+
+/// Run the m0014 migration (issue #324): the queue-advance continuation
+/// record.
+fn run_m0014(conn: &mut Connection) -> Result<(), StateError> {
+    let tx = conn
+        .transaction()
+        .map_err(|err| StateError::from_sqlite("migrate m0014: begin", err))?;
+    let checksum = sha256_hex(M0014_SQL.as_bytes());
+    tx.execute_batch(M0014_SQL)
+        .map_err(|err| StateError::from_sqlite("migrate m0014", err))?;
+    tx.execute(
+        "INSERT INTO schema_migrations (migration_id, applies_from, applies_to, checksum, applied_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            M0014_ID,
+            M0014_APPLIES_FROM,
+            M0014_APPLIES_TO,
+            checksum,
+            time::rfc3339_now()
+        ],
+    )
+    .map_err(|err| StateError::from_sqlite("migrate m0014: bookkeeping", err))?;
+    tx.pragma_update(None, "user_version", M0014_APPLIES_TO)
+        .map_err(|err| StateError::from_sqlite("migrate m0014: user_version", err))?;
+    tx.commit()
+        .map_err(|err| StateError::from_sqlite("migrate m0014: commit", err))?;
+    Ok(())
+}
+
+/// The queue-advance continuation column added by m0014 (issue #324),
+/// purely additive: a consumed delivery whose OWN committed submission had
+/// nothing left to dispatch continues the repository's next parked
+/// submission, and `next_submission_id` names the submission whose cursor
+/// that dispatch advanced (`NULL` when the dispatch stayed inside the
+/// delivering submission's own membership — every row written before this
+/// migration).
+const M0014_SQL: &str = "\
+ALTER TABLE queue_advances ADD COLUMN next_submission_id TEXT;
 ";
 
 #[cfg(test)]
@@ -17663,12 +18166,12 @@ mod tests {
         assert_eq!(grant.status, "active");
         assert_eq!(grant.state_epoch, 1);
         assert_eq!(state.current_epoch().expect("epoch"), 1);
-        assert_eq!(SCHEMA_VERSION, 13);
+        assert_eq!(SCHEMA_VERSION, 14);
         {
-            let conn = state.lock("test: m0005..m0013 bookkeeping").expect("lock");
+            let conn = state.lock("test: m0005..m0014 bookkeeping").expect("lock");
             for migration_id in [
                 M0005_ID, M0006_ID, M0007_ID, M0008_ID, M0009_ID, M0010_ID, M0011_ID, M0012_ID,
-                M0013_ID,
+                M0013_ID, M0014_ID,
             ] {
                 let recorded: i64 = conn
                     .query_row(
