@@ -54,13 +54,29 @@ pub const LIVE_PAGE_LIMIT: i64 = BOARD_PAGE_DEFAULT as i64;
 /// Live board adapter: one bounded page of the real read model per snapshot.
 ///
 /// The read model is re-read on every snapshot (a bounded, deterministic
-/// read with no cache), so a refresh always shows recorded facts; the last
-/// successfully read page is retained only so a failed read can state that
-/// no fresh read happened while the last known page stays visible.
+/// read with no cache), at the cursor the operator has paged to, so a
+/// refresh always shows recorded facts; the last successfully read page is
+/// retained only so a failed read can state that no fresh read happened
+/// while the last known page stays visible.
 pub struct LiveBoard<'a> {
     state: &'a State,
     limit: i64,
     last: RefCell<Option<CachedPage>>,
+    paging: RefCell<Paging>,
+}
+
+/// Where the surface is in the read model's order (issue #341).
+///
+/// Paging is cursor-based, exactly like the read model it drives: `current`
+/// is the cursor of the page being shown (`None` for the first page), `trail`
+/// holds the cursors of the pages before it so `previous_page` can step back,
+/// and `next` is the cursor the last successful read reported for the page
+/// after this one (`None` when that read reached the end of the order).
+#[derive(Default)]
+struct Paging {
+    current: Option<String>,
+    trail: Vec<Option<String>>,
+    next: Option<String>,
 }
 
 #[derive(Clone)]
@@ -84,7 +100,65 @@ impl<'a> LiveBoard<'a> {
             state,
             limit,
             last: RefCell::new(None),
+            paging: RefCell::new(Paging::default()),
         }
+    }
+
+    /// Advance to the page after the one being shown (issue #341).
+    ///
+    /// Returns whether the board moved. A page is only left behind when the
+    /// last read reported a next-page cursor — i.e. when that page held a
+    /// full page of rows and more rows exist beyond it — so the rows the
+    /// surface has paged past are always known exactly. At the end of the
+    /// order this is a no-op: the surface never invents a page.
+    pub fn next_page(&mut self) -> bool {
+        let paging = self.paging.get_mut();
+        let Some(next) = paging.next.take() else {
+            return false;
+        };
+        paging.trail.push(paging.current.take());
+        paging.current = Some(next);
+        true
+    }
+
+    /// Go back to the page before the one being shown (issue #341).
+    ///
+    /// Returns whether the board moved; on the first page this is a no-op.
+    pub fn previous_page(&mut self) -> bool {
+        let paging = self.paging.get_mut();
+        let Some(previous) = paging.trail.pop() else {
+            return false;
+        };
+        paging.current = previous;
+        paging.next = None;
+        true
+    }
+
+    /// The view of one freshly read page, positioned in the paging session.
+    ///
+    /// The page number and the rows before it come from the pages this
+    /// surface actually read; `count`/`total_rows` stay `None` while the
+    /// read reports more rows beyond the page (an unknown total is never
+    /// guessed — the renderer states the page's window instead).
+    fn view_of(&self, page: &BoardPage) -> BoardView {
+        let mut view = view_of_page(page);
+        let pages_before = self.paging.borrow().trail.len() as u64;
+        let rows_before = pages_before * self.limit.max(0) as u64;
+        view.page = Page {
+            current: pages_before + 1,
+            count: if page.truncated {
+                None
+            } else {
+                Some(pages_before + 1)
+            },
+            total_rows: if page.truncated {
+                None
+            } else {
+                Some(rows_before + page.rows.len() as u64)
+            },
+            rows_before,
+        };
+        view
     }
 
     /// The offline view: the stable failure code, plus the last known page
@@ -112,6 +186,7 @@ impl<'a> LiveBoard<'a> {
                     current: 1,
                     count: None,
                     total_rows: None,
+                    rows_before: 0,
                 },
                 freshness: Freshness {
                     age_secs: 0,
@@ -125,13 +200,15 @@ impl<'a> LiveBoard<'a> {
 
 impl ReadModel for LiveBoard<'_> {
     fn snapshot(&self) -> BoardView {
-        let query = match BoardQuery::new(Some(self.limit), None) {
+        let after = self.paging.borrow().current.clone();
+        let query = match BoardQuery::new(Some(self.limit), after.as_deref()) {
             Ok(query) => query,
             Err(err) => return self.offline(format!("board query refused: {}", err.code)),
         };
         match read_board(self.state, &query) {
             Ok(page) => {
-                let view = view_of_page(&page);
+                let view = self.view_of(&page);
+                self.paging.borrow_mut().next = page.next_cursor.clone();
                 *self.last.borrow_mut() = Some(CachedPage {
                     view: view.clone(),
                     observed_at: page.observed_at.clone(),
@@ -147,9 +224,11 @@ impl ReadModel for LiveBoard<'_> {
 ///
 /// Pure: the same page always renders the same view. The rows keep the read
 /// model's deterministic order and the page is the one bounded page that was
-/// loaded (`current: 1`); `count`/`total_rows` stay `None` when the read
-/// model reported more rows beyond that bounded read — an unknown total is
-/// never guessed, and the surface says `page 1/?` and `N+ rows` instead.
+/// loaded, positioned first (`current: 1`, no rows before it);
+/// [`LiveBoard::snapshot`] repositions it when the operator has paged.
+/// `count`/`total_rows` stay `None` when the read model reported more rows
+/// beyond that bounded read — an unknown total is never guessed, and the
+/// surface states the page's window and how to reach the rest instead.
 pub fn view_of_page(page: &BoardPage) -> BoardView {
     let complete = !page.truncated
         && page
@@ -178,6 +257,7 @@ pub fn view_of_page(page: &BoardPage) -> BoardView {
             } else {
                 Some(page.rows.len() as u64)
             },
+            rows_before: 0,
         },
         freshness: Freshness {
             age_secs: age_secs(&page.observed_at).unwrap_or(0),

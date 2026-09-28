@@ -131,15 +131,20 @@ fn grant_id() -> String {
 }
 
 fn grant_doc(epoch: i64) -> Val {
+    grant_doc_for(epoch, 5, &grant_id())
+}
+
+/// One `hf-grant/v1` document binding `issue` to `grant_id` in `epoch`.
+fn grant_doc_for(epoch: i64, issue: i64, grant_id: &str) -> Val {
     Val::parse_json(&format!(
         r#"{{"schema":"hf-grant/v1","grant_id":"{id}","repository":"{REPO}",
-            "issue":{{"number":5,"revision":"{REVISION}"}},
+            "issue":{{"number":{issue},"revision":"{REVISION}"}},
             "workflow_hash":"{WORKFLOW_HASH}","policy_hash":"{POLICY_HASH}",
-            "phase":"merge","scope":"worktrees/issues/5",
+            "phase":"merge","scope":"worktrees/issues/{issue}",
             "caps":["read","worktree","spawn","review","merge"],
             "expires_at":"2999-01-01T00:00:00Z","state_epoch":{epoch},
             "created_at":"2026-09-06T00:00:00Z"}}"#,
-        id = grant_id()
+        id = grant_id
     ))
     .expect("grant document")
 }
@@ -217,6 +222,20 @@ impl Fixture {
 
     fn db(&self) -> PathBuf {
         self.state_dir.join("canter").join("state.db")
+    }
+
+    /// A fixture whose state store holds no recorded runs: the board screen
+    /// reads the state store (never the socket), so a test that needs its own
+    /// records seeds them itself through the public state API.
+    fn empty(name: &str) -> Fixture {
+        let dir = temp_dir(name);
+        let fixture = Fixture {
+            state_dir: dir.join("state"),
+            socket: dir.join("daemon.sock"),
+            dir,
+        };
+        std::fs::create_dir_all(fixture.state_dir.join("canter")).expect("state dir");
+        fixture
     }
 
     fn open(&self) -> State {
@@ -632,6 +651,113 @@ fn the_board_screen_keeps_the_key_hint_and_the_supervision_strip_on_their_own_ro
             "row {row} carries a key hint outside its own row: {line:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Paging past the first bounded page (issue #341)
+// ---------------------------------------------------------------------------
+
+/// The recorded run identity of one seeded issue.
+fn paged_run(issue: i64) -> String {
+    format!("run-paged-{issue:04}")
+}
+
+/// Seed `count` recorded runs in `REPO` (issues 1..=count, one grant each),
+/// the last `running` of them left running: on the real board those live runs
+/// sit beyond the first bounded page, whose page size is the read model's
+/// default.
+fn seed_paged_runs(state: &State, count: i64, running: i64) {
+    let epoch = state.current_epoch().expect("epoch");
+    for issue in 1..=count {
+        let grant_id = format!("gr_{issue:016x}");
+        state
+            .issue_grant(&grant_doc_for(epoch, issue, &grant_id))
+            .expect("issue grant");
+        state
+            .start_instance(
+                &paged_run(issue),
+                &grant_id,
+                DOCTRINE_WORKFLOW_ID,
+                "2026-09-06T00:00:00Z",
+            )
+            .expect("start instance");
+    }
+    for issue in (count - running + 1)..=count {
+        state
+            .advance_instance(
+                &paged_run(issue),
+                "implementer",
+                0,
+                0,
+                false,
+                0,
+                "2026-09-06T00:00:01Z",
+            )
+            .expect("advance running");
+    }
+}
+
+#[test]
+fn the_board_pages_past_its_first_bounded_page_to_the_rows_that_are_running() {
+    let fixture = Fixture::empty("board-paging");
+    let state = fixture.open();
+    seed_paged_runs(&state, 23, 3);
+    let mut console = OperatorConsole::new(&state, fixture.socket.clone(), None, None);
+
+    // Page 1 is the bounded first page: the running rows are past it, and the
+    // header says both where the operator is and how to reach the rest.
+    let first = render_lines(&console, (120, 40)).join("\n");
+    assert!(
+        !first.contains(&format!("#21 {REPO}")),
+        "the first page does not hold the row beyond it: {first}"
+    );
+    assert!(first.contains("In progress (0)"), "{first}");
+    assert!(first.contains("page 1"), "{first}");
+    assert!(
+        first.contains("rows 1-20") && first.contains("n next page"),
+        "the partial view states its position and the key that moves it: {first}"
+    );
+    assert!(
+        !first.contains("page 1/?"),
+        "an unknown total is never rendered as an unknown page marker: {first}"
+    );
+
+    // Reaching a hidden row is an operator action, not a code change.
+    assert_eq!(
+        console.handle_key(key(KeyCode::Char('n'))),
+        Some(Action::Redraw),
+        "the board accepts a page-advance key"
+    );
+    let second = render_lines(&console, (120, 40)).join("\n");
+    for issue in [21, 22, 23] {
+        assert!(
+            second.contains(&format!("#{issue} {REPO}")),
+            "the running row #{issue} is rendered on page 2: {second}"
+        );
+    }
+    assert!(
+        second.contains("In progress (3)"),
+        "the three live runs are stated as in progress: {second}"
+    );
+    assert!(second.contains("Implementing"), "{second}");
+    assert!(second.contains("page 2/2"), "{second}");
+    assert!(
+        second.contains("23 rows") && second.contains("last page: N previous page"),
+        "the last page states the read's totals and the way back: {second}"
+    );
+
+    // The way back is a key too, and it lands on the first page again.
+    assert_eq!(
+        console.handle_key(key(KeyCode::Char('N'))),
+        Some(Action::Redraw),
+        "the board accepts the back key"
+    );
+    let back = render_lines(&console, (120, 40)).join("\n");
+    assert!(!back.contains(&format!("#21 {REPO}")), "{back}");
+    assert!(
+        back.contains("page 1") && back.contains("rows 1-20"),
+        "{back}"
+    );
 }
 
 // ---------------------------------------------------------------------------
