@@ -106,6 +106,74 @@ fn panes(
     Ok(herdr_items(&doc, "panes").to_vec())
 }
 
+/// Prepare the lane's OWN pane so the substrate can classify the lane's agent
+/// even when the kind's launcher is a host-visible wrapper (issue #331): split
+/// the pane the workspace was opened with, WITH the kind's wrapper hint in its
+/// environment, close that opened pane again, and prove the read-back holds
+/// exactly the hinted pane at the lane worktree.
+///
+/// So the lane workspace never holds more than its own ONE pane, and a split
+/// that does not produce a NEW pane refuses instead of starting the lane on a
+/// pane whose environment says nothing about the kind.
+fn lane_pane_with_hint(
+    opened: &str,
+    id: &str,
+    worktree: &Path,
+    kind: &str,
+    timeout: Duration,
+    env: &BTreeMap<String, String>,
+) -> Result<String, ProcessFailure> {
+    let split = herdr_call(
+        &herdr_pane_split_args(opened, worktree, &herdr_wrapper_hint(kind)),
+        timeout,
+        env,
+        Some(worktree),
+    )?;
+    let pane = {
+        let row = split.get("pane").cloned().unwrap_or_else(null);
+        herdr_pane_identity(&row)?
+    };
+    if pane == opened {
+        return Err(refusal(
+            CODE_MALFORMED,
+            format!("the lane pane split returned the pane it split ({opened})"),
+        ));
+    }
+    herdr_call_effect(&herdr_pane_close_args(opened), timeout, env, Some(worktree))?;
+    let rows = panes(id, timeout, env, worktree)?;
+    if rows.len() != 1 {
+        let held: Vec<String> = rows
+            .iter()
+            .filter_map(|row| herdr_pane_identity(row).ok())
+            .collect();
+        return Err(refusal(
+            CODE_MALFORMED,
+            format!(
+                "the lane workspace must hold exactly its own pane {pane:?} after the split; \
+                 it holds [{}]",
+                held.join(", ")
+            ),
+        ));
+    }
+    let held = herdr_pane_identity(&rows[0])?;
+    if held != pane {
+        return Err(refusal(
+            CODE_STALE_GENERATION,
+            format!(
+                "the lane workspace holds pane {held:?}, not the pane the split created \
+                 ({pane:?}) whose environment carries the {HERDR_AGENT_HINT} hint for this kind"
+            ),
+        ));
+    }
+    if !same_worktree(&herdr_str(&rows[0], "cwd"), worktree) {
+        return Err(refusal(
+            CODE_STALE_GENERATION,
+            "the lane's own pane has wrong checkout",
+        ));
+    }
+    Ok(pane)
+}
+
 fn verify_pane(row: &Val, session: &SessionHandle, cwd: &Path) -> Result<String, ProcessFailure> {
     let pane = herdr_pane_identity(row)?;
     // Pane rows have no agent name; verify the same token/generation/cwd tuple.
@@ -269,18 +337,12 @@ pub(super) fn start_with_env(
         verify_workspace(row, root, worktree)?;
         ((*row).clone(), pane, false)
     } else {
-        let args = vec![
-            "worktree".to_string(),
-            "open".to_string(),
-            "--cwd".to_string(),
-            root.to_string_lossy().into_owned(),
-            "--path".to_string(),
-            worktree.to_string_lossy().into_owned(),
-            "--label".to_string(),
-            names.workspace.clone(),
-            "--no-focus".to_string(),
-        ];
-        let opened = herdr_call(&args, timeout, env, Some(worktree))?;
+        let opened = herdr_call(
+            &herdr_worktree_open_args(root, worktree, &names.workspace),
+            timeout,
+            env,
+            Some(worktree),
+        )?;
         let workspace = opened.get("workspace").cloned().unwrap_or_else(null);
         let id = workspace_id(&workspace)?;
         // An external creator won the race. Never adopt or close its workspace.
@@ -296,13 +358,20 @@ pub(super) fn start_with_env(
                     "new lane workspace must have exactly one pane",
                 ));
             }
-            let pane = herdr_pane_identity(&rows[0])?;
+            let opened_pane = herdr_pane_identity(&rows[0])?;
             if !same_worktree(&herdr_str(&rows[0], "cwd"), worktree) {
                 return Err(refusal(
                     CODE_STALE_GENERATION,
                     "new pane has wrong checkout",
                 ));
             }
+            // Issue #331: the lane's own pane must carry the kind's wrapper
+            // hint. `herdr worktree open` — the row that created this
+            // worktree-backed workspace (issue #154) — documents no
+            // environment switch, so the lane's pane is SPLIT off the pane the
+            // workspace was opened with, and that pane is closed again: the
+            // lane workspace keeps exactly its own ONE pane.
+            let pane = lane_pane_with_hint(&opened_pane, &id, worktree, kind, timeout, env)?;
             herdr_call_effect(
                 &herdr_pane_report_metadata_args(
                     &pane,
