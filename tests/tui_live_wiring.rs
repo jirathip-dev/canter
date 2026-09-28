@@ -329,7 +329,8 @@ fn live_board_renders_the_real_read_model_rows() {
         Page {
             current: 1,
             count: Some(1),
-            total_rows: Some(8)
+            total_rows: Some(8),
+            rows_before: 0,
         }
     );
     assert!(!view.freshness.stale, "a fresh read is not stale");

@@ -260,6 +260,7 @@ fn view_with(rows: Vec<WorkRow>, state: BoardState) -> BoardView {
             current: 1,
             count: Some(1),
             total_rows: Some(total_rows),
+            rows_before: 0,
         },
         freshness: fresh(12),
     }

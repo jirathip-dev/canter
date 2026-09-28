@@ -443,7 +443,10 @@ pub enum BoardState {
 ///
 /// `count` and `total_rows` are `None` while the source reports that more
 /// rows exist beyond the bounded read: the totals are unknown then and are
-/// never guessed. The renderer says so explicitly.
+/// never guessed. The renderer says so explicitly, and states the page's
+/// window in the read's order from [`Page::rows_before`] plus the rows it
+/// actually holds — the position is a fact of the reads performed, not an
+/// estimate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Page {
     /// 1-based page number.
@@ -452,6 +455,12 @@ pub struct Page {
     pub count: Option<u64>,
     /// Total number of rows across all pages, when the source can report it.
     pub total_rows: Option<u64>,
+    /// Rows read on the pages before this one (0 on the first page).
+    ///
+    /// A page is only left behind when the read reported another page, i.e.
+    /// when it held exactly a full page, so this is the number of recorded
+    /// rows the surface has paged past — never an assumed or invented count.
+    pub rows_before: u64,
 }
 
 /// Explicit typed view model: everything the surface renders.

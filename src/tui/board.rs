@@ -208,17 +208,29 @@ fn source_line(view: &BoardView, palette: &Palette) -> Line<'static> {
     } else {
         palette.accent
     };
-    // Unknown totals (a bounded read that reported more rows) are stated as
-    // unknown, never filled in with a guess.
+    // The page position is stated, never left as an unknown marker (issue
+    // #341): the page number, the window of rows this page holds in the
+    // read's order (the rows read before it are counted exactly, so the
+    // window is stated, not guessed), and — while the read reports more rows
+    // beyond this bounded page — what reaches them. Unknown totals stay
+    // unknown; only the reachable position is named.
     let page = match view.page.count {
-        Some(count) => format!("page {}/{}", view.page.current, count),
-        None => format!("page {}/?", view.page.current),
+        Some(count) => format!("page {}/{count}", view.page.current),
+        None => format!("page {}", view.page.current),
     };
     let rows = match view.page.total_rows {
         Some(total) => format!("{total} rows"),
-        None => format!("{}+ rows", view.rows.len()),
+        None => {
+            let first = view.page.rows_before + 1;
+            let last = view.page.rows_before + view.rows.len() as u64;
+            if first == last {
+                format!("row {first}")
+            } else {
+                format!("rows {first}-{last}")
+            }
+        }
     };
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled("source: ", palette.muted),
         Span::raw(clip(&view.source, 64)),
         Span::raw(" | "),
@@ -229,7 +241,27 @@ fn source_line(view: &BoardView, palette: &Palette) -> Line<'static> {
         Span::raw(page),
         Span::raw(" | "),
         Span::raw(rows),
-    ])
+    ];
+    if let Some(nav) = page_nav(view) {
+        spans.push(Span::raw(" | "));
+        spans.push(Span::styled(nav, palette.accent));
+    }
+    Line::from(spans)
+}
+
+/// How to reach the rows this bounded page does not show.
+///
+/// `count` is `None` exactly while the read reported more rows beyond the
+/// page it returned, so the partial view names the key that reaches them and
+/// the key that returns; a page that ends the order says so. The first page
+/// of a complete read adds nothing.
+fn page_nav(view: &BoardView) -> Option<&'static str> {
+    match (view.page.count.is_none(), view.page.current) {
+        (true, 1) => Some("more rows follow: n next page"),
+        (true, _) => Some("more rows follow: n next page, N previous page"),
+        (false, 1) => None,
+        (false, _) => Some("last page: N previous page"),
+    }
 }
 
 fn legend_line(palette: &Palette) -> Line<'static> {

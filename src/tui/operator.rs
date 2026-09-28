@@ -380,9 +380,11 @@ impl<'a> OperatorConsole<'a> {
     /// when at least one selected item is eligible; `Space` sets the
     /// authorization box; the authorization screen's `Enter` is the ONLY key
     /// that starts work. `s` opens the compact supervision status and the
-    /// guarded continuation controls of the selected run (issue #97). `b`/`Esc`
-    /// navigate back (never forward) and always clear the authorization box;
-    /// `q` quits.
+    /// guarded continuation controls of the selected run (issue #97). On the
+    /// board screen `n` (`PageDown`) reads the page of recorded rows after
+    /// the one shown and `N` (`PageUp`) the page before it (issue #341, a
+    /// no-op at either end of the recorded order); `b`/`Esc` navigate back
+    /// (never forward) and always clear the authorization box; `q` quits.
     ///
     /// Only `Press` events are handled: an autorepeat or release event never
     /// effects anything on any screen (a held key cannot commit a control the
@@ -461,9 +463,21 @@ impl<'a> OperatorConsole<'a> {
         }
     }
 
-    /// The board screen: board navigation plus `p` (open the exact preview)
-    /// and `s` (open the compact supervision status/controls).
+    /// The board screen: board navigation plus `p` (open the exact preview),
+    /// `s` (open the compact supervision status/controls) and `n`/`N` (page
+    /// forward/back through the recorded rows, issue #341).
     fn board_key(&mut self, key: KeyEvent) -> Option<Action> {
+        match key.code {
+            KeyCode::Char('n') | KeyCode::PageDown => {
+                self.board.next_page();
+                return Some(Action::Redraw);
+            }
+            KeyCode::Char('N') | KeyCode::PageUp => {
+                self.board.previous_page();
+                return Some(Action::Redraw);
+            }
+            _ => {}
+        }
         if key.code == KeyCode::Char('p') {
             self.request_preview();
             return Some(Action::Redraw);
