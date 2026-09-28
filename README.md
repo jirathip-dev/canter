@@ -133,6 +133,10 @@ and the renderer provenance note live in
 pins included), kept as dated records — see the
 [compatibility contract](docs/contracts/compatibility.md#product-rename-issue-106).
 
+[![How canter works as built: an operator surface for exceptions and approvals drives one single-writer daemon (admission, digest-bound grants, per-issue ownership, epochs and journals, and a fixed supervision tick with honest states — healthy, waiting-approval, needs-attention, never done without evidence); the daemon runs the typed p1..p8 workflow spine, starts implementer and reviewer roles on the execution substrate that owns the workspaces and processes, and closes the loop at the verification panel — a committed delta measured from the pinned base, a pass or fail verdict from a reviewer that is not the implementer plus a fresh exact-head read-back, a merge published per the plan's merge policy, and a cleanup that proves the landed content](docs/architecture/canter.control-plane.architecture.svg)
+
+The figure above is canter's as-built control path (a self-contained SVG, so the dark ground is its own); the canonical text is [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 ## Quickstart
 
 Prerequisites: Rust 1.97.1 (pinned by `rust-toolchain.toml`; see
