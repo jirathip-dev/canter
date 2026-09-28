@@ -6,6 +6,38 @@ release process activates (docs/RELEASING.md), then semver applies.
 
 ## [Unreleased]
 
+### Added (issue #221 — a versioned, reversible install of a built canter: recorded sha, `--version` read-back, one-step rollback)
+
+- `scripts/install-canter.py` installs a built canter to a stable PATH
+  prefix (default `~/.local/bin`) with the installed sha256 recorded and
+  the `--version` read-back stored beside it in `canter.installed.json`
+  (schema, action, installed sha, the read-back lines, the source revision
+  and whether it was dirty, the candidate, and the retained previous
+  binary). It builds `cargo build --release --locked` in the checkout — a
+  dirty tree refuses (`install.refusal.tree_dirty`) unless `--allow-dirty`
+  records it — or takes a prebuilt `--candidate`, RUNS the staged copy
+  before replacing anything (a read-back failure refuses
+  `install.refusal.readback` and leaves the installed binary untouched),
+  retains the current bytes as `<prefix>/canter.previous`, replaces
+  `<prefix>/canter` atomically, re-hashes it against the staged bytes, and
+  supports `--rollback` (restores the retained bytes and retains the
+  replaced ones, so the pair swaps) and `--dry-run` (prints the exact
+  commands and touches nothing). Every failure is a typed
+  `install.refusal.<code>` with its exit status; the driver never touches
+  the service manager or the daemon — rendering and executing the service
+  unit stay with `canter service install-plan` and a human (install
+  execution is human-gated).
+- `scripts/test-install-canter.py` proves the contract in disposable
+  prefixes with fake candidates (the host's own prefix, service manager and
+  daemon are never touched, and the suite needs no release build):
+  install/read-back/retention, the rollback swap and its typed refusal,
+  a refused read-back never replacing the installed bytes, dry-run plans
+  for both modes, the build-mode source-revision record, and the dirty-tree
+  refusal with its explicit override.
+- Runbook: `docs/OPERATIONS.md` section 10.2 (install → config → service →
+  rollback, with the refusal table), and the driver's self-test row in
+  `docs/DEVELOPMENT.md`.
+
 ### Fixed (issue #324 — the advance fires when the delivering run completes, not only at its delivery)
 
 - A bare-exhaustion cursor row is re-opened at the reconciliation that

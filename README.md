@@ -372,6 +372,9 @@ mediated; there is no supported end-to-end workflow yet (see
 
 1. **Install** (Day 1): clone and build pinned.
    `git clone https://github.com/jirathip-dev/canter.git && cd canter && cargo build --release --locked`
+   — then install the binary to a stable PATH prefix with the installed sha
+   recorded and a one-step rollback: `python3 scripts/install-canter.py`
+   (see OPERATIONS §10.2).
 2. **Config init/validate**: print the annotated template, save it, edit one
    repository in.
    `canter config init > ~/.config/canter/config.toml` then
