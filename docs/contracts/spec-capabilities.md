@@ -155,6 +155,15 @@ can run with **no harness credentials** (AC7).
     `worktree open --cwd <repo root> --path <lane worktree> --label <label>
     --no-focus` (issue #154: linked identity is present at creation and read
     back through `workspace list` + `pane list`, never inferred from a label),
+    `pane split --pane <pane> --direction right --cwd <lane worktree> --env
+    HERDR_AGENT=<kind>` followed by `pane close <pane>` (issue #331: the lane's
+    OWN pane is the split one and carries Herdr's documented wrapper hint in
+    its environment, and the pane the registration created is closed again, so
+    the lane workspace keeps exactly its own ONE pane — the hint is what
+    classifies a lane whose kind launches through a host-visible wrapper, and
+    without it `agent start --kind <kind>` times out and the lane can never be
+    addressed by `agent prompt <lane name>`; a workspace REUSED by a later
+    start of the same lane is never re-split),
     `agent start <agent name> --kind <kind> --pane <pane> [-- <role args>]` (the profile-authoritative binding rides on the start row, as on
     the headless rows), `pane report-metadata … --token canter_lane=<session>
     --token canter_generation=<n>` (the lane↔pane/agent binding),

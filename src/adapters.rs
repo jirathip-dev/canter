@@ -1603,6 +1603,68 @@ fn herdr_pane_report_metadata_args(pane: &str, lane: &str, generation: u64) -> V
     ]
 }
 
+/// The environment variable of [`herdr_wrapper_hint`] (Herdr's documented
+/// wrapper hint).
+pub const HERDR_AGENT_HINT: &str = "HERDR_AGENT";
+
+/// The environment assignment that carries Herdr's wrapper hint for one agent
+/// kind (`HERDR_AGENT=<kind>`) — the substrate's documented remedy when a
+/// host-visible wrapper hides the real agent process (herdr docs, "VMs and
+/// sandbox wrappers"): the hint names the agent whose manifest classifies that
+/// pane's foreground process, so the lane is detected, named and addressable
+/// even when the kind's launcher execs a bootstrap interpreter instead of the
+/// agent binary the manifest matches on (issue #331). The hint applies to the
+/// pane's own foreground process only, and a lane workspace's only foreground
+/// agent is the lane's.
+pub fn herdr_wrapper_hint(kind: &str) -> String {
+    format!("{HERDR_AGENT_HINT}={kind}")
+}
+
+/// `herdr worktree open --cwd <repo root> --path <lane worktree> --label
+/// <label> --no-focus`: the row that registers the run's linked lane worktree
+/// as a Herdr workspace (issue #154).
+fn herdr_worktree_open_args(root: &Path, worktree: &Path, label: &str) -> Vec<String> {
+    vec![
+        "worktree".to_string(),
+        "open".to_string(),
+        "--cwd".to_string(),
+        root.to_string_lossy().into_owned(),
+        "--path".to_string(),
+        worktree.to_string_lossy().into_owned(),
+        "--label".to_string(),
+        label.to_string(),
+        "--no-focus".to_string(),
+    ]
+}
+
+/// `herdr pane split --pane <pane> --direction right --cwd <dir> --env
+/// <KEY=VALUE>`: the row that creates the lane's OWN pane with the wrapper
+/// hint in its environment. `herdr worktree open` (the row that registers the
+/// linked-worktree workspace, and the only row that may create the lane
+/// workspace — issue #154) documents no environment switch, so the lane's
+/// pane is split off it with the hint and the pane the workspace was opened
+/// with is closed again (issue #331).
+fn herdr_pane_split_args(pane: &str, cwd: &Path, hint: &str) -> Vec<String> {
+    vec![
+        "pane".to_string(),
+        "split".to_string(),
+        "--pane".to_string(),
+        pane.to_string(),
+        "--direction".to_string(),
+        "right".to_string(),
+        "--cwd".to_string(),
+        cwd.to_string_lossy().into_owned(),
+        "--env".to_string(),
+        hint.to_string(),
+    ]
+}
+
+/// `herdr pane close <pane>`: retires the pane the lane workspace was opened
+/// with, so the lane workspace keeps exactly ONE pane — its own (issue #331).
+fn herdr_pane_close_args(pane: &str) -> Vec<String> {
+    vec!["pane".to_string(), "close".to_string(), pane.to_string()]
+}
+
 /// The role arguments the pane start row carries after `--`. The binding is
 /// the profile's (never a param, never a default): Hermes passes the profile
 /// key on the documented global flag `-p <key>` plus the declared
@@ -1751,6 +1813,32 @@ fn bounded_raw(text: &str) -> String {
         end -= 1;
     }
     format!("{}... ({} bytes total)", &escaped[..end], text.len())
+}
+
+/// The evidence line of ONE failed invocation (issue #148 item 2, issue #331):
+/// the row's exact argv (bounded, single-line, redacted), the exit status it
+/// reported and its raw stdout and stderr with byte counts. A bare
+/// `adapter.exit` that published neither the argv nor the captured output left
+/// a failed `harness_start` undiagnosable from the ledger; the SAME shape is
+/// used by the prompt rows, so a failure's evidence can never drift between
+/// the paths.
+fn failed_row_evidence(argv: &str, exit: &str, stdout: &str, stderr: &str) -> String {
+    format!(
+        "argv: {argv} | exit: {exit} | stdout ({} bytes): {} | stderr ({} bytes): {}",
+        stdout.len(),
+        bounded_raw(stdout),
+        stderr.len(),
+        bounded_raw(stderr),
+    )
+}
+
+/// The program and its exact argv as ONE bounded line: what a failed row
+/// names as the thing that failed (issue #331).
+fn argv_line(program: &str, args: &[String]) -> String {
+    let mut parts: Vec<&str> = Vec::with_capacity(args.len() + 1);
+    parts.push(program);
+    parts.extend(args.iter().map(String::as_str));
+    bounded_raw(&parts.join(" "))
 }
 
 /// `herdr agent get <lane>`: the agent row of the CLI's `agent_info`
@@ -2053,13 +2141,13 @@ fn herdr_prompt_row_evidence(args: &[String], out: &ProcOut, lane: &str, pane: &
         None => "no exit status (the row was killed at its bound)".to_string(),
     };
     format!(
-        "argv: {WORKSPACE_EXECUTABLE} {} | exit: {exit} | stdout ({} bytes): {} | stderr ({} \
-         bytes): {} | agent: {lane} | pane: {pane}",
-        bounded_raw(&args.join(" ")),
-        out.stdout.len(),
-        bounded_raw(&out.stdout),
-        out.stderr.len(),
-        bounded_raw(&out.stderr),
+        "{} | agent: {lane} | pane: {pane}",
+        failed_row_evidence(
+            &format!("{WORKSPACE_EXECUTABLE} {}", bounded_raw(&args.join(" "))),
+            &exit,
+            &out.stdout,
+            &out.stderr,
+        )
     )
 }
 
@@ -4683,17 +4771,23 @@ fn run_typed_with(
             }
             let combined = format!("{}{}", out.stdout, out.stderr);
             let lower = combined.to_ascii_lowercase();
+            let argv = argv_line(program, args);
             if AUTH_MARKERS.iter().any(|marker| lower.contains(marker)) {
                 ProcessOutcome::Failed(ProcessFailure {
                     code: CODE_CREDENTIALS,
                     message: "the harness reported an authentication failure; credentials live in the harness, never here".to_string(),
-                    detail: diagnostics(&combined),
+                    detail: failed_row_evidence(&argv, &code.to_string(), &out.stdout, &out.stderr),
                 })
             } else {
+                // Issue #331: the failure NAMES the row it belongs to (program
+                // and exact argv) and publishes its captured stdout/stderr —
+                // `harness_start` must be diagnosable from the ledger, and a
+                // bare `adapter.exit` also misattributed every Herdr row to
+                // "the harness".
                 ProcessOutcome::Failed(ProcessFailure {
                     code: CODE_EXIT,
-                    message: format!("the harness exited with code {code}"),
-                    detail: diagnostics(&combined),
+                    message: format!("{argv} exited with code {code}"),
+                    detail: failed_row_evidence(&argv, &code.to_string(), &out.stdout, &out.stderr),
                 })
             }
         }
@@ -5535,6 +5629,73 @@ mod tests {
         env.insert("HERDR_ENV".to_string(), "1".to_string());
         env.insert("HERDR_PANE_ID".to_string(), "".to_string());
         assert_eq!(herdr_pane_context(&env), None, "empty pane id");
+    }
+
+    #[test]
+    fn the_lane_pane_carries_the_kinds_wrapper_hint() {
+        // Issue #331: the lane's OWN pane is the one split off the pane the
+        // worktree registration created, and that split row is what puts
+        // Herdr's documented wrapper hint in the lane's environment — without
+        // it a kind that launches through a host-visible wrapper is never
+        // classified, so the lane can not be addressed by name.
+        assert_eq!(herdr_wrapper_hint("hermes"), "HERDR_AGENT=hermes");
+        assert_eq!(HERDR_AGENT_HINT, "HERDR_AGENT");
+        assert_eq!(
+            herdr_pane_split_args(
+                "w1:p1",
+                Path::new("/tmp/lane worktree"),
+                &herdr_wrapper_hint("hermes"),
+            ),
+            [
+                "pane",
+                "split",
+                "--pane",
+                "w1:p1",
+                "--direction",
+                "right",
+                "--cwd",
+                "/tmp/lane worktree",
+                "--env",
+                "HERDR_AGENT=hermes",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<String>>()
+        );
+        assert_eq!(
+            herdr_pane_close_args("w1:p1"),
+            ["pane", "close", "w1:p1"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<String>>()
+        );
+    }
+
+    #[test]
+    fn a_failed_row_publishes_its_argv_and_both_streams() {
+        // Issue #331: a bare `adapter.exit` ("the harness exited with code 1")
+        // published neither the argv nor the captured output, so the failure
+        // was undiagnosable from the ledger.
+        let evidence = failed_row_evidence(
+            &argv_line("herdr", &["agent".to_string(), "start".to_string()]),
+            "1",
+            "partial stdout",
+            "fatal: refused",
+        );
+        assert!(evidence.contains("argv: herdr agent start"), "{evidence}");
+        assert!(evidence.contains("exit: 1"), "{evidence}");
+        assert!(
+            evidence.contains("stdout (14 bytes): partial stdout"),
+            "{evidence}"
+        );
+        assert!(
+            evidence.contains("stderr (14 bytes): fatal: refused"),
+            "{evidence}"
+        );
+        assert!(
+            evidence.lines().count() == 1,
+            "the evidence stays one diagnosable line: {evidence}"
+        );
     }
 
     #[test]

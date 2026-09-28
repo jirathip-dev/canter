@@ -632,7 +632,78 @@ fn plain_nonzero_exit_is_a_typed_failed_outcome() {
             result.message,
             result.detail
         );
+        // Issue #331: the failure NAMES the row (program + exact argv) and
+        // publishes what the row actually printed — the raw stdout and stderr
+        // with byte counts — so a failing row is diagnosable from the ledger
+        // alone instead of a bare "the harness exited with code N".
+        let message = result.message.clone().unwrap_or_default();
+        assert!(
+            message.contains(executable_name(kind)) && message.contains("exited with code 3"),
+            "{}: {message}",
+            kind.name()
+        );
+        let detail = result.detail.clone().unwrap_or_default();
+        assert!(
+            detail.contains("argv: ") && detail.contains("exit: 3"),
+            "{}: {detail}",
+            kind.name()
+        );
+        assert!(
+            detail.contains("stdout (0 bytes)") && detail.contains("stderr (0 bytes)"),
+            "{}: {detail}",
+            kind.name()
+        );
+        assert!(detail.lines().count() == 1, "{}: {detail}", kind.name());
     }
+}
+
+/// Issue #331: the raw output a failing row captured is published verbatim —
+/// argv, exit status, stdout and stderr — so `harness_start` failures stop
+/// being undiagnosable from the ledger (the #148 shape).
+#[test]
+fn a_failing_row_publishes_its_argv_and_raw_output() {
+    let bins = FakeBins::new();
+    // The hermes prompt row (the shape `harness_body` pins) prints one stdout
+    // line and one stderr line before failing.
+    bins.bin(
+        executable_name(HarnessKind::Hermes),
+        &format!(
+            "if [ \"$1\" = \"--version\" ]; then echo \"0.85.1\"; exit 0; fi\n\
+             if [ \"$1\" = \"-p\" ] && [ \"$2\" = \"{}\" ] && [ \"$3\" = \"chat\" ]; then\n\
+             echo 'partial stdout line'\n\
+             echo 'harness refused: no credentials for the bound profile' >&2\n\
+             exit 1\n\
+             fi\n\
+             echo \"unexpected argv: $*\" >&2\nexit 9\n",
+            HarnessKind::Hermes.name()
+        ),
+    );
+    let profile = official_profile(HarnessKind::Hermes);
+    let result = run_op_retry(
+        &profile,
+        &prompt_request("make it fail", ADAPTER_TIMEOUT),
+        &bins.env(),
+    );
+    assert_eq!(
+        result.status, "failed",
+        "message={:?} detail={:?}",
+        result.message, result.detail
+    );
+    assert_eq!(result.code, Some(CODE_EXIT));
+    let message = result.message.clone().unwrap_or_default();
+    assert!(
+        message.contains(executable_name(HarnessKind::Hermes))
+            && message.contains("exited with code 1"),
+        "the failure names the row: {message}"
+    );
+    let detail = result.detail.clone().unwrap_or_default();
+    assert!(detail.contains("argv: "), "{detail}");
+    assert!(detail.contains("exit: 1"), "{detail}");
+    assert!(detail.contains("partial stdout line"), "{detail}");
+    assert!(
+        detail.contains("harness refused: no credentials for the bound profile"),
+        "the raw stderr is published: {detail}"
+    );
 }
 
 // ---------------------------------------------------------------------------

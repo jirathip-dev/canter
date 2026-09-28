@@ -649,10 +649,35 @@ workspace_doc() {
   printf '{"workspace_id":"w1","label":"%s","worktree":{"repo_root":"%s","checkout_path":"%s","is_linked_worktree":true,"repo_name":"widgets"}}' \
     "$(read_state label '')" "$(read_state root '')" "$(read_state cwd '')"
 }
+# Issue #331: the lane's own pane is split off the pane the workspace was
+# opened with (WITH the kind's wrapper hint in `--env`), and that opened pane
+# is closed again — so `pane` state follows the SPLIT pane and the workspace
+# still answers with exactly one pane.
 case "$1 $2" in
+  "pane split")
+    log "$*"
+    pane=""; cwd=""; env=""
+    shift 2
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --pane) pane="$2"; shift 2 ;;
+        --cwd) cwd="$2"; shift 2 ;;
+        --env) env="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    printf '%s' "$cwd" > "$STATE/cwd"
+    printf '%s' "$env" > "$STATE/env"
+    printf 'w1:p2' > "$STATE/pane"
+    printf '{"result":{"pane":{"pane_id":"w1:p2","cwd":"%s"}}}\n' "$cwd"
+    ;;
+  "pane close")
+    log "$*"
+    printf '{"result":{}}\n'
+    ;;
   "workspace close")
     log "$*"
-    rm -f "$STATE/pane" "$STATE/name"
+    rm -f "$STATE/pane" "$STATE/name" "$STATE/env"
     printf '{"result":{}}\n'
     ;;
   "workspace list")
@@ -680,11 +705,17 @@ case "$1 $2" in
     printf '%s' "$label" > "$STATE/label"
     printf 'w1' > "$STATE/workspace"
     printf 'w1:p1' > "$STATE/pane"
-    printf '{"result":{"workspace":%s,"already_open":false}}\n' "$(workspace_doc)"
+    if [ -f "$STATE/created" ]; then
+      # The workspace the start row created is the one being registered: the
+      # row reports it back as already open (issue #331).
+      printf '{"result":{"workspace":%s,"already_open":true}}\n' "$(workspace_doc)"
+    else
+      printf '{"result":{"workspace":%s,"already_open":false}}\n' "$(workspace_doc)"
+    fi
     ;;
   "pane list")
     log "$*"
-    printf '{"result":{"panes":[{"pane_id":"w1:p1","cwd":"%s","tokens":{"canter_lane":"%s","canter_generation":"%s"}}]}}\n' "$(read_state cwd '')" "$(read_state lane '')" "$(read_state generation '')"
+    printf '{"result":{"panes":[{"pane_id":"%s","cwd":"%s","tokens":{"canter_lane":"%s","canter_generation":"%s"}}]}}\n' "$(read_state pane 'w1:p1')" "$(read_state cwd '')" "$(read_state lane '')" "$(read_state generation '')"
     ;;
   "pane report-metadata")
     log "$*"

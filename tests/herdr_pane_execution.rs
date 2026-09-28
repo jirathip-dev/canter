@@ -169,9 +169,32 @@ workspace_doc() {
     "$(read_state label '')" "$(read_state cwd '')" "$root" "$checkout" "$linked" "$repo"
 }
 case "$1 $2" in
+  "pane split")
+    log "$*"
+    pane=""; cwd=""; env=""
+    shift 2
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --pane) pane="$2"; shift 2 ;;
+        --cwd) cwd="$2"; shift 2 ;;
+        --env) env="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    # Issue #331: the lane's own pane is the SPLIT pane, and it is the one
+    # whose environment carries the kind's wrapper hint.
+    printf '%s' "$cwd" > "$STATE/cwd"
+    printf '%s' "$env" > "$STATE/env"
+    printf 'w1:p2' > "$STATE/pane"
+    printf '{"id":"cli:pane:split","result":{"pane":{"pane_id":"w1:p2","cwd":"%s"},"type":"pane_info"}}\n' "$cwd"
+    ;;
+  "pane close")
+    log "$*"
+    printf '{"id":"cli:pane:close","result":{"type":"ok"}}\n'
+    ;;
   "workspace close")
     log "$*"
-    rm -f "$STATE/pane" "$STATE/name" "$STATE/workspace"
+    rm -f "$STATE/pane" "$STATE/name" "$STATE/workspace" "$STATE/env"
     printf '{"result":{}}\n'
     ;;
   "workspace list")
@@ -574,8 +597,9 @@ fn the_role_starts_in_a_herdr_pane_created_in_the_lane_worktree() {
 
     assert_eq!(result.status, "succeeded", "{:?}", result.message);
     let payload = result.payload.clone().expect("payload");
-    // The recorded binding names the pane/agent identity and the worktree.
-    assert_eq!(payload.get("pane").and_then(Val::as_str), Some("w1:p1"));
+    // The recorded binding names the pane/agent identity and the worktree: the
+    // pane is the SPLIT pane, the lane's own (issue #331).
+    assert_eq!(payload.get("pane").and_then(Val::as_str), Some("w1:p2"));
     assert_eq!(payload.get("agent").and_then(Val::as_str), Some("impl-5"));
     assert_eq!(
         payload.get("worktree").and_then(Val::as_str),
@@ -586,8 +610,10 @@ fn the_role_starts_in_a_herdr_pane_created_in_the_lane_worktree() {
         Some("herdr")
     );
 
-    // The pane was created IN the lane worktree, and the role was started in
-    // that pane with the profile-authoritative binding on the start row.
+    // The pane was created IN the lane worktree, the lane's own pane was split
+    // off it WITH the kind's wrapper hint, the pane the workspace was opened
+    // with was closed again, and the role was started in the lane's own pane
+    // with the profile-authoritative binding on the start row.
     let rows = fixture.rows();
     assert!(
         rows.iter().any(|row| {
@@ -605,14 +631,32 @@ fn the_role_starts_in_a_herdr_pane_created_in_the_lane_worktree() {
         "the pane is created in the lane worktree: {rows:?}"
     );
     assert!(
-        rows.iter().any(|row| row
-            == "agent start impl-5 --kind hermes --pane w1:p1 -- -p lane-role \
-                --provider example-provider -m example-model"),
-        "the role starts in that pane with the bound binding: {rows:?}"
+        rows.iter().any(|row| {
+            row == &format!(
+                "pane split --pane w1:p1 --direction right --cwd {} --env HERDR_AGENT=hermes",
+                fixture.worktree.display()
+            )
+        }),
+        "the lane's own pane carries the kind's wrapper hint: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row == "pane close w1:p1"),
+        "the pane the workspace was opened with is closed again: {rows:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.state.join("env")).unwrap_or_default(),
+        "HERDR_AGENT=hermes",
+        "the split's environment is what the substrate classifies the lane by"
     );
     assert!(
         rows.iter().any(|row| row
-            == "pane report-metadata w1:p1 --source custom:canter-lane --agent canter \
+            == "agent start impl-5 --kind hermes --pane w1:p2 -- -p lane-role \
+                --provider example-provider -m example-model"),
+        "the role starts in the lane's own pane with the bound binding: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row
+            == "pane report-metadata w1:p2 --source custom:canter-lane --agent canter \
                 --token canter_lane=lane-abc123 --token canter_generation=1"),
         "the lane↔pane/agent binding is recorded: {rows:?}"
     );
@@ -670,6 +714,26 @@ fn a_second_start_reuses_the_bound_pane_and_agent() {
             .count(),
         1,
         "the reuse path starts no second agent: {:?}",
+        fixture.rows()
+    );
+    assert_eq!(
+        fixture
+            .rows()
+            .iter()
+            .filter(|row| row.starts_with("pane split"))
+            .count(),
+        1,
+        "the reuse path never re-splits the lane's own pane: {:?}",
+        fixture.rows()
+    );
+    assert_eq!(
+        fixture
+            .rows()
+            .iter()
+            .filter(|row| row.starts_with("pane close"))
+            .count(),
+        1,
+        "only the creation closed a pane — the reuse's own pane is already the hinted one: {:?}",
         fixture.rows()
     );
 }
@@ -1925,7 +1989,7 @@ fn an_undelivered_prompt_refuses_typed_with_argv_raw_output_exit_and_identity() 
         "the CLI's own error code is named: {message}"
     );
     assert!(
-        message.contains("impl-5") && message.contains("w1:p1"),
+        message.contains("impl-5") && message.contains("w1:p2"),
         "the refusal names the resolved agent and pane: {message}"
     );
     let detail = result.detail.clone().unwrap_or_default();
@@ -1951,7 +2015,7 @@ fn an_undelivered_prompt_refuses_typed_with_argv_raw_output_exit_and_identity() 
         "the raw stderr is recorded: {detail}"
     );
     assert!(
-        detail.contains("agent: impl-5") && detail.contains("pane: w1:p1"),
+        detail.contains("agent: impl-5") && detail.contains("pane: w1:p2"),
         "the resolved identity is recorded: {detail}"
     );
     assert!(
@@ -2033,7 +2097,7 @@ fn a_prompt_row_that_exited_zero_without_delivering_is_still_undelivered() {
         "the raw stdout document is recorded: {detail}"
     );
     assert!(
-        detail.contains("agent: impl-5") && detail.contains("pane: w1:p1"),
+        detail.contains("agent: impl-5") && detail.contains("pane: w1:p2"),
         "the resolved identity is recorded: {detail}"
     );
     assert!(
@@ -2590,8 +2654,8 @@ fn the_harness_start_step_starts_the_worker_in_the_lane_worktrees_pane() {
     };
     assert_eq!(
         fields.get("pane").and_then(Val::as_str),
-        Some("w1:p1"),
-        "the recorded bind names the pane the worker runs in"
+        Some("w1:p2"),
+        "the recorded bind names the lane's own pane the worker runs in"
     );
     assert_eq!(fields.get("agent").and_then(Val::as_str), Some("impl-5"));
     assert_eq!(fields.get("execution").and_then(Val::as_str), Some("herdr"));
@@ -2608,6 +2672,15 @@ fn the_harness_start_step_starts_the_worker_in_the_lane_worktrees_pane() {
                 fixture.worktree.display()
             )),
         "the pane is created in the run's lane worktree: {:?}",
+        fixture.rows()
+    );
+    assert!(
+        fixture.rows().iter().any(|row| row
+            == &format!(
+                "pane split --pane w1:p1 --direction right --cwd {} --env HERDR_AGENT=hermes",
+                fixture.worktree.display()
+            )),
+        "the lane's own pane carries the kind's wrapper hint: {:?}",
         fixture.rows()
     );
     assert!(!fixture.bare_spawned());

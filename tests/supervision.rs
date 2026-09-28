@@ -2871,8 +2871,10 @@ fn the_supervised_run_starts_its_worker_in_a_herdr_pane_in_the_lane_worktree() {
     let started = apply(3, "p2", "pane-bind-0001");
     assert_eq!(
         started.get("pane").and_then(Val::as_str),
-        Some("w1:p1"),
-        "the recorded bind names the Herdr pane: {}",
+        Some("w1:p2"),
+        "the recorded bind names the lane's OWN Herdr pane (issue #331: the \
+         pane split off the registration, whose environment carries the kind's \
+         wrapper hint): {}",
         canter::canonical::canonical_text(&started)
     );
     assert_eq!(started.get("agent").and_then(Val::as_str), Some("impl-5"));
@@ -2894,9 +2896,26 @@ fn the_supervised_run_starts_its_worker_in_a_herdr_pane_in_the_lane_worktree() {
     );
     assert!(
         rows.lines().any(|row| row
-            == "agent start impl-5 --kind hermes --pane w1:p1 -- -p lane-1 --provider \
+            == format!(
+                "pane split --pane w1:p1 --direction right --cwd {} --env HERDR_AGENT=hermes",
+                lane.display()
+            )),
+        "the lane's own pane carries the kind's wrapper hint: {rows}"
+    );
+    assert!(
+        rows.lines().any(|row| row == "pane close w1:p1"),
+        "the pane the registration created is closed again: {rows}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.dir.join("herdr-state/env")).expect("split env"),
+        "HERDR_AGENT=hermes",
+        "the lane's own pane is the one whose environment carries the hint"
+    );
+    assert!(
+        rows.lines().any(|row| row
+            == "agent start impl-5 --kind hermes --pane w1:p2 -- -p lane-1 --provider \
                  provider-a -m model-a"),
-        "the role starts in that pane with the run's declared binding: {rows}"
+        "the role starts in the lane's own pane with the run's declared binding: {rows}"
     );
     assert_eq!(
         std::fs::read_to_string(fixture.dir.join("herdr-state/cwd")).expect("pane cwd"),

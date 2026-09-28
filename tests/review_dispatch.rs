@@ -816,8 +816,32 @@ case "$1 $2" in
     id=""
     shift 2
     while [ $# -gt 0 ]; do case "$1" in --workspace) id="$2"; shift 2;; *) shift;; esac; done
-    printf '{"id":"cli:pane:list","result":{"panes":[{"pane_id":"%s:p1","cwd":"%s","tokens":{"canter_lane":"%s","canter_generation":"%s"}}],"type":"pane_list"}}\n' \
-      "$id" "$(cat "$STATE/$id.cwd")" "$(cat "$STATE/$id.lane" 2>/dev/null)" "$(cat "$STATE/$id.generation" 2>/dev/null)"
+    printf '{"id":"cli:pane:list","result":{"panes":[{"pane_id":"%s","cwd":"%s","tokens":{"canter_lane":"%s","canter_generation":"%s"}}],"type":"pane_list"}}\n' \
+      "$(cat "$STATE/$id.pane")" "$(cat "$STATE/$id.cwd")" "$(cat "$STATE/$id.lane" 2>/dev/null)" "$(cat "$STATE/$id.generation" 2>/dev/null)"
+    ;;
+  "pane split")
+    log "$*"
+    pane=""; cwd=""; env=""
+    shift 2
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --pane) pane="$2"; shift 2 ;;
+        --cwd) cwd="$2"; shift 2 ;;
+        --env) env="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    # Issue #331: the lane's own pane is the SPLIT pane, and it is the one
+    # whose environment carries the kind's wrapper hint.
+    id=$(id_of_pane "$pane")
+    printf '%s' "$id:p2" > "$STATE/$id.pane"
+    printf '%s' "$env" > "$STATE/$id.env"
+    printf '%s' "$cwd" > "$STATE/$id.cwd"
+    printf '{"id":"cli:pane:split","result":{"pane":{"pane_id":"%s:p2","cwd":"%s"},"type":"pane_info"}}\n' "$id" "$cwd"
+    ;;
+  "pane close")
+    log "$*"
+    printf '{"id":"cli:pane:close","result":{"type":"ok"}}\n'
     ;;
   "pane report-metadata")
     log "$*"
@@ -1892,7 +1916,7 @@ fn a_re_attempted_review_step_consumes_the_late_verdict_without_re_prompting_the
     );
     assert_eq!(
         receipt.get("pane").and_then(Val::as_str),
-        Some("w1:p1"),
+        Some("w1:p2"),
         "the record names the pane the submission was verified in"
     );
     assert_eq!(
@@ -1904,7 +1928,7 @@ fn a_re_attempted_review_step_consumes_the_late_verdict_without_re_prompting_the
     let message = first.message.clone().unwrap_or_default();
     assert!(
         message.contains(&reviewer.session_id)
-            && message.contains("w1:p1")
+            && message.contains("w1:p2")
             && message.contains(REVIEWER_MODEL)
             && message.contains("1 submission attempt(s)"),
         "the timeout records the reviewer identity, pane, serving model and attempt count: {message}"
@@ -1929,7 +1953,7 @@ fn a_re_attempted_review_step_consumes_the_late_verdict_without_re_prompting_the
     );
     assert_eq!(
         result.get("reviewer_pane").and_then(Val::as_str),
-        Some("w1:p1"),
+        Some("w1:p2"),
         "W4: the outcome names the leg's pane"
     );
     assert_eq!(
@@ -2050,7 +2074,7 @@ fn an_ambiguous_review_timeout_never_resolves_into_a_terminal_prompt_refusal() {
     let message = second.message.clone().unwrap_or_default();
     assert!(
         message.contains(&reviewer.session_id)
-            && message.contains("w1:p1")
+            && message.contains("w1:p2")
             && message.contains(REVIEWER_MODEL),
         "the typed wait still names the reviewer lane, pane and serving model: {message}"
     );
