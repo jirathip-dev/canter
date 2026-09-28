@@ -593,6 +593,48 @@ fn the_screens_render_the_exact_plan_the_scope_and_the_observed_facts() {
 }
 
 // ---------------------------------------------------------------------------
+// The board screen's own rows (issue #340)
+// ---------------------------------------------------------------------------
+
+/// The rendered frame, row by row, trailing blanks trimmed.
+fn render_lines(console: &OperatorConsole<'_>, size: (u16, u16)) -> Vec<String> {
+    render_text(console, size)
+        .split('\n')
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn the_board_screen_keeps_the_key_hint_and_the_supervision_strip_on_their_own_rows() {
+    let fixture = Fixture::seeded("board-rows");
+    let state = fixture.open();
+    let console = OperatorConsole::new(&state, fixture.socket.clone(), Some(config()), None);
+
+    // The acceptance capture, row by row: the last row carries exactly one
+    // logical line, and the key hint keeps its own row above it.
+    let lines = render_lines(&console, (200, 50));
+    assert_eq!(lines.len(), 50, "the capture is the whole 200x50 grid");
+    assert_eq!(
+        lines[49], "supervision: not read — select a run and press s",
+        "the last row is the supervision strip, alone"
+    );
+    assert_eq!(
+        lines[48], "keys: Tab focus | Up/Down select | Left/Right group | q quit",
+        "the key hint is neither overprinted nor truncated"
+    );
+    for (row, line) in lines.iter().enumerate() {
+        assert!(
+            !line.contains("soup"),
+            "row {row} splices the two lines into nonsense: {line:?}"
+        );
+        assert!(
+            !line.contains("keys:") || row == 48,
+            "row {row} carries a key hint outside its own row: {line:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Authorization is the ONE key that writes
 // ---------------------------------------------------------------------------
 

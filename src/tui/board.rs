@@ -64,16 +64,32 @@ impl Palette {
 
 /// Render the surface into the frame's full area.
 pub fn draw(view: &BoardView, state: &UiState, mode: ColorMode, frame: &mut ratatui::Frame) {
-    let area = frame.area();
+    draw_in(frame.area(), view, state, mode, frame);
+}
+
+/// Render the surface into `area` instead of the whole frame.
+///
+/// Every rect the board lays out is confined to `area`, so a caller that
+/// draws lines of its own (the operator console's supervision strip, issue
+/// #340) reserves the rows it needs and passes the remainder here: one row
+/// then carries exactly one logical line, and no widget can overprint
+/// another's row.
+pub fn draw_in(
+    area: Rect,
+    view: &BoardView,
+    state: &UiState,
+    mode: ColorMode,
+    frame: &mut ratatui::Frame,
+) {
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         draw_too_small(area, frame);
         return;
     }
     let palette = Palette::for_mode(mode);
     if area.width >= WIDE_MIN_WIDTH {
-        draw_wide(view, state, &palette, frame);
+        draw_wide(view, state, &palette, area, frame);
     } else {
-        draw_narrow(view, state, &palette, frame);
+        draw_narrow(view, state, &palette, area, frame);
     }
 }
 
@@ -88,8 +104,13 @@ fn draw_too_small(area: Rect, frame: &mut ratatui::Frame) {
     frame.render_widget(Paragraph::new(text), area);
 }
 
-fn draw_wide(view: &BoardView, state: &UiState, palette: &Palette, frame: &mut ratatui::Frame) {
-    let area = frame.area();
+fn draw_wide(
+    view: &BoardView,
+    state: &UiState,
+    palette: &Palette,
+    area: Rect,
+    frame: &mut ratatui::Frame,
+) {
     let notices = notice_lines(view, palette);
     let [head, notice_area, board, detail_area, footer] = Layout::vertical([
         Constraint::Length(3),
@@ -118,8 +139,13 @@ fn draw_wide(view: &BoardView, state: &UiState, palette: &Palette, frame: &mut r
     frame.render_widget(Paragraph::new(footer_line(palette)), footer);
 }
 
-fn draw_narrow(view: &BoardView, state: &UiState, palette: &Palette, frame: &mut ratatui::Frame) {
-    let area = frame.area();
+fn draw_narrow(
+    view: &BoardView,
+    state: &UiState,
+    palette: &Palette,
+    area: Rect,
+    frame: &mut ratatui::Frame,
+) {
     let notices = notice_lines(view, palette);
     let [head, notice_area, body, footer] = Layout::vertical([
         Constraint::Length(4),

@@ -1325,24 +1325,36 @@ impl ReadModel for OperatorConsole<'_> {
 
 /// Render the operator surface into the frame.
 ///
-/// On the board screen the board renderer draws and the bottom row carries the
-/// supervision strip of the selected run (issue #97) — or the typed notice,
-/// which always wins because it reports why an action refused. Every other
-/// screen renders its own bounded lines; the supervision screen scrolls with
-/// the panel's own offset.
+/// On the board screen the board renderer draws into every row except the
+/// last, and the last row carries the supervision strip of the selected run
+/// (issue #97) — or the typed notice, which always wins because it reports
+/// why an action refused. The two are distinct rows on purpose (issue #340):
+/// the strip used to be drawn over the board's own key-hint row, splicing
+/// one line's tail into the other. Every other screen renders its own bounded
+/// lines; the supervision screen scrolls with the panel's own offset.
 pub fn draw(console: &OperatorConsole<'_>, mode: ColorMode, frame: &mut ratatui::Frame) {
     let area = frame.area();
     match console.screen() {
         Screen::Board => {
             let view = console.snapshot();
-            super::board::draw(&view, console.ui_state(), mode, frame);
-            if area.height > 0 {
-                let strip = Rect {
-                    x: area.x,
-                    y: area.y + area.height - 1,
-                    width: area.width,
-                    height: 1,
-                };
+            // The strip owns the bottom row; the board gets the rows above
+            // it, so its key-hint row is the row before the strip and no
+            // cell is written by both widgets.
+            let strip = (area.height > 0).then(|| Rect {
+                x: area.x,
+                y: area.y + area.height - 1,
+                width: area.width,
+                height: 1,
+            });
+            let board_area = match strip {
+                Some(_) => Rect {
+                    height: area.height - 1,
+                    ..area
+                },
+                None => area,
+            };
+            super::board::draw_in(board_area, &view, console.ui_state(), mode, frame);
+            if let Some(strip) = strip {
                 let line = match console.notice_line(area.width as usize) {
                     Some(notice) => notice,
                     None => console
