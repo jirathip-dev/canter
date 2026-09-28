@@ -48,7 +48,9 @@ document schema families: hf-config/v1, hf-policy/v1, hf-output/v1, hf-error/v1,
 
 `--version` reports the schema facts the binary was built against — the
 same facts release archives bind to their provenance records
-([RELEASING.md](RELEASING.md)).
+([RELEASING.md](RELEASING.md)). Installing the binary to a stable PATH
+location, with the installed sha recorded and a one-step rollback, is
+section 10.2.
 
 Failure → remedy:
 
@@ -832,6 +834,78 @@ workspace, and a pass that leaves any scenario daemon behind FAILS:
 
 ```console
 $ python3 scripts/test-accept-bump.py          # needs target/release/canter
+```
+
+---
+
+### 10.2 Installing the binary on PATH (operator tooling, issue #221)
+
+The cutover cannot run from a build artifact: a real queue needs a stable,
+versioned binary on PATH, installed from a known head with the installed sha
+recorded, and a one-command way back out.
+
+`scripts/install-canter.py` is the operator driver for that install. It
+builds `cargo build --release --locked` in the checkout — the installed
+bytes must match a recorded head, so a dirty tree refuses
+(`install.refusal.tree_dirty`) unless `--allow-dirty` records it on purpose
+— or takes a prebuilt `--candidate`. It stages the bytes beside the
+destination, RUNS the staged copy (`--version`) before anything is replaced,
+retains the bytes currently installed as `<prefix>/canter.previous`,
+replaces `<prefix>/canter` atomically, re-hashes it against the staged bytes,
+and writes `<prefix>/canter.installed.json` (schema, action, the installed
+sha256, the full `--version` read-back, the source revision and whether it
+was dirty, the candidate, and the retained previous binary). `<prefix>`
+defaults to `~/.local/bin`.
+
+It is operator tooling: run it by hand, never from CI. It never touches the
+service manager and never starts or stops the daemon — it installs BYTES.
+
+```console
+$ python3 scripts/install-canter.py                          # build + install
+$ python3 scripts/install-canter.py --candidate /path/to/canter
+$ python3 scripts/install-canter.py --rollback               # one step back
+$ python3 scripts/install-canter.py --dry-run                # print the exact commands
+```
+
+The cutover sequence (steps 2 and 3 are executed by a human):
+
+1. **Install.** `python3 scripts/install-canter.py` from a green integration
+   head (the record names the revision it built from). `canter --version`
+   from a fresh shell must resolve to `<prefix>/canter`, and its
+   `shasum -a 256` must equal the record's `binary_sha256`.
+2. **Config.** `<prefix>/canter config init > $XDG_CONFIG_HOME/canter/config.toml`,
+   edit the real queue's repository/harness bindings in, then
+   `config validate` and `doctor --json`: the REAL state store and topology,
+   never the acceptance sandbox.
+3. **Service.** `<prefix>/canter service install-plan --json` — render the
+   unit from the INSTALLED binary (its `ExecStart` is the binary that
+   rendered it), then execute the printed steps on the target host:
+   launchd `bootstrap gui/$(id -u) <plist>` / `print`, or systemd
+   `daemon-reload` + `enable --now` + `status` (section 5.1). The
+   `enable`/`bootstrap` step is what makes the job survive a reboot.
+4. **Rollback (one step).** `<prefix>/canter service uninstall-plan --json`
+   removes the unit; `python3 scripts/install-canter.py --rollback` restores
+   the retained previous binary, retains the replaced one (the pair swaps),
+   re-runs the read-back and rewrites the record. `--rollback --dry-run`
+   prints the exact commands and touches nothing.
+
+| Refusal code | Exit | Meaning |
+| --- | --- | --- |
+| `install.refusal.usage` | 2 | invalid invocation (e.g. neither `--checkout` nor `--candidate`, a `--checkout` that is not a git checkout) |
+| `install.refusal.build` | 4 | `cargo build --release --locked` (or the artifact) failed |
+| `install.refusal.candidate` | 5 | the candidate is missing or not an executable file |
+| `install.refusal.prefix` | 6 | the prefix exists and is not a directory |
+| `install.refusal.install` | 7 | staging, retaining or replacing the installed binary failed |
+| `install.refusal.readback` | 8 | the bytes to install did not answer `--version`; the installed binary is left untouched |
+| `install.refusal.rollback` | 9 | no retained previous binary to restore (or it does not match the record) |
+| `install.refusal.tree_dirty` | 10 | the checkout has uncommitted changes |
+
+The driver is self-tested in disposable prefixes — the host's own
+`~/.local/bin`, its service manager and its daemon are never touched, and
+the suite needs no release build:
+
+```console
+$ python3 scripts/test-install-canter.py
 ```
 
 ---

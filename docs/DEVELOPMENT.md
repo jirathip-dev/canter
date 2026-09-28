@@ -171,6 +171,27 @@ $ python3 scripts/test-accept-bump.py
 
 The self-test needs a built release binary (`cargo build --release --locked`).
 
+## Operator install/rollback driver (issue #221)
+
+`scripts/install-canter.py` puts a built canter at a stable PATH location
+with the installed sha recorded and a one-step rollback. It builds
+`cargo build --release --locked` in the checkout (a dirty tree refuses; the
+binary must match a recorded head) or takes a prebuilt `--candidate`, runs
+the staged copy's `--version` BEFORE replacing anything, retains the current
+bytes as `<prefix>/canter.previous`, replaces `<prefix>/canter` atomically,
+and records `<prefix>/canter.installed.json`. `--rollback` restores the
+retained bytes (the pair swaps) and `--dry-run` prints the exact commands
+and writes nothing. It never touches the service manager or the daemon:
+rendering and executing the service unit stay with
+`canter service install-plan` and a human (`docs/OPERATIONS.md` section
+10.2 is the runbook). It is operator tooling — run it by hand, never from
+CI — and it is self-tested in disposable prefixes with fake candidates, so
+the suite needs no release build:
+
+```console
+$ python3 scripts/test-install-canter.py
+```
+
 ## Coverage — Phase 1 decision
 
 **Phase 1: no coverage gate.** The scaffold's test surface was a CLI metadata
