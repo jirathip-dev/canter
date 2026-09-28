@@ -18,8 +18,10 @@ What is proven:
 * rollback — `--rollback` restores the retained bytes, retains the replaced
   ones (the pair swaps), and rewrites the record for the restored bytes;
 * refusal — a rollback with nothing retained, a missing candidate, a prefix
-  that is a file, a candidate whose `--version` fails, and a dirty checkout
-  each exit with their typed `install.refusal.<code>` and change nothing;
+  that is a file, a candidate whose `--version` fails, a dirty checkout, a
+  checkout that is not a git repository, a failing build and a directory at
+  the destination each exit with their typed `install.refusal.<code>` and
+  change nothing;
 * dry-run — the exact commands are printed and no file is created, changed
   or removed (install and rollback).
 
@@ -367,7 +369,36 @@ def checks(binary: str | None, keep: bool) -> int:
                        "prefix that is a file")
         suite.check("install.refusal.prefix" in proc.stderr,
                     "the refusal code is not on stderr: " + proc.stderr)
+        proc = install(suite, workspace,
+                       ["--checkout", workspace, "--prefix", prefix_three], 2,
+                       "checkout that is not a git checkout")
+        suite.check("install.refusal.usage" in proc.stderr,
+                    "the refusal code is not on stderr: " + proc.stderr)
         print("PASS: a missing candidate and an unusable prefix refuse typed")
+
+        # 8b. The remaining refusal branches: a failed build, and a
+        # destination that exists as a directory.
+        failing_cargo = make_executable(
+            os.path.join(workspace, "fake-cargo-fails"),
+            "#!/usr/bin/env python3\nimport sys\nsys.exit(9)\n")
+        proc = install(suite, workspace,
+                       ["--checkout", checkout, "--prefix", prefix_three,
+                        "--cargo", failing_cargo, "--allow-dirty"], 4,
+                       "failing build")
+        suite.check("install.refusal.build" in proc.stderr,
+                    "the refusal code is not on stderr: " + proc.stderr)
+        prefix_six = os.path.join(workspace, "prefix-six")
+        os.makedirs(os.path.join(prefix_six, "canter"))
+        proc = install(suite, workspace,
+                       ["--candidate", candidate_a, "--prefix", prefix_six], 7,
+                       "destination that is a directory")
+        suite.check("install.refusal.install" in proc.stderr,
+                    "the refusal code is not on stderr: " + proc.stderr)
+        suite.check(os.path.isdir(os.path.join(prefix_six, "canter")),
+                    "the refusal touched the directory at the destination")
+        leftovers = [name for name in os.listdir(prefix_six) if ".new-" in name]
+        suite.check(not leftovers, "staged files were left behind: {}".format(leftovers))
+        print("PASS: a failing build and a directory at the destination refuse typed")
 
         # 10. Optional: the REAL binary installs and reads its own version back.
         if binary is not None:

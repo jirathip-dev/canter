@@ -285,6 +285,10 @@ class Installer:
             pass
 
     def do_install(self) -> int:
+        if os.path.isdir(self.binary):
+            raise Refusal("install.refusal.install",
+                          "{} is a directory; remove it before installing".format(
+                              self.binary))
         candidate = self.resolve_candidate()
         candidate_sha = "" if self.dry_run else sha256_file(candidate)
         self.out("candidate_sha256={}".format(candidate_sha or "(dry-run)"))
@@ -469,6 +473,8 @@ class Installer:
             print("{}: {}".format(refusal.code, refusal.message), file=sys.stderr)
             return refusal.exit_code
         except OSError as exc:
+            for staged in (self.staged, self.staged_previous, self.staged_rollback):
+                self.discard(staged)
             message = "install.refusal.install: {}".format(exc)
             self.out(message)
             print(message, file=sys.stderr)
