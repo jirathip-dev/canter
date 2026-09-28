@@ -134,6 +134,25 @@ through the custom rows; jcode registers through the custom rows only.
 OPERATIONS.md section 3.1 describes monitoring an unrecognized-harness lane
 from canter state instead of `herdr agent list`.
 
+## Control layer: current vs target
+
+The sections above describe the layers and the module split; this section
+records the *control chain* that drives them — the present shape and the
+intended one, so a reader can see both and why the difference matters. This
+is a documentation record: no architecture change is authorised here.
+
+**Current:** `owner -> conductor model -> orchestrator model -> lanes`, with **two control planes registered** (the legacy fleet tooling and the canter daemon). **Failure mode: a stalled hop stops the queue** — if any model-driven hop in the middle stalls (exhausted capacity, a wedged turn, a human waiting on a ruling), the whole chain stops even though the daemon and the lanes are healthy.
+
+**Target:** `owner -> typed operator surface -> canter daemon (the only driver) -> execution substrate -> implementer/reviewer lanes`, with models used only for lane work and exception escalation — **never as a required hop**. A model must not be a mandatory link in the control chain.
+
+Why the difference matters: in the current shape the middle hops are
+model-driven and human-adjacent, so a stall anywhere between the owner and the
+lanes becomes a queue stall — the healthy parts (single-writer state, live
+lanes) cannot carry the work forward. In the target shape the daemon is the
+only driver and typed state carries the work between steps, so a wedged or
+exhausted model turn is an *exception to escalate* (diagnose, retry within a
+bound, replace or release) instead of a stop condition for every other lane.
+
 ## Corral's actual current path (separate product)
 
 ```text
