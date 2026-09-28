@@ -67,3 +67,7 @@
 {"expect": "accept", "family": "hf-board", "file": "board/board.page.valid.json", "kind": "valid", "note": "a bounded first page with a continuation cursor must validate"}
 {"expect": "refuse", "family": "hf-board", "file": "board/board.malformed.json", "kind": "malformed", "note": "a reported-done row relabelled as verified without recorded evidence must be refused"}
 {"expect": "refuse", "family": "hf-board", "file": "board/board.unknown-version.json", "kind": "unknown-version", "note": "unsupported board schema version must be refused"}
+{"expect": "accept", "family": "hf-escalation", "file": "escalation/escalation.valid.json", "kind": "valid", "note": "one complete escalation page (delivery moved, worker timeout, expired grant) with closed codes and typed answers must validate"}
+{"expect": "accept", "family": "hf-escalation", "file": "escalation/escalation.page.valid.json", "kind": "valid", "note": "a bounded first page whose cursor is the ordering key of its last row must validate"}
+{"expect": "refuse", "family": "hf-escalation", "file": "escalation/escalation.malformed.json", "kind": "malformed", "note": "an escalation code outside the closed set must be refused"}
+{"expect": "refuse", "family": "hf-escalation", "file": "escalation/escalation.unknown-version.json", "kind": "unknown-version", "note": "unsupported escalation schema version must be refused"}
