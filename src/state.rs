@@ -14928,9 +14928,20 @@ fn advance_queue_in_tx(
             return Ok(());
         }
         if recorded.reason.is_none() {
-            // Exhausted: nothing was left to dispatch then, and a later
-            // delivery owns any further cursor move.
-            return Ok(());
+            // Exhausted at the last reconciliation: nothing of this
+            // submission's own was left to dispatch then, so the row records
+            // a bare exhaustion (issue #324). That is not a fence against the
+            // REPOSITORY's next parked submission: the delivering run was
+            // still LIVE when that exhaustion was written (it kept its counted
+            // slot for its own committed merge and cleanup, issue #152), and
+            // this is the reconciliation that completes it — the slot is free
+            // exactly now, so the repository's parked candidate is re-evaluated
+            // in THIS transaction below, and the row records which delivery
+            // consumed it. A delivery recorded while the run stays live after
+            // this point (the next leg's own delivery, #96) is still spent.
+            if !delivery_completes_run(state, tx, &submission.request_line, delivering_instance)? {
+                return Ok(());
+            }
         }
     }
     let (base_ordinal, base_work_item, base_instance, reason, message) = match &attempt.candidate {

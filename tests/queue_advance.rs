@@ -1490,10 +1490,31 @@ fn submit_single(
     key: &str,
     at: &str,
 ) -> (QueueSubmissionRow, Option<String>) {
-    let (bound, digest) = render_bound(
+    submit_single_request(
         state,
-        &request_with(vec![selected(&format!("#{issue}"), &[])]),
-    );
+        request_with(vec![selected(&format!("#{issue}"), &[])]),
+        issue,
+        grant_id,
+        caps,
+        key,
+        at,
+    )
+}
+
+/// The same submission, with a caller-supplied committed spine — the real
+/// queue spine carries the merge and the cleanup AFTER the reviewed-evidence
+/// delivery (`committed_tail_steps`), and that tail is what keeps the
+/// delivering run live at its delivery.
+fn submit_single_request(
+    state: &State,
+    request: qp::QueueRequest,
+    issue: i64,
+    grant_id: &str,
+    caps: ConcurrencyCaps,
+    key: &str,
+    at: &str,
+) -> (QueueSubmissionRow, Option<String>) {
+    let (bound, digest) = render_bound(state, &request);
     let params = submit_params_doc(
         key,
         &bound,
@@ -1776,6 +1797,186 @@ fn a_verified_delivery_continues_the_repositorys_next_parked_submission() {
             .len(),
         1
     );
+}
+
+/// Issue #324 residual (the live `qs_c1a6bb4c9c845674` / #276 / run-3a6b16d09a297839 shape).
+///
+/// The real queue spine carries its merge and its cleanup AFTER the
+/// reviewed-evidence delivery (`plan::doctrine_steps` p6/p7/p8), so the
+/// reconciliation that recognises a delivery leaves the delivering run LIVE:
+/// it still owes those steps and keeps the only per-repository slot. The
+/// repository's parked submission is re-evaluated in THAT transaction and
+/// holds — and the delivering delivery's own cursor row is written as a bare
+/// exhaustion (`reason` and `next_*` NULL: nothing of its OWN was left to
+/// dispatch). When the run's last committed step lands, the NEXT
+/// reconciliation completes it and frees the slot — and the cursor it wrote
+/// when it was still live must not foreclose that freed slot: the parked
+/// item advances then, in the same transaction, and its stale submit-time
+/// reason is replaced by the admission. At the defect's base the item stays
+/// `waiting` on the stale `refusal.admission.cap_repository` text forever —
+/// naming the run that is `done` — because nothing ever re-evaluates it (the
+/// recorded exhaustion early-returns the advance).
+#[test]
+fn a_completed_delivering_run_continues_the_repositorys_parked_submission() {
+    let fixture = Fixture::new("continuation-tail");
+    let state = fixture.open();
+    seed_grant(&state, "gr_0000000000000015", 15);
+    seed_grant(&state, "gr_0000000000000016", 16);
+    // ONE per-repository slot: the later submission parks — the live shape.
+    let caps = ConcurrencyCaps {
+        global: 4,
+        per_repository: 1,
+        per_harness: 4,
+    };
+    // The delivering submission: its committed spine is the real queue shape,
+    // with the merge and the cleanup after the reviewed delivery.
+    let mut delivering = request_with(vec![selected("#15", &[])]);
+    delivering.steps = committed_tail_steps();
+    delivering.boundary.caps = tail_boundary_caps();
+    let (submission_a, run_a) = submit_single_request(
+        &state,
+        delivering,
+        15,
+        "gr_0000000000000015",
+        caps,
+        "ik_324-continuation-tail-a",
+        "2026-01-02T00:00:00Z",
+    );
+    let run_a = run_a.expect("issue 15 admitted");
+    let (submission_b, parked_b) = submit_single(
+        &state,
+        16,
+        "gr_0000000000000016",
+        caps,
+        "ik_324-continuation-tail-b",
+        "2026-01-02T00:00:01Z",
+    );
+    assert_eq!(parked_b, None, "issue 16 parks: the only slot is taken");
+    // The steps the run already executed (the checkout + its own reviewed
+    // evidence), as a real run leaves them on the ledger.
+    record_achieved_step(&state, &run_a, "p1", "mutate.checkout", 21);
+    record_achieved_step(&state, &run_a, "r1", "mutate.review_evidence", 22);
+
+    // The delivery is recognised: reviewed PASS + every named check passed.
+    let evidence_id = record_delivery(&state, &run_a, HEAD_A);
+    let delivery = reconcile(&state, &run_a, true).expect("a fresh verified delivery");
+    assert_eq!(delivery.submission_id, submission_a.submission_id);
+
+    // The delivering run stays LIVE (its committed merge + cleanup are owed)
+    // and keeps its counted slot, so the parked item was re-evaluated against
+    // the live run: it holds, naming the run that still occupies the slot —
+    // and the delivering cursor records the bare exhaustion.
+    assert_ne!(
+        run_status(&state, &run_a),
+        "done",
+        "a run whose committed spine still owes the merge and the cleanup stays live"
+    );
+    let held = item_of(&submission_items(&state, &submission_b.submission_id), 16);
+    assert_eq!(held.status, "waiting");
+    assert_eq!(
+        held.reason.as_deref(),
+        Some("refusal.admission.cap_repository"),
+        "the slot is still genuinely held: {:?}",
+        held.message
+    );
+    assert!(
+        held.message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("widgets#15"),
+        "the live hold names the run that holds the slot: {:?}",
+        held.message
+    );
+    let advances_a = state
+        .queue_advance_rows(&submission_a.submission_id)
+        .expect("advances");
+    assert_eq!(advances_a.len(), 1);
+    assert_eq!(advances_a[0].next_instance_id, None);
+    assert_eq!(
+        advances_a[0].reason, None,
+        "nothing of the delivering submission's own was left to dispatch"
+    );
+
+    // The run's committed merge lands; the cleanup is still owed, so the run
+    // stays live and the parked item still waits.
+    record_achieved_step(&state, &run_a, "m1", "mutate.merge", 23);
+    assert_eq!(reconcile(&state, &run_a, false), Some(delivery.clone()));
+    assert_ne!(run_status(&state, &run_a), "done");
+    assert_eq!(
+        item_of(&submission_items(&state, &submission_b.submission_id), 16).status,
+        "waiting"
+    );
+
+    // The LAST committed step lands: the run COMPLETES here and the slot is
+    // free — the parked item must advance in the SAME transaction, with the
+    // cursor recording which delivery consumed it.
+    record_achieved_step(&state, &run_a, "c1", "mutate.cleanup", 24);
+    reconcile(&state, &run_a, false);
+    assert_eq!(
+        run_status(&state, &run_a),
+        "done",
+        "the delivering run completes after its LAST committed step"
+    );
+    let advanced = item_of(&submission_items(&state, &submission_b.submission_id), 16);
+    assert_eq!(
+        advanced.status, "admitted",
+        "the parked item advances once the delivering run is terminal and the slot is \
+         free; still waiting={:?} reason={:?} message={:?}",
+        advanced.status, advanced.reason, advanced.message
+    );
+    assert_eq!(advanced.reason, None, "the cleared hold is gone");
+    let run_b = advanced
+        .instance_id
+        .clone()
+        .expect("the continued run exists");
+    // The consumption is the delivering delivery's own row, read back from
+    // the cursor it advanced: which delivery, and what it dispatched.
+    let continuations = state
+        .queue_continuation_rows(&submission_b.submission_id)
+        .expect("continuations");
+    assert_eq!(continuations.len(), 1);
+    assert_eq!(
+        continuations[0].submission_id, submission_a.submission_id,
+        "the consuming delivery is named"
+    );
+    assert_eq!(continuations[0].delivered_head, HEAD_A);
+    assert_eq!(continuations[0].evidence_id, evidence_id);
+    assert_eq!(continuations[0].next_ordinal, Some(0));
+    assert_eq!(
+        continuations[0].next_instance_id.as_deref(),
+        Some(run_b.as_str())
+    );
+    let advances_a = state
+        .queue_advance_rows(&submission_a.submission_id)
+        .expect("advances");
+    assert_eq!(
+        advances_a[0].next_submission_id.as_deref(),
+        Some(submission_b.submission_id.as_str()),
+        "the delivering cursor names the submission it continued"
+    );
+    // The readback the operator sees moves: consumed 1 · dispatched 1.
+    let doc = submission_readback(&state, &submission_b.submission_id);
+    let advance = doc.get("advance").expect("advance block");
+    assert_eq!(advance.get("consumed").and_then(Val::as_int), Some(1));
+    assert_eq!(advance.get("dispatched").and_then(Val::as_int), Some(1));
+    assert!(matches!(advance.get("held"), Some(Val::Null)));
+    // The continued run is armed with the authorization ITS submission
+    // committed (issue #261), and the delivering run's check is its last one
+    // (issue #311).
+    let armed = state
+        .supervision_by_id(&run_b)
+        .expect("read")
+        .expect("the continued run is supervised");
+    assert_eq!(armed.desired, "armed");
+    assert_eq!(armed.authorization_digest, submission_b.digest);
+    let completed = state
+        .supervision_by_id(&run_a)
+        .expect("read")
+        .expect("the delivering run is supervised");
+    assert_eq!(completed.desired, "disabled");
+    assert_eq!(completed.retired_state, "done");
+    // And the completion reconciliation is the last one.
+    assert_eq!(reconcile(&state, &run_a, false), None);
 }
 
 /// Issue #324 + #261. The continuation ADMITS runs, so it must arm what it
