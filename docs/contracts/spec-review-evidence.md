@@ -160,11 +160,16 @@ The leg runs, in order:
    `effect.review_timeout` (ambiguous, parked), and the engine only ever READS
    that path. The deadline is the step's own effective bound: the plan's
    declared `deadline_secs` when it declared one, else the documented review
-   row `REVIEW_DEADLINE_DEFAULT_SECS` (1800 s, the prompt tier — a verdict
-   round trip is a worker-turn-class wait, issue #217; before that row the
-   kind fell into the generic 60 s I/O default and every live review —
-   measured verdicts take tens of minutes — was an `effect.review_timeout` by
-   construction).
+   row `REVIEW_DEADLINE_DEFAULT_SECS` (**3600 s, the effect ceiling** — the
+   reviewer's round trip IS the verification battery the review contract
+   demands of the leg: the red/green legs, a mutation probe, the boundary
+   scans; measured verdicts ran 1523 s of the old 1800 s window on a PASS and
+   expired it exactly while the reviewer was still working, `p6-294` r1/r2,
+   with `p6-224` r3 as the earlier occurrence — a correct delivery denied a
+   verdict purely on process duration, issues #217/#224; before the #217 row
+   the kind fell into the generic 60 s I/O default and every live review was
+   an `effect.review_timeout` by construction, and the row never leaves this
+   family's documented ceiling, `EFFECT_DEADLINE_CEILING_SECS`).
 
 **Proven delivery, recorded — a re-dispatch resumes, never re-delivers
 (issue #214).** The pane-substrate prompt reports success only through the
@@ -182,9 +187,10 @@ delivery is never repeated: the attempt resumes the bounded verdict wait, and
 RENEWED under the overall ceiling (`EFFECT_DEADLINE_CEILING_SECS`, 3600 s;
 issue #217: the reviewer is the one doing the waiting-work by then, so the
 attempt waits the maximum this effect family is ever allowed to wait instead
-of re-opening the fresh 1800 s window a live review has already outrun; a
-declared `deadline_secs` is the plan's own reviewed policy and is never
-overridden). The
+of re-opening a fresh window a live review has already outrun — with the #224
+review row AT the ceiling the renewal resolves to the same bound the fresh
+window carries, so nothing is widened by it; a declared `deadline_secs` is the
+plan's own reviewed policy and is never overridden). The
 duplicate delivery is exactly what the measured chain was made of
 (`run-1d4806c802c1088c`, p6-132): while the reviewer's turn was running the
 substrate could not take a second submission inside the prompt's bounded

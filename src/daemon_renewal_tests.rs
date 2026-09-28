@@ -541,10 +541,12 @@ fn the_renewed_window_is_derived_from_the_remaining_committed_spine() {
     );
     // The long head's remaining spine is rendered with the DOCUMENTED
     // deadlines, one per kind: 300 s (`harness_start`) + 1800 s (`prompt`) +
-    // 1800 s (`collect_outcome`) + 1800 s (`review_evidence`, issue #217: the
-    // review verdict wait carries the prompt tier's documented bound, never
-    // the generic 60 s I/O default).
-    for (fixture, window) in [(&short, 180_i64), (&long, 5700)] {
+    // 1800 s (`collect_outcome`) + 3600 s (`review_evidence`, issues #217/#224:
+    // the review verdict wait carries the effect ceiling's documented bound —
+    // the reviewer's round trip IS the verification battery, measured at 1523 s
+    // of the old 1800 s prompt-tier window on a PASS and expiring it while the
+    // reviewer was still working — never the generic 60 s I/O default).
+    for (fixture, window) in [(&short, 180_i64), (&long, 7500)] {
         fixture.lapse();
         let at = time::rfc3339_now();
         let state = fixture.shared.lock_state().unwrap();
@@ -575,7 +577,7 @@ fn the_renewed_window_is_derived_from_the_remaining_committed_spine() {
             "the superseded grant is never renewed again"
         );
     }
-    assert_ne!(180, 5700);
+    assert_ne!(180, 7500);
 }
 
 /// The negative witnesses: a FOREIGN, REVOKED, STALE-EPOCH or RELEASED
