@@ -95,8 +95,8 @@ re-specify them, it binds the orch to them.
 
 | Family | Operations | Kind | Scope |
 | --- | --- | --- | --- |
-| `queue` | `preview`, `submit`, `status` | preview/status read-only; `submit` records one digest-bound submission | one reviewed submission |
-| `run` | `pause`, `resume`, `retry`, `release`, `resolve`, `dispatch`, `status` | `status` read-only; the rest are typed controls | exactly ONE run (`run-` + 16 hex) |
+| `queue` | `preview`, `submit`, `status`, `intake` | preview/status read-only; `submit` records one digest-bound submission; `intake` (issue #245) is the deterministic feeder that renders ONE bound-input submission from the repository's own issue state and never bypasses admission | one reviewed submission |
+| `run` | `pause`, `resume`, `retry`, `reevaluate`, `release`, `retire-lane`, `resolve`, `dispatch`, `status` | `status` read-only; the rest are typed controls (`reevaluate` re-evaluates ONE check producer's own recorded checks at the same certified head; `retire-lane` retires the stale lane records of ONE ledger-terminal run) | exactly ONE run (`run-` + 16 hex) |
 | `grant` | `issue` | mint ONE route grant from a reviewed bound-input document (issuance is not authorization) | one repository/phase/scope |
 | `lane` | `preview`, `request`, `status` | `preview`/`status` read-only; `request` records ONE durable request (no spawn/kill/Git/grant/resume) | exactly ONE lane |
 | `supervision` | `status` | read-only | exactly ONE run |
@@ -201,7 +201,8 @@ closed sets are refused (the fixture corpus pins this:
 
 ## 4. The closed code set and the answering map (v1)
 
-Each code is an existing engine code (`src/mutation.rs` `code` module) whose
+Each code is an existing engine code (the `code` modules of
+`src/mutation.rs` and `src/adapters.rs`) whose
 documented semantics park a run or leave it needing a decision. `needs`
 separates a decision the orch can record through the typed controls from one
 that requires authority outside the run's committed boundary.
