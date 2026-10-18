@@ -495,17 +495,22 @@ fn the_run_dispatches_its_own_reviewer_and_consumes_the_verdict_it_writes() {
 // (issue #217) the verdict wait's documented bound
 // ---------------------------------------------------------------------------
 
-/// W217-1 (issue #217): a review step that declares NO `deadline_secs` waits
-/// under the documented review bound — the prompt tier — not the generic
-/// 60 s I/O default the kind used to fall into (which made every live review
-/// an `effect.review_timeout` by construction: measured verdicts take tens of
-/// minutes). The effective bound this witness pins RIDES the step outcome
-/// (`deadline_secs`, issue #92 F1), so the pinned value is the one the
-/// verdict wait USED. The bound is asserted as literals on purpose: this
-/// witness must compile — and FAIL — at the pre-#217 bound.
+/// W217-1 (issue #217, re-pinned by issue #224): a review step that declares
+/// NO `deadline_secs` waits under the documented review bound — since issue
+/// #224 that bound is the effect ceiling (3600 s), because the reviewer's
+/// round trip runs the verification battery the repository's review contract
+/// demands of the leg (the red/green legs, a mutation probe, the boundary
+/// scans) and that battery does not fit the prompt tier on a loaded host:
+/// measured p6-294 r1 PASSed at 1523 s of the old 1800 s window and r2
+/// expired it exactly while the reviewer was still working (issue #224, with
+/// p6-224 r3 as the earlier occurrence) — a correct delivery denied a verdict
+/// purely on process duration. The effective bound this witness pins RIDES
+/// the step outcome (`deadline_secs`, issue #92 F1), so the pinned value is
+/// the one the verdict wait USED. The bound is asserted as literals on
+/// purpose: this witness must compile — and FAIL — at the pre-#224 bound.
 ///
-/// RED (pre-#217): the outcome records 60 -> this test fails.
-/// GREEN (reviewed): the outcome records 1800 -> this test passes.
+/// RED (pre-#224): the outcome records 1800 -> this test fails.
+/// GREEN (reviewed): the outcome records 3600 -> this test passes.
 /// Raw exits: `cargo test --locked --test review_dispatch
 /// a_review_step_without_a_declared_deadline_waits_under_the_documented_review_bound`
 #[test]
@@ -532,14 +537,13 @@ fn a_review_step_without_a_declared_deadline_waits_under_the_documented_review_b
         .and_then(Val::as_int)
         .expect("the effective bound rides the step outcome (issue #92 F1)");
     assert_eq!(
-        bound, 1800,
+        bound, 3600,
         "the documented review verdict bound (REVIEW_DEADLINE_DEFAULT_SECS, the \
-         prompt tier): {outcome:?}"
+         effect ceiling — issues #217/#224): {outcome:?}"
     );
     assert!(
-        bound > 60,
-        "never the generic I/O default (EFFECT_DEADLINE_DEFAULT_SECS) that made \
-         every live review a timeout: {bound}"
+        bound > 1800,
+        "never the prompt tier the measured review battery outran (issue #224): {bound}"
     );
 }
 

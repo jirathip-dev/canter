@@ -100,12 +100,23 @@ const LANE_OUTLIVED_REVIEW: &str =
 
 /// Documented default deadline (seconds) for one review step's verdict wait
 /// (`review_evidence`): the reviewer's own round trip — read the certified
-/// head, review it, write the verdict — is the prompt tier's round trip, so
-/// the review kind carries the prompt tier's documented bound instead of
-/// falling into the generic I/O default (issue #217; the 60 s row it landed
-/// in made every live review an `effect.review_timeout` by construction —
-/// measured verdicts take tens of minutes on this host).
-pub const REVIEW_DEADLINE_DEFAULT_SECS: u64 = PROMPT_DEADLINE_DEFAULT_SECS;
+/// head, review it, write the verdict — IS the verification battery the
+/// repository's review contract demands of the leg (the red/green legs, a
+/// mutation probe, the boundary scans), and that battery does not fit the
+/// prompt tier's 1800 s bound on a loaded host. Measured (issue #224): a PASS
+/// verdict took 1523 s of the 1800 s window on a loaded host, and a
+/// re-evaluation round expired the window exactly while the reviewer was
+/// still working — a correct delivery denied a verdict purely on process
+/// duration, with the run paying a bounded retry plus a re-evaluation cycle
+/// for a timing condition that resolved itself. The review kind therefore
+/// carries the documented effect ceiling — the maximum any ONE effect of this
+/// family may ever wait ([`EFFECT_DEADLINE_CEILING_SECS`]) — never the generic
+/// 60 s I/O default the kind first landed in (issue #217) and never the prompt
+/// tier that preceded it. The #217 resumed renewal
+/// ([`review_verdict_wait_secs`]) is never widened by this row: with the row
+/// AT the ceiling it resolves to the same bound the fresh window already
+/// carries, and a plan's declared `deadline_secs` still wins either way.
+pub const REVIEW_DEADLINE_DEFAULT_SECS: u64 = EFFECT_DEADLINE_CEILING_SECS;
 
 /// Issue #170 (N7): how many CONSECUTIVE non-working read-backs of a
 /// collection's pane worker — each separated by the real
@@ -213,6 +224,12 @@ pub fn default_deadline_secs(kind: &str) -> u64 {
 /// A plan that declared its own `deadline_secs` keeps its reviewed policy
 /// (bound by the plan digest): the renewal replaces only the engine's own
 /// default window, never a declared one.
+///
+/// Issue #224: the review row ([`REVIEW_DEADLINE_DEFAULT_SECS`]) IS the
+/// documented ceiling now, so for an undeclared plan the fresh wait and the
+/// renewed one carry the SAME bound — the renewal still resolves inside the
+/// ceiling and a declared `deadline_secs` still wins, so nothing is widened
+/// by it.
 pub fn review_verdict_wait_secs(effective: u64, declared: bool, resumed: bool) -> u64 {
     if resumed && !declared {
         EFFECT_DEADLINE_CEILING_SECS
@@ -10450,13 +10467,18 @@ mod tests {
             PROMPT_DEADLINE_DEFAULT_SECS
         );
         assert_eq!(effect_deadline_secs("collect_outcome", None).unwrap(), 1800);
-        // Issue #217: the review verdict wait carries its own documented row
-        // at the prompt tier — never the generic 60 s I/O default.
+        // Issues #217/#224: the review verdict wait carries its own documented
+        // row AT the effect ceiling — never the generic 60 s I/O default, and
+        // never the prompt tier the measured review battery outran.
         assert_eq!(
             effect_deadline_secs("review_evidence", None).expect("default"),
             REVIEW_DEADLINE_DEFAULT_SECS
         );
-        assert_eq!(REVIEW_DEADLINE_DEFAULT_SECS, PROMPT_DEADLINE_DEFAULT_SECS);
+        assert_eq!(REVIEW_DEADLINE_DEFAULT_SECS, EFFECT_DEADLINE_CEILING_SECS);
+        // The row IS the effect ceiling, and never the prompt tier the
+        // measured review battery outran (issue #224): pinned as a literal
+        // on purpose — this witness must FAIL at the pre-#224 bound.
+        assert_eq!(REVIEW_DEADLINE_DEFAULT_SECS, 3600);
         assert!(
             effect_deadline_secs("review_evidence", None).expect("default")
                 > EFFECT_DEADLINE_DEFAULT_SECS,

@@ -6,6 +6,31 @@ release process activates (docs/RELEASING.md), then semver applies.
 
 ## [Unreleased]
 
+### Fixed (issue #224 — the review verdict wait's documented row is the effect ceiling: the reviewer's round trip IS the verification battery)
+
+- `REVIEW_DEADLINE_DEFAULT_SECS` is now `EFFECT_DEADLINE_CEILING_SECS`
+  (3600 s), not the prompt tier's 1800 s: a reviewer reads the certified
+  head, runs the witnesses the review contract demands of the leg (the
+  red/green legs, a mutation probe, the boundary scans) and writes the
+  verdict, and that battery does not fit 1800 s on a loaded host — measured
+  `p6-294` r1 PASSed at 1523 s of the window and r2 expired it exactly while
+  the reviewer was still working (`p6-224` r3 as the earlier occurrence), so
+  a correct delivery was denied a verdict purely on process duration and the
+  run paid a bounded retry plus a re-evaluation cycle for a timing condition
+  that resolved itself. The resume-and-renew discipline of #214/#217 is
+  unchanged (the renewal now resolves to the same bound the fresh window
+  carries), a plan's declared `deadline_secs` still wins, and the grant
+  renewal window derived from the remaining spine follows the documented row
+  (a spine that still owes a review renews 1800 s longer).
+  - witnesses: `a_review_step_without_a_declared_deadline_waits_under_the_documented_review_bound`
+    (literal pin, RED at the pre-#224 bound → `cargo test --locked --test
+    review_dispatch`), the per-kind row unit witness
+    (`src/mutation.rs::tests`), and the spine-window witness
+    (`src/daemon_renewal_tests.rs::renew_lapsed_run_grant…`).
+  - normative detail: `docs/contracts/spec-review-evidence.md` (item 6 and
+    the resume paragraph) and `docs/contracts/spec-plans.md` (the per-kind
+    deadline table).
+
 ### Added (issue #221 — a versioned, reversible install of a built canter: recorded sha, `--version` read-back, one-step rollback)
 
 - `scripts/install-canter.py` installs a built canter to a stable PATH

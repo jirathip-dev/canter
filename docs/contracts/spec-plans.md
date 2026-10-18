@@ -341,10 +341,14 @@ runs control-plane effects:
 - **Per-effect deadlines (issue #92 F1)**: every effect that spawns has an
   explicit, documented, bounded deadline, resolved from a per-kind table —
   never a bare constant at the effect site:
-  - `prompt`, `collect_outcome` and `review_evidence` 1800 s (the review
-    step's own documented row, `REVIEW_DEADLINE_DEFAULT_SECS`: a reviewer's
-    verdict round trip is a worker-turn-class wait and never the generic I/O
-    default — issue #217), `cleanup` 1800 s (`CLEANUP_DEADLINE_DEFAULT_SECS`:
+  - `prompt` and `collect_outcome` 1800 s, `review_evidence` 3600 s (the
+    review step's own documented row, `REVIEW_DEADLINE_DEFAULT_SECS`: a
+    reviewer's verdict round trip IS the verification battery the review
+    contract demands of the leg — the red/green legs, a mutation probe, the
+    boundary scans — so the row carries the effect ceiling and never the
+    generic I/O default; measured verdicts ran 1523 s of the old 1800 s
+    window on a PASS and expired it while the reviewer was still working —
+    issues #217/#224), `cleanup` 1800 s (`CLEANUP_DEADLINE_DEFAULT_SECS`:
     the step's bounded wait for a lane that outlived its own publish IS the
     worker's round trip, so the generic 60 s row would park a run whose
     publish already succeeded — issue #224), `harness_start` 300 s, every
